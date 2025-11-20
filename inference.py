@@ -692,7 +692,7 @@ for step in tqdm(range(len(order_list)-2)):
                 py=py*suo
                 v=np.sqrt(pow(px.item()-x.item(),2)+pow(y.item()-py.item(),2))
                
-                if v<100:
+                if v<1000:
                     l5.append(tnid[j])
 
                     l6.append(x.item())
@@ -742,4 +742,5 @@ track=track.merge(cc, on='trackid')
 track=track.loc[track.countq>3] 
 
 track.to_csv(output_dir_path+'track.csv',index=False) 
+
 
