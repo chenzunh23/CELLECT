@@ -231,6 +231,7 @@ class UNet3D(nn.Module):
             nn.LeakyReLU())
 
     def forward(self, x):
+        # x: (B, 2, X, Y, Z) two-frame input with shape (batch_size, channels, depth, height, width)
         #  Level 1 context pathway
         out = self.conv3d_c1_1(x)
         residual_1 = out
@@ -334,18 +335,38 @@ class UNet3D(nn.Module):
         ds1_ds2_sum_upscale_ds3_sum_upscale = self.upsacle(ds1_ds2_sum_upscale_ds3_sum)
 
         out = out_pred + ds1_ds2_sum_upscale_ds3_sum_upscale
+        # Paper Fig. 1 / Methods mapping:
+        # seg_layer is the shared 6-channel dense prediction tensor before it is
+        # split into coarse segmentation, division logits, and radius/size.
+        #   channels 0:3 -> coarse cell/background segmentation logits
+        #   channels 3:5 -> division probability logits
+        #   channels 5:6 -> coarse cell size/radius estimate
         seg_layer = out
 
         
         f=torch.cat([f,ds1_ds2_sum_upscale_ds3_sum_upscale],1)
         f1=self.conv_norm_lrelu_f1(f)
         f1=self.conv3d_f1(f1)
-        u=seg_layer[:,:3]
+        # f1 is the 64-channel latent embedding map used by contrastive learning
+        # and by the intra-/inter-frame MLPs after sampling at center points.
+        u=seg_layer[:,:3] # (B,3,X,Y,Z)
+        # CEN/LNet input: raw segmentation logits, their softmax probabilities,
+        # and the original two-frame image input. The output uo is the enhanced
+        # confidence map from which center-point peaks are selected.
+        # print(f'[DEBUG] u shape: {u.shape}, f1 shape: {f1.shape}, seg_layer shape: {seg_layer.shape}, x shape: {x.shape}')
         uu=torch.cat([u,self.softmax(u)],1)
+        # print(f'[DEBUG] After adding softmax, uu shape: {uu.shape}')
         uu=torch.cat([uu,x],1)
-        uo=self.lnet(uu)
+        # print(f'[DEBUG] After adding original input, uu shape: {uu.shape}')
+        uo=self.lnet(uu) # (B,5,X,Y,Z)
      
         ku=self.relu(seg_layer[:,5:])
+        # Return order used throughout cellectP.py:
+        #   u   -> coarse segmentation logits
+        #   uo  -> enhanced confidence map / center score map
+        #   f1  -> 64-channel latent embedding map
+        #   seg_layer[:,3:5] -> division logits
+        #   ku  -> size/radius estimate
         return u,uo,f1,seg_layer[:,3:5],ku#,seg_layer[:,4:]
     
     

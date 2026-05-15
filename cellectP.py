@@ -169,8 +169,16 @@ DK1=torch.from_numpy(DK1).float().reshape([1,1,7,7,1])#.repeat(1,1,1,1,3)
 ######################## Test each patch using U-Net
 def feature_extract_patch(U,x,la):
     device = x.device
+    # Paper-to-code mapping for one 3D patch:
+    #   Uout  -> coarse segmentation logits from the main UNet branch
+    #   uo    -> enhanced confidence map / center score map from CEN/LNet
+    #   foz   -> 64-channel latent embedding map
+    #   zs1   -> division logits
+    #   size1 -> coarse cell size/radius map
     Uout,uo,foz,zs1,size1 =  U(x)
+    # Reorder embedding map so features can be sampled as Uf[:, batch, x, y, z].
     Uf=foz.transpose(0,1)
+    # Smooth the confidence-map channels in XY before searching for peaks.
     uo[:, :5] = F.conv3d(
         uo[:, :5].float(),
         DK1.expand(5, 1, *DK1.shape[2:]).to(device),  # shape [5,1,7,7,1]
@@ -180,24 +188,46 @@ def feature_extract_patch(U,x,la):
     # uu=(Uout.argmax(1)==1)
     # uxo=uo[:,4]
     #uc=(F.max_pool3d(uxo, kernel_size=3, stride=1, padding=2)==uxo)*uu
+    # uc is the center-point mask selected from the enhanced confidence map.
+    # Channel 4 is treated as the final center-confidence channel; candidate
+    # peaks are also rejected if the coarse segmentation predicts background
+    # around them.
+    # Take the max -> Local peak score = channel 4 score -> Filter out candidates
+    # with background segmentation in the neighborhood. 
+    # The paper does not specify the exact neighborhood size for this step; 
+    # 3x3x3 is used here as a reasonable choice.
     uc=((F.max_pool3d(uo[:,:].max(1)[0], kernel_size=3, stride=1, padding=1)==uo[:,4]))*(kflb(Uout.argmax(1)==0).cuda().sum(1)==0)
     #uc=((kflb(uo[:,:].max(1)[0]).cuda().max(1)[0]==uo[:,4]))*(Uout.argmax(1)>0)
+    
+    # Remove false peaks near the patch borders. The paper does not specify 
+    # this step but it is necessary to prevent out-of-bounds errors when sampling 
+    # features around peaks near the borders.
     uc[:,:3]=0
     uc[:,-3:]=0
     uc[:,:,:3]=0
     uc[:,:,-3:]=0
     uc[:,:,:,:3]=0
     uc[:,:,:,-2:]=0    
+    # ar is not the paper segmentation output. It is an occupied-region mask
+    # expanded around selected centers and is used for patch-overlap deduping.
     ar=F.conv3d((uc>0).float().unsqueeze(1), DK1.to(device), padding=(3,3,0))  
     #ar=F.conv3d((ar>0).float(), DK1.to(device), padding=(3,3,0))
     for i in range(1):
-            ar=ud(ar)   
+            ar=ud(ar)
+    # u: batch indices; x,y,z: center coordinates. Shape: [N_centers]
     u,x,y,z=torch.where(uc.to(device, dtype=torch.float))
+    # Sample per-center outputs from dense maps.
+    # Feature map at centers
     f1=Uf[:,u,x,y,z].transpose(0,1)
+    # Size map at centers
     s1=size1[u,0,x,y,z]
+    # division sigmoid at centers
     zs1=F.sigmoid(zs1[u,:,x,y,z])
-    lb1=la[u,x,y,z]  
+    lb1=la[u,x,y,z]
+    # center coordinates
     p1=torch.cat([u.unsqueeze(1),x.unsqueeze(1),y.unsqueeze(1),z.unsqueeze(1)],1)
+    # Return local patch centers, center embeddings, size, division scores,
+    # labels at centers, occupied mask for deduping, and coarse segmentation logits.
     return p1,f1,s1,zs1,lb1,ar,Uout
 def cp2(x,ba,bb,bc):
     aa=((x[:,1])<=ba.max())*((x[:,1])>=ba.min())
@@ -211,6 +241,9 @@ def cp3(x,ba):
 
 ########## U-Net feature extraction process for the entire image
 def feature_extract(U,x,l):
+    # Sliding-window inference over a full 3D volume.
+    # x is the two-frame input volume, shape [B, 2, X, Y, Z].
+    # l carries labels only when available; inference passes an all-zero tensor.
     u,c,pl1,pl2,pl3=x.shape
     ax=pl3
     #print(ax)
@@ -219,12 +252,22 @@ def feature_extract(U,x,l):
         u,c,pl1,pl2,pl3=x.shape
     pol=256
     polz=32
+    # Patch size is 256 x 256 x 32, with overlap 8 x 8 x 4.
     pl=pol-8#256-128
     plz=polz-4
     xm,ym,zm=pl1//pl+int(pl1%pl>0),pl2//pl+int(pl2%pl>0),pl3//plz+int(pl3%plz>0)
+    # Accumulators over all patches:
+    #   p  -> center coordinates [batch, x, y, z]
+    #   f  -> 64-channel center embeddings
+    #   s  -> center size/radius estimates
+    #   zs -> center division probabilities
+    #   lb -> labels at centers if labels are supplied
     p,f,s,zs,lb=[],[],[],[],[]
     plist=[]
     num=0
+    # uout is the coarse segmentation aggregation used later as
+    # result['frame*']['seg']; ku is only for duplicate suppression across
+    # overlapping patches.
     uout=torch.zeros([pl1,pl2,pl3])
     ku=torch.zeros([pl1,pl2,pl3])
     kup=torch.zeros([pl1,pl2,pl3])
@@ -248,6 +291,10 @@ def feature_extract(U,x,l):
           
                 with torch.no_grad():
                     p1,f1,s1,zs1,lb1,ar,uo=  feature_extract_patch(U,x[:,:,v1:v2,v3:v4,v5:v6],l[:,v1:v2,v3:v4,v5:v6])  
+                # uo is unfortunately named here: feature_extract_patch returns
+                # Uout in this slot, i.e. the coarse segmentation logits, not
+                # the enhanced confidence map. Class 1 is accumulated as the
+                # coarse cell segmentation mask.
                 uout[v1+2:v2-2,v3+2:v4-2,v5:v6]+=(uo.argmax(1).squeeze().cpu()[2:-2,2:-2]==1).float()
                     
                 ar[ar>1]=1
@@ -261,6 +308,8 @@ def feature_extract(U,x,l):
               
                   
                    
+                    # Drop centers that fall inside a previously occupied
+                    # region from an overlapping patch.
                     kn=cp3(p1.cpu(),ku==1)
                     
            
@@ -289,6 +338,9 @@ def feature_extract(U,x,l):
     f=f[fn]
     s=s[fn]
     zs=zs[fn]
+    # Return full-volume center detections and dense coarse segmentation.
+    # The fifth return value is kept for API compatibility; in inference it is
+    # a duplicate of size rather than a true label tensor.
     return p,f,zs,s,s,uout[:,:,:ax]
 ################################# Load and test the final frame to determine the processing scope
 
@@ -297,9 +349,10 @@ def track(inputs, in2, in3, zratio, PA, U, EX, EN, div = 1):
     o1={}
     o2={}
     with torch.no_grad():
-                p1,f1,zs1,s1,lb1,uout =  feature_extract(U,(PA(torch.cat([inputs,in2],1))),inputs[:,0]*0)
+                # Centers, center embedding, division probability, size, labels, and coarse segmentation for the first pair
+                p1,f1,zs1,s1,lb1,uout =  feature_extract(U,PA(torch.cat([inputs,in2],1)),inputs[:,0]*0)
 
-                p2,f2,zs2,s2,lb2,uo2 =  feature_extract(U,(PA(torch.cat([in2,in3],1))),in2[:,0]*0) 
+                p2,f2,zs2,s2,lb2,uo2 =  feature_extract(U,PA(torch.cat([in2,in3],1)),in2[:,0]*0) 
     p1=p1[:,1:].float()
     p2=p2[:,1:].float()
       
@@ -337,6 +390,8 @@ def track(inputs, in2, in3, zratio, PA, U, EX, EN, div = 1):
     zs2=zs2[u]
     s2=s2[u]
     lb2=lb2[u]
+    p1_mask=p1.clone()
+    p2_mask=p2.clone()
     p1[:,2]=p1[:,2]*zratio
     p2[:,2]=p2[:,2]*zratio
     
@@ -654,12 +709,16 @@ def track(inputs, in2, in3, zratio, PA, U, EX, EN, div = 1):
             else:
                 r[i]=[j[0] for j in r[i]]
         Z={}
+        # Build a simple instance-like segmentation for linked detections.
+        # This corresponds to the paper's "cell segmentation" derived from
+        # confidence-map peaks and estimated size/radius, then intersected with
+        # the coarse UNet segmentation.
         tq=np.zeros(inputs.squeeze().shape)     
         tq2=np.zeros(inputs.squeeze().shape)  
         u1=list(r.keys())
         for i in range(p1.shape[0]):
             if i in u1:
-                x,y,z=p1[i]
+                x,y,z=p1_mask[i]
                 x=int(x)
                 y=int(y)
                 z=int(z)
@@ -667,7 +726,7 @@ def track(inputs, in2, in3, zratio, PA, U, EX, EN, div = 1):
 
                 tq=fill(tq,x,y,z,s=max(3,s),r=zratio,v=i+1)
                 for j in r[i]:
-                    x,y,z=p2[j]
+                    x,y,z=p2_mask[j]
                     x=int(x)
                     y=int(y)
                     z=int(z)
@@ -678,13 +737,17 @@ def track(inputs, in2, in3, zratio, PA, U, EX, EN, div = 1):
         o1['feature']=f1
         o1['size']=s1
         o1['div']=zs1
+        # seg: dense coarse segmentation aggregated from UNet class-1 logits.
+        # seg_mask: center/size-filled instances restricted by seg > 0.
         o1['seg']=uout
         o1['seg_mask']=tq*(uout.cpu().numpy()>0)#.float()
         o1['group']=dx
+
         o2['pos']=p2
         o2['feature']=f2
         o2['size']=s2
         o2['div']=zs2
+        # Same two segmentation products for frame2.
         o2['seg']=uo2
         o2['seg_mask']=tq2*(uo2.cpu().numpy()>0)
         o2['group']=dx2  

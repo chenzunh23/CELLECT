@@ -1,0 +1,12 @@
+__pycache__/
+.vscode/
+.venv/
+tmp/
+output*/
+demos/
+extradata/
+*.fits
+*.pickle
+*.zip*
+*.tar*
+*.log
