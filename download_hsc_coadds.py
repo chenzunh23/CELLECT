@@ -21,6 +21,7 @@ import netrc
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -128,6 +129,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=60.0, help="HTTP timeout in seconds.")
     parser.add_argument("--retries", type=int, default=3, help="Retries per file. Default: 3.")
     parser.add_argument(
+        "--scan-retries",
+        type=int,
+        default=3,
+        help="Retries per remote directory listing. Default: 3.",
+    )
+    parser.add_argument(
+        "--scan-delay",
+        type=float,
+        default=2.0,
+        help="Initial delay between directory-listing retries, in seconds. Default: 2.",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Overwrite existing files. By default existing files are skipped.",
@@ -141,6 +154,17 @@ def parse_args() -> argparse.Namespace:
         "--no-size-check",
         action="store_true",
         help="Do not issue HEAD requests to compare existing file sizes.",
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable the live progress line.",
+    )
+    parser.add_argument(
+        "--progress-interval",
+        type=float,
+        default=0.2,
+        help="Minimum seconds between progress refreshes. Default: 0.2.",
     )
     return parser.parse_args()
 
@@ -245,6 +269,29 @@ def discover_fits(
     return urls
 
 
+def discover_fits_with_retries(
+    opener: urllib.request.OpenerDirector,
+    directory_url: str,
+    file_types: set[str] | None,
+    timeout: float,
+    retries: int,
+    delay: float,
+) -> list[str]:
+    last_error: Exception | None = None
+    for attempt in range(1, max(1, retries) + 1):
+        try:
+            return discover_fits(opener, directory_url, file_types, timeout=timeout)
+        except urllib.error.HTTPError:
+            raise
+        except urllib.error.URLError as exc:
+            last_error = exc
+            if attempt < retries:
+                time.sleep(max(0.0, delay) * attempt)
+    if last_error:
+        raise last_error
+    return []
+
+
 def filename_matches_types(filename: str, file_types: set[str]) -> bool:
     return any(re.search(rf"(^|[-_.]){re.escape(kind)}([-_.]|$)", filename) for kind in file_types)
 
@@ -296,6 +343,104 @@ def should_skip_existing(
     return True
 
 
+class ProgressReporter:
+    def __init__(self, total_files: int, enabled: bool = True, interval: float = 0.2) -> None:
+        self.total_files = total_files
+        self.enabled = enabled and sys.stderr.isatty()
+        self.interval = max(0.05, interval)
+        self.lock = threading.Lock()
+        self.completed_files = 0
+        self.failed_files = 0
+        self.bytes_done = 0
+        self.bytes_total = 0
+        self.active: dict[str, str] = {}
+        self.started_at = time.monotonic()
+        self.last_render = 0.0
+
+    def add_total(self, size: int | None) -> None:
+        if not self.enabled or not size:
+            return
+        with self.lock:
+            self.bytes_total += size
+
+    def update(self, task: DownloadTask, bytes_count: int) -> None:
+        if not self.enabled:
+            return
+        with self.lock:
+            self.bytes_done += bytes_count
+            self.active[self._task_key(task)] = task.dest.name
+            self._render_locked()
+
+    def finish_file(self, task: DownloadTask, failed: bool = False, force: bool = False) -> None:
+        if not self.enabled:
+            return
+        with self.lock:
+            self.completed_files += 1
+            if failed:
+                self.failed_files += 1
+            self.active.pop(self._task_key(task), None)
+            self._render_locked(force=force)
+
+    def close(self) -> None:
+        if not self.enabled:
+            return
+        with self.lock:
+            self._render_locked(force=True)
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+
+    def _render_locked(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self.last_render < self.interval:
+            return
+        self.last_render = now
+
+        elapsed = max(now - self.started_at, 1e-6)
+        speed = self.bytes_done / elapsed
+        if self.bytes_total:
+            fraction = min(self.bytes_done / self.bytes_total, 1.0)
+            percent = f"{fraction * 100:5.1f}%"
+            bar = self._bar(fraction)
+            byte_text = f"{format_bytes(self.bytes_done)}/{format_bytes(self.bytes_total)}"
+        else:
+            percent = "  n/a"
+            bar = self._bar(None)
+            byte_text = format_bytes(self.bytes_done)
+
+        active = next(iter(self.active.values()), "")
+        if len(active) > 34:
+            active = "..." + active[-31:]
+        line = (
+            f"\r{bar} {percent} "
+            f"files {self.completed_files}/{self.total_files}"
+            f" fail {self.failed_files} "
+            f"{byte_text} {format_bytes(speed)}/s {active:<34}"
+        )
+        sys.stderr.write(line[:160])
+        sys.stderr.flush()
+
+    @staticmethod
+    def _bar(fraction: float | None, width: int = 24) -> str:
+        if fraction is None:
+            return "[" + "." * width + "]"
+        filled = int(width * fraction)
+        return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+    @staticmethod
+    def _task_key(task: DownloadTask) -> str:
+        return f"{task.band}/{task.patch}/{task.dest.name}"
+
+
+def format_bytes(value: float) -> str:
+    units = ("B", "KB", "MB", "GB", "TB")
+    size = float(value)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:4.1f}{unit}"
+        size /= 1024
+    return f"{size:.1f}TB"
+
+
 def download_one(
     opener: urllib.request.OpenerDirector,
     task: DownloadTask,
@@ -303,8 +448,11 @@ def download_one(
     retries: int,
     overwrite: bool,
     size_check: bool,
+    progress: ProgressReporter | None,
 ) -> str:
     if should_skip_existing(opener, task, timeout, size_check, overwrite):
+        if progress:
+            progress.finish_file(task)
         return f"SKIP {task.dest}"
 
     task.dest.parent.mkdir(parents=True, exist_ok=True)
@@ -314,12 +462,19 @@ def download_one(
     for attempt in range(1, retries + 1):
         try:
             with opener.open(task.url, timeout=timeout) as response, part_path.open("wb") as output:
+                length = response.headers.get("Content-Length")
+                if progress:
+                    progress.add_total(int(length) if length and length.isdigit() else None)
                 while True:
                     chunk = response.read(1024 * 1024)
                     if not chunk:
                         break
                     output.write(chunk)
+                    if progress:
+                        progress.update(task, len(chunk))
             part_path.replace(task.dest)
+            if progress:
+                progress.finish_file(task)
             return f"OK   {task.dest}"
         except Exception as exc:  # noqa: BLE001 - keep downloader resilient and report context.
             last_error = exc
@@ -330,6 +485,8 @@ def download_one(
             if attempt < retries:
                 time.sleep(min(2**attempt, 30))
 
+    if progress:
+        progress.finish_file(task, failed=True)
     return f"FAIL {task.url} -> {task.dest}: {last_error}"
 
 
@@ -363,8 +520,17 @@ def main() -> int:
     for band in bands:
         for patch in patches:
             directory_url = make_directory_url(args.base_url, band, args.tract, patch)
+            if not args.no_progress and sys.stderr.isatty():
+                print(f"\rScanning HSC-{band} patch {patch}...".ljust(80), end="", file=sys.stderr)
             try:
-                urls = discover_fits(opener, directory_url, file_types, timeout=args.timeout)
+                urls = discover_fits_with_retries(
+                    opener,
+                    directory_url,
+                    file_types,
+                    timeout=args.timeout,
+                    retries=args.scan_retries,
+                    delay=args.scan_delay,
+                )
             except urllib.error.HTTPError as exc:
                 print(f"ERROR {directory_url}: HTTP {exc.code} {exc.reason}", file=sys.stderr)
                 if exc.code in {401, 403} and not (username and password):
@@ -387,6 +553,8 @@ def main() -> int:
                 dest = args.data_root / str(args.tract) / f"HSC-{band}" / patch / filename
                 tasks.append(DownloadTask(url=url, dest=dest, band=band, patch=patch))
 
+    if not args.no_progress and sys.stderr.isatty():
+        print("\r" + " " * 80 + "\r", end="", file=sys.stderr)
     print(f"Found {len(tasks)} file(s) for {len(bands)} band(s), {len(patches)} patch(es).")
     if not tasks:
         return 1
@@ -399,6 +567,11 @@ def main() -> int:
     workers = max(1, args.workers)
     size_check = not args.no_size_check
     failures = 0
+    progress = ProgressReporter(
+        total_files=len(tasks),
+        enabled=not args.no_progress,
+        interval=args.progress_interval,
+    )
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [
             executor.submit(
@@ -409,14 +582,20 @@ def main() -> int:
                 args.retries,
                 args.overwrite,
                 size_check,
+                progress,
             )
             for task in tasks
         ]
         for future in as_completed(futures):
             message = future.result()
-            print(message)
+            if progress.enabled:
+                if message.startswith("FAIL"):
+                    print(f"\n{message}")
+            else:
+                print(message)
             if message.startswith("FAIL"):
                 failures += 1
+    progress.close()
 
     if failures:
         print(f"Finished with {failures} failed download(s).", file=sys.stderr)

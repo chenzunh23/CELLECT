@@ -37,6 +37,7 @@ from astro_train_eval import (
     collate_cutouts,
     detect_centers,
     detect_centers_with_en,
+    detect_centers_with_ex_link,
     discover_cutout_records,
 )
 
@@ -450,6 +451,7 @@ def evaluate_astro(args: argparse.Namespace) -> Tuple[List[dict], dict]:
         args.root,
         reference_dir=args.reference_dir,
         cutout_dir=args.cutout_dir,
+        band_reference_root=args.band_reference_root,
         bands=args.bands,
         max_records=args.max_records,
     )
@@ -490,7 +492,20 @@ def evaluate_astro(args: argparse.Namespace) -> Tuple[List[dict], dict]:
     for batch in tqdm(loader, desc="astro magnitude", leave=False):
         image = batch["image"].to(device=device, dtype=torch.float32)
         outputs = model(image)
-        if args.use_en_postprocess and hasattr(model, "EN"):
+        if args.use_ex_link_postprocess and outputs["seg_logits"].ndim == 5 and hasattr(model, "EX"):
+            pred_list, _components = detect_centers_with_ex_link(
+                model,
+                outputs,
+                threshold=args.confidence_threshold,
+                nms_radius=args.nms_radius,
+                confidence_score=args.confidence_score,
+                match_radius=match_radius,
+                candidate_count=args.matcher_candidate_count,
+                ex_threshold=args.ex_link_threshold,
+                use_en_postprocess=args.use_en_postprocess,
+                en_threshold=args.en_postprocess_threshold,
+            )
+        elif args.use_en_postprocess and hasattr(model, "EN"):
             pred_list = detect_centers_with_en(
                 model,
                 outputs,
@@ -515,16 +530,52 @@ def evaluate_astro(args: argparse.Namespace) -> Tuple[List[dict], dict]:
                 nms_radius=args.nms_radius,
                 confidence_score=args.confidence_score,
             )
-        if len(pred_list) != len(batch["name"]):
-            if len(args.bands) == 1 and len(pred_list) == len(batch["name"]):
-                pass
-            else:
+        per_band_prediction = outputs["seg_logits"].ndim == 5 and not (
+            args.use_ex_link_postprocess and hasattr(model, "EX")
+        )
+        if per_band_prediction:
+            expected = len(batch["name"]) * len(args.bands)
+            if len(pred_list) != expected:
                 raise RuntimeError(
-                    f"prediction list length {len(pred_list)} does not match batch size {len(batch['name'])}; "
-                    "multi-band magnitude completeness currently expects one prediction set per cutout"
+                    f"prediction list length {len(pred_list)} does not match batch*bands {expected}; "
+                    "per-band magnitude completeness expects one prediction set per cutout per band"
                 )
-        for name, pred_xy, image_tensor in zip(batch["name"], pred_list, batch["image"]):
-            record = record_by_name[str(name)]
+            prediction_items = []
+            for batch_idx, name in enumerate(batch["name"]):
+                record = record_by_name[str(name)]
+                for band_idx, band_name in enumerate(args.bands):
+                    meas_path = (
+                        record.band_meas_paths[band_idx]
+                        if record.band_meas_paths and band_idx < len(record.band_meas_paths)
+                        else record.meas_path
+                    )
+                    band_record = CutoutRecord(
+                        name=record.name,
+                        image_paths=record.image_paths,
+                        meas_path=meas_path,
+                        x0=record.x0,
+                        y0=record.y0,
+                    )
+                    prediction_items.append(
+                        (
+                            f"{name}:{band_name}",
+                            f"{args.astro_label}-{band_name}",
+                            pred_list[batch_idx * len(args.bands) + band_idx],
+                            batch["image"][batch_idx],
+                            band_record,
+                        )
+                    )
+        else:
+            if len(pred_list) != len(batch["name"]):
+                raise RuntimeError(
+                    f"prediction list length {len(pred_list)} does not match batch size {len(batch['name'])}"
+                )
+            prediction_items = [
+                (str(name), args.astro_label, pred_xy, image_tensor, record_by_name[str(name)])
+                for name, pred_xy, image_tensor in zip(batch["name"], pred_list, batch["image"])
+            ]
+
+        for name, method, pred_xy, image_tensor, record in prediction_items:
             h, w = int(image_tensor.shape[-2]), int(image_tensor.shape[-1])
             ref = load_reference_sources(
                 record,
@@ -540,7 +591,7 @@ def evaluate_astro(args: argparse.Namespace) -> Tuple[List[dict], dict]:
             rows.extend(
                 bin_rows_for_cutout(
                     cutout=str(name),
-                    method=args.astro_label,
+                    method=str(method),
                     mag=mag,  # type: ignore[arg-type]
                     ref_used=ref_used,
                     bins=bins,
@@ -569,6 +620,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--root", type=Path, default=Path("./output/hsc_astro_preprocessed"))
     parser.add_argument("--reference-dir", type=Path, default=None)
     parser.add_argument("--cutout-dir", type=Path, default=None)
+    parser.add_argument("--band-reference-root", type=Path, default=None)
     parser.add_argument("--targets-dir", type=Path, default=None)
     parser.add_argument("--image-cache-dir", type=Path, default=None)
     parser.add_argument("--checkpoint", type=Path, default=Path("./output/astro_hsc_i_cellect_conf/best.pt"))
@@ -594,6 +646,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nms-radius", type=int, default=1)
     parser.add_argument("--use-en-postprocess", action="store_true")
     parser.add_argument("--en-postprocess-threshold", type=float, default=0.6)
+    parser.add_argument("--use-ex-link-postprocess", action="store_true")
+    parser.add_argument("--ex-link-threshold", type=float, default=0.5)
     parser.add_argument("--matcher-candidate-count", type=int, default=5)
     parser.add_argument("--match-radius-arcsec", type=float, default=0.5)
     parser.add_argument("--pixel-scale", type=float, default=0.168)
@@ -620,6 +674,7 @@ def main() -> None:
     args.out_dir = _expand(args.out_dir)
     args.reference_dir = _expand(args.reference_dir) if args.reference_dir else None
     args.cutout_dir = _expand(args.cutout_dir) if args.cutout_dir else None
+    args.band_reference_root = _expand(args.band_reference_root) if args.band_reference_root else None
     args.targets_dir = _expand(args.targets_dir) if args.targets_dir else args.root / "targets"
     args.image_cache_dir = _expand(args.image_cache_dir) if args.image_cache_dir else None
     args.lsst_aggregate_csv = _expand(args.lsst_aggregate_csv) if args.lsst_aggregate_csv else None

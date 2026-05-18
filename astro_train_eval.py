@@ -33,6 +33,9 @@ from torch import Tensor, nn
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
+# For debugging
+import time
+
 from astro_cellect2d import (
     AstroMatchNet2D,
     AstroUNet2D,
@@ -41,6 +44,10 @@ from astro_cellect2d import (
     astro_zscale_preprocess,
     ordinal_confidence_loss,
     read_fits_bands,
+)
+from astro_match_eval import (
+    matcher_classification_loss as vectorized_matcher_classification_loss,
+    parse_ex_band_pairs as parse_matcher_ex_band_pairs,
 )
 
 
@@ -631,6 +638,9 @@ def dense_losses(
     device: torch.device,
     center_radius_px: float,
 ) -> Dict[str, Tensor]:
+    # Debug
+    # torch.cuda.synchronize()
+    # start_time = time.time()
     seg_target = batch["seg"].to(device=device, dtype=torch.long)  # type: ignore[union-attr]
     conf_target = batch["confidence"].to(device=device, dtype=torch.long)  # type: ignore[union-attr]
     shape_target = batch["shape"].to(device=device, dtype=torch.float32)  # type: ignore[union-attr]
@@ -638,17 +648,32 @@ def dense_losses(
 
     seg_weight = torch.tensor(weights.segmentation_3cls, device=device, dtype=torch.float32)
     seg_loss = F.cross_entropy(outputs["seg_logits"], seg_target, weight=seg_weight)
+    # torch.cuda.synchronize()
+    # seg_time = time.time()
+    # print(f'[DEBUG] Segmentation loss computed in {seg_time - start_time:.3f} seconds.')
     conf_loss = ordinal_confidence_loss(
         outputs["confidence"],
         conf_target,
         pos_weight=weights.confidence_pos_weight,
     )
+    # torch.cuda.synchronize()
+    # conf_time = time.time()
+    # print(f'[DEBUG] Confidence loss computed in {conf_time - seg_time:.3f} seconds.')
     per_pixel_shape = F.mse_loss(outputs["shape"], shape_target, reduction="none").mean(dim=1)
     if bool((shape_weight > 0).any()):
         shape_loss = (per_pixel_shape * shape_weight).sum() / shape_weight.sum().clamp_min(1.0)
     else:
         shape_loss = per_pixel_shape.mean() * 0.0
-    center_loss = center_localization_loss(outputs, batch["centers"], radius_px=center_radius_px)
+    # torch.cuda.synchronize()
+    # shape_time = time.time()
+    # print(f'[DEBUG] Shape loss computed in {shape_time - conf_time:.3f} seconds.')
+    if weights.center_position > 0.0:
+        center_loss = center_localization_loss(outputs, batch["centers"], radius_px=center_radius_px)
+    else:
+        center_loss = torch.tensor(0.0, device=device)
+    # torch.cuda.synchronize()
+    # center_time = time.time()
+    # print(f'[DEBUG] Center localization loss computed in {center_time - shape_time:.3f} seconds.')
     total = seg_loss + conf_loss + shape_loss + weights.center_position * center_loss
     return {"total": total, "seg": seg_loss, "confidence": conf_loss, "shape": shape_loss, "center": center_loss}
 
@@ -925,6 +950,268 @@ def detect_centers_with_en(
     ]
 
 
+@torch.no_grad()
+def detect_centers_with_ex_link(
+    model: nn.Module,
+    outputs: Dict[str, Tensor],
+    *,
+    threshold: float,
+    nms_radius: int,
+    confidence_score: str,
+    match_radius: float,
+    candidate_count: int,
+    ex_threshold: float,
+    use_en_postprocess: bool = False,
+    en_threshold: float = 0.6,
+    max_distance_factor: float = 6.0,
+    band_pairs: Optional[Sequence[Tuple[int, int]]] = None,
+) -> Tuple[List[np.ndarray], List[List[Dict[str, object]]]]:
+    """CELLECT-style cross-band linking after per-band center detection.
+
+    CELLECT uses EX after center extraction: each anchor detection searches its
+    five nearest detections in the next frame and the MLP scores candidate links
+    using center embedding, position offset, and size/division features.  The
+    astronomy variant has no division branch, so EX links detections across
+    bands using embedding, position offset, and predicted shape/size.  The
+    returned predictions are object-level fused centers, while ``components``
+    keeps the per-band members for diagnostics and catalog construction.
+    """
+
+    if outputs["seg_logits"].ndim != 5 or not hasattr(model, "EX"):
+        if outputs["seg_logits"].ndim == 5:
+            flat_outputs = _flatten_per_band_outputs(outputs)
+            raw = detect_centers(
+                flat_outputs,
+                threshold=threshold,
+                nms_radius=nms_radius,
+                confidence_score=confidence_score,
+            )
+            return raw, []
+        if use_en_postprocess and hasattr(model, "EN"):
+            return (
+                detect_centers_with_en(
+                    model,
+                    outputs,
+                    threshold=threshold,
+                    nms_radius=nms_radius,
+                    confidence_score=confidence_score,
+                    match_radius=match_radius,
+                    candidate_count=candidate_count,
+                    en_threshold=en_threshold,
+                ),
+                [],
+            )
+        return (
+            detect_centers(
+                outputs,
+                threshold=threshold,
+                nms_radius=nms_radius,
+                confidence_score=confidence_score,
+            ),
+            [],
+        )
+
+    batch, bands = outputs["seg_logits"].shape[:2]
+    flat_outputs = _flatten_per_band_outputs(outputs)
+    raw = detect_centers(
+        flat_outputs,
+        threshold=threshold,
+        nms_radius=nms_radius,
+        confidence_score=confidence_score,
+    )
+    per_batch: List[List[np.ndarray]] = []
+    for batch_idx in range(batch):
+        item: List[np.ndarray] = []
+        for band_idx in range(bands):
+            flat_idx = batch_idx * bands + band_idx
+            centers = raw[flat_idx]
+            if use_en_postprocess and hasattr(model, "EN"):
+                one = {key: value[batch_idx, band_idx].unsqueeze(0) for key, value in outputs.items()}
+                centers = en_deduplicate_centers(
+                    model.EN,
+                    one,
+                    centers,
+                    batch_index=0,
+                    candidate_count=candidate_count,
+                    offset_scale=match_radius,
+                    same_threshold=en_threshold,
+                )
+            item.append(np.asarray(centers, dtype=np.float32))
+        per_batch.append(item)
+
+    merged: List[np.ndarray] = []
+    components_all: List[List[Dict[str, object]]] = []
+    for batch_idx, centers_by_band in enumerate(per_batch):
+        centers, components = _link_one_multiband_item(
+            model.EX,
+            outputs,
+            centers_by_band,
+            batch_index=batch_idx,
+            candidate_count=candidate_count,
+            offset_scale=match_radius,
+            ex_threshold=ex_threshold,
+            max_distance_factor=max_distance_factor,
+            band_pairs=band_pairs,
+        )
+        merged.append(centers)
+        components_all.append(components)
+    return merged, components_all
+
+
+@torch.no_grad()
+def _link_one_multiband_item(
+    ex_net: AstroMatchNet2D,
+    outputs: Dict[str, Tensor],
+    centers_by_band: Sequence[np.ndarray],
+    *,
+    batch_index: int,
+    candidate_count: int,
+    offset_scale: float,
+    ex_threshold: float,
+    max_distance_factor: float,
+    band_pairs: Optional[Sequence[Tuple[int, int]]] = None,
+) -> Tuple[np.ndarray, List[Dict[str, object]]]:
+    device = outputs["embedding"].device
+    bands = len(centers_by_band)
+    node_band: List[int] = []
+    node_index: List[int] = []
+    node_xy: List[Tensor] = []
+    node_feature: List[Tensor] = []
+    node_shape: List[Tensor] = []
+    node_score: List[Tensor] = []
+
+    for band_idx, centers_np in enumerate(centers_by_band):
+        centers = torch.as_tensor(np.asarray(centers_np, dtype=np.float32), device=device)
+        if centers.ndim != 2 or centers.shape[0] == 0:
+            continue
+        emb_map = outputs["embedding"][batch_index, band_idx]
+        shape_map = outputs["shape"][batch_index, band_idx]
+        one = {key: value[batch_index, band_idx].unsqueeze(0) for key, value in outputs.items()}
+        features = _sample_map_at_centers(emb_map, centers)
+        shapes = _sample_map_at_centers(shape_map, centers)
+        scores = _confidence_score_at_centers(one, centers, batch_index=0)
+        for det_idx in range(centers.shape[0]):
+            node_band.append(band_idx)
+            node_index.append(det_idx)
+            node_xy.append(centers[det_idx])
+            node_feature.append(features[det_idx])
+            node_shape.append(shapes[det_idx])
+            node_score.append(scores[det_idx])
+
+    if not node_xy:
+        return np.zeros((0, 2), dtype=np.float32), []
+    if len(node_xy) == 1 or bands <= 1:
+        center = node_xy[0].detach().cpu().numpy()[None].astype(np.float32)
+        return center, [{"members": [(node_band[0], node_index[0])], "score": float(node_score[0].detach().cpu())}]
+
+    xy = torch.stack(node_xy)
+    features = torch.stack(node_feature)
+    shapes = torch.stack(node_shape)
+    scores = torch.stack(node_score)
+    node_band_t = torch.tensor(node_band, dtype=torch.long, device=device)
+    k = int(candidate_count)
+    edges: List[Tuple[float, float, int, int]] = []
+    allowed_pairs = {(int(src), int(dst)) for src, dst in band_pairs} if band_pairs is not None else None
+
+    for anchor in range(xy.shape[0]):
+        other = node_band_t != node_band_t[anchor]
+        if allowed_pairs is not None:
+            allowed_dst = torch.tensor(
+                [dst for src, dst in allowed_pairs if src == int(node_band_t[anchor].item())],
+                dtype=torch.long,
+                device=device,
+            )
+            if allowed_dst.numel() == 0:
+                continue
+            other = other & torch.isin(node_band_t, allowed_dst)
+        if not bool(other.any()):
+            continue
+        candidate_ids = torch.nonzero(other, as_tuple=False).flatten()
+        dist = torch.linalg.norm(xy[candidate_ids] - xy[anchor][None, :], dim=1)
+        order = torch.argsort(dist)[: min(k, candidate_ids.numel())]
+        selected = candidate_ids[order]
+        selected_dist = dist[order]
+        if selected.numel() == 0:
+            continue
+        if selected.numel() < k:
+            pad = k - int(selected.numel())
+            selected = torch.cat([selected, selected[-1:].repeat(pad)], dim=0)
+            selected_dist = torch.cat([selected_dist, selected_dist[-1:].repeat(pad)], dim=0)
+
+        cand_features = features[selected].unsqueeze(0)
+        cand_xy = xy[selected].unsqueeze(0)
+        offsets = (cand_xy - xy[anchor].view(1, 1, 2)) / max(float(offset_scale), 1e-6)
+        cand_shapes = shapes[selected].unsqueeze(0)
+        shape_features = torch.cat([shapes[anchor].view(1, 1, -1).expand(1, k, -1), cand_shapes], dim=-1)
+        ex_was_training = ex_net.training
+        if ex_was_training:
+            ex_net.eval()
+        logits = ex_net(features[anchor].view(1, -1), cand_features, offsets, shape_features)
+        if ex_was_training:
+            ex_net.train()
+        prob = F.softmax(logits, dim=1)[0]
+        cand_prob = prob[:k]
+        none_prob = prob[k]
+        best = int(torch.argmax(cand_prob).item())
+        best_node = int(selected[best].item())
+        best_score = float(cand_prob[best].detach().cpu())
+        best_dist = float(selected_dist[best].detach().cpu())
+        major = max(float(abs(shapes[anchor, 0].detach().cpu())) if shapes.shape[1] > 0 else 1.0, 1.0)
+        distance_limit = max(float(offset_scale), max_distance_factor * max(major, 1.0))
+        if best_score > float(ex_threshold) and cand_prob[best] > none_prob and best_dist <= distance_limit:
+            lo, hi = sorted((anchor, best_node))
+            edges.append((best_score, best_dist, lo, hi))
+
+    parent = list(range(len(node_xy)))
+    component_bands: List[set[int]] = [{band} for band in node_band]
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for score, dist, a, b in sorted(edges, key=lambda item: (-item[0], item[1])):
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            continue
+        if component_bands[ra] & component_bands[rb]:
+            continue
+        parent[rb] = ra
+        component_bands[ra] |= component_bands[rb]
+
+    grouped: Dict[int, List[int]] = {}
+    for idx in range(len(node_xy)):
+        grouped.setdefault(find(idx), []).append(idx)
+
+    components: List[Dict[str, object]] = []
+    fused_centers: List[np.ndarray] = []
+    for members in grouped.values():
+        member_scores = scores[members].detach()
+        weights = torch.clamp(member_scores, min=0)
+        if not bool((weights > 0).any()):
+            weights = torch.ones_like(weights)
+        member_xy = xy[members]
+        fused = (member_xy * weights[:, None]).sum(dim=0) / weights.sum().clamp_min(1e-6)
+        fused_centers.append(fused.detach().cpu().numpy().astype(np.float32))
+        components.append(
+            {
+                "members": [(int(node_band[i]), int(node_index[i])) for i in members],
+                "center": fused.detach().cpu().numpy().astype(np.float32).tolist(),
+                "score": float(member_scores.max().detach().cpu()),
+            }
+        )
+
+    order = np.argsort([item["score"] for item in components])[::-1] if components else []
+    components = [components[int(i)] for i in order]
+    fused_array = (
+        np.stack([fused_centers[int(i)] for i in order], axis=0).astype(np.float32)
+        if len(order) > 0
+        else np.zeros((0, 2), dtype=np.float32)
+    )
+    return fused_array, components
+
+
 def _sample_multiband_sources(
     outputs: Dict[str, Tensor],
     batch: Dict[str, object],
@@ -993,6 +1280,64 @@ def _nearest_candidate_indices(
     return selected
 
 
+def _resolve_band_index(bands: Sequence[str], name: str) -> int:
+    """Resolve full band names like HSC-I and short names like I."""
+
+    query = str(name).strip()
+    if not query:
+        raise ValueError("empty band name")
+    for idx, band in enumerate(bands):
+        if str(band) == query:
+            return idx
+    query_upper = query.upper()
+    for idx, band in enumerate(bands):
+        band_upper = str(band).upper()
+        if band_upper == query_upper or band_upper.split("-")[-1] == query_upper:
+            return idx
+    raise ValueError(f"band {name!r} is not in configured bands {list(bands)}")
+
+
+def parse_ex_band_pairs(
+    bands: Sequence[str],
+    *,
+    core_band: str,
+    pair_specs: Optional[Sequence[str]] = None,
+) -> Tuple[Tuple[int, int], ...]:
+    """Build directed EX training pairs.
+
+    By default EX is trained from one core band to every other band, which keeps
+    the CELLECT idea of one anchor frame while avoiding all pair permutations.
+    Explicit specs use ``src:dst`` or ``src->dst``; ``all`` restores every
+    directed cross-band pair.
+    """
+
+    if len(bands) <= 1:
+        return tuple()
+    specs = [part.strip() for item in (pair_specs or ()) for part in str(item).split(",") if part.strip()]
+    if any(spec.lower() == "all" for spec in specs):
+        return tuple((src, dst) for src in range(len(bands)) for dst in range(len(bands)) if src != dst)
+    pairs: List[Tuple[int, int]] = []
+    if specs:
+        for spec in specs:
+            if "->" in spec:
+                src_name, dst_name = spec.split("->", 1)
+            elif ":" in spec:
+                src_name, dst_name = spec.split(":", 1)
+            else:
+                raise ValueError(f"EX band pair {spec!r} must use src:dst or src->dst")
+            src = _resolve_band_index(bands, src_name)
+            dst = _resolve_band_index(bands, dst_name)
+            if src == dst:
+                raise ValueError(f"EX band pair {spec!r} links a band to itself")
+            pair = (src, dst)
+            if pair not in pairs:
+                pairs.append(pair)
+        return tuple(pairs)
+
+    core_idx = _resolve_band_index(bands, core_band)
+    return tuple((core_idx, dst) for dst in range(len(bands)) if dst != core_idx)
+
+
 def matcher_classification_loss(
     matcher: AstroMatchNet2D,
     outputs: Dict[str, Tensor],
@@ -1001,6 +1346,7 @@ def matcher_classification_loss(
     mode: str,
     candidate_count: int,
     offset_scale: float,
+    band_pairs: Optional[Sequence[Tuple[int, int]]] = None,
 ) -> Tensor:
     """Cross-entropy loss for EX/EN candidate classification.
 
@@ -1024,17 +1370,27 @@ def matcher_classification_loss(
     targets: List[int] = []
     k = int(candidate_count)
     scale = max(float(offset_scale), 1e-6)
+    pair_map: Optional[Dict[int, List[int]]] = None
+    if mode == "ex" and band_pairs is not None:
+        pair_map = {}
+        for src, dst in band_pairs:
+            pair_map.setdefault(int(src), []).append(int(dst))
 
     for per_item in sampled:
         for band_idx, anchor_band in enumerate(per_item):
             if anchor_band["xy"].numel() == 0:
                 continue
             if mode == "ex":
-                candidate_band_indices = [idx for idx in range(len(per_item)) if idx != band_idx]
+                if pair_map is None:
+                    candidate_band_indices = [idx for idx in range(len(per_item)) if idx != band_idx]
+                else:
+                    candidate_band_indices = [idx for idx in pair_map.get(band_idx, []) if 0 <= idx < len(per_item)]
             elif mode == "en":
                 candidate_band_indices = [band_idx]
             else:
                 raise ValueError(f"unknown matcher mode: {mode}")
+            if not candidate_band_indices:
+                continue
 
             for anchor_idx in range(anchor_band["xy"].shape[0]):
                 anchor_id = anchor_band["ids"][anchor_idx]
@@ -1390,7 +1746,9 @@ def run_epoch(
     ex_enabled: bool,
     en_enabled: bool,
     matcher_candidate_count: int,
+    matcher_max_anchors_per_band: int,
     triplet_max_sources_per_group: int,
+    ex_band_pairs: Optional[Sequence[Tuple[int, int]]],
     center_radius_px: float,
 ) -> Dict[str, float]:
     training = optimizer is not None
@@ -1406,11 +1764,21 @@ def run_epoch(
         "en_class": 0.0,
     }
     count = 0
+    t_epoch_start = time.time()
+    # torch.cuda.synchronize(device) if device.type == "cuda" else None
+    # print('[DEBUG] Starting epoch, running initial evaluation loop to prime caches...')
+    # t_batch = time.time()
     for batch in tqdm(loader, desc="train" if training else "eval", leave=False):
         image = batch["image"].to(device=device, dtype=torch.float32)
         outputs = model(image)
+        # torch.cuda.synchronize(device) if device.type == "cuda" else None
+        # t_batch_model = time.time()
+        # print(f'[DEBUG] Model forward pass done, time {t_batch_model - t_batch:.3f} seconds.')
         losses = dense_losses_any(outputs, batch, weights=weights, device=device, center_radius_px=center_radius_px)
         total = losses["total"]
+        # torch.cuda.synchronize(device) if device.type == "cuda" else None
+        # dense_time = time.time()
+        # print(f'[DEBUG] Dense loss computation done, time {dense_time - t_batch_model:.3f} seconds.')
 
         triplet = total.new_tensor(0.0)
         if triplet_enabled:
@@ -1421,35 +1789,54 @@ def run_epoch(
                 max_sources_per_group=triplet_max_sources_per_group,
             )
             total = total + weights.triplet_outer_weight * triplet
+            # torch.cuda.synchronize(device) if device.type == "cuda" else None
+            # t_triplet = time.time()
+            # print(f'[DEBUG] Triplet loss computation done, time {t_triplet - dense_time:.3f} seconds.')
+            # dense_time = t_triplet
 
         ex_class = total.new_tensor(0.0)
         if ex_enabled and hasattr(model, "EX") and image.shape[1] > 1:
-            ex_class = matcher_classification_loss(
+            ex_class = vectorized_matcher_classification_loss(
                 model.EX,
                 outputs,
                 batch,
                 mode="ex",
                 candidate_count=matcher_candidate_count,
                 offset_scale=center_radius_px,
+                band_pairs=ex_band_pairs,
+                max_anchors_per_band=matcher_max_anchors_per_band,
             )
             total = total + weights.matcher_outer_weight * ex_class
+            # torch.cuda.synchronize(device) if device.type == "cuda" else None
+            # t_ex = time.time()
+            # print(f'[DEBUG] EX classification loss computation done, time {t_ex - dense_time:.3f} seconds.')
+            # dense_time = t_ex
 
         en_class = total.new_tensor(0.0)
         if en_enabled and hasattr(model, "EN"):
-            en_class = matcher_classification_loss(
+            en_class = vectorized_matcher_classification_loss(
                 model.EN,
                 outputs,
                 batch,
                 mode="en",
                 candidate_count=matcher_candidate_count,
                 offset_scale=center_radius_px,
+                max_anchors_per_band=matcher_max_anchors_per_band,
             )
             total = total + weights.matcher_outer_weight * en_class
+            # torch.cuda.synchronize(device) if device.type == "cuda" else None
+            # t_en = time.time()
+            # print(f'[DEBUG] EN classification loss computation done, time {t_en - dense_time:.3f} seconds.')
+            # dense_time = t_en
 
+        # t_backward = dense_time
         if training:
             optimizer.zero_grad(set_to_none=True)
             total.backward()
             optimizer.step()
+            # torch.cuda.synchronize(device) if device.type == "cuda" else None
+            # t_backward = time.time()
+            # print(f'[DEBUG] Optimizer step done, time {t_backward - dense_time:.3f} seconds.')
 
         batch_size = int(image.shape[0])
         count += batch_size
@@ -1461,6 +1848,8 @@ def run_epoch(
         sums["triplet"] += float(triplet.detach()) * batch_size
         sums["ex_class"] += float(ex_class.detach()) * batch_size
         sums["en_class"] += float(en_class.detach()) * batch_size
+        t_batch = time.time()
+    # print(f"[DEBUG] Epoch completed in {time.time() - t_epoch_start:.3f} seconds.")
     return {key: val / max(count, 1) for key, val in sums.items()}
 
 
@@ -1477,12 +1866,21 @@ def evaluate_detection(
     use_en_postprocess: bool = False,
     en_candidate_count: int = 5,
     en_threshold: float = 0.6,
-) -> Dict[str, float]:
+    use_ex_link_postprocess: bool = False,
+    ex_link_threshold: float = 0.5,
+    ex_band_pairs: Optional[Sequence[Tuple[int, int]]] = None,
+    band_names: Sequence[str] = (),
+) -> Dict[str, object]:
     model.eval()
     tp = fp = fn = 0
+    linked_tp = linked_fp = linked_fn = 0
+    per_band_counts: Dict[str, Dict[str, int]] = {
+        str(name): {"tp": 0, "fp": 0, "fn": 0} for name in band_names
+    }
     for batch in tqdm(loader, desc="detect", leave=False):
         image = batch["image"].to(device=device, dtype=torch.float32)
         outputs = model(image)
+        band_count = int(outputs["seg_logits"].shape[1]) if outputs["seg_logits"].ndim == 5 else 0
         if use_en_postprocess and hasattr(model, "EN"):
             pred_list = detect_centers_with_en(
                 model,
@@ -1495,6 +1893,7 @@ def evaluate_detection(
                 en_threshold=en_threshold,
             )
             gt_list = _flatten_band_centers(batch["band_centers"]) if outputs["seg_logits"].ndim == 5 else batch["centers"]  # type: ignore[arg-type]
+            band_indices = [idx % band_count for idx in range(len(pred_list))] if band_count else [None for _ in pred_list]
         elif outputs["seg_logits"].ndim == 5:
             flat_outputs = _flatten_per_band_outputs(outputs)
             pred_list = detect_centers(
@@ -1504,6 +1903,7 @@ def evaluate_detection(
                 confidence_score=confidence_score,
             )
             gt_list = _flatten_band_centers(batch["band_centers"])  # type: ignore[arg-type]
+            band_indices = [idx % band_count for idx in range(len(pred_list))]
         else:
             pred_list = detect_centers(
                 outputs,
@@ -1512,15 +1912,85 @@ def evaluate_detection(
                 confidence_score=confidence_score,
             )
             gt_list = batch["centers"]  # type: ignore[assignment]
-        for pred_xy, gt_xy in zip(pred_list, gt_list):
+            band_indices = [None for _ in pred_list]
+        for pred_xy, gt_xy, band_idx in zip(pred_list, gt_list, band_indices):
             t, f, n = match_points(pred_xy, gt_xy.numpy().astype(np.float32), match_radius)
             tp += t
             fp += f
             fn += n
+            if band_idx is not None and band_names:
+                band_name = str(band_names[int(band_idx)])
+                counts = per_band_counts.setdefault(band_name, {"tp": 0, "fp": 0, "fn": 0})
+                counts["tp"] += int(t)
+                counts["fp"] += int(f)
+                counts["fn"] += int(n)
+
+        if use_ex_link_postprocess and outputs["seg_logits"].ndim == 5 and hasattr(model, "EX"):
+            linked_pred_list, _components = detect_centers_with_ex_link(
+                model,
+                outputs,
+                threshold=threshold,
+                nms_radius=nms_radius,
+                confidence_score=confidence_score,
+                match_radius=match_radius,
+                candidate_count=en_candidate_count,
+                ex_threshold=ex_link_threshold,
+                use_en_postprocess=use_en_postprocess,
+                en_threshold=en_threshold,
+                band_pairs=ex_band_pairs,
+            )
+            linked_gt_list = batch["centers"]  # type: ignore[assignment]
+            for pred_xy, gt_xy in zip(linked_pred_list, linked_gt_list):
+                t, f, n = match_points(pred_xy, gt_xy.numpy().astype(np.float32), match_radius)
+                linked_tp += t
+                linked_fp += f
+                linked_fn += n
     precision = tp / max(tp + fp, 1)
     recall = tp / max(tp + fn, 1)
     f1 = 2.0 * precision * recall / max(precision + recall, 1e-12)
-    return {"tp": float(tp), "fp": float(fp), "fn": float(fn), "precision": precision, "recall": recall, "f1": f1}
+    result: Dict[str, object] = {
+        "tp": float(tp),
+        "fp": float(fp),
+        "fn": float(fn),
+        "precision": precision,
+        "purity": precision,
+        "recall": recall,
+        "completeness": recall,
+        "f1": f1,
+    }
+    if per_band_counts:
+        per_band: Dict[str, Dict[str, float]] = {}
+        for band_name, counts in per_band_counts.items():
+            btp = int(counts["tp"])
+            bfp = int(counts["fp"])
+            bfn = int(counts["fn"])
+            b_precision = btp / max(btp + bfp, 1)
+            b_recall = btp / max(btp + bfn, 1)
+            per_band[band_name] = {
+                "tp": float(btp),
+                "fp": float(bfp),
+                "fn": float(bfn),
+                "precision": b_precision,
+                "purity": b_precision,
+                "recall": b_recall,
+                "completeness": b_recall,
+                "f1": 2.0 * b_precision * b_recall / max(b_precision + b_recall, 1e-12),
+            }
+        result["per_band"] = per_band
+    if use_ex_link_postprocess:
+        linked_precision = linked_tp / max(linked_tp + linked_fp, 1)
+        linked_recall = linked_tp / max(linked_tp + linked_fn, 1)
+        result["linked"] = {
+            "tp": float(linked_tp),
+            "fp": float(linked_fp),
+            "fn": float(linked_fn),
+            "precision": linked_precision,
+            "purity": linked_precision,
+            "recall": linked_recall,
+            "completeness": linked_recall,
+            "f1": 2.0 * linked_precision * linked_recall / max(linked_precision + linked_recall, 1e-12),
+        }
+    return result
 
 
 def split_records(
@@ -1626,7 +2096,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Center matching radius in pixels. Defaults to center_tolerance_arcsec / pixel_scale_arcsec.",
     )
-    parser.add_argument("--center-loss-weight", type=float, default=1.0)
+    # Shut down the time consuming center loss by default since confidence map supervision is usually sufficient for good center detection, and the center loss can be a significant bottleneck when training with many small sources.
+    parser.add_argument("--center-loss-weight", type=float, default=0.0)
     parser.add_argument("--segmentation-class-weights", type=float, nargs=3, default=(1.0, 32.0, 1.0))
     parser.add_argument("--confidence-pos-weight", type=float, default=32.0)
     parser.add_argument("--triplet-outer-weight", type=float, default=10.0)
@@ -1644,6 +2115,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Disable EX cross-band classification loss. By default EX is trained for per_band multi-band runs.",
     )
     parser.add_argument(
+        "--ex-core-band",
+        default="HSC-I",
+        help="Core band used as EX anchor when --ex-band-pairs is not set. Short names like I are accepted.",
+    )
+    parser.add_argument(
+        "--ex-band-pairs",
+        nargs="*",
+        default=None,
+        help="Directed EX training pairs such as HSC-I:HSC-G HSC-I:HSC-R. "
+        "Use 'all' to restore all directed cross-band pairs.",
+    )
+    parser.add_argument(
         "--enable-en-loss",
         action="store_true",
         help="Train EN same-band duplicate/none-of-above classification loss. Useful for single-band duplicate suppression too.",
@@ -1654,7 +2137,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Apply CELLECT-style EN same-band deduplication after detect_centers during evaluation/inference.",
     )
     parser.add_argument("--en-postprocess-threshold", type=float, default=0.6)
+    parser.add_argument(
+        "--use-ex-link-postprocess",
+        action="store_true",
+        help="Apply CELLECT-style EX cross-band linking after per-band center detection. "
+        "When enabled, detection metrics are object-level instead of band-level.",
+    )
+    parser.add_argument("--ex-link-threshold", type=float, default=0.5)
     parser.add_argument("--matcher-candidate-count", type=int, default=5)
+    parser.add_argument(
+        "--matcher-max-anchors-per-band",
+        type=int,
+        default=128,
+        help="Maximum source anchors per batch item and band for EX/EN classification loss. "
+        "Set <=0 to use all anchors.",
+    )
     parser.add_argument("--matcher-outer-weight", type=float, default=10.0)
     parser.add_argument(
         "--image-cache-dir",
@@ -1666,6 +2163,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    # Debug: output the time of each step
+    T=time.time()
     args = build_arg_parser().parse_args()
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -1740,7 +2239,8 @@ def main() -> None:
         num_workers=args.num_workers,
         collate_fn=collate_cutouts,
     )
-
+    # t_preprocessing = time.time()
+    # print(f'[DEBUG] Preprocessing done, time {t_preprocessing - T:.3f} seconds. Starting model setup...')
     device = torch.device(args.device)
     if args.model_variant == "auto":
         model_variant = "fused_encoder" if len(args.bands) > 1 or args.enable_en_loss else "fused"
@@ -1750,6 +2250,12 @@ def main() -> None:
     ex_enabled = matcher_variant and len(args.bands) > 1 and not args.disable_ex_loss
     en_enabled = matcher_variant and bool(args.enable_en_loss)
     en_postprocess_enabled = matcher_variant and (bool(args.use_en_postprocess) or en_enabled)
+    ex_link_postprocess_enabled = matcher_variant and len(args.bands) > 1 and bool(args.use_ex_link_postprocess)
+    ex_band_pairs = (
+        parse_matcher_ex_band_pairs(args.bands, core_band=args.ex_core_band, pair_specs=args.ex_band_pairs)
+        if ex_enabled
+        else tuple()
+    )
 
     if model_variant == "per_band":
         model = MultiBandAstroCELLECT2D(
@@ -1805,7 +2311,9 @@ def main() -> None:
             ex_enabled=ex_enabled,
             en_enabled=en_enabled,
             matcher_candidate_count=args.matcher_candidate_count,
+            matcher_max_anchors_per_band=args.matcher_max_anchors_per_band,
             triplet_max_sources_per_group=args.triplet_max_sources_per_group,
+            ex_band_pairs=ex_band_pairs,
             center_radius_px=center_radius_px,
         )
         det = evaluate_detection(
@@ -1819,6 +2327,10 @@ def main() -> None:
             use_en_postprocess=en_postprocess_enabled,
             en_candidate_count=args.matcher_candidate_count,
             en_threshold=args.en_postprocess_threshold,
+            use_ex_link_postprocess=ex_link_postprocess_enabled,
+            ex_link_threshold=args.ex_link_threshold,
+            ex_band_pairs=ex_band_pairs,
+            band_names=args.bands,
         )
         print(json.dumps({"dense": dense, "detection": det}, indent=2))
         return
@@ -1841,10 +2353,17 @@ def main() -> None:
         "band_reference_root": str(band_reference_root) if band_reference_root is not None else None,
         "model_variant": model_variant,
         "ex_enabled": ex_enabled,
+        "ex_band_pairs": [[str(args.bands[src]), str(args.bands[dst])] for src, dst in ex_band_pairs],
+        "matcher_max_anchors_per_band": int(args.matcher_max_anchors_per_band),
         "en_enabled": en_enabled,
         "en_postprocess_enabled": en_postprocess_enabled,
+        "ex_link_postprocess_enabled": ex_link_postprocess_enabled,
+        "ex_link_threshold": float(args.ex_link_threshold),
     }
     (out_dir / "run_config.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    # t_model = time.time()
+    # print(f'[DEBUG] Model setup done, time {t_model - t_preprocessing:.3f} seconds. Starting training loop...')
 
     best_val = float("inf")
     for epoch in range(args.epochs):
@@ -1859,7 +2378,9 @@ def main() -> None:
             ex_enabled=ex_enabled,
             en_enabled=en_enabled,
             matcher_candidate_count=args.matcher_candidate_count,
+            matcher_max_anchors_per_band=args.matcher_max_anchors_per_band,
             triplet_max_sources_per_group=args.triplet_max_sources_per_group,
+            ex_band_pairs=ex_band_pairs,
             center_radius_px=center_radius_px,
         )
         val_metrics = run_epoch(
@@ -1873,7 +2394,9 @@ def main() -> None:
             ex_enabled=ex_enabled,
             en_enabled=en_enabled,
             matcher_candidate_count=args.matcher_candidate_count,
+            matcher_max_anchors_per_band=args.matcher_max_anchors_per_band,
             triplet_max_sources_per_group=args.triplet_max_sources_per_group,
+            ex_band_pairs=ex_band_pairs,
             center_radius_px=center_radius_px,
         )
         det_metrics = evaluate_detection(
@@ -1887,6 +2410,10 @@ def main() -> None:
             use_en_postprocess=en_postprocess_enabled,
             en_candidate_count=args.matcher_candidate_count,
             en_threshold=args.en_postprocess_threshold,
+            use_ex_link_postprocess=ex_link_postprocess_enabled,
+            ex_link_threshold=args.ex_link_threshold,
+            ex_band_pairs=ex_band_pairs,
+            band_names=args.bands,
         )
         scheduler.step(val_metrics["total"])
         log_line = {
