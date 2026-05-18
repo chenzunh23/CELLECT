@@ -614,6 +614,167 @@ def build_astro_cellect2d(
     return AstroCELLECT2D(backbone=backbone, EX=EX, EN=EN)
 
 
+class MultiBandAstroCELLECT2D(nn.Module):
+    """Shared per-band AstroCELLECT model with EX/EN matchers.
+
+    Unlike ``AstroUNet2D(in_channels=N)`` which fuses bands as input channels
+    before detection, this module runs one shared 2D CELLECT backbone on each
+    band independently.  The returned dense maps keep an explicit band axis:
+
+    - ``seg_logits``: [B, C, seg_classes, H, W]
+    - ``confidence``: [B, C, confidence_levels, H, W]
+    - ``embedding``: [B, C, embedding_dim, H, W]
+    - ``shape``: [B, C, shape_channels, H, W]
+
+    ``EX`` is used to classify cross-band candidates with the same source id.
+    ``EN`` is used to classify same-band candidates and suppress duplicates.
+    For single-band data, EX should be disabled by the training loop while EN
+    can still be trained if duplicate labels or hard negatives are desired.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_bands: int,
+        seg_classes: int = 3,
+        confidence_levels: int = 5,
+        embedding_dim: int = 64,
+        base_channels: int = 32,
+        shape_channels: int = 3,
+        candidate_count: int = 5,
+        shape_feature_dim: int = 6,
+    ) -> None:
+        super().__init__()
+        self.num_bands = int(num_bands)
+        self.backbone = AstroUNet2D(
+            in_channels=1,
+            seg_classes=seg_classes,
+            confidence_levels=confidence_levels,
+            embedding_dim=embedding_dim,
+            base_channels=base_channels,
+            shape_channels=shape_channels,
+        )
+        self.EX = AstroMatchNet2D(
+            feature_dim=embedding_dim,
+            candidate_count=candidate_count,
+            shape_feature_dim=shape_feature_dim,
+        )
+        self.EN = AstroMatchNet2D(
+            feature_dim=embedding_dim,
+            candidate_count=candidate_count,
+            shape_feature_dim=shape_feature_dim,
+        )
+
+    def forward(self, x: Tensor) -> Dict[str, Tensor]:
+        if x.ndim != 4:
+            raise ValueError(f"MultiBandAstroCELLECT2D expects BCHW input, got {tuple(x.shape)}")
+        batch, bands, height, width = x.shape
+        if bands != self.num_bands:
+            raise ValueError(f"input has {bands} bands but model was built for {self.num_bands}")
+
+        flat = x.reshape(batch * bands, 1, height, width)
+        flat_out = self.backbone(flat)
+        out: Dict[str, Tensor] = {}
+        for key, value in flat_out.items():
+            out[key] = value.reshape(batch, bands, *value.shape[1:])
+        return out
+
+
+class FusedEncoderMultiBandAstroCELLECT2D(nn.Module):
+    """Multi-band AstroCELLECT with one fused encoder and per-band heads.
+
+    This is the astronomy counterpart of CELLECT's multi-frame input style:
+    all bands enter the backbone together as channels, so the expensive UNet/CEN
+    path runs once per cutout.  Lightweight band-conditioned heads then expand
+    the fused latent map back to per-band dense outputs, preserving the
+    ``[B, band, ...]`` layout needed by EX/EN and triplet losses.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_bands: int,
+        seg_classes: int = 3,
+        confidence_levels: int = 5,
+        embedding_dim: int = 64,
+        base_channels: int = 32,
+        shape_channels: int = 3,
+        candidate_count: int = 5,
+        shape_feature_dim: int = 6,
+    ) -> None:
+        super().__init__()
+        self.num_bands = int(num_bands)
+        self.shape_channels = int(shape_channels)
+        self.backbone = AstroUNet2D(
+            in_channels=num_bands,
+            seg_classes=seg_classes,
+            confidence_levels=confidence_levels,
+            embedding_dim=embedding_dim,
+            base_channels=base_channels,
+            shape_channels=shape_channels,
+        )
+        band_head_channels = max(16, embedding_dim // 2)
+        self.band_refine = nn.Sequential(
+            nn.Conv2d(embedding_dim + 1, band_head_channels, kernel_size=1, bias=False),
+            nn.InstanceNorm2d(band_head_channels),
+            nn.LeakyReLU(),
+        )
+        self.band_seg_head = nn.Conv2d(band_head_channels, seg_classes, kernel_size=1, bias=False)
+        self.band_conf_head = nn.Conv2d(band_head_channels, confidence_levels, kernel_size=1, bias=False)
+        self.band_embedding_head = nn.Conv2d(band_head_channels, embedding_dim, kernel_size=1, bias=False)
+        self.band_shape_head = nn.Conv2d(band_head_channels, shape_channels, kernel_size=1, bias=False)
+        self.band_embedding_bias = nn.Parameter(torch.zeros(num_bands, embedding_dim, 1, 1))
+        self.EX = AstroMatchNet2D(
+            feature_dim=embedding_dim,
+            candidate_count=candidate_count,
+            shape_feature_dim=shape_feature_dim,
+        )
+        self.EN = AstroMatchNet2D(
+            feature_dim=embedding_dim,
+            candidate_count=candidate_count,
+            shape_feature_dim=shape_feature_dim,
+        )
+
+    def _shape_from_raw(self, base_shape: Tensor, raw: Tensor) -> Tensor:
+        if self.shape_channels >= 2:
+            base_axes = torch.clamp(base_shape[:, :2], min=1e-3)
+            axes = F.softplus(torch.log(base_axes) + raw[:, :2]) + 1e-3
+            tail = base_shape[:, 2:] + raw[:, 2:]
+            return torch.cat([axes, tail], dim=1)
+        return F.softplus(torch.log(torch.clamp(base_shape, min=1e-3)) + raw) + 1e-3
+
+    def forward(self, x: Tensor) -> Dict[str, Tensor]:
+        if x.ndim != 4:
+            raise ValueError(f"FusedEncoderMultiBandAstroCELLECT2D expects BCHW input, got {tuple(x.shape)}")
+        batch, bands, _height, _width = x.shape
+        if bands != self.num_bands:
+            raise ValueError(f"input has {bands} bands but model was built for {self.num_bands}")
+
+        fused = self.backbone(x)
+        seg_logits = []
+        confidence = []
+        embedding = []
+        shape = []
+        fused_embedding = fused["embedding"]
+        for band in range(bands):
+            band_feat = self.band_refine(torch.cat([fused_embedding, x[:, band : band + 1]], dim=1))
+            seg_logits.append(fused["seg_logits"] + self.band_seg_head(band_feat))
+            confidence.append(fused["confidence"] + self.band_conf_head(band_feat))
+            embedding.append(
+                fused_embedding
+                + self.band_embedding_head(band_feat)
+                + self.band_embedding_bias[band].unsqueeze(0)
+            )
+            shape.append(self._shape_from_raw(fused["shape"], self.band_shape_head(band_feat)))
+
+        return {
+            "seg_logits": torch.stack(seg_logits, dim=1),
+            "confidence": torch.stack(confidence, dim=1),
+            "embedding": torch.stack(embedding, dim=1),
+            "shape": torch.stack(shape, dim=1),
+        }
+
+
 def ordinal_confidence_loss(
     logits: Tensor,
     target: Tensor,
@@ -621,10 +782,17 @@ def ordinal_confidence_loss(
     ignore_index: int = -100,
     pos_weight: float = 32.0,
 ) -> Tensor:
-    """CELLECT-style ordinal center-confidence loss for 2D maps.
+    """CELLECT ``crloss`` for 2D ordinal center-confidence maps.
 
     logits: [B, L, H, W], where L is usually 5.
     target: [B, H, W] with integer levels 0..L-1 and optional ignore_index.
+
+    This intentionally mirrors ``recoloss.crloss`` rather than a standard
+    cumulative ordinal loss. CELLECT first compares background channel 0 with
+    every positive confidence channel for ``target >= 1``. It then compares each
+    higher channel against the max of lower channels, while masking out lower
+    positive rings so that, for example, level-1 pixels are not trained as
+    negatives for the level-2/3/4 classifiers.
     """
     if logits.ndim != 4:
         raise ValueError("logits must be [B,L,H,W]")
@@ -634,19 +802,39 @@ def ordinal_confidence_loss(
     if not bool(valid.any()):
         return logits.sum() * 0.0
 
-    loss = logits.new_tensor(0.0)
+    loss_map = logits.new_zeros(target.shape, dtype=logits.dtype)
     class_weight = logits.new_tensor([1.0, float(pos_weight)])
     levels = logits.shape[1]
     safe_target = torch.where(valid, target, torch.zeros_like(target)).long()
 
-    for level in range(1, levels):
-        prev = logits[:, :level].max(dim=1).values.unsqueeze(1)
-        curr = logits[:, level : level + 1]
-        binary_logits = torch.cat([prev, curr], dim=1)
-        binary_target = (safe_target >= level).long()
-        this_loss = F.cross_entropy(binary_logits, binary_target, weight=class_weight, reduction="none")
-        loss = loss + this_loss[valid].mean()
-    return loss
+    for channel in range(1, levels):
+        binary_logits = torch.cat([logits[:, :1], logits[:, channel : channel + 1]], dim=1)
+        binary_target = (safe_target >= 1).long()
+        loss_map = loss_map + F.cross_entropy(
+            binary_logits,
+            binary_target,
+            weight=class_weight,
+            reduction="none",
+        )
+
+    for level in range(2, levels):
+        supervise = valid & ((safe_target == 0) | (safe_target >= level))
+        if not bool(supervise.any()):
+            continue
+        for channel in range(level, levels):
+            prev = logits[:, :channel].max(dim=1).values.unsqueeze(1)
+            curr = logits[:, channel : channel + 1]
+            binary_logits = torch.cat([prev, curr], dim=1)
+            binary_target = (safe_target >= level).long()
+            this_loss = F.cross_entropy(
+                binary_logits,
+                binary_target,
+                weight=class_weight,
+                reduction="none",
+            )
+            loss_map = loss_map + this_loss * supervise.to(dtype=this_loss.dtype)
+
+    return loss_map[valid].mean()
 
 
 def make_center_confidence_target(

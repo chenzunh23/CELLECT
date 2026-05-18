@@ -5,6 +5,8 @@ tmp/
 output*/
 demos/
 extradata/
+cutouts/
+reference_catalogs/
 *.fits
 *.pickle
 *.zip*
