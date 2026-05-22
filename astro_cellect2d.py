@@ -258,6 +258,8 @@ class CenterEnhancementNet2D(nn.Module):
         if out.shape[-2:] != context_1.shape[-2:]:
             out = F.interpolate(out, size=context_1.shape[-2:], mode="nearest")
         out = torch.cat([out, context_1], dim=1)
+        out = self.conv_l2(out)
+        out = torch.cat([out, context_1], dim=1)
         return self.out(self.out_refine(out))
 
 

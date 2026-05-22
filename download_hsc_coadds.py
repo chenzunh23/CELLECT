@@ -20,6 +20,7 @@ import html.parser
 import netrc
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -29,7 +30,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 
 DEFAULT_BASE_URL = (
@@ -129,6 +130,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=60.0, help="HTTP timeout in seconds.")
     parser.add_argument("--retries", type=int, default=3, help="Retries per file. Default: 3.")
     parser.add_argument(
+        "--proxy",
+        default=None,
+        help="Explicit proxy URL used by urllib and wget, e.g. http://host:port. Does not rely on environment variables.",
+    )
+    parser.add_argument(
+        "--scan-backend",
+        choices=("python", "wget"),
+        default="python",
+        help="Backend for directory listing. Use wget when Python proxy handling is problematic.",
+    )
+    parser.add_argument(
+        "--download-backend",
+        choices=("python", "wget"),
+        default="python",
+        help="Backend for FITS downloads. wget supports explicit -e proxy settings.",
+    )
+    parser.add_argument("--wget-bin", default="wget", help="wget executable path/name. Default: wget.")
+    parser.add_argument(
         "--scan-retries",
         type=int,
         default=3,
@@ -144,6 +163,11 @@ def parse_args() -> argparse.Namespace:
         "--overwrite",
         action="store_true",
         help="Overwrite existing files. By default existing files are skipped.",
+    )
+    parser.add_argument(
+        "--overwrite-smaller",
+        action="store_true",
+        help="Only overwrite existing files when local size is smaller than remote Content-Length.",
     )
     parser.add_argument(
         "--dry-run",
@@ -219,8 +243,15 @@ def credentials_from_netrc(url: str) -> tuple[str | None, str | None]:
     return login, password
 
 
-def build_opener(base_url: str, username: str | None, password: str | None) -> urllib.request.OpenerDirector:
+def build_opener(
+    base_url: str,
+    username: str | None,
+    password: str | None,
+    proxy: str | None = None,
+) -> urllib.request.OpenerDirector:
     handlers: list[urllib.request.BaseHandler] = []
+    if proxy:
+        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
     if username and password:
         password_mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
         parsed = urllib.parse.urlparse(base_url)
@@ -237,6 +268,63 @@ def build_opener(base_url: str, username: str | None, password: str | None) -> u
     return opener
 
 
+def wget_common_args(
+    *,
+    wget_bin: str,
+    timeout: float,
+    username: str | None,
+    password: str | None,
+    proxy: str | None,
+) -> list[str]:
+    args = [
+        wget_bin,
+        "--timeout",
+        str(max(1, int(timeout))),
+        "--tries",
+        "1",
+    ]
+    if username:
+        args.extend(["--user", username])
+    if password:
+        args.extend(["--password", password])
+    if proxy:
+        args.extend(
+            [
+                "-e",
+                "use_proxy=yes",
+                "-e",
+                f"http_proxy={proxy}",
+                "-e",
+                f"https_proxy={proxy}",
+            ]
+        )
+    return args
+
+
+def open_url_wget(
+    url: str,
+    *,
+    timeout: float,
+    username: str | None,
+    password: str | None,
+    proxy: str | None,
+    wget_bin: str,
+) -> bytes:
+    cmd = wget_common_args(
+        wget_bin=wget_bin,
+        timeout=timeout,
+        username=username,
+        password=password,
+        proxy=proxy,
+    )
+    cmd.extend(["--quiet", "--output-document", "-", url])
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace").strip()
+        raise urllib.error.URLError(f"wget failed for {url}: {stderr or result.returncode}")
+    return result.stdout
+
+
 def open_url(opener: urllib.request.OpenerDirector, url: str, timeout: float) -> bytes:
     with opener.open(url, timeout=timeout) as response:
         return response.read()
@@ -247,8 +335,10 @@ def discover_fits(
     directory_url: str,
     file_types: set[str] | None,
     timeout: float,
+    fetcher: Callable[[str, float], bytes] | None = None,
 ) -> list[str]:
-    html = open_url(opener, directory_url, timeout=timeout).decode("utf-8", errors="replace")
+    raw_html = fetcher(directory_url, timeout) if fetcher is not None else open_url(opener, directory_url, timeout=timeout)
+    html = raw_html.decode("utf-8", errors="replace")
     parser = LinkParser()
     parser.feed(html)
 
@@ -276,11 +366,12 @@ def discover_fits_with_retries(
     timeout: float,
     retries: int,
     delay: float,
+    fetcher: Callable[[str, float], bytes] | None = None,
 ) -> list[str]:
     last_error: Exception | None = None
     for attempt in range(1, max(1, retries) + 1):
         try:
-            return discover_fits(opener, directory_url, file_types, timeout=timeout)
+            return discover_fits(opener, directory_url, file_types, timeout=timeout, fetcher=fetcher)
         except urllib.error.HTTPError:
             raise
         except urllib.error.URLError as exc:
@@ -319,25 +410,68 @@ def content_length(
         return None
 
 
+def content_length_wget(
+    url: str,
+    *,
+    timeout: float,
+    username: str | None,
+    password: str | None,
+    proxy: str | None,
+    wget_bin: str,
+) -> int | None:
+    cmd = wget_common_args(
+        wget_bin=wget_bin,
+        timeout=timeout,
+        username=username,
+        password=password,
+        proxy=proxy,
+    )
+    cmd.extend(["--spider", "--server-response", url])
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    text = (
+        result.stdout.decode("utf-8", errors="replace")
+        + "\n"
+        + result.stderr.decode("utf-8", errors="replace")
+    )
+    for line in reversed(text.splitlines()):
+        name, sep, value = line.strip().partition(":")
+        if sep and name.lower() == "content-length":
+            try:
+                return int(value.strip())
+            except ValueError:
+                return None
+    return None
+
+
 def should_skip_existing(
     opener: urllib.request.OpenerDirector,
     task: DownloadTask,
     timeout: float,
     size_check: bool,
     overwrite: bool,
+    overwrite_smaller: bool,
+    content_length_func: Callable[[str], int | None] | None = None,
 ) -> bool:
     if overwrite or not task.dest.exists():
         return False
     if not size_check:
         return True
-    remote_size = content_length(opener, task.url, timeout=timeout)
+    remote_size = content_length_func(task.url) if content_length_func is not None else content_length(opener, task.url, timeout=timeout)
     if remote_size is None:
         return True
-    if task.dest.stat().st_size == remote_size:
+    local_size = task.dest.stat().st_size
+    if local_size == remote_size:
         return True
+    if overwrite_smaller and local_size < remote_size:
+        print(
+            f"REDOWNLOAD smaller: {task.dest} "
+            f"(local={local_size}, remote={remote_size})",
+            file=sys.stderr,
+        )
+        return False
     print(
         f"SIZE MISMATCH skip: {task.dest} "
-        f"(local={task.dest.stat().st_size}, remote={remote_size}; use --overwrite to replace)",
+        f"(local={local_size}, remote={remote_size}; use --overwrite or --overwrite-smaller to replace)",
         file=sys.stderr,
     )
     return True
@@ -441,16 +575,52 @@ def format_bytes(value: float) -> str:
     return f"{size:.1f}TB"
 
 
+def download_with_wget(
+    task: DownloadTask,
+    part_path: Path,
+    *,
+    timeout: float,
+    username: str | None,
+    password: str | None,
+    proxy: str | None,
+    wget_bin: str,
+    expected_size: int | None,
+) -> None:
+    cmd = wget_common_args(
+        wget_bin=wget_bin,
+        timeout=timeout,
+        username=username,
+        password=password,
+        proxy=proxy,
+    )
+    cmd.extend(["--quiet", "--output-document", str(part_path), task.url])
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace").strip()
+        raise IOError(f"wget failed with exit code {result.returncode}: {stderr}")
+    if expected_size is not None:
+        actual_size = part_path.stat().st_size
+        if actual_size != expected_size:
+            raise IOError(f"incomplete wget download: wrote {actual_size} byte(s), expected {expected_size}")
+
+
 def download_one(
     opener: urllib.request.OpenerDirector,
     task: DownloadTask,
     timeout: float,
     retries: int,
     overwrite: bool,
+    overwrite_smaller: bool,
     size_check: bool,
+    download_backend: str,
+    wget_bin: str,
+    username: str | None,
+    password: str | None,
+    proxy: str | None,
+    content_length_func: Callable[[str], int | None] | None,
     progress: ProgressReporter | None,
 ) -> str:
-    if should_skip_existing(opener, task, timeout, size_check, overwrite):
+    if should_skip_existing(opener, task, timeout, size_check, overwrite, overwrite_smaller, content_length_func):
         if progress:
             progress.finish_file(task)
         return f"SKIP {task.dest}"
@@ -461,17 +631,47 @@ def download_one(
     last_error: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
-            with opener.open(task.url, timeout=timeout) as response, part_path.open("wb") as output:
-                length = response.headers.get("Content-Length")
+            expected_size: int | None = None
+            bytes_written = 0
+            if size_check:
+                expected_size = (
+                    content_length_func(task.url)
+                    if content_length_func is not None
+                    else content_length(opener, task.url, timeout=timeout)
+                )
+            if progress:
+                progress.add_total(expected_size)
+            if download_backend == "wget":
+                download_with_wget(
+                    task,
+                    part_path,
+                    timeout=timeout,
+                    username=username,
+                    password=password,
+                    proxy=proxy,
+                    wget_bin=wget_bin,
+                    expected_size=expected_size,
+                )
                 if progress:
-                    progress.add_total(int(length) if length and length.isdigit() else None)
-                while True:
-                    chunk = response.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    output.write(chunk)
-                    if progress:
-                        progress.update(task, len(chunk))
+                    progress.update(task, part_path.stat().st_size)
+            else:
+                with opener.open(task.url, timeout=timeout) as response, part_path.open("wb") as output:
+                    if expected_size is None:
+                        length = response.headers.get("Content-Length")
+                        if length and length.isdigit():
+                            expected_size = int(length)
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        output.write(chunk)
+                        bytes_written += len(chunk)
+                        if progress:
+                            progress.update(task, len(chunk))
+                if expected_size is not None and bytes_written != expected_size:
+                    raise IOError(
+                        f"incomplete download: wrote {bytes_written} byte(s), expected {expected_size} from Content-Length"
+                    )
             part_path.replace(task.dest)
             if progress:
                 progress.finish_file(task)
@@ -500,6 +700,9 @@ def make_directory_url(base_url: str, band: str, tract: str, patch: str) -> str:
 
 def main() -> int:
     args = parse_args()
+    if args.overwrite_smaller and args.no_size_check:
+        print("--overwrite-smaller requires size checks; remove --no-size-check.", file=sys.stderr)
+        return 2
     bands = [normalize_band(band) for band in args.bands]
     patches = load_patches(args.patches, args.patch_file)
 
@@ -511,7 +714,27 @@ def main() -> int:
     if args.ask_password and username and not password:
         password = getpass.getpass("HSC archive password: ")
 
-    opener = build_opener(probe_url, username, password)
+    opener = build_opener(probe_url, username, password, proxy=args.proxy)
+    scan_fetcher = None
+    if args.scan_backend == "wget":
+        scan_fetcher = lambda url, timeout: open_url_wget(  # noqa: E731 - small adapter for retry helper.
+            url,
+            timeout=timeout,
+            username=username,
+            password=password,
+            proxy=args.proxy,
+            wget_bin=args.wget_bin,
+        )
+    length_fetcher = None
+    if args.download_backend == "wget" or args.scan_backend == "wget":
+        length_fetcher = lambda url: content_length_wget(  # noqa: E731 - small adapter for worker threads.
+            url,
+            timeout=args.timeout,
+            username=username,
+            password=password,
+            proxy=args.proxy,
+            wget_bin=args.wget_bin,
+        )
     file_types = None if "all" in {item.lower() for item in args.file_types} else {
         item.lower() for item in args.file_types
     }
@@ -530,6 +753,7 @@ def main() -> int:
                     timeout=args.timeout,
                     retries=args.scan_retries,
                     delay=args.scan_delay,
+                    fetcher=scan_fetcher,
                 )
             except urllib.error.HTTPError as exc:
                 print(f"ERROR {directory_url}: HTTP {exc.code} {exc.reason}", file=sys.stderr)
@@ -581,7 +805,14 @@ def main() -> int:
                 args.timeout,
                 args.retries,
                 args.overwrite,
+                args.overwrite_smaller,
                 size_check,
+                args.download_backend,
+                args.wget_bin,
+                username,
+                password,
+                args.proxy,
+                length_fetcher,
                 progress,
             )
             for task in tasks
