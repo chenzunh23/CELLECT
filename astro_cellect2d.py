@@ -638,7 +638,7 @@ class MultiBandAstroCELLECT2D(nn.Module):
         self,
         *,
         num_bands: int,
-        seg_classes: int = 3,
+        seg_classes: int = 2,
         confidence_levels: int = 5,
         embedding_dim: int = 64,
         base_channels: int = 32,
@@ -696,7 +696,7 @@ class FusedEncoderMultiBandAstroCELLECT2D(nn.Module):
         self,
         *,
         num_bands: int,
-        seg_classes: int = 3,
+        seg_classes: int = 2,
         confidence_levels: int = 5,
         embedding_dim: int = 64,
         base_channels: int = 32,
@@ -783,6 +783,7 @@ def ordinal_confidence_loss(
     *,
     ignore_index: int = -100,
     pos_weight: float = 32.0,
+    weight: Optional[Tensor] = None,
 ) -> Tensor:
     """CELLECT ``crloss`` for 2D ordinal center-confidence maps.
 
@@ -801,6 +802,11 @@ def ordinal_confidence_loss(
     if target.ndim != 3:
         raise ValueError("target must be [B,H,W]")
     valid = target != ignore_index
+    if weight is not None:
+        if weight.shape != target.shape:
+            raise ValueError("weight must have the same shape as target")
+        weight = weight.to(device=logits.device, dtype=logits.dtype).clamp_min(0.0)
+        valid = valid & (weight > 0)
     if not bool(valid.any()):
         return logits.sum() * 0.0
 
@@ -836,6 +842,8 @@ def ordinal_confidence_loss(
             )
             loss_map = loss_map + this_loss * supervise.to(dtype=this_loss.dtype)
 
+    if weight is not None:
+        return (loss_map * weight)[valid].sum() / weight[valid].sum().clamp_min(1.0)
     return loss_map[valid].mean()
 
 

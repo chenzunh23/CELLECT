@@ -79,9 +79,9 @@ def parse_ex_band_pairs(
 ) -> Tuple[Tuple[int, int], ...]:
     """Build directed EX training pairs.
 
-    Default: one core band anchors all other bands, e.g. HSC-I -> HSC-G/R.
-    Explicit specs use ``src:dst`` or ``src->dst``.  ``all`` restores every
-    directed cross-band pair.
+    Default: adjacent wavelength-order pairs in both directions, e.g.
+    HSC-G<->HSC-R<->HSC-I<->HSC-Z<->HSC-Y.  Explicit specs use ``src:dst`` or
+    ``src->dst``.  ``all`` restores every directed cross-band pair.
     """
 
     if len(bands) <= 1:
@@ -89,6 +89,9 @@ def parse_ex_band_pairs(
     specs = [part.strip() for item in (pair_specs or ()) for part in str(item).split(",") if part.strip()]
     if any(spec.lower() == "all" for spec in specs):
         return tuple((src, dst) for src in range(len(bands)) for dst in range(len(bands)) if src != dst)
+    if any(spec.lower() == "core" for spec in specs):
+        core_idx = _resolve_band_index(bands, core_band)
+        return tuple((core_idx, dst) for dst in range(len(bands)) if dst != core_idx)
     pairs: List[Tuple[int, int]] = []
     if specs:
         for spec in specs:
@@ -107,8 +110,10 @@ def parse_ex_band_pairs(
                 pairs.append(pair)
         return tuple(pairs)
 
-    core_idx = _resolve_band_index(bands, core_band)
-    return tuple((core_idx, dst) for dst in range(len(bands)) if dst != core_idx)
+    for src in range(len(bands) - 1):
+        pairs.append((src, src + 1))
+        pairs.append((src + 1, src))
+    return tuple(pairs)
 
 
 def _sample_anchor_indices(ids: Tensor, *, max_anchors: int, prefer_repeated: bool) -> Tensor:

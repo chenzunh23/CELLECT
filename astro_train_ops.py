@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import math
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -37,9 +39,13 @@ def unwrap_model(model: nn.Module) -> nn.Module:
 class LossWeights:
     """CELLECT constants carried into the 2D astronomy training loop."""
 
-    segmentation_3cls: Tuple[float, float, float] = (1.0, 32.0, 1.0)
+    segmentation_binary: Tuple[float, float] = (1.0, 32.0)
+    segmentation_outer_weight: float = 1.0
+    segmentation_loss_stride: int = 1
     confidence_pos_weight: float = 32.0
+    shape_outer_weight: float = 1.0
     center_position: float = 1.0
+    shape_angle_weight: float = 4.0
     triplet_margin: float = 0.3
     triplet_outer_weight: float = 10.0
     matcher_outer_weight: float = 10.0
@@ -97,13 +103,43 @@ def dense_losses(
     # Debug
     # torch.cuda.synchronize()
     # start_time = time.time()
-    seg_target = batch["seg"].to(device=device, dtype=torch.long)  # type: ignore[union-attr]
     conf_target = batch["confidence"].to(device=device, dtype=torch.long)  # type: ignore[union-attr]
-    shape_target = batch["shape"].to(device=device, dtype=torch.float32)  # type: ignore[union-attr]
-    shape_weight = batch["shape_weight"].to(device=device, dtype=torch.float32)  # type: ignore[union-attr]
+    conf_weight = batch.get("confidence_weight")
+    if conf_weight is not None:
+        conf_weight = conf_weight.to(device=device, dtype=torch.float32)  # type: ignore[union-attr]
 
-    seg_weight = torch.tensor(weights.segmentation_3cls, device=device, dtype=torch.float32)
-    seg_loss = F.cross_entropy(outputs["seg_logits"], seg_target, weight=seg_weight)
+    if float(weights.segmentation_outer_weight) <= 0.0:
+        seg_loss = outputs["seg_logits"].sum() * 0.0
+    else:
+        seg_target = (batch["seg"].to(device=device, dtype=torch.long) > 0).long()  # type: ignore[union-attr]
+        seg_loss_weight = batch.get("seg_loss_weight")
+        if seg_loss_weight is not None:
+            seg_loss_weight = seg_loss_weight.to(device=device, dtype=torch.float32)  # type: ignore[union-attr]
+        seg_logits = _binary_segmentation_logits(outputs["seg_logits"])
+        seg_stride = max(1, int(weights.segmentation_loss_stride))
+        if seg_stride > 1:
+            seg_logits = F.avg_pool2d(seg_logits, kernel_size=seg_stride, stride=seg_stride)
+            seg_target = F.max_pool2d(
+                seg_target.unsqueeze(1).to(dtype=torch.float32),
+                kernel_size=seg_stride,
+                stride=seg_stride,
+            ).squeeze(1).to(dtype=torch.long)
+            if seg_loss_weight is not None:
+                seg_loss_weight = F.max_pool2d(
+                    seg_loss_weight.unsqueeze(1),
+                    kernel_size=seg_stride,
+                    stride=seg_stride,
+                ).squeeze(1)
+        seg_weight = torch.tensor(weights.segmentation_binary[:2], device=device, dtype=torch.float32)
+        per_pixel_seg = F.cross_entropy(seg_logits, seg_target, weight=seg_weight, reduction="none")
+        if seg_loss_weight is not None:
+            seg_loss_weight = seg_loss_weight.clamp_min(0.0)
+            if bool((seg_loss_weight > 0).any()):
+                seg_loss = (per_pixel_seg * seg_loss_weight).sum() / seg_loss_weight.sum().clamp_min(1.0)
+            else:
+                seg_loss = per_pixel_seg.sum() * 0.0
+        else:
+            seg_loss = per_pixel_seg.mean()
     # torch.cuda.synchronize()
     # seg_time = time.time()
     # print(f'[DEBUG] Segmentation loss computed in {seg_time - start_time:.3f} seconds.')
@@ -111,15 +147,43 @@ def dense_losses(
         outputs["confidence"],
         conf_target,
         pos_weight=weights.confidence_pos_weight,
+        weight=conf_weight,
     )
     # torch.cuda.synchronize()
     # conf_time = time.time()
     # print(f'[DEBUG] Confidence loss computed in {conf_time - seg_time:.3f} seconds.')
-    per_pixel_shape = F.mse_loss(outputs["shape"], shape_target, reduction="none").mean(dim=1)
-    if bool((shape_weight > 0).any()):
-        shape_loss = (per_pixel_shape * shape_weight).sum() / shape_weight.sum().clamp_min(1.0)
+    if float(weights.shape_outer_weight) <= 0.0:
+        shape_loss = outputs["shape"].sum() * 0.0
     else:
-        shape_loss = per_pixel_shape.mean() * 0.0
+        shape_target = batch["shape"].to(device=device, dtype=torch.float32)  # type: ignore[union-attr]
+        shape_weight = batch["shape_weight"].to(device=device, dtype=torch.float32)  # type: ignore[union-attr]
+        pseudo_mask = batch.get("pseudo_mask")
+        pseudo_bool = (
+            pseudo_mask.to(device=device, dtype=torch.bool)  # type: ignore[union-attr]
+            if pseudo_mask is not None
+            else None
+        )
+        ignore_mask = batch.get("ignore_mask")
+        if ignore_mask is not None:
+            ignore_bool = ignore_mask.to(device=device, dtype=torch.bool)  # type: ignore[union-attr]
+            if pseudo_bool is not None:
+                ignore_bool = ignore_bool & ~pseudo_bool
+            shape_weight = shape_weight * (~ignore_bool).to(dtype=torch.float32)
+        center_only_mask = batch.get("center_only_mask")
+        if center_only_mask is not None:
+            center_only_bool = center_only_mask.to(device=device, dtype=torch.bool)  # type: ignore[union-attr]
+            if pseudo_bool is not None:
+                center_only_bool = center_only_bool & ~pseudo_bool
+            shape_weight = shape_weight * (~center_only_bool).to(dtype=torch.float32)
+        per_pixel_shape = shape_regression_loss_map(
+            outputs["shape"],
+            shape_target,
+            angle_weight=weights.shape_angle_weight,
+        )
+        if bool((shape_weight > 0).any()):
+            shape_loss = (per_pixel_shape * shape_weight).sum() / shape_weight.sum().clamp_min(1.0)
+        else:
+            shape_loss = per_pixel_shape.mean() * 0.0
     # torch.cuda.synchronize()
     # shape_time = time.time()
     # print(f'[DEBUG] Shape loss computed in {shape_time - conf_time:.3f} seconds.')
@@ -130,8 +194,64 @@ def dense_losses(
     # torch.cuda.synchronize()
     # center_time = time.time()
     # print(f'[DEBUG] Center localization loss computed in {center_time - shape_time:.3f} seconds.')
-    total = seg_loss + conf_loss + shape_loss + weights.center_position * center_loss
+    total = (
+        weights.segmentation_outer_weight * seg_loss
+        + conf_loss
+        + weights.shape_outer_weight * shape_loss
+        + weights.center_position * center_loss
+    )
     return {"total": total, "seg": seg_loss, "confidence": conf_loss, "shape": shape_loss, "center": center_loss}
+
+
+def _binary_segmentation_logits(seg_logits: Tensor) -> Tensor:
+    """Return [B,2,H,W] background/foreground logits.
+
+    New astronomy models output two segmentation channels.  Older checkpoints
+    may still output CELLECT-style 3-class logits; in that case all nonzero
+    segmentation classes are folded into one foreground logit.
+    """
+
+    if seg_logits.ndim < 4:
+        raise ValueError("seg_logits must have channel dimension")
+    if seg_logits.shape[1] == 2:
+        return seg_logits
+    if seg_logits.shape[1] > 2:
+        bg = seg_logits[:, :1]
+        fg = torch.logsumexp(seg_logits[:, 1:], dim=1, keepdim=True)
+        return torch.cat([bg, fg], dim=1)
+    raise ValueError("binary segmentation requires at least two logits")
+
+
+def shape_regression_loss_map(pred: Tensor, target: Tensor, *, angle_weight: float = 4.0) -> Tensor:
+    """Per-pixel shape loss with periodic angular error for channel 2.
+
+    Channels 0 and 1 are semi-major/semi-minor axes and remain ordinary MSE.
+    Channel 2 is an angle in radians, so direct MSE is brittle near the wrap
+    boundary; use 1 - cos(delta_theta) and upweight it by default.
+    """
+
+    if pred.shape != target.shape:
+        raise ValueError("pred and target shape tensors must have identical shapes")
+    if pred.ndim < 3 or pred.shape[1] < 3:
+        return F.mse_loss(pred, target, reduction="none").mean(dim=1)
+    pred_a = pred[:, 0].clamp_min(1e-3)
+    pred_b = pred[:, 1].clamp_min(1e-3)
+    target_a = target[:, 0].clamp_min(1e-3)
+    target_b = target[:, 1].clamp_min(1e-3)
+    pred_area = pred_a * pred_b
+    target_area = target_a * target_b
+    area_loss = F.smooth_l1_loss(torch.log(pred_area), torch.log(target_area), reduction="none")
+    pred_ratio = torch.log(pred_a / pred_b.clamp_min(1e-3))
+    target_ratio = torch.log(target_a / target_b.clamp_min(1e-3))
+    ratio_loss = F.smooth_l1_loss(pred_ratio, target_ratio, reduction="none")
+    axes_loss = ratio_loss + area_loss
+    # axes_loss = F.mse_loss(pred[:, :2], target[:, :2], reduction="none").mean(dim=1)
+    # pred_area = pred[:,0].clamp_min(1e-6) * pred[:,1].clamp_min(1e-6)
+    # target_area = target[:,0].clamp_min(1e-6) * target[:,1].clamp_min(1e-6)
+    # axes_loss = torch.abs(pred_area - target_area) / target_area.clamp_min(1e-6)
+    angle_loss = 1.0 - torch.cos(2 * (pred[:, 2] - target[:, 2]))
+    angle_weight_t = pred.new_tensor(float(angle_weight)).clamp_min(0.0)
+    return (2.0 * axes_loss + angle_weight_t * angle_loss) / (2.0 + angle_weight_t)
 
 
 def _flatten_per_band_outputs(outputs: Dict[str, Tensor]) -> Dict[str, Tensor]:
@@ -144,6 +264,81 @@ def _flatten_per_band_outputs(outputs: Dict[str, Tensor]) -> Dict[str, Tensor]:
 
 def _flatten_band_centers(nested: Sequence[Sequence[Tensor]]) -> List[Tensor]:
     return [centers for item in nested for centers in item]
+
+
+def _flatten_band_masks(mask: Tensor) -> List[Tensor]:
+    if mask.ndim == 4:
+        return [item for record in mask for item in record]
+    if mask.ndim == 3:
+        return [item for item in mask]
+    return []
+
+
+def _filter_points_by_ignore_mask(pred_xy: np.ndarray, ignore_mask: Optional[Tensor]) -> np.ndarray:
+    if ignore_mask is None or pred_xy.size == 0:
+        return pred_xy
+    mask_np = ignore_mask.detach().cpu().numpy().astype(bool)
+    if mask_np.ndim != 2:
+        return pred_xy
+    h, w = mask_np.shape
+    keep = []
+    for xy in pred_xy:
+        x = int(round(float(xy[0])))
+        y = int(round(float(xy[1])))
+        if x < 0 or y < 0 or x >= w or y >= h:
+            keep.append(True)
+        else:
+            keep.append(not bool(mask_np[y, x]))
+    return pred_xy[np.asarray(keep, dtype=bool)]
+
+
+def _filter_points_by_mask_with_count(pred_xy: np.ndarray, mask: Optional[Tensor]) -> Tuple[np.ndarray, int]:
+    if mask is None or pred_xy.size == 0:
+        return pred_xy, 0
+    mask_np = mask.detach().cpu().numpy().astype(bool)
+    if mask_np.ndim != 2:
+        return pred_xy, 0
+    h, w = mask_np.shape
+    keep = []
+    removed = 0
+    for xy in pred_xy:
+        x = int(round(float(xy[0])))
+        y = int(round(float(xy[1])))
+        inside = 0 <= x < w and 0 <= y < h and bool(mask_np[y, x])
+        if inside:
+            removed += 1
+            keep.append(False)
+        else:
+            keep.append(True)
+    return pred_xy[np.asarray(keep, dtype=bool)], removed
+
+
+def _point_in_mask(mask_np: np.ndarray, xy: np.ndarray) -> bool:
+    if mask_np.ndim != 2:
+        return False
+    h, w = mask_np.shape
+    x = int(round(float(xy[0])))
+    y = int(round(float(xy[1])))
+    return 0 <= x < w and 0 <= y < h and bool(mask_np[y, x])
+
+
+def _count_points_in_masks(pred_xy: np.ndarray, masks: Sequence[Optional[Tensor]]) -> int:
+    if pred_xy.size == 0:
+        return 0
+    mask_arrays: List[np.ndarray] = []
+    for mask in masks:
+        if mask is None:
+            continue
+        arr = mask.detach().cpu().numpy().astype(bool)
+        if arr.ndim == 2:
+            mask_arrays.append(arr)
+    if not mask_arrays:
+        return int(len(pred_xy))
+    count = 0
+    for xy in pred_xy:
+        if any(_point_in_mask(mask_np, xy) for mask_np in mask_arrays):
+            count += 1
+    return count
 
 
 def dense_losses_any(
@@ -165,6 +360,17 @@ def dense_losses_any(
         "confidence": batch["band_confidence"].reshape(-1, *batch["band_confidence"].shape[2:]),  # type: ignore[union-attr]
         "shape": batch["band_shape"].reshape(-1, *batch["band_shape"].shape[2:]),  # type: ignore[union-attr]
         "shape_weight": batch["band_shape_weight"].reshape(-1, *batch["band_shape_weight"].shape[2:]),  # type: ignore[union-attr]
+        "confidence_weight": batch["band_confidence_weight"].reshape(
+            -1, *batch["band_confidence_weight"].shape[2:]
+        ),  # type: ignore[union-attr]
+        "seg_loss_weight": batch["band_seg_loss_weight"].reshape(
+            -1, *batch["band_seg_loss_weight"].shape[2:]
+        ),  # type: ignore[union-attr]
+        "ignore_mask": batch["band_ignore_mask"].reshape(-1, *batch["band_ignore_mask"].shape[2:]),  # type: ignore[union-attr]
+        "center_only_mask": batch["band_center_only_mask"].reshape(
+            -1, *batch["band_center_only_mask"].shape[2:]
+        ),  # type: ignore[union-attr]
+        "pseudo_mask": batch["band_pseudo_mask"].reshape(-1, *batch["band_pseudo_mask"].shape[2:]),  # type: ignore[union-attr]
         "centers": _flatten_band_centers(batch["band_centers"]),  # type: ignore[arg-type]
     }
     return dense_losses(flat_outputs, flat_batch, weights=weights, device=device, center_radius_px=center_radius_px)
@@ -236,7 +442,7 @@ def _sample_map_at_centers(map_tensor: Tensor, centers: Tensor) -> Tensor:
     if centers.numel() == 0:
         return map_tensor.new_zeros((0, map_tensor.shape[0]))
     h, w = map_tensor.shape[-2:]
-    xy = centers.to(device=map_tensor.device, dtype=torch.long)
+    xy = torch.round(centers.to(device=map_tensor.device, dtype=torch.float32)).to(dtype=torch.long)
     x = xy[:, 0].clamp(0, w - 1)
     y = xy[:, 1].clamp(0, h - 1)
     return map_tensor[:, y, x].transpose(0, 1)
@@ -252,7 +458,7 @@ def _confidence_score_at_centers(outputs: Dict[str, Tensor], centers: Tensor, *,
         raise ValueError("_confidence_score_at_centers expects one dense band output")
     score_map = _cellect_confidence_smooth_2d(confidence)[batch_index, -1]
     h, w = score_map.shape[-2:]
-    xy = centers.to(device=score_map.device, dtype=torch.long)
+    xy = torch.round(centers.to(device=score_map.device, dtype=torch.float32)).to(dtype=torch.long)
     x = xy[:, 0].clamp(0, w - 1)
     y = xy[:, 1].clamp(0, h - 1)
     return score_map[y, x]
@@ -352,6 +558,8 @@ def detect_centers_with_en(
     match_radius: float,
     candidate_count: int,
     en_threshold: float,
+    center_refinement: str = "integer",
+    center_refinement_radius: int = 1,
 ) -> List[np.ndarray]:
     """Detect centers and optionally apply CELLECT-style EN deduplication."""
 
@@ -364,6 +572,8 @@ def detect_centers_with_en(
             threshold=threshold,
             nms_radius=nms_radius,
             confidence_score=confidence_score,
+            center_refinement=center_refinement,
+            center_refinement_radius=center_refinement_radius,
         )
         if not hasattr(model, "EN"):
             return raw
@@ -390,6 +600,8 @@ def detect_centers_with_en(
         threshold=threshold,
         nms_radius=nms_radius,
         confidence_score=confidence_score,
+        center_refinement=center_refinement,
+        center_refinement_radius=center_refinement_radius,
     )
     if not hasattr(model, "EN"):
         return raw
@@ -418,6 +630,8 @@ def detect_centers_with_ex_link(
     match_radius: float,
     candidate_count: int,
     ex_threshold: float,
+    center_refinement: str = "integer",
+    center_refinement_radius: int = 1,
     use_en_postprocess: bool = False,
     en_threshold: float = 0.6,
     max_distance_factor: float = 6.0,
@@ -443,6 +657,8 @@ def detect_centers_with_ex_link(
                 threshold=threshold,
                 nms_radius=nms_radius,
                 confidence_score=confidence_score,
+                center_refinement=center_refinement,
+                center_refinement_radius=center_refinement_radius,
             )
             return raw, []
         if use_en_postprocess and hasattr(model, "EN"):
@@ -453,6 +669,8 @@ def detect_centers_with_ex_link(
                     threshold=threshold,
                     nms_radius=nms_radius,
                     confidence_score=confidence_score,
+                    center_refinement=center_refinement,
+                    center_refinement_radius=center_refinement_radius,
                     match_radius=match_radius,
                     candidate_count=candidate_count,
                     en_threshold=en_threshold,
@@ -465,6 +683,8 @@ def detect_centers_with_ex_link(
                 threshold=threshold,
                 nms_radius=nms_radius,
                 confidence_score=confidence_score,
+                center_refinement=center_refinement,
+                center_refinement_radius=center_refinement_radius,
             ),
             [],
         )
@@ -476,6 +696,8 @@ def detect_centers_with_ex_link(
         threshold=threshold,
         nms_radius=nms_radius,
         confidence_score=confidence_score,
+        center_refinement=center_refinement,
+        center_refinement_radius=center_refinement_radius,
     )
     per_batch: List[List[np.ndarray]] = []
     for batch_idx in range(batch):
@@ -779,10 +1001,9 @@ def parse_ex_band_pairs(
 ) -> Tuple[Tuple[int, int], ...]:
     """Build directed EX training pairs.
 
-    By default EX is trained from one core band to every other band, which keeps
-    the CELLECT idea of one anchor frame while avoiding all pair permutations.
-    Explicit specs use ``src:dst`` or ``src->dst``; ``all`` restores every
-    directed cross-band pair.
+    Default EX pairs are adjacent bands in both directions.  Explicit specs use
+    ``src:dst`` or ``src->dst``; ``all`` restores every directed cross-band
+    pair and ``core`` uses the legacy core-band-to-all pattern.
     """
 
     if len(bands) <= 1:
@@ -790,6 +1011,9 @@ def parse_ex_band_pairs(
     specs = [part.strip() for item in (pair_specs or ()) for part in str(item).split(",") if part.strip()]
     if any(spec.lower() == "all" for spec in specs):
         return tuple((src, dst) for src in range(len(bands)) for dst in range(len(bands)) if src != dst)
+    if any(spec.lower() == "core" for spec in specs):
+        core_idx = _resolve_band_index(bands, core_band)
+        return tuple((core_idx, dst) for dst in range(len(bands)) if dst != core_idx)
     pairs: List[Tuple[int, int]] = []
     if specs:
         for spec in specs:
@@ -808,8 +1032,10 @@ def parse_ex_band_pairs(
                 pairs.append(pair)
         return tuple(pairs)
 
-    core_idx = _resolve_band_index(bands, core_band)
-    return tuple((core_idx, dst) for dst in range(len(bands)) if dst != core_idx)
+    for src in range(len(bands) - 1):
+        pairs.append((src, src + 1))
+        pairs.append((src + 1, src))
+    return tuple(pairs)
 
 
 def matcher_classification_loss(
@@ -1065,12 +1291,53 @@ def _cellect_foreground_gate_2d(seg_logits: Tensor) -> Tensor:
     return ~background_near
 
 
+def _refine_peak_coordinates(
+    score_map: Tensor,
+    y: Tensor,
+    x: Tensor,
+    *,
+    method: str,
+    radius: int,
+) -> Tensor:
+    """Return x,y peak coordinates, optionally refined to sub-pixel positions."""
+
+    if x.numel() == 0:
+        return score_map.new_zeros((0, 2), dtype=torch.float32)
+    method = str(method)
+    if method in ("none", "integer"):
+        return torch.stack([x, y], dim=1).to(dtype=torch.float32)
+    if method != "softargmax":
+        raise ValueError(f"Unknown center refinement method: {method}")
+
+    h, w = score_map.shape[-2:]
+    window = max(0, int(radius))
+    coords: List[Tensor] = []
+    for yi, xi in zip(y.tolist(), x.tolist()):
+        x0, x1 = max(0, int(xi) - window), min(w, int(xi) + window + 1)
+        y0, y1 = max(0, int(yi) - window), min(h, int(yi) + window + 1)
+        patch = score_map[y0:y1, x0:x1].float()
+        if patch.numel() == 0 or not bool(torch.isfinite(patch).any()):
+            coords.append(score_map.new_tensor([float(xi), float(yi)], dtype=torch.float32))
+            continue
+        patch = torch.nan_to_num(patch, nan=float("-inf"))
+        weights = F.softmax((patch - patch.max()).reshape(-1), dim=0)
+        xs = torch.arange(x0, x1, device=score_map.device, dtype=torch.float32)
+        ys = torch.arange(y0, y1, device=score_map.device, dtype=torch.float32)
+        yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+        refined_x = (weights * xx.reshape(-1)).sum()
+        refined_y = (weights * yy.reshape(-1)).sum()
+        coords.append(torch.stack((refined_x, refined_y)))
+    return torch.stack(coords, dim=0).to(dtype=torch.float32)
+
+
 def detect_centers(
     outputs: Dict[str, Tensor],
     *,
     threshold: float = 0.0,
     nms_radius: int = 1,
     confidence_score: str = "cellect",
+    center_refinement: str = "integer",
+    center_refinement_radius: int = 1,
 ) -> List[np.ndarray]:
     """Detect center candidates from confidence maps.
 
@@ -1101,8 +1368,59 @@ def detect_centers(
     result: List[np.ndarray] = []
     for b in range(conf.shape[0]):
         y, x = torch.where(peaks[b])
-        coords = torch.stack([x, y], dim=1).detach().cpu().numpy().astype(np.float32)
+        coords = _refine_peak_coordinates(
+            conf[b],
+            y,
+            x,
+            method=center_refinement,
+            radius=center_refinement_radius,
+        )
+        coords = coords.detach().cpu().numpy().astype(np.float32)
         result.append(coords)
+    return result
+
+
+@torch.no_grad()
+def detect_centers_with_scores(
+    outputs: Dict[str, Tensor],
+    *,
+    threshold: float = -float("inf"),
+    nms_radius: int = 1,
+    confidence_score: str = "cellect",
+    center_refinement: str = "integer",
+    center_refinement_radius: int = 1,
+) -> List[Dict[str, np.ndarray]]:
+    """Detect centers and return ``xy`` plus scalar confidence scores."""
+
+    if confidence_score == "cellect":
+        smoothed = _cellect_confidence_smooth_2d(outputs["confidence"])
+        local_score = smoothed.max(dim=1).values
+        center_score = smoothed[:, -1]
+        pooled = F.max_pool2d(local_score.unsqueeze(1), kernel_size=2 * nms_radius + 1, stride=1, padding=nms_radius).squeeze(1)
+        peaks = (pooled == center_score) & _cellect_foreground_gate_2d(outputs["seg_logits"]) & (center_score > threshold)
+        conf = center_score
+    else:
+        conf = _confidence_detection_score(outputs, confidence_score)
+        fg = outputs["seg_logits"].argmax(dim=1) > 0
+        pooled = F.max_pool2d(conf.unsqueeze(1), kernel_size=2 * nms_radius + 1, stride=1, padding=nms_radius).squeeze(1)
+        peaks = (conf == pooled) & fg & (conf > threshold)
+
+    result: List[Dict[str, np.ndarray]] = []
+    for b in range(conf.shape[0]):
+        y, x = torch.where(peaks[b])
+        if x.numel() == 0:
+            result.append({"xy": np.zeros((0, 2), dtype=np.float32), "score": np.zeros((0,), dtype=np.float32)})
+            continue
+        xy_t = _refine_peak_coordinates(
+            conf[b],
+            y,
+            x,
+            method=center_refinement,
+            radius=center_refinement_radius,
+        )
+        xy = xy_t.detach().cpu().numpy().astype(np.float32)
+        score = conf[b, y, x].detach().cpu().numpy().astype(np.float32)
+        result.append({"xy": xy, "score": score})
     return result
 
 
@@ -1189,11 +1507,336 @@ def build_cellect_style_segmentation(
     return results
 
 
+def _ellipse_mask_np(
+    shape_hw: Tuple[int, int],
+    cx: float,
+    cy: float,
+    major: float,
+    minor: float,
+    theta: float,
+    *,
+    ellipse_sigma: float,
+    min_axis: float = 1.5,
+) -> np.ndarray:
+    h, w = int(shape_hw[0]), int(shape_hw[1])
+    if not (np.isfinite(cx) and np.isfinite(cy)):
+        return np.zeros((h, w), dtype=bool)
+    a = max(abs(float(major)) * float(ellipse_sigma), float(min_axis))
+    b = max(abs(float(minor)) * float(ellipse_sigma), float(min_axis))
+    if not np.isfinite(a) or not np.isfinite(b):
+        return np.zeros((h, w), dtype=bool)
+    xi = int(round(float(cx)))
+    yi = int(round(float(cy)))
+    radius = int(math.ceil(max(a, b))) + 2
+    y0, y1 = max(0, yi - radius), min(h, yi + radius + 1)
+    x0, x1 = max(0, xi - radius), min(w, xi + radius + 1)
+    if x0 >= x1 or y0 >= y1:
+        return np.zeros((h, w), dtype=bool)
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    dx = xx.astype(np.float32) - float(cx)
+    dy = yy.astype(np.float32) - float(cy)
+    cos_t = math.cos(float(theta)) if np.isfinite(theta) else 1.0
+    sin_t = math.sin(float(theta)) if np.isfinite(theta) else 0.0
+    xr = cos_t * dx + sin_t * dy
+    yr = -sin_t * dx + cos_t * dy
+    local = (xr / a) ** 2 + (yr / b) ** 2 <= 1.0
+    out = np.zeros((h, w), dtype=bool)
+    out[y0:y1, x0:x1] = local
+    return out
+
+
+def _connected_components_bool(mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    mask_bool = np.asarray(mask, dtype=bool)
+    if not bool(mask_bool.any()):
+        return np.zeros(mask_bool.shape, dtype=np.int32), np.zeros((1,), dtype=np.int64)
+    try:
+        from scipy import ndimage
+
+        labels, _num = ndimage.label(mask_bool, structure=np.ones((3, 3), dtype=np.uint8))
+        areas = np.bincount(labels.ravel()).astype(np.int64)
+        return labels.astype(np.int32, copy=False), areas
+    except Exception:
+        labels = np.zeros(mask_bool.shape, dtype=np.int32)
+        h, w = mask_bool.shape
+        current = 0
+        areas = [0]
+        for y in range(h):
+            for x in range(w):
+                if not mask_bool[y, x] or labels[y, x] != 0:
+                    continue
+                current += 1
+                stack = [(y, x)]
+                labels[y, x] = current
+                area = 0
+                while stack:
+                    yy, xx = stack.pop()
+                    area += 1
+                    for ny in range(max(0, yy - 1), min(h, yy + 2)):
+                        for nx in range(max(0, xx - 1), min(w, xx + 2)):
+                            if mask_bool[ny, nx] and labels[ny, nx] == 0:
+                                labels[ny, nx] = current
+                                stack.append((ny, nx))
+                areas.append(area)
+        return labels, np.asarray(areas, dtype=np.int64)
+
+
+def _max_iou_with_labeled_mask(pred_mask: np.ndarray, label_map: np.ndarray, label_areas: np.ndarray) -> float:
+    pred_bool = np.asarray(pred_mask, dtype=bool)
+    pred_area = int(pred_bool.sum())
+    if pred_area <= 0 or label_areas.size <= 1:
+        return 0.0
+    pred_labels = np.asarray(label_map[pred_bool], dtype=np.int64)
+    pred_labels = pred_labels[pred_labels > 0]
+    if pred_labels.size == 0:
+        return 0.0
+    overlaps = np.bincount(pred_labels, minlength=int(label_areas.size))
+    hit_labels = np.flatnonzero(overlaps > 0)
+    max_iou = 0.0
+    for label in hit_labels:
+        inter = int(overlaps[label])
+        clean_area = int(label_areas[label])
+        union = pred_area + clean_area - inter
+        if union > 0:
+            max_iou = max(max_iou, float(inter) / float(union))
+    return max_iou
+
+
+def _centers_from_confidence_target(confidence: Tensor) -> np.ndarray:
+    conf = confidence.detach().cpu()
+    if conf.numel() == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    level = int(conf.max().item())
+    if level <= 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    y, x = torch.where(conf == level)
+    if x.numel() == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    return torch.stack([x, y], dim=1).numpy().astype(np.float32)
+
+
+def _min_distance_to_points(xy: np.ndarray, points: np.ndarray) -> float:
+    if points.size == 0:
+        return float("inf")
+    delta = points[:, :2].astype(np.float32) - np.asarray(xy, dtype=np.float32)[None, :2]
+    return float(np.sqrt(np.sum(delta * delta, axis=1)).min())
+
+
+@torch.no_grad()
+def generate_pu_pseudo_labels(
+    model: nn.Module,
+    loader: DataLoader,
+    *,
+    device: torch.device,
+    epoch: int,
+    total_epochs: int,
+    output_path: Path,
+    band_names: Sequence[str],
+    score_percentile_start: float = 99.0,
+    score_percentile_end: float = 60.0,
+    min_center_distance_px: float = 3.0,
+    clean_iou_threshold: float = 0.33,
+    axis_ratio_min: float = 0.1,
+    nms_radius: int = 1,
+    confidence_score: str = "cellect",
+    ellipse_sigma: float = 2.0,
+    max_pseudo_per_record_band: int = 512,
+    show_progress: bool = True,
+) -> Dict[str, object]:
+    """Run detection and write high-confidence PU self-training pseudo labels.
+
+    Candidates are thresholded by a percentile schedule from p99 to p60,
+    are required to be farther than ``min_center_distance_px`` from existing
+    clean/center_only centers, have IoU < ``clean_iou_threshold`` with the clean
+    mask, and have ``minor / major > axis_ratio_min``.
+    """
+
+    model.eval()
+    epoch_number = int(epoch) + 1
+    progress = 0.0 if total_epochs <= 1 else min(max(float(epoch) / float(total_epochs - 1), 0.0), 1.0)
+    percentile = float(score_percentile_start) + (float(score_percentile_end) - float(score_percentile_start)) * progress
+    percentile = float(np.clip(percentile, 0.0, 100.0))
+    raw_items: List[Dict[str, object]] = []
+    all_scores: List[float] = []
+
+    for batch in tqdm(loader, desc="pu-pseudo-detect", leave=False, disable=not show_progress):
+        images = batch["image"].to(device=device, dtype=torch.float32, non_blocking=True)  # type: ignore[union-attr]
+        outputs = model(images)
+        if outputs["seg_logits"].ndim == 5:
+            flat_outputs = _flatten_per_band_outputs(outputs)
+            detection_items = detect_centers_with_scores(
+                flat_outputs,
+                threshold=-float("inf"),
+                nms_radius=nms_radius,
+                confidence_score=confidence_score,
+            )
+            batch_size = int(outputs["seg_logits"].shape[0])
+            band_count = int(outputs["seg_logits"].shape[1])
+            flat_shape = flat_outputs["shape"].detach().cpu()
+            for flat_idx, item in enumerate(detection_items):
+                rec_idx = flat_idx // band_count
+                band_idx = flat_idx % band_count
+                if rec_idx >= batch_size:
+                    continue
+                record_name = str(batch["name"][rec_idx])  # type: ignore[index]
+                clean_mask = batch["band_clean_mask"][rec_idx][band_idx].detach().cpu().numpy().astype(bool)  # type: ignore[index]
+                clean_label_map, clean_label_areas = _connected_components_bool(clean_mask)
+                existing_centers = _centers_from_confidence_target(batch["band_confidence"][rec_idx][band_idx])  # type: ignore[index]
+                h, w = clean_mask.shape
+                xy = np.asarray(item["xy"], dtype=np.float32)
+                score = np.asarray(item["score"], dtype=np.float32)
+                for cand_idx, (center_xy, score_value) in enumerate(zip(xy, score)):
+                    x, y = float(center_xy[0]), float(center_xy[1])
+                    xi, yi = int(round(x)), int(round(y))
+                    if xi < 0 or yi < 0 or xi >= w or yi >= h:
+                        continue
+                    major = float(flat_shape[flat_idx, 0, yi, xi]) if flat_shape.shape[1] >= 1 else 1.5
+                    minor = float(flat_shape[flat_idx, 1, yi, xi]) if flat_shape.shape[1] >= 2 else major
+                    theta = float(flat_shape[flat_idx, 2, yi, xi]) if flat_shape.shape[1] >= 3 else 0.0
+                    axis_ratio = min(abs(minor), abs(major)) / max(abs(minor), abs(major), 1e-6)
+                    if not np.isfinite(axis_ratio) or axis_ratio <= float(axis_ratio_min):
+                        continue
+                    min_dist = _min_distance_to_points(center_xy, existing_centers)
+                    if min_dist <= float(min_center_distance_px):
+                        continue
+                    pred_mask = _ellipse_mask_np((h, w), x, y, major, minor, theta, ellipse_sigma=ellipse_sigma)
+                    pred_area = int(pred_mask.sum())
+                    if pred_area <= 0:
+                        continue
+                    clean_iou = _max_iou_with_labeled_mask(pred_mask, clean_label_map, clean_label_areas)
+                    if clean_iou >= float(clean_iou_threshold):
+                        continue
+                    item_dict = {
+                        "record": record_name,
+                        "band": str(band_names[band_idx]) if band_idx < len(band_names) else f"band{band_idx}",
+                        "band_index": int(band_idx),
+                        "x": x,
+                        "y": y,
+                        "score": float(score_value),
+                        "major": major,
+                        "minor": minor,
+                        "theta": theta,
+                        "axis_ratio": float(axis_ratio),
+                        "min_existing_center_distance_px": min_dist,
+                        "clean_iou": clean_iou,
+                        "source": "pu_self_training",
+                        "epoch": epoch_number,
+                    }
+                    raw_items.append(item_dict)
+                    all_scores.append(float(score_value))
+        else:
+            detection_items = detect_centers_with_scores(
+                outputs,
+                threshold=-float("inf"),
+                nms_radius=nms_radius,
+                confidence_score=confidence_score,
+            )
+            shape_cpu = outputs["shape"].detach().cpu()
+            for rec_idx, item in enumerate(detection_items):
+                record_name = str(batch["name"][rec_idx])  # type: ignore[index]
+                clean_mask = batch["clean_mask"][rec_idx].detach().cpu().numpy().astype(bool)  # type: ignore[index]
+                clean_label_map, clean_label_areas = _connected_components_bool(clean_mask)
+                existing_centers = _centers_from_confidence_target(batch["confidence"][rec_idx])  # type: ignore[index]
+                h, w = clean_mask.shape
+                xy = np.asarray(item["xy"], dtype=np.float32)
+                score = np.asarray(item["score"], dtype=np.float32)
+                for center_xy, score_value in zip(xy, score):
+                    x, y = float(center_xy[0]), float(center_xy[1])
+                    xi, yi = int(round(x)), int(round(y))
+                    if xi < 0 or yi < 0 or xi >= w or yi >= h:
+                        continue
+                    major = float(shape_cpu[rec_idx, 0, yi, xi]) if shape_cpu.shape[1] >= 1 else 1.5
+                    minor = float(shape_cpu[rec_idx, 1, yi, xi]) if shape_cpu.shape[1] >= 2 else major
+                    theta = float(shape_cpu[rec_idx, 2, yi, xi]) if shape_cpu.shape[1] >= 3 else 0.0
+                    axis_ratio = min(abs(minor), abs(major)) / max(abs(minor), abs(major), 1e-6)
+                    if not np.isfinite(axis_ratio) or axis_ratio <= float(axis_ratio_min):
+                        continue
+                    min_dist = _min_distance_to_points(center_xy, existing_centers)
+                    if min_dist <= float(min_center_distance_px):
+                        continue
+                    pred_mask = _ellipse_mask_np((h, w), x, y, major, minor, theta, ellipse_sigma=ellipse_sigma)
+                    pred_area = int(pred_mask.sum())
+                    if pred_area <= 0:
+                        continue
+                    clean_iou = _max_iou_with_labeled_mask(pred_mask, clean_label_map, clean_label_areas)
+                    if clean_iou >= float(clean_iou_threshold):
+                        continue
+                    item_dict = {
+                        "record": record_name,
+                        "band": "__primary__",
+                        "band_index": -1,
+                        "x": x,
+                        "y": y,
+                        "score": float(score_value),
+                        "major": major,
+                        "minor": minor,
+                        "theta": theta,
+                        "axis_ratio": float(axis_ratio),
+                        "min_existing_center_distance_px": min_dist,
+                        "clean_iou": clean_iou,
+                        "source": "pu_self_training",
+                        "epoch": epoch_number,
+                    }
+                    raw_items.append(item_dict)
+                    all_scores.append(float(score_value))
+
+    score_threshold = float(np.percentile(np.asarray(all_scores, dtype=np.float32), percentile)) if all_scores else float("inf")
+    by_record: Dict[str, Dict[str, List[Dict[str, object]]]] = {}
+    kept = 0
+    counts_by_record_band: Dict[Tuple[str, str], int] = {}
+    for item in sorted(raw_items, key=lambda row: float(row["score"]), reverse=True):
+        if float(item["score"]) < score_threshold:
+            continue
+        key = (str(item["record"]), str(item["band"]))
+        count = counts_by_record_band.get(key, 0)
+        if count >= int(max_pseudo_per_record_band):
+            continue
+        counts_by_record_band[key] = count + 1
+        record_bucket = by_record.setdefault(str(item["record"]), {})
+        band_bucket = record_bucket.setdefault(str(item["band"]), [])
+        band_bucket.append(item)
+        kept += 1
+
+    payload = {
+        "version": 1,
+        "epoch": epoch_number,
+        "percentile": percentile,
+        "score_threshold": score_threshold,
+        "raw_candidates": len(raw_items),
+        "kept": kept,
+        "filters": {
+            "min_center_distance_px": float(min_center_distance_px),
+            "clean_iou_threshold": float(clean_iou_threshold),
+            "axis_ratio_min": float(axis_ratio_min),
+            "ellipse_sigma": float(ellipse_sigma),
+        },
+        "bands": [str(band) for band in band_names],
+        "by_record": by_record,
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return {
+        "path": str(output_path),
+        "epoch": epoch_number,
+        "percentile": percentile,
+        "score_threshold": score_threshold,
+        "raw_candidates": len(raw_items),
+        "kept": kept,
+    }
+
+
 def match_points(pred_xy: np.ndarray, gt_xy: np.ndarray, radius: float) -> Tuple[int, int, int]:
+    matched_pred, matched_gt = match_point_indices(pred_xy, gt_xy, radius)
+    tp = len(matched_pred)
+    fp = len(pred_xy) - tp
+    fn = len(gt_xy) - tp
+    return tp, fp, fn
+
+
+def match_point_indices(pred_xy: np.ndarray, gt_xy: np.ndarray, radius: float) -> Tuple[set[int], set[int]]:
     if pred_xy.size == 0:
-        return 0, 0, int(len(gt_xy))
+        return set(), set()
     if gt_xy.size == 0:
-        return 0, int(len(pred_xy)), 0
+        return set(), set()
     dist = np.sqrt(((pred_xy[:, None, :] - gt_xy[None, :, :]) ** 2).sum(axis=2))
     pairs = []
     for i in range(dist.shape[0]):
@@ -1203,16 +1846,50 @@ def match_points(pred_xy: np.ndarray, gt_xy: np.ndarray, radius: float) -> Tuple
     pairs.sort()
     used_pred = set()
     used_gt = set()
-    tp = 0
     for _d, i, j in pairs:
         if i in used_pred or j in used_gt:
             continue
         used_pred.add(i)
         used_gt.add(j)
-        tp += 1
-    fp = len(pred_xy) - tp
-    fn = len(gt_xy) - tp
-    return tp, fp, fn
+    return used_pred, used_gt
+
+
+def match_clean_and_ordinary_ignore(
+    pred_xy: np.ndarray,
+    clean_gt_xy: np.ndarray,
+    ordinary_ignore_xy: np.ndarray,
+    radius: float,
+    *,
+    clean_region_masks: Sequence[Optional[Tensor]] = (),
+) -> Dict[str, int]:
+    clean_pred, clean_gt = match_point_indices(pred_xy, clean_gt_xy, radius)
+    unmatched_indices = [idx for idx in range(len(pred_xy)) if idx not in clean_pred]
+    if unmatched_indices:
+        unmatched_pred = pred_xy[np.asarray(unmatched_indices, dtype=np.int64)]
+    else:
+        unmatched_pred = np.zeros((0, 2), dtype=np.float32)
+    ordinary_pred_rel, ordinary_gt = match_point_indices(unmatched_pred, ordinary_ignore_xy, radius)
+    ordinary_pred = {unmatched_indices[idx] for idx in ordinary_pred_rel}
+    clean_tp = len(clean_pred)
+    ordinary_tp = len(ordinary_pred)
+    unmatched_after_all = [
+        idx for idx in range(len(pred_xy))
+        if idx not in clean_pred and idx not in ordinary_pred
+    ]
+    if unmatched_after_all:
+        unmatched_after_all_xy = pred_xy[np.asarray(unmatched_after_all, dtype=np.int64)]
+    else:
+        unmatched_after_all_xy = np.zeros((0, 2), dtype=np.float32)
+    clean_region_fp = _count_points_in_masks(unmatched_after_all_xy, clean_region_masks)
+    return {
+        "tp": clean_tp,
+        "fp": int(len(pred_xy) - clean_tp - ordinary_tp),
+        "clean_region_fp": int(clean_region_fp),
+        "fn": int(len(clean_gt_xy) - len(clean_gt)),
+        "ordinary_ignore_tp": ordinary_tp,
+        "ordinary_ignore_fn": int(len(ordinary_ignore_xy) - len(ordinary_gt)),
+        "ordinary_ignore_total": int(len(ordinary_ignore_xy)),
+    }
 
 
 def _band_label(band_idx: int, band_names: Sequence[str]) -> str:
@@ -1466,6 +2143,433 @@ def _finalize_link_metrics(total: Dict[str, object]) -> Dict[str, object]:
     }
 
 
+def _init_detection_totals(band_names: Sequence[str]) -> Dict[str, object]:
+    return {
+        "tp": 0,
+        "fp": 0,
+        "clean_region_fp": 0,
+        "fn": 0,
+        "ordinary_ignore_tp": 0,
+        "ordinary_ignore_fn": 0,
+        "ordinary_ignore_total": 0,
+        "strict_ignored_pred": 0,
+        "linked_tp": 0,
+        "linked_fp": 0,
+        "linked_fn": 0,
+        "per_band_counts": {
+            str(name): {
+                "tp": 0,
+                "fp": 0,
+                "clean_region_fp": 0,
+                "fn": 0,
+                "ordinary_ignore_tp": 0,
+                "ordinary_ignore_fn": 0,
+                "ordinary_ignore_total": 0,
+                "strict_ignored_pred": 0,
+            }
+            for name in band_names
+        },
+        "link_metrics_total": {
+            "tp": 0.0,
+            "fp": 0.0,
+            "fn": 0.0,
+            "layers": {},
+            "reasons": {},
+            "examples": [],
+            "gt_reference": "merged_reference_catalog_with_filtered_band_presence",
+        },
+    }
+
+
+def _merge_detection_totals(items: Sequence[Dict[str, object]], band_names: Sequence[str]) -> Dict[str, object]:
+    merged = _init_detection_totals(band_names)
+    for item in items:
+        for key in (
+            "tp",
+            "fp",
+            "clean_region_fp",
+            "fn",
+            "ordinary_ignore_tp",
+            "ordinary_ignore_fn",
+            "ordinary_ignore_total",
+            "strict_ignored_pred",
+            "linked_tp",
+            "linked_fp",
+            "linked_fn",
+        ):
+            merged[key] = int(merged.get(key, 0)) + int(item.get(key, 0))
+        merged_per_band = merged["per_band_counts"]
+        item_per_band = item.get("per_band_counts", {})
+        assert isinstance(merged_per_band, dict)
+        if isinstance(item_per_band, dict):
+            for band_name, counts_obj in item_per_band.items():
+                counts = counts_obj if isinstance(counts_obj, dict) else {}
+                bucket = merged_per_band.setdefault(str(band_name), {"tp": 0, "fp": 0, "fn": 0})
+                assert isinstance(bucket, dict)
+                for count_key in (
+                    "tp",
+                    "fp",
+                    "clean_region_fp",
+                    "fn",
+                    "ordinary_ignore_tp",
+                    "ordinary_ignore_fn",
+                    "ordinary_ignore_total",
+                    "strict_ignored_pred",
+                ):
+                    bucket[count_key] = int(bucket.get(count_key, 0)) + int(counts.get(count_key, 0))
+        merged_link = merged["link_metrics_total"]
+        item_link = item.get("link_metrics_total")
+        assert isinstance(merged_link, dict)
+        if isinstance(item_link, dict):
+            _accumulate_link_metrics(merged_link, item_link)
+    return merged
+
+
+def _update_detection_totals(
+    totals: Dict[str, object],
+    base_model: nn.Module,
+    outputs: Dict[str, Tensor],
+    batch: Dict[str, object],
+    *,
+    threshold: float,
+    nms_radius: int,
+    confidence_score: str,
+    center_refinement: str,
+    center_refinement_radius: int,
+    match_radius: float,
+    use_en_postprocess: bool,
+    en_candidate_count: int,
+    en_threshold: float,
+    use_ex_link_postprocess: bool,
+    ex_link_threshold: float,
+    ex_band_pairs: Optional[Sequence[Tuple[int, int]]],
+    band_names: Sequence[str],
+    ignore_mask_during_detection: bool = True,
+) -> None:
+    band_count = int(outputs["seg_logits"].shape[1]) if outputs["seg_logits"].ndim == 5 else 0
+    def _empty_center_list(n: int) -> List[Tensor]:
+        return [outputs["confidence"].new_zeros((0, 2), dtype=torch.float32).cpu() for _ in range(n)]
+
+    if use_en_postprocess and hasattr(base_model, "EN"):
+        pred_list = detect_centers_with_en(
+            base_model,
+            outputs,
+            threshold=threshold,
+            nms_radius=nms_radius,
+            confidence_score=confidence_score,
+            center_refinement=center_refinement,
+            center_refinement_radius=center_refinement_radius,
+            match_radius=match_radius,
+            candidate_count=en_candidate_count,
+            en_threshold=en_threshold,
+        )
+        gt_list = _flatten_band_centers(batch["band_centers"]) if outputs["seg_logits"].ndim == 5 else batch["centers"]  # type: ignore[arg-type]
+        band_indices = [idx % band_count for idx in range(len(pred_list))] if band_count else [None for _ in pred_list]
+        strict_masks = (
+            _flatten_band_masks(batch["band_strict_ignore_mask"])  # type: ignore[arg-type]
+            if ignore_mask_during_detection and outputs["seg_logits"].ndim == 5 and "band_strict_ignore_mask" in batch
+            else ([item for item in batch["strict_ignore_mask"]] if ignore_mask_during_detection and "strict_ignore_mask" in batch else [None for _ in pred_list])  # type: ignore[index]
+        )
+        clean_masks = (
+            _flatten_band_masks(batch["band_clean_mask"])  # type: ignore[arg-type]
+            if outputs["seg_logits"].ndim == 5 and "band_clean_mask" in batch
+            else ([item for item in batch["clean_mask"]] if "clean_mask" in batch else [None for _ in pred_list])  # type: ignore[index]
+        )
+        background_masks = (
+            _flatten_band_masks(batch["band_background_mask"])  # type: ignore[arg-type]
+            if outputs["seg_logits"].ndim == 5 and "band_background_mask" in batch
+            else ([item for item in batch["background_mask"]] if "background_mask" in batch else [None for _ in pred_list])  # type: ignore[index]
+        )
+        ordinary_ignore_list = (
+            _flatten_band_centers(batch["band_ignore_centers"])  # type: ignore[arg-type]
+            if outputs["seg_logits"].ndim == 5 and "band_ignore_centers" in batch
+            else (batch["ignore_centers"] if "ignore_centers" in batch else _empty_center_list(len(pred_list)))  # type: ignore[assignment]
+        )
+    elif outputs["seg_logits"].ndim == 5:
+        flat_outputs = _flatten_per_band_outputs(outputs)
+        pred_list = detect_centers(
+            flat_outputs,
+            threshold=threshold,
+            nms_radius=nms_radius,
+            confidence_score=confidence_score,
+            center_refinement=center_refinement,
+            center_refinement_radius=center_refinement_radius,
+        )
+        gt_list = _flatten_band_centers(batch["band_centers"])  # type: ignore[arg-type]
+        band_indices = [idx % band_count for idx in range(len(pred_list))]
+        strict_masks = (
+            _flatten_band_masks(batch["band_strict_ignore_mask"])  # type: ignore[arg-type]
+            if ignore_mask_during_detection and "band_strict_ignore_mask" in batch
+            else [None for _ in pred_list]
+        )
+        clean_masks = (
+            _flatten_band_masks(batch["band_clean_mask"])  # type: ignore[arg-type]
+            if "band_clean_mask" in batch
+            else [None for _ in pred_list]
+        )
+        background_masks = (
+            _flatten_band_masks(batch["band_background_mask"])  # type: ignore[arg-type]
+            if "band_background_mask" in batch
+            else [None for _ in pred_list]
+        )
+        ordinary_ignore_list = (
+            _flatten_band_centers(batch["band_ignore_centers"])  # type: ignore[arg-type]
+            if "band_ignore_centers" in batch
+            else _empty_center_list(len(pred_list))
+        )
+    else:
+        pred_list = detect_centers(
+            outputs,
+            threshold=threshold,
+            nms_radius=nms_radius,
+            confidence_score=confidence_score,
+            center_refinement=center_refinement,
+            center_refinement_radius=center_refinement_radius,
+        )
+        gt_list = batch["centers"]  # type: ignore[assignment]
+        band_indices = [None for _ in pred_list]
+        strict_masks = (
+            [item for item in batch["strict_ignore_mask"]]  # type: ignore[index]
+            if ignore_mask_during_detection and "strict_ignore_mask" in batch
+            else [None for _ in pred_list]
+        )
+        clean_masks = [item for item in batch["clean_mask"]] if "clean_mask" in batch else [None for _ in pred_list]  # type: ignore[index]
+        background_masks = (
+            [item for item in batch["background_mask"]] if "background_mask" in batch else [None for _ in pred_list]  # type: ignore[index]
+        )
+        ordinary_ignore_list = batch["ignore_centers"] if "ignore_centers" in batch else _empty_center_list(len(pred_list))  # type: ignore[assignment]
+
+    per_band_counts = totals["per_band_counts"]
+    assert isinstance(per_band_counts, dict)
+    for pred_xy, gt_xy, band_idx, strict_mask, clean_mask, background_mask, ordinary_ignore_xy in zip(
+        pred_list, gt_list, band_indices, strict_masks, clean_masks, background_masks, ordinary_ignore_list
+    ):
+        pred_xy, strict_ignored = _filter_points_by_mask_with_count(pred_xy, strict_mask)
+        clean_gt_np = gt_xy.numpy().astype(np.float32)
+        ordinary_np = ordinary_ignore_xy.numpy().astype(np.float32)
+        counts_now = match_clean_and_ordinary_ignore(
+            pred_xy,
+            clean_gt_np,
+            ordinary_np,
+            match_radius,
+            clean_region_masks=(clean_mask, background_mask),
+        )
+        totals["tp"] = int(totals["tp"]) + int(counts_now["tp"])
+        totals["fp"] = int(totals["fp"]) + int(counts_now["fp"])
+        totals["clean_region_fp"] = int(totals["clean_region_fp"]) + int(counts_now["clean_region_fp"])
+        totals["fn"] = int(totals["fn"]) + int(counts_now["fn"])
+        totals["ordinary_ignore_tp"] = int(totals["ordinary_ignore_tp"]) + int(counts_now["ordinary_ignore_tp"])
+        totals["ordinary_ignore_fn"] = int(totals["ordinary_ignore_fn"]) + int(counts_now["ordinary_ignore_fn"])
+        totals["ordinary_ignore_total"] = int(totals["ordinary_ignore_total"]) + int(counts_now["ordinary_ignore_total"])
+        totals["strict_ignored_pred"] = int(totals["strict_ignored_pred"]) + int(strict_ignored)
+        if band_idx is not None and band_names:
+            band_name = str(band_names[int(band_idx)])
+            counts = per_band_counts.setdefault(
+                band_name,
+                {
+                    "tp": 0,
+                    "fp": 0,
+                    "clean_region_fp": 0,
+                    "fn": 0,
+                    "ordinary_ignore_tp": 0,
+                    "ordinary_ignore_fn": 0,
+                    "ordinary_ignore_total": 0,
+                    "strict_ignored_pred": 0,
+                },
+            )
+            assert isinstance(counts, dict)
+            counts["tp"] = int(counts.get("tp", 0)) + int(counts_now["tp"])
+            counts["fp"] = int(counts.get("fp", 0)) + int(counts_now["fp"])
+            counts["clean_region_fp"] = int(counts.get("clean_region_fp", 0)) + int(counts_now["clean_region_fp"])
+            counts["fn"] = int(counts.get("fn", 0)) + int(counts_now["fn"])
+            counts["ordinary_ignore_tp"] = int(counts.get("ordinary_ignore_tp", 0)) + int(counts_now["ordinary_ignore_tp"])
+            counts["ordinary_ignore_fn"] = int(counts.get("ordinary_ignore_fn", 0)) + int(counts_now["ordinary_ignore_fn"])
+            counts["ordinary_ignore_total"] = int(counts.get("ordinary_ignore_total", 0)) + int(counts_now["ordinary_ignore_total"])
+            counts["strict_ignored_pred"] = int(counts.get("strict_ignored_pred", 0)) + int(strict_ignored)
+
+    if use_ex_link_postprocess and outputs["seg_logits"].ndim == 5 and hasattr(base_model, "EX"):
+        linked_pred_list, components_all = detect_centers_with_ex_link(
+            base_model,
+            outputs,
+            threshold=threshold,
+            nms_radius=nms_radius,
+            confidence_score=confidence_score,
+            center_refinement=center_refinement,
+            center_refinement_radius=center_refinement_radius,
+            match_radius=match_radius,
+            candidate_count=en_candidate_count,
+            ex_threshold=ex_link_threshold,
+            use_en_postprocess=use_en_postprocess,
+            en_threshold=en_threshold,
+            band_pairs=ex_band_pairs,
+        )
+        linked_gt_list = batch["centers"]  # type: ignore[assignment]
+        for pred_xy, gt_xy in zip(linked_pred_list, linked_gt_list):
+            t, f, n = match_points(pred_xy, gt_xy.numpy().astype(np.float32), match_radius)
+            totals["linked_tp"] = int(totals["linked_tp"]) + int(t)
+            totals["linked_fp"] = int(totals["linked_fp"]) + int(f)
+            totals["linked_fn"] = int(totals["linked_fn"]) + int(n)
+
+        nested_band_centers: Sequence[Sequence[Tensor]] = batch["band_centers"]  # type: ignore[assignment]
+        nested_band_ids: Sequence[Sequence[Tensor]] = batch["band_ids"]  # type: ignore[assignment]
+        merged_centers_list: Sequence[Tensor] = batch["centers"]  # type: ignore[assignment]
+        merged_ids_list: Sequence[Tensor] = batch["ids"]  # type: ignore[assignment]
+        nested_band_rejected_ids: Optional[Sequence[Sequence[Tensor]]] = batch.get("band_rejected_ids")  # type: ignore[assignment,union-attr]
+        link_metrics_total = totals["link_metrics_total"]
+        assert isinstance(link_metrics_total, dict)
+        for item_idx, components in enumerate(components_all):
+            item_metrics = _evaluate_link_components(
+                components,
+                nested_band_centers[item_idx],
+                nested_band_ids[item_idx],
+                match_radius=match_radius,
+                band_names=band_names,
+                merged_centers=merged_centers_list[item_idx],
+                merged_ids=merged_ids_list[item_idx],
+                band_rejected_ids=(
+                    nested_band_rejected_ids[item_idx] if nested_band_rejected_ids is not None else None
+                ),
+            )
+            _accumulate_link_metrics(link_metrics_total, item_metrics)
+
+
+def _finalize_detection_totals(
+    totals: Dict[str, object],
+    *,
+    band_names: Sequence[str],
+    use_ex_link_postprocess: bool,
+) -> Dict[str, object]:
+    tp = int(totals["tp"])
+    fp = int(totals["fp"])
+    clean_region_fp = int(totals.get("clean_region_fp", fp))
+    fn = int(totals["fn"])
+    ordinary_tp = int(totals.get("ordinary_ignore_tp", 0))
+    ordinary_fn = int(totals.get("ordinary_ignore_fn", 0))
+    ordinary_total = int(totals.get("ordinary_ignore_total", ordinary_tp + ordinary_fn))
+    strict_ignored_pred = int(totals.get("strict_ignored_pred", 0))
+    precision = tp / max(tp + fp, 1)
+    clean_region_precision = tp / max(tp + clean_region_fp, 1)
+    recall = tp / max(tp + fn, 1)
+    combined_tp = tp + ordinary_tp
+    combined_fn = fn + ordinary_fn
+    combined_precision = combined_tp / max(combined_tp + fp, 1)
+    combined_clean_region_precision = combined_tp / max(combined_tp + clean_region_fp, 1)
+    combined_recall = combined_tp / max(combined_tp + combined_fn, 1)
+    result: Dict[str, object] = {
+        "tp": float(tp),
+        "fp": float(fp),
+        "clean_region_fp": float(clean_region_fp),
+        "fn": float(fn),
+        "precision": precision,
+        "purity": precision,
+        "clean_region_precision": clean_region_precision,
+        "clean_region_purity": clean_region_precision,
+        "recall": recall,
+        "completeness": recall,
+        "f1": 2.0 * precision * recall / max(precision + recall, 1e-12),
+        "strict_ignored_pred": float(strict_ignored_pred),
+        "ordinary_ignore": {
+            "tp": float(ordinary_tp),
+            "fn": float(ordinary_fn),
+            "total": float(ordinary_total),
+            "recall": ordinary_tp / max(ordinary_tp + ordinary_fn, 1),
+            "completeness": ordinary_tp / max(ordinary_tp + ordinary_fn, 1),
+        },
+        "gt_plus_ordinary_ignore": {
+            "tp": float(combined_tp),
+            "fp": float(fp),
+            "clean_region_fp": float(clean_region_fp),
+            "fn": float(combined_fn),
+            "precision": combined_precision,
+            "purity": combined_precision,
+            "clean_region_precision": combined_clean_region_precision,
+            "clean_region_purity": combined_clean_region_precision,
+            "recall": combined_recall,
+            "completeness": combined_recall,
+            "f1": 2.0 * combined_precision * combined_recall / max(combined_precision + combined_recall, 1e-12),
+        },
+    }
+    per_band_counts = totals.get("per_band_counts", {})
+    if band_names and isinstance(per_band_counts, dict):
+        per_band: Dict[str, Dict[str, float]] = {}
+        for band_name, counts_obj in per_band_counts.items():
+            counts = counts_obj if isinstance(counts_obj, dict) else {"tp": 0, "fp": 0, "fn": 0}
+            btp = int(counts["tp"])
+            bfp = int(counts["fp"])
+            b_clean_region_fp = int(counts.get("clean_region_fp", bfp))
+            bfn = int(counts["fn"])
+            bord_tp = int(counts.get("ordinary_ignore_tp", 0))
+            bord_fn = int(counts.get("ordinary_ignore_fn", 0))
+            bord_total = int(counts.get("ordinary_ignore_total", bord_tp + bord_fn))
+            b_strict_ignored = int(counts.get("strict_ignored_pred", 0))
+            b_precision = btp / max(btp + bfp, 1)
+            b_clean_region_precision = btp / max(btp + b_clean_region_fp, 1)
+            b_recall = btp / max(btp + bfn, 1)
+            b_combined_tp = btp + bord_tp
+            b_combined_fn = bfn + bord_fn
+            b_combined_precision = b_combined_tp / max(b_combined_tp + bfp, 1)
+            b_combined_clean_region_precision = b_combined_tp / max(b_combined_tp + b_clean_region_fp, 1)
+            b_combined_recall = b_combined_tp / max(b_combined_tp + b_combined_fn, 1)
+            per_band[str(band_name)] = {
+                "tp": float(btp),
+                "fp": float(bfp),
+                "clean_region_fp": float(b_clean_region_fp),
+                "fn": float(bfn),
+                "precision": b_precision,
+                "purity": b_precision,
+                "clean_region_precision": b_clean_region_precision,
+                "clean_region_purity": b_clean_region_precision,
+                "recall": b_recall,
+                "completeness": b_recall,
+                "f1": 2.0 * b_precision * b_recall / max(b_precision + b_recall, 1e-12),
+                "strict_ignored_pred": float(b_strict_ignored),
+                "ordinary_ignore": {
+                    "tp": float(bord_tp),
+                    "fn": float(bord_fn),
+                    "total": float(bord_total),
+                    "recall": bord_tp / max(bord_tp + bord_fn, 1),
+                    "completeness": bord_tp / max(bord_tp + bord_fn, 1),
+                },
+                "gt_plus_ordinary_ignore": {
+                    "tp": float(b_combined_tp),
+                    "fp": float(bfp),
+                    "clean_region_fp": float(b_clean_region_fp),
+                    "fn": float(b_combined_fn),
+                    "precision": b_combined_precision,
+                    "purity": b_combined_precision,
+                    "clean_region_precision": b_combined_clean_region_precision,
+                    "clean_region_purity": b_combined_clean_region_precision,
+                    "recall": b_combined_recall,
+                    "completeness": b_combined_recall,
+                    "f1": 2.0
+                    * b_combined_precision
+                    * b_combined_recall
+                    / max(b_combined_precision + b_combined_recall, 1e-12),
+                },
+            }
+        result["per_band"] = per_band
+    if use_ex_link_postprocess:
+        linked_tp = int(totals["linked_tp"])
+        linked_fp = int(totals["linked_fp"])
+        linked_fn = int(totals["linked_fn"])
+        linked_precision = linked_tp / max(linked_tp + linked_fp, 1)
+        linked_recall = linked_tp / max(linked_tp + linked_fn, 1)
+        result["linked"] = {
+            "tp": float(linked_tp),
+            "fp": float(linked_fp),
+            "fn": float(linked_fn),
+            "precision": linked_precision,
+            "purity": linked_precision,
+            "recall": linked_recall,
+            "completeness": linked_recall,
+            "f1": 2.0 * linked_precision * linked_recall / max(linked_precision + linked_recall, 1e-12),
+        }
+        link_metrics_total = totals["link_metrics_total"]
+        assert isinstance(link_metrics_total, dict)
+        result["link_metrics"] = _finalize_link_metrics(link_metrics_total)
+    return result
+
+
 def run_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -1505,7 +2609,7 @@ def run_epoch(
     # print('[DEBUG] Starting epoch, running initial evaluation loop to prime caches...')
     # t_batch = time.time()
     for batch in tqdm(loader, desc="train" if training else "eval", leave=False, disable=not show_progress):
-        image = batch["image"].to(device=device, dtype=torch.float32)
+        image = batch["image"].to(device=device, dtype=torch.float32, non_blocking=True)
         outputs = model(image)
         # torch.cuda.synchronize(device) if device.type == "cuda" else None
         # t_batch_model = time.time()
@@ -1597,6 +2701,157 @@ def run_epoch(
 
 
 @torch.no_grad()
+def validate_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    *,
+    device: torch.device,
+    weights: LossWeights,
+    triplet_loss_fn: HardTripletLoss,
+    triplet_enabled: bool,
+    ex_enabled: bool,
+    en_enabled: bool,
+    matcher_candidate_count: int,
+    matcher_max_anchors_per_band: int,
+    triplet_max_sources_per_group: int,
+    triplet_negative_scope: str,
+    ex_band_pairs: Optional[Sequence[Tuple[int, int]]],
+    center_radius_px: float,
+    compute_detection: bool,
+    threshold: float,
+    nms_radius: int,
+    confidence_score: str,
+    center_refinement: str,
+    center_refinement_radius: int,
+    use_en_postprocess: bool,
+    en_threshold: float,
+    use_ex_link_postprocess: bool,
+    ex_link_threshold: float,
+    band_names: Sequence[str],
+    ignore_mask_during_detection: bool = True,
+    distributed: bool = False,
+    show_progress: bool = True,
+) -> Tuple[Dict[str, float], Dict[str, object]]:
+    model.eval()
+    base_model = unwrap_model(model)
+    sums: Dict[str, float] = {
+        "total": 0.0,
+        "seg": 0.0,
+        "confidence": 0.0,
+        "shape": 0.0,
+        "center": 0.0,
+        "triplet": 0.0,
+        "ex_class": 0.0,
+        "en_class": 0.0,
+    }
+    count = 0
+    det_totals = _init_detection_totals(band_names) if compute_detection else None
+    desc = "val+detect" if compute_detection else "val"
+    for batch in tqdm(loader, desc=desc, leave=False, disable=not show_progress):
+        image = batch["image"].to(device=device, dtype=torch.float32, non_blocking=True)
+        outputs = model(image)
+        losses = dense_losses_any(outputs, batch, weights=weights, device=device, center_radius_px=center_radius_px)
+        total = losses["total"]
+
+        triplet = total.new_tensor(0.0)
+        if triplet_enabled:
+            triplet = embedding_triplet_loss(
+                outputs,
+                batch,
+                loss_fn=triplet_loss_fn,
+                max_sources_per_group=triplet_max_sources_per_group,
+                negative_scope=triplet_negative_scope,
+            )
+            total = total + weights.triplet_outer_weight * triplet
+
+        ex_class = total.new_tensor(0.0)
+        if ex_enabled and hasattr(base_model, "EX") and image.shape[1] > 1:
+            ex_class = vectorized_matcher_classification_loss(
+                base_model.EX,
+                outputs,
+                batch,
+                mode="ex",
+                candidate_count=matcher_candidate_count,
+                offset_scale=center_radius_px,
+                band_pairs=ex_band_pairs,
+                max_anchors_per_band=matcher_max_anchors_per_band,
+            )
+            total = total + weights.matcher_outer_weight * ex_class
+
+        en_class = total.new_tensor(0.0)
+        if en_enabled and hasattr(base_model, "EN"):
+            en_class = vectorized_matcher_classification_loss(
+                base_model.EN,
+                outputs,
+                batch,
+                mode="en",
+                candidate_count=matcher_candidate_count,
+                offset_scale=center_radius_px,
+                max_anchors_per_band=matcher_max_anchors_per_band,
+            )
+            total = total + weights.matcher_outer_weight * en_class
+
+        if det_totals is not None:
+            _update_detection_totals(
+                det_totals,
+                base_model,
+                outputs,
+                batch,
+                threshold=threshold,
+                nms_radius=nms_radius,
+                confidence_score=confidence_score,
+                center_refinement=center_refinement,
+                center_refinement_radius=center_refinement_radius,
+                match_radius=center_radius_px,
+                use_en_postprocess=use_en_postprocess,
+                en_candidate_count=matcher_candidate_count,
+                en_threshold=en_threshold,
+                use_ex_link_postprocess=use_ex_link_postprocess,
+                ex_link_threshold=ex_link_threshold,
+                ex_band_pairs=ex_band_pairs,
+                band_names=band_names,
+                ignore_mask_during_detection=ignore_mask_during_detection,
+            )
+
+        batch_size = int(image.shape[0])
+        count += batch_size
+        sums["total"] += float(total.detach()) * batch_size
+        sums["seg"] += float(losses["seg"].detach()) * batch_size
+        sums["confidence"] += float(losses["confidence"].detach()) * batch_size
+        sums["shape"] += float(losses["shape"].detach()) * batch_size
+        sums["center"] += float(losses["center"].detach()) * batch_size
+        sums["triplet"] += float(triplet.detach()) * batch_size
+        sums["ex_class"] += float(ex_class.detach()) * batch_size
+        sums["en_class"] += float(en_class.detach()) * batch_size
+
+    if distributed and dist.is_available() and dist.is_initialized():
+        keys = list(sums.keys())
+        packed = torch.tensor([sums[key] for key in keys] + [float(count)], device=device, dtype=torch.float64)
+        dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+        sums = {key: float(packed[idx].item()) for idx, key in enumerate(keys)}
+        count = int(packed[-1].item())
+        if det_totals is not None:
+            gathered: List[Optional[Dict[str, object]]] = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(gathered, det_totals)
+            det_totals = _merge_detection_totals(
+                [item for item in gathered if isinstance(item, dict)],
+                band_names,
+            )
+
+    dense = {key: val / max(count, 1) for key, val in sums.items()}
+    det = (
+        _finalize_detection_totals(
+            det_totals,
+            band_names=band_names,
+            use_ex_link_postprocess=use_ex_link_postprocess,
+        )
+        if det_totals is not None
+        else {}
+    )
+    return dense, det
+
+
+@torch.no_grad()
 def evaluate_detection(
     model: nn.Module,
     loader: DataLoader,
@@ -1606,6 +2861,8 @@ def evaluate_detection(
     nms_radius: int,
     confidence_score: str,
     match_radius: float,
+    center_refinement: str = "integer",
+    center_refinement_radius: int = 1,
     use_en_postprocess: bool = False,
     en_candidate_count: int = 5,
     en_threshold: float = 0.6,
@@ -1617,151 +2874,31 @@ def evaluate_detection(
 ) -> Dict[str, object]:
     model.eval()
     base_model = unwrap_model(model)
-    tp = fp = fn = 0
-    linked_tp = linked_fp = linked_fn = 0
-    link_metrics_total: Dict[str, object] = {
-        "tp": 0.0,
-        "fp": 0.0,
-        "fn": 0.0,
-        "layers": {},
-        "reasons": {},
-        "examples": [],
-        "gt_reference": "merged_reference_catalog_with_filtered_band_presence",
-    }
-    per_band_counts: Dict[str, Dict[str, int]] = {
-        str(name): {"tp": 0, "fp": 0, "fn": 0} for name in band_names
-    }
+    totals = _init_detection_totals(band_names)
     for batch in tqdm(loader, desc="detect", leave=False, disable=not show_progress):
-        image = batch["image"].to(device=device, dtype=torch.float32)
+        image = batch["image"].to(device=device, dtype=torch.float32, non_blocking=True)
         outputs = model(image)
-        band_count = int(outputs["seg_logits"].shape[1]) if outputs["seg_logits"].ndim == 5 else 0
-        if use_en_postprocess and hasattr(base_model, "EN"):
-            pred_list = detect_centers_with_en(
-                base_model,
-                outputs,
-                threshold=threshold,
-                nms_radius=nms_radius,
-                confidence_score=confidence_score,
-                match_radius=match_radius,
-                candidate_count=en_candidate_count,
-                en_threshold=en_threshold,
-            )
-            gt_list = _flatten_band_centers(batch["band_centers"]) if outputs["seg_logits"].ndim == 5 else batch["centers"]  # type: ignore[arg-type]
-            band_indices = [idx % band_count for idx in range(len(pred_list))] if band_count else [None for _ in pred_list]
-        elif outputs["seg_logits"].ndim == 5:
-            flat_outputs = _flatten_per_band_outputs(outputs)
-            pred_list = detect_centers(
-                flat_outputs,
-                threshold=threshold,
-                nms_radius=nms_radius,
-                confidence_score=confidence_score,
-            )
-            gt_list = _flatten_band_centers(batch["band_centers"])  # type: ignore[arg-type]
-            band_indices = [idx % band_count for idx in range(len(pred_list))]
-        else:
-            pred_list = detect_centers(
-                outputs,
-                threshold=threshold,
-                nms_radius=nms_radius,
-                confidence_score=confidence_score,
-            )
-            gt_list = batch["centers"]  # type: ignore[assignment]
-            band_indices = [None for _ in pred_list]
-        for pred_xy, gt_xy, band_idx in zip(pred_list, gt_list, band_indices):
-            t, f, n = match_points(pred_xy, gt_xy.numpy().astype(np.float32), match_radius)
-            tp += t
-            fp += f
-            fn += n
-            if band_idx is not None and band_names:
-                band_name = str(band_names[int(band_idx)])
-                counts = per_band_counts.setdefault(band_name, {"tp": 0, "fp": 0, "fn": 0})
-                counts["tp"] += int(t)
-                counts["fp"] += int(f)
-                counts["fn"] += int(n)
-
-        if use_ex_link_postprocess and outputs["seg_logits"].ndim == 5 and hasattr(base_model, "EX"):
-            linked_pred_list, components_all = detect_centers_with_ex_link(
-                base_model,
-                outputs,
-                threshold=threshold,
-                nms_radius=nms_radius,
-                confidence_score=confidence_score,
-                match_radius=match_radius,
-                candidate_count=en_candidate_count,
-                ex_threshold=ex_link_threshold,
-                use_en_postprocess=use_en_postprocess,
-                en_threshold=en_threshold,
-                band_pairs=ex_band_pairs,
-            )
-            linked_gt_list = batch["centers"]  # type: ignore[assignment]
-            for pred_xy, gt_xy in zip(linked_pred_list, linked_gt_list):
-                t, f, n = match_points(pred_xy, gt_xy.numpy().astype(np.float32), match_radius)
-                linked_tp += t
-                linked_fp += f
-                linked_fn += n
-            nested_band_centers: Sequence[Sequence[Tensor]] = batch["band_centers"]  # type: ignore[assignment]
-            nested_band_ids: Sequence[Sequence[Tensor]] = batch["band_ids"]  # type: ignore[assignment]
-            merged_centers_list: Sequence[Tensor] = batch["centers"]  # type: ignore[assignment]
-            merged_ids_list: Sequence[Tensor] = batch["ids"]  # type: ignore[assignment]
-            nested_band_rejected_ids: Optional[Sequence[Sequence[Tensor]]] = batch.get("band_rejected_ids")  # type: ignore[assignment,union-attr]
-            for item_idx, components in enumerate(components_all):
-                item_metrics = _evaluate_link_components(
-                    components,
-                    nested_band_centers[item_idx],
-                    nested_band_ids[item_idx],
-                    match_radius=match_radius,
-                    band_names=band_names,
-                    merged_centers=merged_centers_list[item_idx],
-                    merged_ids=merged_ids_list[item_idx],
-                    band_rejected_ids=(
-                        nested_band_rejected_ids[item_idx] if nested_band_rejected_ids is not None else None
-                    ),
-                )
-                _accumulate_link_metrics(link_metrics_total, item_metrics)
-    precision = tp / max(tp + fp, 1)
-    recall = tp / max(tp + fn, 1)
-    f1 = 2.0 * precision * recall / max(precision + recall, 1e-12)
-    result: Dict[str, object] = {
-        "tp": float(tp),
-        "fp": float(fp),
-        "fn": float(fn),
-        "precision": precision,
-        "purity": precision,
-        "recall": recall,
-        "completeness": recall,
-        "f1": f1,
-    }
-    if per_band_counts:
-        per_band: Dict[str, Dict[str, float]] = {}
-        for band_name, counts in per_band_counts.items():
-            btp = int(counts["tp"])
-            bfp = int(counts["fp"])
-            bfn = int(counts["fn"])
-            b_precision = btp / max(btp + bfp, 1)
-            b_recall = btp / max(btp + bfn, 1)
-            per_band[band_name] = {
-                "tp": float(btp),
-                "fp": float(bfp),
-                "fn": float(bfn),
-                "precision": b_precision,
-                "purity": b_precision,
-                "recall": b_recall,
-                "completeness": b_recall,
-                "f1": 2.0 * b_precision * b_recall / max(b_precision + b_recall, 1e-12),
-            }
-        result["per_band"] = per_band
-    if use_ex_link_postprocess:
-        linked_precision = linked_tp / max(linked_tp + linked_fp, 1)
-        linked_recall = linked_tp / max(linked_tp + linked_fn, 1)
-        result["linked"] = {
-            "tp": float(linked_tp),
-            "fp": float(linked_fp),
-            "fn": float(linked_fn),
-            "precision": linked_precision,
-            "purity": linked_precision,
-            "recall": linked_recall,
-            "completeness": linked_recall,
-            "f1": 2.0 * linked_precision * linked_recall / max(linked_precision + linked_recall, 1e-12),
-        }
-        result["link_metrics"] = _finalize_link_metrics(link_metrics_total)
-    return result
+        _update_detection_totals(
+            totals,
+            base_model,
+            outputs,
+            batch,
+            threshold=threshold,
+            nms_radius=nms_radius,
+            confidence_score=confidence_score,
+            center_refinement=center_refinement,
+            center_refinement_radius=center_refinement_radius,
+            match_radius=match_radius,
+            use_en_postprocess=use_en_postprocess,
+            en_candidate_count=en_candidate_count,
+            en_threshold=en_threshold,
+            use_ex_link_postprocess=use_ex_link_postprocess,
+            ex_link_threshold=ex_link_threshold,
+            ex_band_pairs=ex_band_pairs,
+            band_names=band_names,
+        )
+    return _finalize_detection_totals(
+        totals,
+        band_names=band_names,
+        use_ex_link_postprocess=use_ex_link_postprocess,
+    )

@@ -1,0 +1,9 @@
+dataset,tile,comparison,iou,intersection_px,union_px,xor_px,left_px,right_px,clean_rows_in_tile,clean_rows_with_proxy_refit,proxy_all_good_rows_in_tile
+coadd,zangetsu_upper_left_x26342_y7477,target_vs_current_table,0.999937353825593,47885,47888,3,47888,47885,440,385,531
+coadd,zangetsu_upper_left_x26342_y7477,target_vs_proxy_same_clean_sources,0.7038231134037773,33837,48076,14239,47888,34025,440,385,531
+coadd,zangetsu_upper_left_x26342_y7477,current_table_vs_proxy_same_clean_sources,0.7038315929608521,33836,48074,14238,47885,34025,440,385,531
+coadd,zangetsu_upper_left_x26342_y7477,target_vs_proxy_all_good_refit_sources,0.6089649892113872,34996,57468,22472,47888,44576,440,385,531
+coadd,zangetsu_lower_right_x27366_y6453,target_vs_current_table,0.9999178509816807,60860,60865,5,60862,60863,532,490,591
+coadd,zangetsu_lower_right_x27366_y6453,target_vs_proxy_same_clean_sources,0.8095058777301156,49443,61078,11635,60862,49659,532,490,591
+coadd,zangetsu_lower_right_x27366_y6453,current_table_vs_proxy_same_clean_sources,0.8094629993451211,49442,61080,11638,60863,49659,532,490,591
+coadd,zangetsu_lower_right_x27366_y6453,target_vs_proxy_all_good_refit_sources,0.7411719340916844,49975,67427,17452,60862,56540,532,490,591

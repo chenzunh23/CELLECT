@@ -22,10 +22,14 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import csv
+import ast
 import json
 import math
 import os
+import shlex
 import shutil
+import subprocess
+import sys
 import traceback
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -33,7 +37,14 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from astropy.io import fits
-from astropy.table import Table
+from astropy.table import Table, vstack
+
+from astro_pu_source_filter import (
+    DEFAULT_A_FLAGS as DEFAULT_PU_A_FLAGS,
+    DEFAULT_B_FLAGS as DEFAULT_PU_B_FLAGS,
+    attach_kron_refit_radius,
+    classify_sources as classify_pu_sources,
+)
 
 
 BANDS = ("HSC-G", "HSC-R", "HSC-I")
@@ -233,6 +244,187 @@ def _band_catalog_path(catalog_root: Path, band: str, tract: int, patch: str) ->
     return candidates[0]
 
 
+def _band_det_path(root: Path, band: str, tract: int, patch: str) -> Optional[Path]:
+    filename = f"det-{band}-{tract}-{patch}.fits"
+    candidates = [
+        root / band / filename,
+        root / band / patch / filename,
+        root / str(tract) / band / patch / filename,
+        root / str(tract) / band / filename,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _lsst_background_cache_root(args: argparse.Namespace, output_root: Path) -> Path:
+    root = getattr(args, "lsst_background_cache_root", None)
+    if root is not None:
+        return _expand(root)
+    return output_root / "lsst_detection_background"
+
+
+def _cached_lsst_det_path(args: argparse.Namespace, output_root: Path, band: str, tract: int, patch: str) -> Path:
+    return (
+        _lsst_background_cache_root(args, output_root)
+        / str(tract)
+        / band
+        / patch
+        / f"det-{band}-{tract}-{patch}.fits"
+    )
+
+
+def _cached_lsst_detected_calexp_path(args: argparse.Namespace, output_root: Path, band: str, tract: int, patch: str) -> Path:
+    return (
+        _lsst_background_cache_root(args, output_root)
+        / str(tract)
+        / band
+        / patch
+        / f"calexp-detect-{band}-{tract}-{patch}.fits"
+    )
+
+
+def _run_lsst_detection_background(
+    *,
+    args: argparse.Namespace,
+    output_root: Path,
+    coadd_path: Path,
+    band: str,
+    tract: int,
+    patch: str,
+    output_calexp_path: Optional[Path] = None,
+) -> Path:
+    det_path = _cached_lsst_det_path(args, output_root, band, tract, patch)
+    if det_path.exists() and (output_calexp_path is None or output_calexp_path.exists()) and not bool(
+        getattr(args, "overwrite_lsst_background", False)
+    ):
+        return det_path
+    helper = Path(__file__).resolve().with_name("lsst_detect_background.py")
+    python_cmd = str(getattr(args, "lsst_detect_python", "") or sys.executable)
+    cmd = [
+        *shlex.split(python_cmd),
+        str(helper),
+        "--input",
+        str(coadd_path),
+        "--output-det",
+        str(det_path),
+    ]
+    if output_calexp_path is not None or bool(getattr(args, "write_lsst_background_products", False)):
+        product_root = det_path.parent
+        output_calexp_path = output_calexp_path or product_root / f"calexp-detect-{band}-{tract}-{patch}.fits"
+        cmd.extend(
+            [
+                "--output-calexp",
+                str(output_calexp_path),
+                "--output-background",
+                str(product_root / f"det_bkgd-{band}-{tract}-{patch}.fits"),
+            ]
+        )
+    print(
+        "running LSST default detection for PU background: "
+        f"patch={patch}, band={band}, input={coadd_path}, output={det_path}",
+        flush=True,
+    )
+    try:
+        subprocess.run(cmd, check=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"failed to run LSST detection command {cmd[0]!r}; set --lsst-detect-python to a Python executable "
+            "with lsst_distrib loaded"
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            "LSST detection fallback failed for PU background. "
+            "Run preprocessing in an LSST stack environment or pass --lsst-background-policy none/existing. "
+            f"Command: {' '.join(shlex.quote(part) for part in cmd)}"
+        ) from exc
+    if not det_path.exists():
+        raise RuntimeError(f"LSST detection finished but did not write expected det catalog: {det_path}")
+    return det_path
+
+
+def _resolve_lsst_background_det_path(
+    *,
+    args: argparse.Namespace,
+    output_root: Path,
+    coadd_root: Path,
+    band: str,
+    tract: int,
+    patch: str,
+) -> Optional[Path]:
+    existing = _band_det_path(coadd_root, band, tract, patch)
+    if existing is not None:
+        return existing
+    policy = str(getattr(args, "lsst_background_policy", "run-if-missing"))
+    if policy in {"none", "existing"}:
+        return None
+    if policy != "run-if-missing":
+        raise ValueError(f"Unknown lsst_background_policy: {policy}")
+    coadd_path = _band_fits_path(coadd_root, band, tract, patch)
+    if not coadd_path.exists():
+        raise FileNotFoundError(f"cannot run LSST background fallback; coadd FITS not found: {coadd_path}")
+    return _run_lsst_detection_background(
+        args=args,
+        output_root=output_root,
+        coadd_path=coadd_path,
+        band=band,
+        tract=tract,
+        patch=patch,
+    )
+
+
+def _read_det_background_mask(path: Path, shape_yx: Tuple[int, int], origin_xy: Tuple[int, int] = (0, 0)) -> np.ndarray:
+    """Return True for pixels outside LSST detection footprints."""
+    with fits.open(path, memmap=True, ignore_missing_end=True) as hdul:
+        if len(hdul) <= 4:
+            return ~np.zeros(shape_yx, dtype=bool)
+        spans = hdul[4].data
+        if spans is None:
+            return ~np.zeros(shape_yx, dtype=bool)
+        rows = [(int(row["y"]), int(row["x0"]), int(row["x1"])) for row in spans]
+
+    def _paint(*, subtract_origin: bool) -> tuple[np.ndarray, int]:
+        footprint = np.zeros(shape_yx, dtype=bool)
+        painted = 0
+        ox, oy = origin_xy if subtract_origin else (0, 0)
+        for raw_y, raw_x0, raw_x1 in rows:
+            y = raw_y - int(oy)
+            if y < 0 or y >= shape_yx[0]:
+                continue
+            x0 = max(0, raw_x0 - int(ox))
+            x1 = min(shape_yx[1] - 1, raw_x1 - int(ox))
+            if x1 >= x0:
+                footprint[y, x0 : x1 + 1] = True
+                painted += x1 - x0 + 1
+        return footprint, painted
+
+    footprint, painted = _paint(subtract_origin=False)
+    if painted == 0 and origin_xy != (0, 0):
+        footprint, _painted = _paint(subtract_origin=True)
+    return ~footprint
+
+
+def _crop_full_mask_for_tile(mask: Optional[np.ndarray], spec: TileSpec, parent_origin: Tuple[int, int]) -> Optional[np.ndarray]:
+    if mask is None:
+        return None
+    x0 = int(spec.x0 - parent_origin[0])
+    y0 = int(spec.y0 - parent_origin[1])
+    x1 = x0 + int(spec.size)
+    y1 = y0 + int(spec.size)
+    out = np.zeros((spec.size, spec.size), dtype=bool)
+    src_x0 = max(0, x0)
+    src_y0 = max(0, y0)
+    src_x1 = min(mask.shape[1], x1)
+    src_y1 = min(mask.shape[0], y1)
+    if src_x1 <= src_x0 or src_y1 <= src_y0:
+        return out
+    dst_x0 = src_x0 - x0
+    dst_y0 = src_y0 - y0
+    out[dst_y0 : dst_y0 + (src_y1 - src_y0), dst_x0 : dst_x0 + (src_x1 - src_x0)] = mask[src_y0:src_y1, src_x0:src_x1]
+    return out
+
+
 def _existing_cutout_fits_path(tile_dir: Path, band: str) -> str:
     band_dir = tile_dir / band
     if not band_dir.exists():
@@ -320,6 +512,256 @@ def _filter_catalog(
     )
 
 
+_DEFAULT_PU_BAND_LIMIT_MAGS = {
+    "HSC-G": 27.4,
+    "HSC-R": 27.1,
+    "HSC-I": 26.9,
+    "HSC-Z": 26.3,
+    "HSC-Y": 25.3,
+}
+
+_DEFAULT_PU_STRICT_IGNORE_SATURATION_MAGS = {
+    "HSC-G": 18.0,
+    "HSC-R": 18.2,
+    "HSC-I": 18.6,
+    "HSC-Z": 17.7,
+    "HSC-Y": 17.4,
+}
+
+
+def _normalize_band_name(name: str) -> str:
+    text = str(name).strip().upper()
+    if not text:
+        return text
+    if not text.startswith("HSC-"):
+        text = f"HSC-{text}"
+    return text
+
+
+def _parse_band_mags(values: Optional[Sequence[str]], defaults: Dict[str, float], *, label: str) -> Dict[str, float]:
+    limits = dict(defaults)
+    if not values:
+        return limits
+    for raw in values:
+        for item in str(raw).replace(",", " ").split():
+            if not item:
+                continue
+            if "=" not in item and ":" not in item:
+                raise ValueError(f"{label} must be BAND=mag, got {item!r}")
+            key, value = item.replace(":", "=", 1).split("=", 1)
+            limits[_normalize_band_name(key)] = float(value)
+    return limits
+
+
+def _parse_band_limit_mags(values: Optional[Sequence[str]]) -> Dict[str, float]:
+    return _parse_band_mags(values, _DEFAULT_PU_BAND_LIMIT_MAGS, label="band limit")
+
+
+def _parse_strict_ignore_saturation_mags(values: Optional[Sequence[str]]) -> Dict[str, float]:
+    return _parse_band_mags(values, _DEFAULT_PU_STRICT_IGNORE_SATURATION_MAGS, label="strict ignore saturation magnitude")
+
+
+def _strict_ignore_mag_threshold(args: argparse.Namespace, *, band: Optional[str]) -> float:
+    override = getattr(args, "pu_strict_ignore_mag_threshold", None)
+    if override is not None:
+        return float(override)
+    band_name = _normalize_band_name(band or getattr(args, "catalog_band", ""))
+    limits = _parse_strict_ignore_saturation_mags(getattr(args, "pu_strict_ignore_saturation_mags", None))
+    if band_name not in limits:
+        raise ValueError(f"No strict ignore saturation magnitude configured for {band_name!r}")
+    return float(limits[band_name])
+
+
+def _pu_args(args: argparse.Namespace, *, band: Optional[str] = None) -> argparse.Namespace:
+    b_mag_min = float(args.pu_b_mag_min)
+    b_mag_max = float(args.pu_b_mag_max)
+    if bool(getattr(args, "pu_use_band_limit_b_filter", False)):
+        band_name = _normalize_band_name(band or getattr(args, "catalog_band", ""))
+        limits = _parse_band_limit_mags(getattr(args, "pu_band_limit_mags", None))
+        if band_name not in limits:
+            raise ValueError(f"No PU band limiting magnitude configured for {band_name!r}")
+        limit = float(limits[band_name])
+        b_mag_min = limit + float(args.pu_band_limit_b_min_offset)
+        b_mag_max = limit + float(args.pu_band_limit_b_max_offset)
+    return argparse.Namespace(
+        source_filter=args.source_filter,
+        a_flags=tuple(args.pu_a_flags),
+        b_flags=tuple(args.pu_b_flags),
+        a_mode=args.pu_a_mode,
+        b_mode=args.pu_b_mode,
+        strict_flags=args.pu_strict_flags,
+        region_sigma=args.ellipse_sigma,
+        min_axis=args.min_ellipse_axis,
+        mag_column=args.pu_mag_column,
+        input_zeropoint=args.pu_input_zeropoint,
+        require_kron_refit_match=bool(args.pu_require_kron_refit_match),
+        a_area_max=args.pu_a_area_max,
+        a_faint_area_max=args.pu_a_faint_area_max,
+        a_faint_mag_min=args.pu_a_faint_mag_min,
+        b_mag_min=b_mag_min,
+        b_mag_max=b_mag_max,
+        pixel_scale_arcsec=args.pixel_scale_arcsec,
+        b_close_center_arcsec=args.pu_b_close_center_arcsec,
+        overlap_iou_threshold=args.pu_overlap_iou_threshold,
+        b_ellipse_area_max=args.pu_b_ellipse_area_max,
+        b_footprint_area_max=args.pu_b_footprint_area_max,
+        b_kron_radius_lt_sdss_major_ratio=args.pu_b_kron_radius_lt_sdss_major_ratio,
+        drop_ellipse_area_min=args.pu_drop_ellipse_area_min,
+        ambiguous_area_max=args.pu_ambiguous_area_max,
+        neighbor_radius=args.pu_neighbor_radius,
+        center_distance_factor=args.pu_center_distance_factor,
+        containment_threshold=args.pu_containment_threshold,
+        mutual_overlap_threshold=args.pu_mutual_overlap_threshold,
+        overlap_sample_grid=args.pu_overlap_sample_grid,
+        ambiguous_mark=args.pu_ambiguous_mark,
+        keep_all_ab_clean=bool(getattr(args, "pu_keep_all_ab_clean", False)),
+    )
+
+
+def _resolve_pu_kron_refit_csv(args: argparse.Namespace, *, band: Optional[str], patch: Optional[str]) -> Optional[Path]:
+    raw = getattr(args, "pu_kron_refit_csv", None)
+    if raw is None:
+        return None
+    text = str(raw)
+    if any(token in text for token in ("{band}", "{tract}", "{patch}")):
+        text = text.format(
+            band=band or getattr(args, "band", "") or getattr(args, "catalog_band", ""),
+            tract=getattr(args, "tract", ""),
+            patch=patch or getattr(args, "patch", ""),
+        )
+    path = Path(text)
+    if path.exists():
+        return path
+    if path.name == "kron_refit_rows.csv":
+        current_name_path = path.with_name("batch_heavyfp_kron_refit.csv")
+        if current_name_path.exists():
+            return current_name_path
+    return path
+
+
+def _attach_pu_kron_refit(
+    table: Table,
+    args: argparse.Namespace,
+    *,
+    band: Optional[str] = None,
+    patch: Optional[str] = None,
+    radius_column: Optional[str] = None,
+    output_column: str = "pu_refit_kron_radius",
+) -> Table:
+    path = _resolve_pu_kron_refit_csv(args, band=band, patch=patch)
+    if path is None:
+        return table
+    return attach_kron_refit_radius(
+        table,
+        path,
+        radius_column=radius_column or getattr(args, "pu_kron_refit_radius_column", "proxy_nan0_flux_aperture_radius"),
+        good_column=getattr(args, "pu_kron_refit_good_column", "proxy_nan0_good"),
+        output_column=output_column,
+    )
+
+
+def _magnitude_from_catalog(table: Table, *, mag_column: str, zeropoint: float) -> np.ndarray:
+    flux = _first_finite_column(
+        table,
+        (
+            mag_column,
+            "ext_photometryKron_KronFlux_instFlux",
+            "base_PsfFlux_instFlux",
+            "modelfit_CModel_instFlux",
+            "base_SdssShape_instFlux",
+        ),
+    )
+    mag = np.full(len(table), np.nan, dtype=np.float32)
+    if flux is None:
+        return mag
+    valid = np.isfinite(flux) & (flux > 0.0)
+    mag[valid] = float(zeropoint) - 2.5 * np.log10(np.asarray(flux[valid], dtype=np.float64))
+    return mag
+
+
+def _strict_bright_ignore_catalog(
+    table: Table,
+    args: argparse.Namespace,
+    *,
+    band: Optional[str] = None,
+    patch: Optional[str] = None,
+) -> Table:
+    if not bool(getattr(args, "pu_enable_strict_bright_ignore", False)):
+        return table[:0].copy(copy_data=True)
+    table = _attach_pu_kron_refit(
+        table,
+        args,
+        band=band,
+        patch=patch,
+        radius_column=getattr(args, "pu_strict_ignore_radius_column", "proxy_nan0_flux_aperture_radius"),
+        output_column="pu_refit_kron_radius",
+    )
+    shaped = add_ellipse_columns(table, shape_source=args.target_shape_source)
+    mag = _magnitude_from_catalog(
+        shaped,
+        mag_column=getattr(args, "pu_mag_column", "ext_photometryKron_KronFlux_instFlux"),
+        zeropoint=float(getattr(args, "pu_input_zeropoint", 27.0)),
+    )
+    x, y = _require_position_columns(shaped, args.x_col, args.y_col)
+    major = np.asarray(shaped["ellipse_major_sigma"], dtype=np.float32)
+    minor = np.asarray(shaped["ellipse_minor_sigma"], dtype=np.float32)
+    valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(mag) & np.isfinite(major) & np.isfinite(minor)
+    valid &= (major > 0.0) & (minor > 0.0)
+    valid &= source_selection_mask(shaped, getattr(args, "source_filter", "nchild0"))
+    if bool(getattr(args, "pu_require_kron_refit_match", False)) and "pu_refit_kron_radius_matched" in shaped.colnames:
+        valid &= np.asarray(shaped["pu_refit_kron_radius_matched"], dtype=bool)
+    threshold = _strict_ignore_mag_threshold(args, band=band)
+    valid &= mag < threshold
+    out = shaped[valid]
+    if len(out):
+        out["pu_class"] = np.asarray(["strict_ignore"] * len(out), dtype=str)
+        out["pu_reason"] = np.asarray(["strict_bright_source"] * len(out), dtype=str)
+        out["pu_mag"] = mag[valid].astype(np.float32)
+        out["pu_strict_ignore_mag_threshold"] = np.full(len(out), float(threshold), dtype=np.float32)
+        out["pu_strict_ignore_radius_column"] = np.asarray(
+            [str(getattr(args, "pu_strict_ignore_radius_column", "proxy_nan0_flux_aperture_radius"))] * len(out),
+            dtype=str,
+        )
+    return out
+
+
+def _exclude_catalog_rows_by_id(table: Table, excluded: Table) -> Table:
+    if len(table) == 0 or len(excluded) == 0:
+        return table
+    id_column = "id" if "id" in table.colnames and "id" in excluded.colnames else (
+        "source_id" if "source_id" in table.colnames and "source_id" in excluded.colnames else None
+    )
+    if id_column is None:
+        return table
+    excluded_ids = set(int(value) for value in np.asarray(excluded[id_column], dtype=np.int64))
+    keep = np.asarray([int(value) not in excluded_ids for value in np.asarray(table[id_column], dtype=np.int64)], dtype=bool)
+    return table[keep]
+
+
+def _classify_pu_catalog(
+    table: Table,
+    args: argparse.Namespace,
+    *,
+    band: Optional[str] = None,
+    patch: Optional[str] = None,
+) -> Tuple[Table, Table, Table, Table, Dict[str, object]]:
+    table = _attach_pu_kron_refit(table, args, band=band, patch=patch)
+    shaped = add_ellipse_columns(table, shape_source=args.target_shape_source)
+    result = classify_pu_sources(table, _pu_args(args, band=band))
+    class_name = np.asarray(result["class_name"], dtype=object)
+    reasons = np.asarray(result["reasons"], dtype=object)
+    area = np.asarray(result["area"], dtype=np.float32)
+    mag = np.asarray(result.get("mag", np.full(len(shaped), np.nan)), dtype=np.float32)
+    shaped["pu_class"] = class_name.astype(str)
+    shaped["pu_reason"] = reasons.astype(str)
+    shaped["pu_kron_area"] = area
+    shaped["pu_mag"] = mag
+    clean = shaped[np.asarray(result["clean"], dtype=bool)]
+    center_only = shaped[np.asarray(result["center_only"], dtype=bool)]
+    ignore = shaped[np.asarray(result.get("ignore", result["b_class"]), dtype=bool)]
+    return clean, center_only, ignore, shaped, result
+
+
 def edge_aligned_starts(length: int, tile_size: int, stride: int) -> List[int]:
     """Return floor-count stride starts with the final tile aligned to the edge.
 
@@ -365,18 +807,47 @@ def make_tile_specs(
 
 
 def _first_finite_column(table: Table, names: Sequence[str]) -> Optional[np.ndarray]:
+    out = np.full(len(table), np.nan, dtype=np.float32)
+    found = False
     for name in names:
         if name in table.colnames:
             vals = np.asarray(table[name], dtype=np.float32)
-            if np.isfinite(vals).any():
-                return vals
-    return None
+            take = ~np.isfinite(out) & np.isfinite(vals)
+            if np.any(take):
+                out[take] = vals[take]
+                found = True
+            if np.isfinite(out).all():
+                break
+    return out if found else None
+
+
+_POSITION_COLUMN_PAIRS: Tuple[Tuple[str, str], ...] = (
+    ("base_SdssCentroid_x", "base_SdssCentroid_y"),
+    ("base_SdssShape_x", "base_SdssShape_y"),
+    ("base_NaiveCentroid_x", "base_NaiveCentroid_y"),
+    ("deblend_psfCenter_x", "deblend_psfCenter_y"),
+    ("slot_Centroid_x", "slot_Centroid_y"),
+    ("x", "y"),
+)
+
+
+def _resolve_position_columns(table: Table, x_col: str, y_col: str) -> Tuple[str, str]:
+    if x_col in table.colnames and y_col in table.colnames:
+        return x_col, y_col
+    for candidate_x, candidate_y in _POSITION_COLUMN_PAIRS:
+        if candidate_x in table.colnames and candidate_y in table.colnames:
+            return candidate_x, candidate_y
+    available = ", ".join(table.colnames[:20])
+    suffix = "..." if len(table.colnames) > 20 else ""
+    raise KeyError(
+        f"catalog must contain {x_col!r} and {y_col!r}, or one of "
+        f"{_POSITION_COLUMN_PAIRS}; available columns: {available}{suffix}"
+    )
 
 
 def _require_position_columns(table: Table, x_col: str, y_col: str) -> Tuple[np.ndarray, np.ndarray]:
-    if x_col not in table.colnames or y_col not in table.colnames:
-        raise KeyError(f"catalog must contain {x_col!r} and {y_col!r}")
-    return np.asarray(table[x_col], dtype=np.float32), np.asarray(table[y_col], dtype=np.float32)
+    resolved_x_col, resolved_y_col = _resolve_position_columns(table, x_col, y_col)
+    return np.asarray(table[resolved_x_col], dtype=np.float32), np.asarray(table[resolved_y_col], dtype=np.float32)
 
 
 def ellipse_parameters(
@@ -409,6 +880,28 @@ def ellipse_parameters(
     major = np.sqrt(np.maximum(0.5 * (trace + delta), 0.25))
     minor = np.sqrt(np.maximum(0.5 * (trace - delta), 0.25))
     angle = 0.5 * np.arctan2(2.0 * xy, xx - yy)
+
+    if shape_source in {"kron", "circular_kron"}:
+        kron = _first_finite_column(
+            table,
+            (
+                "pu_refit_kron_radius",
+                "ext_photometryKron_KronFlux_radius",
+                "ext_photometryKron_KronFlux_radius_for_radius",
+            ),
+        )
+        if kron is not None:
+            kron = np.asarray(kron, dtype=np.float32)
+            determinant_radius = np.sqrt(np.maximum(major * minor, 0.0))
+            valid = np.isfinite(kron) & (kron > 0) & np.isfinite(determinant_radius) & (determinant_radius > 0)
+            if shape_source == "kron":
+                scale = np.ones_like(kron, dtype=np.float32)
+                scale[valid] = kron[valid] / determinant_radius[valid]
+                major = np.where(valid, major * scale, major)
+                minor = np.where(valid, minor * scale, minor)
+            else:
+                major = np.where(valid, kron, major)
+                minor = np.where(valid, kron, minor)
     return major.astype(np.float32), minor.astype(np.float32), angle.astype(np.float32)
 
 
@@ -514,11 +1007,17 @@ def crop_catalog_for_tile(
     y_col: str,
     margin: float,
 ) -> Table:
-    x, y = _require_position_columns(table, x_col, y_col)
+    if len(table) == 0:
+        out = table.copy(copy_data=True)
+        out["centroid_local_x"] = np.asarray([], dtype=np.float32)
+        out["centroid_local_y"] = np.asarray([], dtype=np.float32)
+        return out
+    resolved_x_col, resolved_y_col = _resolve_position_columns(table, x_col, y_col)
+    x, y = _require_position_columns(table, resolved_x_col, resolved_y_col)
     cropped = table[_contains(x, y, spec, margin=margin)]
     out = cropped.copy(copy_data=True)
-    out["centroid_local_x"] = np.asarray(out[x_col], dtype=np.float32) - float(spec.x0)
-    out["centroid_local_y"] = np.asarray(out[y_col], dtype=np.float32) - float(spec.y0)
+    out["centroid_local_x"] = np.asarray(out[resolved_x_col], dtype=np.float32) - float(spec.x0)
+    out["centroid_local_y"] = np.asarray(out[resolved_y_col], dtype=np.float32) - float(spec.y0)
     return out
 
 
@@ -576,9 +1075,13 @@ def make_dense_targets(
     for idx in range(len(sources)):
         cx = float(x_global[idx] - spec.x0)
         cy = float(y_global[idx] - spec.y0)
-        a = float(max(major[idx] * ellipse_sigma, 1.5))
-        b = float(max(minor[idx] * ellipse_sigma, 1.5))
-        theta = float(angle[idx])
+        if np.isfinite(major[idx]) and np.isfinite(minor[idx]) and np.isfinite(angle[idx]):
+            a = float(max(major[idx] * ellipse_sigma, 1.5))
+            b = float(max(minor[idx] * ellipse_sigma, 1.5))
+            theta = float(angle[idx])
+        else:
+            a = b = float(max(2.0 * ellipse_sigma, 1.5))
+            theta = 0.0
         radius = int(math.ceil(max(a, b))) + 2
         cx_i = int(round(cx))
         cy_i = int(round(cy))
@@ -607,14 +1110,9 @@ def make_dense_targets(
             level_radius = confidence_levels - 1
             cy0, cy1 = max(0, cy_i - level_radius), min(h, cy_i + level_radius + 1)
             cx0, cx1 = max(0, cx_i - level_radius), min(w, cx_i + level_radius + 1)
-            dist = np.abs(xx_full[cy0:cy1, cx0:cx1] - cx_i) + np.abs(yy_full[cy0:cy1, cx0:cx1] - cy_i)
-            vals = np.clip(level_radius - dist, a_min=0, a_max=None).astype(np.int16)
+            dist = np.abs(xx_full[cy0:cy1, cx0:cx1] - cx) + np.abs(yy_full[cy0:cy1, cx0:cx1] - cy)
+            vals = np.ceil(np.clip(level_radius - dist, a_min=0, a_max=None)).astype(np.int16)
             confidence[cy0:cy1, cx0:cx1] = np.maximum(confidence[cy0:cy1, cx0:cx1], vals)
-
-            ky0, ky1 = max(0, cy_i - core_radius), min(h, cy_i + core_radius + 1)
-            kx0, kx1 = max(0, cx_i - core_radius), min(w, cx_i + core_radius + 1)
-            core = np.abs(xx_full[ky0:ky1, kx0:kx1] - cx_i) + np.abs(yy_full[ky0:ky1, kx0:kx1] - cy_i)
-            seg[ky0:ky1, kx0:kx1][core <= core_radius] = 2
 
     return {
         "seg": seg,
@@ -623,6 +1121,208 @@ def make_dense_targets(
         "shape_weight": shape_weight,
         "overlap_count": overlap_count,
     }
+
+
+def _paint_ellipse_mask(
+    mask: np.ndarray,
+    sources: Table,
+    spec: TileSpec,
+    *,
+    x_col: str,
+    y_col: str,
+    ellipse_sigma: float,
+) -> None:
+    if len(sources) == 0:
+        return
+    h, w = mask.shape
+    x_global, y_global = _require_position_columns(sources, x_col, y_col)
+    major = np.asarray(sources["ellipse_major_sigma"], dtype=np.float32)
+    minor = np.asarray(sources["ellipse_minor_sigma"], dtype=np.float32)
+    angle = np.asarray(sources["ellipse_theta"], dtype=np.float32)
+    yy_full, xx_full = np.mgrid[0:h, 0:w]
+    for idx in range(len(sources)):
+        cx = float(x_global[idx] - spec.x0)
+        cy = float(y_global[idx] - spec.y0)
+        if np.isfinite(major[idx]) and np.isfinite(minor[idx]) and np.isfinite(angle[idx]):
+            a = float(max(major[idx] * ellipse_sigma, 1.5))
+            b = float(max(minor[idx] * ellipse_sigma, 1.5))
+            theta = float(angle[idx])
+        else:
+            a = b = float(max(2.0 * ellipse_sigma, 1.5))
+            theta = 0.0
+        radius = int(math.ceil(max(a, b))) + 2
+        cx_i = int(round(cx))
+        cy_i = int(round(cy))
+        y0, y1 = max(0, cy_i - radius), min(h, cy_i + radius + 1)
+        x0, x1 = max(0, cx_i - radius), min(w, cx_i + radius + 1)
+        if y0 >= y1 or x0 >= x1:
+            continue
+        dx = xx_full[y0:y1, x0:x1] - cx
+        dy = yy_full[y0:y1, x0:x1] - cy
+        cos_t = math.cos(theta)
+        sin_t = math.sin(theta)
+        xr = cos_t * dx + sin_t * dy
+        yr = -sin_t * dx + cos_t * dy
+        ellipse = (xr / a) ** 2 + (yr / b) ** 2 <= 1.0
+        mask[y0:y1, x0:x1][ellipse] = 1
+
+
+def _paint_confidence(
+    confidence: np.ndarray,
+    confidence_weight: np.ndarray,
+    sources: Table,
+    spec: TileSpec,
+    *,
+    x_col: str,
+    y_col: str,
+    confidence_levels: int,
+    weight: float,
+) -> None:
+    if len(sources) == 0:
+        return
+    h, w = confidence.shape
+    x_global, y_global = _require_position_columns(sources, x_col, y_col)
+    yy_full, xx_full = np.mgrid[0:h, 0:w]
+    for idx in range(len(sources)):
+        cx = float(x_global[idx] - spec.x0)
+        cy = float(y_global[idx] - spec.y0)
+        cx_i = int(round(cx))
+        cy_i = int(round(cy))
+        if not (0 <= cx_i < w and 0 <= cy_i < h):
+            continue
+        level_radius = confidence_levels - 1
+        cy0, cy1 = max(0, cy_i - level_radius), min(h, cy_i + level_radius + 1)
+        cx0, cx1 = max(0, cx_i - level_radius), min(w, cx_i + level_radius + 1)
+        dist = np.abs(xx_full[cy0:cy1, cx0:cx1] - cx) + np.abs(yy_full[cy0:cy1, cx0:cx1] - cy)
+        vals = np.ceil(np.clip(level_radius - dist, a_min=0, a_max=None)).astype(np.int16)
+        region = vals > 0
+        patch_conf = confidence[cy0:cy1, cx0:cx1]
+        patch_weight = confidence_weight[cy0:cy1, cx0:cx1]
+        patch_conf[region] = np.maximum(patch_conf[region], vals[region])
+        patch_weight[region] = np.maximum(patch_weight[region], float(weight))
+
+
+def make_pu_dense_targets(
+    clean_sources: Table,
+    center_only_sources: Table,
+    ignore_sources: Table,
+    spec: TileSpec,
+    *,
+    x_col: str,
+    y_col: str,
+    ellipse_sigma: float,
+    confidence_levels: int,
+    core_radius: int,
+    center_only_weight: float,
+    lsst_background_mask: Optional[np.ndarray] = None,
+    strict_ignore_sources: Optional[Table] = None,
+    strict_ignore_ellipse_sigma: float = 1.0,
+) -> Dict[str, np.ndarray]:
+    targets = make_dense_targets(
+        clean_sources,
+        spec,
+        x_col=x_col,
+        y_col=y_col,
+        ellipse_sigma=ellipse_sigma,
+        confidence_levels=confidence_levels,
+        core_radius=core_radius,
+    )
+    h = w = spec.size
+    clean_mask = (targets["seg"] > 0).astype(np.uint8)
+    center_only_mask = np.zeros((h, w), dtype=np.uint8)
+    ignore_mask = np.zeros((h, w), dtype=np.uint8)
+    strict_ignore_mask = np.zeros((h, w), dtype=np.uint8)
+    a_failed_mask = np.zeros((h, w), dtype=np.uint8)
+    if "pu_class" in ignore_sources.colnames:
+        classes = np.asarray(ignore_sources["pu_class"], dtype=str)
+        a_failed_sources = ignore_sources[classes == "a_failed"]
+        ordinary_ignore_sources = ignore_sources[classes != "a_failed"]
+    else:
+        a_failed_sources = Table()
+        ordinary_ignore_sources = ignore_sources
+    _paint_ellipse_mask(center_only_mask, center_only_sources, spec, x_col=x_col, y_col=y_col, ellipse_sigma=ellipse_sigma)
+    _paint_ellipse_mask(ignore_mask, ordinary_ignore_sources, spec, x_col=x_col, y_col=y_col, ellipse_sigma=ellipse_sigma)
+    _paint_ellipse_mask(a_failed_mask, a_failed_sources, spec, x_col=x_col, y_col=y_col, ellipse_sigma=ellipse_sigma)
+    if strict_ignore_sources is not None and len(strict_ignore_sources):
+        _paint_ellipse_mask(
+            strict_ignore_mask,
+            strict_ignore_sources,
+            spec,
+            x_col=x_col,
+            y_col=y_col,
+            ellipse_sigma=strict_ignore_ellipse_sigma,
+        )
+    clean_bool = clean_mask > 0
+    strict_bool = strict_ignore_mask > 0
+    clean_bool &= ~strict_bool
+    center_bool = (center_only_mask > 0) & ~clean_bool & ~strict_bool
+    ignore_bool = ((ignore_mask > 0) | strict_bool) & ~clean_bool & ~center_bool
+    a_failed_bool = (a_failed_mask > 0) & ~clean_bool & ~center_bool & ~ignore_bool
+    if lsst_background_mask is not None:
+        lsst_background_bool = np.asarray(lsst_background_mask, dtype=bool)
+        if lsst_background_bool.shape != (h, w):
+            raise ValueError(f"lsst_background_mask shape {lsst_background_bool.shape} != {(h, w)}")
+        background_bool = lsst_background_bool & ~clean_bool & ~center_bool & ~ignore_bool & ~strict_bool
+        ignore_bool = ignore_bool | (~background_bool & ~clean_bool & ~center_bool)
+    else:
+        background_bool = np.zeros((h, w), dtype=bool)
+        ignore_bool = ignore_bool | (~clean_bool & ~center_bool & ~strict_bool)
+    clean_mask = clean_bool.astype(np.uint8)
+    center_only_mask = center_bool.astype(np.uint8)
+    strict_ignore_mask = strict_bool.astype(np.uint8)
+    ignore_mask = ignore_bool.astype(np.uint8)
+
+    source_union_mask = (clean_bool | center_bool | ignore_bool).astype(np.uint8)
+    background_mask = background_bool.astype(np.uint8)
+    pu_class_mask = np.zeros((h, w), dtype=np.uint8)
+    pu_class_mask[clean_bool] = 1
+    pu_class_mask[center_bool] = 2
+    pu_class_mask[ignore_bool] = 3
+    pu_class_mask[background_bool] = 4
+    pu_class_mask[strict_bool] = 5
+
+    confidence_weight = np.ones((h, w), dtype=np.float32)
+    seg_loss_weight = np.ones((h, w), dtype=np.float32)
+    uncertain = center_bool | ignore_bool
+    confidence_weight[uncertain] = 0.0
+    seg_loss_weight[uncertain] = 0.0
+    targets["shape_weight"][uncertain] = 0.0
+    _paint_confidence(
+        targets["confidence"],
+        confidence_weight,
+        center_only_sources,
+        spec,
+        x_col=x_col,
+        y_col=y_col,
+        confidence_levels=confidence_levels,
+        weight=center_only_weight,
+    )
+    _paint_confidence(
+        targets["confidence"],
+        confidence_weight,
+        clean_sources,
+        spec,
+        x_col=x_col,
+        y_col=y_col,
+        confidence_levels=confidence_levels,
+        weight=1.0,
+    )
+
+    targets.update(
+        {
+            "clean_mask": clean_mask,
+            "center_only_mask": center_only_mask,
+            "ignore_mask": ignore_mask,
+            "strict_ignore_mask": strict_ignore_mask,
+            "source_union_mask": source_union_mask,
+            "background_mask": background_mask,
+            "pu_class_mask": pu_class_mask,
+            "confidence_weight": confidence_weight,
+            "seg_loss_weight": seg_loss_weight,
+            "center_only_weight_value": np.asarray(float(center_only_weight), dtype=np.float32),
+        }
+    )
+    return targets
 
 
 def write_targets(targets: Dict[str, np.ndarray], output_npz: Path, output_fits_prefix: Optional[Path]) -> None:
@@ -642,6 +1342,66 @@ def write_targets(targets: Dict[str, np.ndarray], output_npz: Path, output_fits_
         targets["overlap_count"],
         overwrite=True,
     )
+    for key in (
+        "clean_mask",
+        "center_only_mask",
+        "ignore_mask",
+        "strict_ignore_mask",
+        "source_union_mask",
+        "background_mask",
+        "pu_class_mask",
+    ):
+        if key in targets:
+            fits.writeto(output_fits_prefix.with_name(output_fits_prefix.name + f"_{key}.fits"), targets[key], overwrite=True)
+
+
+def _first_present_float_column(table: Table, names: Sequence[str], default: float = np.nan) -> np.ndarray:
+    out = np.full(len(table), float(default), dtype=np.float32)
+    filled = np.zeros(len(table), dtype=bool)
+    for name in names:
+        if name in table.colnames:
+            values = np.asarray(table[name], dtype=np.float32)
+            take = ~filled & np.isfinite(values)
+            out[take] = values[take]
+            filled[take] = True
+            if filled.all():
+                break
+    return out
+
+
+def _metadata_from_catalog(table: Table) -> Dict[str, np.ndarray]:
+    centers = np.zeros((len(table), 2), dtype=np.float32)
+    if len(table):
+        centers[:, 0] = np.asarray(table["centroid_local_x"], dtype=np.float32)
+        centers[:, 1] = np.asarray(table["centroid_local_y"], dtype=np.float32)
+    ids = np.asarray(table["id"], dtype=np.int64) if "id" in table.colnames else np.arange(len(table), dtype=np.int64)
+    xx = _first_present_float_column(table, ("base_SdssShape_xx", "ext_shapeHSM_HsmSourceMoments_xx"), default=4.0)
+    yy = _first_present_float_column(table, ("base_SdssShape_yy", "ext_shapeHSM_HsmSourceMoments_yy"), default=4.0)
+    xy = _first_present_float_column(table, ("base_SdssShape_xy", "ext_shapeHSM_HsmSourceMoments_xy"), default=0.0)
+    kron_radius = _first_present_float_column(
+        table,
+        ("pu_refit_kron_radius", "ext_photometryKron_KronFlux_radius", "ext_photometryKron_KronFlux_radius_for_radius"),
+        default=np.nan,
+    )
+    footprint = _first_present_float_column(table, ("base_FootprintArea_value",), default=0.0)
+    return {
+        "centers": centers.astype(np.float32),
+        "ids": ids.astype(np.int64),
+        "moments": np.stack([xx, yy, xy], axis=1).astype(np.float32),
+        "kron_radius": kron_radius.astype(np.float32),
+        "footprint": footprint.astype(np.float32),
+    }
+
+
+def write_catalog_metadata(table: Table, output_npz: Path) -> None:
+    output_npz.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(output_npz, **_metadata_from_catalog(table))
+
+
+def write_ids_metadata(table: Table, output_npz: Path) -> None:
+    output_npz.parent.mkdir(parents=True, exist_ok=True)
+    ids = np.asarray(table["id"], dtype=np.int64) if "id" in table.colnames else np.arange(len(table), dtype=np.int64)
+    np.savez_compressed(output_npz, ids=ids.astype(np.int64))
 
 
 def _zscale_cache_path(
@@ -681,24 +1441,39 @@ def write_zscale_cache(
 
 
 def mirror_fast_outputs(source_root: Path, fast_root: Path) -> None:
+    source_root = source_root.resolve()
+    fast_root = fast_root.resolve()
+    if source_root == fast_root:
+        return
     dirs = (
         "targets",
+        "tile_metadata",
         "reference_catalogs",
         "reference_catalogs_csv",
+        "center_only_catalogs",
+        "ignore_catalogs",
         "band_reference_catalogs",
         "band_reference_rejected",
+        "band_reference_center_only",
+        "band_reference_ignore",
+        "band_reference_pu_all",
+        "band_targets",
+        "band_tile_metadata",
+        "band_rejected_ids",
         "sources",
     )
     files = ("manifest.json", "tiles.csv", "cutout_paths.json")
     fast_root.mkdir(parents=True, exist_ok=True)
     for dirname in dirs:
         src = source_root / dirname
-        if src.exists():
-            shutil.copytree(src, fast_root / dirname, dirs_exist_ok=True)
+        dst = fast_root / dirname
+        if src.exists() and src.resolve() != dst.resolve():
+            shutil.copytree(src, dst, dirs_exist_ok=True)
     for filename in files:
         src = source_root / filename
-        if src.exists():
-            shutil.copy2(src, fast_root / filename)
+        dst = fast_root / filename
+        if src.exists() and src.resolve() != dst.resolve():
+            shutil.copy2(src, dst)
 
 
 def _jsonable_args(args: argparse.Namespace) -> Dict[str, object]:
@@ -713,14 +1488,50 @@ def _jsonable_args(args: argparse.Namespace) -> Dict[str, object]:
     return out
 
 
+def _compact_exception_message(exc: BaseException, *, limit: int = 2000) -> str:
+    if isinstance(exc, shutil.Error) and exc.args:
+        payload = exc.args[0]
+        if isinstance(payload, list):
+            if all(isinstance(item, str) and len(item) == 1 for item in payload):
+                message = "".join(payload)
+            else:
+                parts = []
+                for item in payload[:5]:
+                    if isinstance(item, tuple) and len(item) >= 3:
+                        parts.append(f"{item[0]} -> {item[1]}: {item[2]}")
+                    else:
+                        parts.append(str(item))
+                suffix = f"; ... {len(payload) - 5} more" if len(payload) > 5 else ""
+                message = "; ".join(parts) + suffix
+        else:
+            message = str(payload)
+    else:
+        message = str(exc)
+
+    if message.startswith("['") and "'," in message:
+        try:
+            parsed = ast.literal_eval(message)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, list) and all(isinstance(item, str) and len(item) == 1 for item in parsed):
+            message = "".join(parsed)
+    if len(message) > limit:
+        return message[:limit] + f"... [truncated {len(message) - limit} chars]"
+    return message
+
+
 def _patch_failure_row(patch: str, catalog_path: Path, output_root: Path, exc: BaseException) -> Dict[str, str]:
+    error = _compact_exception_message(exc)
+    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    if len(tb) > 20000:
+        tb = tb[:20000] + f"... [traceback truncated {len(tb) - 20000} chars]"
     return {
         "patch": patch,
         "catalog": str(catalog_path),
         "output_root": str(output_root),
         "error_type": type(exc).__name__,
-        "error": str(exc),
-        "traceback": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+        "error": error,
+        "traceback": tb,
     }
 
 
@@ -769,7 +1580,7 @@ def preprocess(args: argparse.Namespace) -> None:
                 )
             except Exception as exc:
                 failed_patch_rows.append(_patch_failure_row(patch, catalog_path, patch_output_root, exc))
-                print(f"FAILED patch {patch}: {exc}", flush=True)
+                print(f"FAILED patch {patch}: {_compact_exception_message(exc, limit=500)}", flush=True)
     else:
         if not args.dry_run:
             data_root.mkdir(parents=True, exist_ok=True)
@@ -796,7 +1607,7 @@ def preprocess(args: argparse.Namespace) -> None:
                 except Exception as exc:
                     catalog_path, patch_output_root = task_by_patch[patch]
                     failed_patch_rows.append(_patch_failure_row(patch, catalog_path, patch_output_root, exc))
-                    print(f"FAILED patch {patch}: {exc}", flush=True)
+                    print(f"FAILED patch {patch}: {_compact_exception_message(exc, limit=500)}", flush=True)
                 completed += 1
                 print(f"completed patch {patch} ({completed}/{len(tasks)})", flush=True)
 
@@ -876,21 +1687,78 @@ def _preprocess_patch(
         specs = specs[: int(args.max_tiles)]
 
     table = _read_table(catalog_path, hdu=args.catalog_hdu, role="primary", patch=patch)
-    filtered, rejected = _filter_catalog(table, args)
+    pu_result: Optional[Dict[str, object]] = None
+    center_only = Table()
+    ignore_sources = Table()
+    strict_ignore_sources = Table()
+    if args.label_mode == "pu":
+        filtered, center_only, ignore_sources, pu_all, pu_result = _classify_pu_catalog(
+            table,
+            args,
+            band=args.catalog_band,
+            patch=patch,
+        )
+        strict_ignore_sources = _strict_bright_ignore_catalog(table, args, band=args.catalog_band, patch=patch)
+        filtered = _exclude_catalog_rows_by_id(filtered, strict_ignore_sources)
+        center_only = _exclude_catalog_rows_by_id(center_only, strict_ignore_sources)
+        ignore_sources = _exclude_catalog_rows_by_id(ignore_sources, strict_ignore_sources)
+        rejected_parts = [part for part in (center_only, ignore_sources, strict_ignore_sources) if len(part)]
+        rejected = vstack(rejected_parts) if len(rejected_parts) >= 2 else (rejected_parts[0] if rejected_parts else Table())
+    else:
+        filtered, rejected = _filter_catalog(table, args)
+        if args.target_shape_source != args.shape_source:
+            filtered = add_ellipse_columns(filtered, shape_source=args.target_shape_source)
+            rejected = add_ellipse_columns(rejected, shape_source=args.target_shape_source)
 
     sources_dir = output_root / "sources"
     if not args.dry_run:
         write_table_pair(filtered, sources_dir / "sources_filtered.fits", sources_dir / "sources_filtered.csv")
-        write_table_pair(rejected, sources_dir / "sources_rejected.fits", sources_dir / "sources_rejected.csv")
+        write_table_pair(
+            rejected,
+            sources_dir / "sources_rejected.fits",
+            None if args.label_mode == "pu" else sources_dir / "sources_rejected.csv",
+        )
+        if args.label_mode == "pu":
+            write_table_pair(filtered, sources_dir / "sources_pu_clean.fits", None)
+            write_table_pair(center_only, sources_dir / "sources_pu_center_only.fits", None)
+            write_table_pair(ignore_sources, sources_dir / "sources_pu_ignore.fits", None)
+            write_table_pair(strict_ignore_sources, sources_dir / "sources_pu_strict_ignore.fits", None)
+            write_table_pair(pu_all, sources_dir / "sources_pu_all.fits", None)
 
     band_catalog_warnings: List[Dict[str, str]] = []
+    band_target_sources: Dict[str, Tuple[Table, Table, Table, Table]] = {}
     if not args.dry_run:
         band_catalog_root = _expand(args.band_catalog_root) if args.band_catalog_root is not None else _expand(args.catalog_root)
         for band in bands:
             band_catalog_path = _band_catalog_path(band_catalog_root, band, args.tract, patch)
             try:
                 band_table = _read_table(band_catalog_path, hdu=args.catalog_hdu, role="band-reference", patch=patch, band=band)
-                band_filtered, band_rejected = _filter_catalog(band_table, args)
+                if args.label_mode == "pu":
+                    band_filtered, band_center_only, band_ignore, band_pu_all, _band_pu_result = _classify_pu_catalog(
+                        band_table,
+                        args,
+                        band=band,
+                        patch=patch,
+                    )
+                    band_strict_ignore = _strict_bright_ignore_catalog(band_table, args, band=band, patch=patch)
+                    band_filtered = _exclude_catalog_rows_by_id(band_filtered, band_strict_ignore)
+                    band_center_only = _exclude_catalog_rows_by_id(band_center_only, band_strict_ignore)
+                    band_ignore = _exclude_catalog_rows_by_id(band_ignore, band_strict_ignore)
+                    band_rejected_parts = [part for part in (band_center_only, band_ignore, band_strict_ignore) if len(part)]
+                    band_rejected = (
+                        vstack(band_rejected_parts)
+                        if len(band_rejected_parts) >= 2
+                        else (band_rejected_parts[0] if band_rejected_parts else Table())
+                    )
+                else:
+                    band_filtered, band_rejected = _filter_catalog(band_table, args)
+                    if args.target_shape_source != args.shape_source:
+                        band_filtered = add_ellipse_columns(band_filtered, shape_source=args.target_shape_source)
+                        band_rejected = add_ellipse_columns(band_rejected, shape_source=args.target_shape_source)
+                    band_center_only = Table()
+                    band_ignore = Table()
+                    band_strict_ignore = Table()
+                    band_pu_all = Table()
             except Exception as exc:
                 policy = str(args.bad_band_catalog_policy)
                 warning = {
@@ -916,6 +1784,11 @@ def _preprocess_patch(
                     flush=True,
                 )
                 band_filtered, band_rejected = filtered, rejected
+                band_center_only = center_only
+                band_ignore = ignore_sources
+                band_strict_ignore = strict_ignore_sources
+                band_pu_all = pu_all if args.label_mode == "pu" else Table()
+            band_target_sources[band] = (band_filtered, band_center_only, band_ignore, band_strict_ignore)
             band_ref_dir = output_root / "band_reference_catalogs" / band
             write_table_pair(
                 band_filtered,
@@ -927,9 +1800,65 @@ def _preprocess_patch(
                 output_root / "band_reference_rejected" / band / f"meas-{band}-{args.tract}-{patch}.fits",
                 None,
             )
+            write_ids_metadata(band_rejected, output_root / "band_rejected_ids" / f"{band}.npz")
+            if args.label_mode == "pu":
+                write_table_pair(
+                    band_center_only,
+                    output_root / "band_reference_center_only" / band / f"meas-{band}-{args.tract}-{patch}.fits",
+                    None,
+                )
+                write_table_pair(
+                    band_ignore,
+                    output_root / "band_reference_ignore" / band / f"meas-{band}-{args.tract}-{patch}.fits",
+                    None,
+                )
+                write_table_pair(
+                    band_strict_ignore,
+                    output_root / "band_reference_strict_ignore" / band / f"meas-{band}-{args.tract}-{patch}.fits",
+                    None,
+                )
+                write_table_pair(
+                    band_pu_all,
+                    output_root / "band_reference_pu_all" / band / f"meas-{band}-{args.tract}-{patch}.fits",
+                    None,
+                )
 
     manifest_rows = []
     cutout_paths: Dict[str, Dict[str, str]] = {}
+    lsst_background_masks: Dict[str, np.ndarray] = {}
+    if args.label_mode == "pu":
+        for band in bands:
+            if bool(getattr(args, "lsst_background_detect_cutouts", False)):
+                det_path = _band_det_path(coadd_root, band, args.tract, patch)
+                if det_path is None:
+                    continue
+                try:
+                    lsst_background_masks[band] = _read_det_background_mask(det_path, image_shape_yx, origin_xy=parent_origin)
+                except Exception as exc:
+                    print(
+                        f"WARNING: failed to read LSST det footprints for patch={patch}, band={band}: {det_path}; {exc}",
+                        flush=True,
+                    )
+                continue
+            det_path = _resolve_lsst_background_det_path(
+                args=args,
+                output_root=output_root,
+                coadd_root=coadd_root,
+                band=band,
+                tract=args.tract,
+                patch=patch,
+            )
+            if det_path is None:
+                print(
+                    f"WARNING: no LSST det footprint file found for patch={patch}, band={band}; "
+                    "PU background mask will be empty and unlabelled pixels will be ignored.",
+                    flush=True,
+                )
+                continue
+            try:
+                lsst_background_masks[band] = _read_det_background_mask(det_path, image_shape_yx, origin_xy=parent_origin)
+            except Exception as exc:
+                print(f"WARNING: failed to read LSST det footprints for patch={patch}, band={band}: {det_path}; {exc}", flush=True)
 
     if args.dry_run:
         print(f"dry-run: would write {len(specs)} tiles to {output_root}", flush=True)
@@ -951,6 +1880,56 @@ def _preprocess_patch(
             y_col=args.y_col,
             margin=args.mask_margin,
         )
+        if args.label_mode == "pu":
+            tile_center_only = crop_catalog_for_tile(
+                center_only,
+                spec,
+                x_col=args.x_col,
+                y_col=args.y_col,
+                margin=0.0,
+            )
+            tile_ignore = crop_catalog_for_tile(
+                ignore_sources,
+                spec,
+                x_col=args.x_col,
+                y_col=args.y_col,
+                margin=0.0,
+            )
+            tile_strict_ignore = crop_catalog_for_tile(
+                strict_ignore_sources,
+                spec,
+                x_col=args.x_col,
+                y_col=args.y_col,
+                margin=0.0,
+            )
+            center_only_mask_sources = crop_catalog_for_tile(
+                center_only,
+                spec,
+                x_col=args.x_col,
+                y_col=args.y_col,
+                margin=args.mask_margin,
+            )
+            ignore_mask_sources = crop_catalog_for_tile(
+                ignore_sources,
+                spec,
+                x_col=args.x_col,
+                y_col=args.y_col,
+                margin=args.mask_margin,
+            )
+            strict_ignore_mask_sources = crop_catalog_for_tile(
+                strict_ignore_sources,
+                spec,
+                x_col=args.x_col,
+                y_col=args.y_col,
+                margin=args.mask_margin,
+            )
+        else:
+            tile_center_only = Table()
+            tile_ignore = Table()
+            tile_strict_ignore = Table()
+            center_only_mask_sources = Table()
+            ignore_mask_sources = Table()
+            strict_ignore_mask_sources = Table()
 
         band_paths: Dict[str, str] = {}
         for band in bands:
@@ -968,6 +1947,43 @@ def _preprocess_patch(
                     overwrite=True,
                 )
 
+        tile_lsst_background_masks: Dict[str, np.ndarray] = {}
+        if args.label_mode == "pu" and bool(getattr(args, "lsst_background_detect_cutouts", False)):
+            policy = str(getattr(args, "lsst_background_policy", "run-if-missing"))
+            for band in bands:
+                if band in lsst_background_masks or policy in {"none", "existing"}:
+                    continue
+                cutout_path = Path(band_paths[band])
+                if args.dry_run:
+                    continue
+                if not cutout_path.exists():
+                    raise FileNotFoundError(
+                        f"--lsst-background-detect-cutouts requires an existing cutout for {patch}/{spec.name}/{band}: "
+                        f"{cutout_path}"
+                    )
+                tile_patch_key = f"{patch}_{spec.name}"
+                detected_calexp_path = (
+                    cutout_path.with_name(f"lsst-detect-{cutout_path.name}")
+                    if bool(getattr(args, "use_lsst_detection_calexp_cutouts", False))
+                    else None
+                )
+                det_path = _run_lsst_detection_background(
+                    args=args,
+                    output_root=output_root,
+                    coadd_path=cutout_path,
+                    band=band,
+                    tract=args.tract,
+                    patch=tile_patch_key,
+                    output_calexp_path=detected_calexp_path,
+                )
+                tile_lsst_background_masks[band] = _read_det_background_mask(
+                    det_path,
+                    (spec.size, spec.size),
+                    origin_xy=(spec.x0, spec.y0),
+                )
+                if detected_calexp_path is not None and detected_calexp_path.exists():
+                    band_paths[band] = str(detected_calexp_path)
+
         if args.zscale_root is not None and not args.dry_run:
             zscale_path = _zscale_cache_path(
                 _expand(args.zscale_root),
@@ -984,23 +2000,130 @@ def _preprocess_patch(
                 overwrite=args.overwrite_zscale,
             )
 
-        targets = make_dense_targets(
-            mask_sources,
-            spec,
-            x_col=args.x_col,
-            y_col=args.y_col,
-            ellipse_sigma=args.ellipse_sigma,
-            confidence_levels=args.confidence_levels,
-            core_radius=args.core_radius,
-        )
+        if args.label_mode == "pu":
+            targets = make_pu_dense_targets(
+                mask_sources,
+                center_only_mask_sources,
+                ignore_mask_sources,
+                spec,
+                x_col=args.x_col,
+                y_col=args.y_col,
+                ellipse_sigma=args.ellipse_sigma,
+                confidence_levels=args.confidence_levels,
+                core_radius=args.core_radius,
+                center_only_weight=args.pu_center_only_weight,
+                lsst_background_mask=_crop_full_mask_for_tile(
+                    lsst_background_masks.get(first_band), spec, parent_origin
+                )
+                if first_band in lsst_background_masks
+                else tile_lsst_background_masks.get(first_band),
+                strict_ignore_sources=strict_ignore_mask_sources,
+                strict_ignore_ellipse_sigma=args.pu_strict_ignore_ellipse_sigma,
+            )
+        else:
+            targets = make_dense_targets(
+                mask_sources,
+                spec,
+                x_col=args.x_col,
+                y_col=args.y_col,
+                ellipse_sigma=args.ellipse_sigma,
+                confidence_levels=args.confidence_levels,
+                core_radius=args.core_radius,
+            )
+
+        band_targets: Dict[str, Dict[str, np.ndarray]] = {}
+        band_tile_catalogs: Dict[str, Table] = {}
+        for band, (band_filtered, band_center_only, band_ignore, band_strict_ignore) in band_target_sources.items():
+            band_tile_catalogs[band] = crop_catalog_for_tile(
+                band_filtered,
+                spec,
+                x_col=args.x_col,
+                y_col=args.y_col,
+                margin=0.0,
+            )
+            if args.skip_band_targets:
+                continue
+            band_mask_sources = crop_catalog_for_tile(
+                band_filtered,
+                spec,
+                x_col=args.x_col,
+                y_col=args.y_col,
+                margin=args.mask_margin,
+            )
+            if args.label_mode == "pu":
+                band_center_mask_sources = crop_catalog_for_tile(
+                    band_center_only,
+                    spec,
+                    x_col=args.x_col,
+                    y_col=args.y_col,
+                    margin=args.mask_margin,
+                )
+                band_ignore_mask_sources = crop_catalog_for_tile(
+                    band_ignore,
+                    spec,
+                    x_col=args.x_col,
+                    y_col=args.y_col,
+                    margin=args.mask_margin,
+                )
+                band_strict_ignore_mask_sources = crop_catalog_for_tile(
+                    band_strict_ignore,
+                    spec,
+                    x_col=args.x_col,
+                    y_col=args.y_col,
+                    margin=args.mask_margin,
+                )
+                band_targets[band] = make_pu_dense_targets(
+                    band_mask_sources,
+                    band_center_mask_sources,
+                    band_ignore_mask_sources,
+                    spec,
+                    x_col=args.x_col,
+                    y_col=args.y_col,
+                    ellipse_sigma=args.ellipse_sigma,
+                    confidence_levels=args.confidence_levels,
+                    core_radius=args.core_radius,
+                    center_only_weight=args.pu_center_only_weight,
+                    lsst_background_mask=_crop_full_mask_for_tile(
+                        lsst_background_masks.get(band), spec, parent_origin
+                    )
+                    if band in lsst_background_masks
+                    else tile_lsst_background_masks.get(band),
+                    strict_ignore_sources=band_strict_ignore_mask_sources,
+                    strict_ignore_ellipse_sigma=args.pu_strict_ignore_ellipse_sigma,
+                )
+            else:
+                band_targets[band] = make_dense_targets(
+                    band_mask_sources,
+                    spec,
+                    x_col=args.x_col,
+                    y_col=args.y_col,
+                    ellipse_sigma=args.ellipse_sigma,
+                    confidence_levels=args.confidence_levels,
+                    core_radius=args.core_radius,
+                )
 
         ref_path = output_root / "reference_catalogs" / f"{spec.name}_meas.fits"
         ref_csv = output_root / "reference_catalogs_csv" / f"{spec.name}_meas.csv"
+        center_ref_path = output_root / "center_only_catalogs" / f"{spec.name}_meas.fits"
+        ignore_ref_path = output_root / "ignore_catalogs" / f"{spec.name}_meas.fits"
+        strict_ignore_ref_path = output_root / "strict_ignore_catalogs" / f"{spec.name}_meas.fits"
         target_path = output_root / "targets" / f"{spec.name}.npz"
         target_fits_prefix = output_root / "target_fits" / spec.name if args.write_target_fits else None
         if not args.dry_run:
             write_table_pair(tile_catalog, ref_path, ref_csv)
+            if args.label_mode == "pu":
+                write_table_pair(tile_center_only, center_ref_path, None)
+                write_table_pair(tile_ignore, ignore_ref_path, None)
+                write_table_pair(tile_strict_ignore, strict_ignore_ref_path, None)
             write_targets(targets, target_path, target_fits_prefix)
+            write_catalog_metadata(tile_catalog, output_root / "tile_metadata" / f"{spec.name}.npz")
+            for band, band_tile_catalog in band_tile_catalogs.items():
+                write_catalog_metadata(
+                    band_tile_catalog,
+                    output_root / "band_tile_metadata" / band / f"{spec.name}.npz",
+                )
+            for band, band_target in band_targets.items():
+                write_targets(band_target, output_root / "band_targets" / band / f"{spec.name}.npz", None)
 
         cutout_paths[spec.name] = band_paths
         manifest_rows.append(
@@ -1016,8 +2139,25 @@ def _preprocess_patch(
                 "size": spec.size,
                 "n_sources_center_in_tile": len(tile_catalog),
                 "n_sources_for_mask_with_margin": len(mask_sources),
+                "n_center_only_center_in_tile": len(tile_center_only),
+                "n_center_only_for_mask_with_margin": len(center_only_mask_sources),
+                "n_ignore_center_in_tile": len(tile_ignore),
+                "n_ignore_for_mask_with_margin": len(ignore_mask_sources),
+                "n_strict_ignore_center_in_tile": len(tile_strict_ignore),
+                "n_strict_ignore_for_mask_with_margin": len(strict_ignore_mask_sources),
                 "seg_foreground_pixels": int((targets["seg"] > 0).sum()),
                 "overlap_pixels": int((targets["overlap_count"] >= 2).sum()),
+                "source_union_pixels": int(targets["source_union_mask"].sum()) if "source_union_mask" in targets else None,
+                "strict_ignore_pixels": int(targets["strict_ignore_mask"].sum()) if "strict_ignore_mask" in targets else None,
+                "background_pixels": int(targets["background_mask"].sum()) if "background_mask" in targets else None,
+                "band_target_paths": {
+                    band: str(output_root / "band_targets" / band / f"{spec.name}.npz") for band in sorted(band_targets)
+                },
+                "tile_metadata_path": str(output_root / "tile_metadata" / f"{spec.name}.npz"),
+                "band_tile_metadata_paths": {
+                    band: str(output_root / "band_tile_metadata" / band / f"{spec.name}.npz")
+                    for band in sorted(band_tile_catalogs)
+                },
             }
         )
 
@@ -1036,6 +2176,20 @@ def _preprocess_patch(
         "num_tiles": len(specs),
         "num_filtered_sources": len(filtered),
         "num_rejected_sources": len(rejected),
+        "label_mode": args.label_mode,
+        "target_shape_source": args.target_shape_source,
+        "num_pu_clean_sources": len(filtered) if args.label_mode == "pu" else None,
+        "num_pu_center_only_sources": len(center_only) if args.label_mode == "pu" else None,
+        "num_pu_ignore_sources": len(ignore_sources) if args.label_mode == "pu" else None,
+        "num_pu_dropped_large_ellipse_sources": int(np.count_nonzero(pu_result["dropped_large_ellipse"]))
+        if pu_result is not None
+        else None,
+        "num_pu_dropped_by_a_sources": int(np.count_nonzero(pu_result["dropped_by_a"])) if pu_result is not None else None,
+        "num_pu_dropped_invalid_kron_sources": int(np.count_nonzero(pu_result["dropped_invalid_kron"]))
+        if pu_result is not None
+        else None,
+        "pu_drop_ellipse_area_min": args.pu_drop_ellipse_area_min if args.label_mode == "pu" else None,
+        "pu_ambiguous_overlap_pairs": int(pu_result["overlap_pair_count"]) if pu_result is not None else None,
         "source_filter": args.source_filter,
         "max_area_3sigma": args.max_area_3sigma,
         "relaxed_area_3sigma": args.relaxed_area_3sigma,
@@ -1238,7 +2392,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-compare-origin", action="store_true")
     parser.add_argument("--x-col", default="base_SdssCentroid_x")
     parser.add_argument("--y-col", default="base_SdssCentroid_y")
-    parser.add_argument("--shape-source", choices=("sdss", "hsm"), default="sdss")
+    parser.add_argument("--shape-source", choices=("sdss", "hsm", "kron", "circular_kron"), default="sdss")
+    parser.add_argument(
+        "--target-shape-source",
+        choices=("sdss", "hsm", "kron", "circular_kron"),
+        default="kron",
+        help=(
+            "Ellipse source used for dense target masks. PU mode defaults to Kron radius plus SDSS axis ratio/angle. "
+            "--shape-source is kept for legacy area filtering."
+        ),
+    )
+    parser.add_argument(
+        "--label-mode",
+        choices=("legacy", "pu"),
+        default="legacy",
+        help="legacy uses the old filtered/rejected catalog split; pu writes clean/center_only/ignore masks and catalogs.",
+    )
+    parser.add_argument(
+        "--skip-band-targets",
+        action="store_true",
+        help="Do not write per-band dense target npz files. By default they are written for faster training.",
+    )
     parser.add_argument("--max-area-3sigma", type=float, default=400.0)
     parser.add_argument("--relaxed-area-3sigma", type=float, default=900.0)
     parser.add_argument(
@@ -1254,10 +2428,174 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Catalog rows used for reference catalogs and dense targets. Default trains on deblend_nChild==0 leaf sources.",
     )
     parser.add_argument("--drop-children", action="store_true", help="Legacy extra filter: also drop rows with parent != 0.")
-    parser.add_argument("--ellipse-sigma", type=float, default=3.0)
+    parser.add_argument(
+        "--ellipse-sigma",
+        type=float,
+        default=1.0,
+        help="Scale applied to target ellipses. Default 1.0 matches Kron/refit aperture radii; use 3.0 for legacy SDSS-moment masks.",
+    )
+    parser.add_argument("--min-ellipse-axis", type=float, default=1.5)
     parser.add_argument("--mask-margin", type=float, default=64.0)
     parser.add_argument("--confidence-levels", type=int, default=5)
     parser.add_argument("--core-radius", type=int, default=2)
+    parser.add_argument("--pu-center-only-weight", type=float, default=0.25)
+    parser.add_argument("--pu-a-flags", nargs="*", default=list(DEFAULT_PU_A_FLAGS))
+    parser.add_argument("--pu-b-flags", nargs="*", default=list(DEFAULT_PU_B_FLAGS))
+    parser.add_argument("--pu-a-mode", choices=("any", "all"), default="any")
+    parser.add_argument("--pu-b-mode", choices=("any", "all"), default="any")
+    parser.add_argument("--pu-strict-flags", action="store_true")
+    parser.add_argument("--pu-mag-column", default="ext_photometryKron_KronFlux_instFlux")
+    parser.add_argument("--pu-input-zeropoint", type=float, default=27.0)
+    parser.add_argument(
+        "--pu-kron-refit-csv",
+        type=Path,
+        default=None,
+        help=(
+            "Optional batch-heavyfp-kron-refit CSV. The path may contain {tract}, {patch}, and {band}; "
+            "matched proxy Kron radii are preferred when target-shape-source is kron/circular_kron."
+        ),
+    )
+    parser.add_argument("--pu-kron-refit-radius-column", default="proxy_nan0_flux_aperture_radius")
+    parser.add_argument("--pu-kron-refit-good-column", default="proxy_nan0_good")
+    parser.add_argument(
+        "--pu-require-kron-refit-match",
+        action="store_true",
+        default=True,
+        help=(
+            "In PU mode, if --pu-kron-refit-csv is provided, only sources with a good matched refit radius "
+            "can become clean/center_only/ignore source ellipses."
+        ),
+    )
+    parser.add_argument("--pixel-scale-arcsec", type=float, default=0.168)
+    parser.add_argument("--pu-a-area-max", type=float, default=10000.0)
+    parser.add_argument("--pu-a-faint-area-max", type=float, default=900.0)
+    parser.add_argument("--pu-a-faint-mag-min", type=float, default=28.0)
+    parser.add_argument("--pu-b-mag-min", type=float, default=18.0)
+    parser.add_argument("--pu-b-mag-max", type=float, default=30.0)
+    parser.add_argument(
+        "--pu-use-band-limit-b-filter",
+        action="store_true",
+        help="Use per-band limiting magnitudes for the PU B filter instead of --pu-b-mag-min/max.",
+    )
+    parser.add_argument(
+        "--pu-band-limit-mags",
+        nargs="*",
+        default=None,
+        help="Per-band limits such as HSC-G=27.4 HSC-R=27.1 HSC-I=26.9 HSC-Z=26.3 HSC-Y=25.3.",
+    )
+    parser.add_argument("--pu-band-limit-b-min-offset", type=float, default=-5.0)
+    parser.add_argument("--pu-band-limit-b-max-offset", type=float, default=0.0)
+    parser.add_argument(
+        "--pu-enable-strict-bright-ignore",
+        action="store_true",
+        help=(
+            "Add a separate strict_ignore_mask for bright-source regions. The mask is also folded into "
+            "ignore_mask so training and eval detection metrics ignore these pixels."
+        ),
+    )
+    parser.add_argument(
+        "--pu-strict-ignore-mag-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Optional global magnitude threshold for strict bright-source ignore. "
+            "When unset, per-band HSC saturation magnitudes are used."
+        ),
+    )
+    parser.add_argument(
+        "--pu-strict-ignore-saturation-mags",
+        nargs="*",
+        default=None,
+        help="Per-band strict ignore saturation magnitudes, e.g. HSC-G=18.0 HSC-R=18.2 HSC-I=18.6 HSC-Z=17.7 HSC-Y=17.4.",
+    )
+    parser.add_argument(
+        "--pu-strict-ignore-radius-column",
+        default="proxy_nan0_flux_aperture_radius",
+        help="Radius column from --pu-kron-refit-csv used for strict bright-source ignore apertures.",
+    )
+    parser.add_argument(
+        "--pu-strict-ignore-ellipse-sigma",
+        type=float,
+        default=1.0,
+        help="Scale applied when rasterizing strict bright-source ignore apertures.",
+    )
+    parser.add_argument("--pu-b-close-center-arcsec", type=float, default=0.5)
+    parser.add_argument("--pu-overlap-iou-threshold", type=float, default=0.33)
+    parser.add_argument("--pu-b-ellipse-area-max", type=float, default=None)
+    parser.add_argument("--pu-b-footprint-area-max", type=float, default=None)
+    parser.add_argument("--pu-b-kron-radius-lt-sdss-major-ratio", type=float, default=0.5)
+    parser.add_argument(
+        "--pu-drop-ellipse-area-min",
+        type=float,
+        default=40000.0,
+        help=(
+            "In PU mode, discard sources with target Kron ellipse area above this threshold before assigning "
+            "clean/center_only/ignore labels. Use a negative value to disable."
+        ),
+    )
+    parser.add_argument("--pu-ambiguous-area-max", type=float, default=40000.0)
+    parser.add_argument("--pu-neighbor-radius", type=float, default=80.0)
+    parser.add_argument("--pu-center-distance-factor", type=float, default=0.75)
+    parser.add_argument("--pu-containment-threshold", type=float, default=0.80)
+    parser.add_argument("--pu-mutual-overlap-threshold", type=float, default=0.35)
+    parser.add_argument("--pu-overlap-sample-grid", type=int, default=9)
+    parser.add_argument("--pu-ambiguous-mark", choices=("both", "smaller"), default="both")
+    parser.add_argument(
+        "--pu-keep-all-ab-clean",
+        action="store_true",
+        default=True,
+        help="Do not make center_only labels from overlapping A+B sources; every A+B source is clean.",
+    )
+    parser.add_argument(
+        "--lsst-background-policy",
+        choices=("run-if-missing", "existing", "none"),
+        default="run-if-missing",
+        help=(
+            "PU background source. Use existing official det footprints when present; with run-if-missing, "
+            "run LSST default DetectCoaddSourcesTask on the input coadd when det footprints are absent. "
+            "existing preserves the old no-run behavior, and none disables LSST background masks."
+        ),
+    )
+    parser.add_argument(
+        "--lsst-background-cache-root",
+        type=Path,
+        default=None,
+        help="Cache root for det catalogs generated by --lsst-background-policy run-if-missing. Default: <patch output>/lsst_detection_background.",
+    )
+    parser.add_argument(
+        "--lsst-detect-python",
+        default="",
+        help=(
+            "Python command used for lsst_detect_background.py. Defaults to the current interpreter; set this to a "
+            "Python executable or wrapper with lsst_distrib loaded when preprocessing runs outside an LSST environment."
+        ),
+    )
+    parser.add_argument(
+        "--overwrite-lsst-background",
+        action="store_true",
+        help="Regenerate cached LSST default detection catalogs used for PU background masks.",
+    )
+    parser.add_argument(
+        "--write-lsst-background-products",
+        action="store_true",
+        help="Also write post-detection exposure and LSST BackgroundList products when running the LSST background fallback.",
+    )
+    parser.add_argument(
+        "--lsst-background-detect-cutouts",
+        action="store_true",
+        help=(
+            "When official det footprints are absent, run LSST default detection independently on each 512x512 cutout "
+            "instead of on the full patch. This is optional because it changes preprocessing I/O and requires an LSST stack."
+        ),
+    )
+    parser.add_argument(
+        "--use-lsst-detection-calexp-cutouts",
+        action="store_true",
+        help=(
+            "With --lsst-background-detect-cutouts, use the LSST detection outputExposure FITS as the cutout path "
+            "for zscale/training metadata. This keeps no-background inputs aligned with the coadd training convention."
+        ),
+    )
     parser.add_argument("--write-target-fits", action="store_true")
     parser.add_argument("--max-tiles", type=int, default=None, help="Optional debug limit after tile generation.")
     parser.add_argument("--no-clean-nonfinite", action="store_true")
@@ -1320,6 +2658,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.no_compare_origin:
         args.compare_origin = None
+    if args.use_lsst_detection_calexp_cutouts and not args.lsst_background_detect_cutouts:
+        parser.error("--use-lsst-detection-calexp-cutouts requires --lsst-background-detect-cutouts")
     preprocess(args)
 
 

@@ -10,10 +10,12 @@ model construction, and distributed training orchestration.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import random
 from dataclasses import asdict
+from datetime import timedelta
 from pathlib import Path
 from typing import Iterable, Sequence, Tuple
 
@@ -22,8 +24,9 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DistributedDataParallel
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
+from tqdm import tqdm
 
 from astro_cellect2d import AstroUNet2D, FusedEncoderMultiBandAstroCELLECT2D, MultiBandAstroCELLECT2D
 from astro_match_eval import parse_ex_band_pairs as parse_matcher_ex_band_pairs
@@ -51,11 +54,13 @@ from astro_train_ops import (
     embedding_triplet_loss,
     en_deduplicate_centers,
     evaluate_detection,
+    generate_pu_pseudo_labels,
     match_points,
     matcher_classification_loss,
     parse_ex_band_pairs,
     run_epoch,
     unwrap_model,
+    validate_epoch,
 )
 
 
@@ -100,7 +105,11 @@ def _setup_distributed(args: argparse.Namespace) -> Tuple[bool, int, int, int, t
         backend = "nccl" if torch.cuda.is_available() and torch.device(args.device).type == "cuda" else "gloo"
 
     if distributed:
-        dist.init_process_group(backend=backend, init_method=args.dist_url)
+        dist.init_process_group(
+            backend=backend,
+            init_method=args.dist_url,
+            timeout=timedelta(minutes=max(1.0, float(args.ddp_timeout_minutes))),
+        )
         rank = dist.get_rank()
         world_size = dist.get_world_size()
     else:
@@ -191,6 +200,310 @@ def _record_patch_label(rec: CutoutRecord, root: Path) -> str:
     return rec.patch or rec.relative_root or "-"
 
 
+def _loader_kwargs(args: argparse.Namespace, *, shuffle: bool, sampler: DistributedSampler | None = None) -> dict[str, object]:
+    kwargs: dict[str, object] = {
+        "batch_size": args.batch_size,
+        "shuffle": shuffle,
+        "sampler": sampler,
+        "num_workers": args.num_workers,
+        "collate_fn": collate_cutouts,
+        "pin_memory": bool(args.pin_memory),
+    }
+    if int(args.num_workers) > 0:
+        kwargs["persistent_workers"] = bool(args.persistent_workers)
+        kwargs["prefetch_factor"] = max(1, int(args.prefetch_factor))
+    return kwargs
+
+
+def _format_float(value: float, digits: int) -> str:
+    if not np.isfinite(value):
+        return ""
+    return f"{float(value):.{int(digits)}f}"
+
+
+def _band_name(band_idx: int, band_names: Sequence[str]) -> str:
+    if 0 <= int(band_idx) < len(band_names):
+        return str(band_names[int(band_idx)])
+    return f"band{int(band_idx)}"
+
+
+def _wcs_for_path(path: str, fits_hdu: int, cache: dict[tuple[str, int], object]) -> object | None:
+    key = (str(path), int(fits_hdu))
+    if key in cache:
+        value = cache[key]
+        return value if value is not False else None
+    try:
+        from astropy.io import fits
+        from astropy.wcs import WCS
+    except Exception:
+        cache[key] = False
+        return None
+
+    try:
+        with fits.open(path, memmap=True) as hdul:
+            header = hdul[int(fits_hdu)].header
+            wcs = WCS(header).celestial
+            if not wcs.has_celestial:
+                cache[key] = False
+                return None
+            cache[key] = wcs
+            return wcs
+    except Exception:
+        cache[key] = False
+        return None
+
+
+def _radec_from_wcs(wcs: object | None, x: float, y: float) -> tuple[float, float]:
+    if wcs is None:
+        return float("nan"), float("nan")
+    try:
+        ra, dec = wcs.all_pix2world([float(x)], [float(y)], 0)  # type: ignore[attr-defined]
+        return float(ra[0]), float(dec[0])
+    except Exception:
+        return float("nan"), float("nan")
+
+
+def _flat_per_band_outputs(outputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    return {key: value.reshape(value.shape[0] * value.shape[1], *value.shape[2:]) for key, value in outputs.items()}
+
+
+@torch.no_grad()
+def _write_eval_sources_csv(
+    model: nn.Module,
+    loader: DataLoader,
+    path: Path,
+    *,
+    device: torch.device,
+    fits_hdu: int,
+    threshold: float,
+    nms_radius: int,
+    confidence_score: str,
+    center_refinement: str,
+    center_refinement_radius: int,
+    match_radius: float,
+    use_en_postprocess: bool,
+    en_candidate_count: int,
+    en_threshold: float,
+    use_ex_link_postprocess: bool,
+    ex_link_threshold: float,
+    ex_band_pairs: Sequence[Tuple[int, int]] | None,
+    band_names: Sequence[str],
+    show_progress: bool,
+) -> int:
+    model.eval()
+    base_model = unwrap_model(model)
+    rows: list[dict[str, object]] = []
+    wcs_cache: dict[tuple[str, int], object] = {}
+    source_id = 0
+
+    def append_row(
+        batch: dict[str, object],
+        item_idx: int,
+        source_type: str,
+        x: float,
+        y: float,
+        *,
+        band_idx: int,
+        source_index: int,
+        member_count: int = 1,
+        member_bands: str = "",
+        member_centers: object = "",
+    ) -> None:
+        nonlocal source_id
+        def _mask_at(mask_key: str, band_mask_key: str) -> bool:
+            mask_obj: object | None = None
+            if band_idx >= 0 and band_mask_key in batch:
+                band_masks = batch[band_mask_key]  # type: ignore[index]
+                try:
+                    mask_obj = band_masks[item_idx, band_idx]  # type: ignore[index]
+                except Exception:
+                    mask_obj = None
+            if mask_obj is None and mask_key in batch:
+                masks = batch[mask_key]  # type: ignore[index]
+                try:
+                    mask_obj = masks[item_idx]  # type: ignore[index]
+                except Exception:
+                    mask_obj = None
+            if mask_obj is None:
+                return False
+            try:
+                mask_np = mask_obj.detach().cpu().numpy().astype(bool)  # type: ignore[attr-defined]
+            except Exception:
+                mask_np = np.asarray(mask_obj, dtype=bool)
+            if mask_np.ndim != 2:
+                return False
+            xi = int(round(float(x)))
+            yi = int(round(float(y)))
+            if xi < 0 or yi < 0 or yi >= mask_np.shape[0] or xi >= mask_np.shape[1]:
+                return False
+            return bool(mask_np[yi, xi])
+
+        image_paths = batch["image_paths"][item_idx]  # type: ignore[index]
+        image_path = ""
+        if isinstance(image_paths, (list, tuple)) and image_paths:
+            safe_band_idx = min(max(int(band_idx), 0), len(image_paths) - 1)
+            image_path = str(image_paths[safe_band_idx])
+        wcs = _wcs_for_path(image_path, fits_hdu, wcs_cache) if image_path else None
+        ra_deg, dec_deg = _radec_from_wcs(wcs, x, y)
+        x0 = int(batch["x0"][item_idx])  # type: ignore[index]
+        y0 = int(batch["y0"][item_idx])  # type: ignore[index]
+        strict_ignored = _mask_at("strict_ignore_mask", "band_strict_ignore_mask")
+        ignored = _mask_at("ignore_mask", "band_ignore_mask") or strict_ignored
+        ordinary_ignored = ignored and not strict_ignored
+        source_id += 1
+        rows.append(
+            {
+                "source_id": source_id,
+                "record": batch["name"][item_idx],  # type: ignore[index]
+                "tract": batch["tract"][item_idx],  # type: ignore[index]
+                "patch": batch["patch"][item_idx],  # type: ignore[index]
+                "tile_name": batch["tile_name"][item_idx],  # type: ignore[index]
+                "source_type": source_type,
+                "source_index": int(source_index),
+                "band": _band_name(band_idx, band_names) if band_idx >= 0 else "",
+                "band_index": int(band_idx) if band_idx >= 0 else "",
+                "x_local": _format_float(x, 6),
+                "y_local": _format_float(y, 6),
+                "x_parent": _format_float(float(x0) + float(x), 6),
+                "y_parent": _format_float(float(y0) + float(y), 6),
+                "ra_deg": _format_float(ra_deg, 10),
+                "dec_deg": _format_float(dec_deg, 10),
+                "ignored_by_mask": int(ignored),
+                "ordinary_ignore": int(ordinary_ignored),
+                "strict_ignore": int(strict_ignored),
+                "eval_excluded_by_mask": int(ignored),
+                "member_count": int(member_count),
+                "member_bands": member_bands,
+                "member_centers": json.dumps(member_centers) if member_centers else "",
+                "image_path": image_path,
+            }
+        )
+
+    for batch in tqdm(loader, desc="eval-csv", leave=False, disable=not show_progress):
+        image = batch["image"].to(device=device, dtype=torch.float32, non_blocking=True)  # type: ignore[union-attr]
+        outputs = model(image)
+        if outputs["seg_logits"].ndim == 5 and use_ex_link_postprocess and hasattr(base_model, "EX"):
+            pred_list, components_all = detect_centers_with_ex_link(
+                base_model,
+                outputs,
+                threshold=threshold,
+                nms_radius=nms_radius,
+                confidence_score=confidence_score,
+                match_radius=match_radius,
+                candidate_count=en_candidate_count,
+                ex_threshold=ex_link_threshold,
+                center_refinement=center_refinement,
+                center_refinement_radius=center_refinement_radius,
+                use_en_postprocess=use_en_postprocess,
+                en_threshold=en_threshold,
+                band_pairs=ex_band_pairs,
+            )
+            for item_idx, pred_xy in enumerate(pred_list):
+                components = components_all[item_idx] if item_idx < len(components_all) else []
+                for source_index, xy in enumerate(np.asarray(pred_xy, dtype=np.float32)):
+                    component = components[source_index] if source_index < len(components) else {}
+                    members = component.get("members", []) if isinstance(component, dict) else []
+                    band_idx = int(members[0][0]) if members else 0
+                    member_centers = component.get("member_centers", "") if isinstance(component, dict) else ""
+                    member_band_names = []
+                    if isinstance(members, list):
+                        member_band_names = [_band_name(int(item[0]), band_names) for item in members]
+                    append_row(
+                        batch,
+                        item_idx,
+                        "linked",
+                        float(xy[0]),
+                        float(xy[1]),
+                        band_idx=band_idx,
+                        source_index=source_index,
+                        member_count=len(members) if members else 1,
+                        member_bands=",".join(member_band_names),
+                        member_centers=member_centers,
+                    )
+            continue
+
+        band_count = int(outputs["seg_logits"].shape[1]) if outputs["seg_logits"].ndim == 5 else 0
+        if use_en_postprocess and hasattr(base_model, "EN"):
+            pred_list = detect_centers_with_en(
+                base_model,
+                outputs,
+                threshold=threshold,
+                nms_radius=nms_radius,
+                confidence_score=confidence_score,
+                match_radius=match_radius,
+                candidate_count=en_candidate_count,
+                en_threshold=en_threshold,
+                center_refinement=center_refinement,
+                center_refinement_radius=center_refinement_radius,
+            )
+        elif outputs["seg_logits"].ndim == 5:
+            pred_list = detect_centers(
+                _flat_per_band_outputs(outputs),
+                threshold=threshold,
+                nms_radius=nms_radius,
+                confidence_score=confidence_score,
+                center_refinement=center_refinement,
+                center_refinement_radius=center_refinement_radius,
+            )
+        else:
+            pred_list = detect_centers(
+                outputs,
+                threshold=threshold,
+                nms_radius=nms_radius,
+                confidence_score=confidence_score,
+                center_refinement=center_refinement,
+                center_refinement_radius=center_refinement_radius,
+            )
+
+        for list_idx, pred_xy in enumerate(pred_list):
+            item_idx = list_idx // band_count if band_count else list_idx
+            band_idx = list_idx % band_count if band_count else 0
+            source_type = "band" if band_count else "fused"
+            for source_index, xy in enumerate(np.asarray(pred_xy, dtype=np.float32)):
+                append_row(
+                    batch,
+                    item_idx,
+                    source_type,
+                    float(xy[0]),
+                    float(xy[1]),
+                    band_idx=band_idx,
+                    source_index=source_index,
+                    member_bands=_band_name(band_idx, band_names) if band_count else "",
+                )
+
+    fieldnames = [
+        "source_id",
+        "record",
+        "tract",
+        "patch",
+        "tile_name",
+        "source_type",
+        "source_index",
+        "band",
+        "band_index",
+        "x_local",
+        "y_local",
+        "x_parent",
+        "y_parent",
+        "ra_deg",
+        "dec_deg",
+        "ignored_by_mask",
+        "ordinary_ignore",
+        "strict_ignore",
+        "eval_excluded_by_mask",
+        "member_count",
+        "member_bands",
+        "member_centers",
+        "image_path",
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    return len(rows)
+
+
 def _checkpoint_payload(
     model: nn.Module,
     *,
@@ -215,6 +528,10 @@ def _checkpoint_payload(
         "val": val_metrics,
         "detection": det_metrics,
     }
+
+
+def _state_dict_cpu_copy(model: nn.Module) -> dict[str, torch.Tensor]:
+    return {key: value.detach().cpu().clone() for key, value in unwrap_model(model).state_dict().items()}
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -245,9 +562,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--pin-memory", action="store_true", help="Enable pinned-memory DataLoader transfers to CUDA.")
+    parser.add_argument(
+        "--persistent-workers",
+        action="store_true",
+        help="Keep DataLoader worker processes alive across epochs. Only used when --num-workers > 0.",
+    )
+    parser.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=2,
+        help="DataLoader prefetch factor when --num-workers > 0.",
+    )
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--base-channels", type=int, default=32)
     parser.add_argument("--embedding-dim", type=int, default=64)
+    parser.add_argument(
+        "--seg-classes",
+        type=int,
+        default=2,
+        help="Number of segmentation logits in the model. New PU training uses 2; set 3 only for old checkpoints.",
+    )
     parser.add_argument(
         "--model-variant",
         choices=("auto", "fused", "per_band", "fused_encoder"),
@@ -256,7 +591,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "fused_encoder runs one multi-band encoder and lightweight per-band heads for EX/EN. "
         "auto uses fused_encoder for multi-band data or when EN is enabled.",
     )
+    parser.add_argument(
+        "--single-band-detector",
+        action="store_true",
+        help=(
+            "Run all requested bands through one shared 1-channel detector as independent samples, while keeping "
+            "per-band outputs and metrics. This forces --model-variant per_band and disables EX/linking."
+        ),
+    )
     parser.add_argument("--max-records", type=int, default=None)
+    parser.add_argument(
+        "--train-patches",
+        nargs="*",
+        default=(),
+        help="Restrict --mode train training records to specific patches, e.g. 0,0 0,1 or 9813/0,0.",
+    )
+    parser.add_argument(
+        "--train-patches-file",
+        default=None,
+        help="Optional text file with one train patch per line. Lines may use 0,0 or 9813/0,0; # comments are ignored.",
+    )
+    parser.add_argument(
+        "--val-patches",
+        nargs="*",
+        default=(),
+        help="Restrict --mode train validation records to specific patches, e.g. 6,1 or 9813/6,1.",
+    )
+    parser.add_argument(
+        "--val-patches-file",
+        default=None,
+        help="Optional text file with one validation patch per line. Lines may use 6,1 or 9813/6,1; # comments are ignored.",
+    )
     parser.add_argument(
         "--eval-patches",
         nargs="*",
@@ -290,7 +655,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="nchild0",
         help="Catalog rows used as center/embedding/eval GT. Default is deblend_nChild==0 leaf sources.",
     )
-    parser.add_argument("--confidence-threshold", type=float, default=0.0)
+    parser.add_argument("--confidence-threshold", type=float, default=2.0)
     parser.add_argument(
         "--nms-radius",
         type=int,
@@ -303,6 +668,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="cellect",
         help="Score used for center detection. cellect applies DK1 smoothing plus kernel_size=3 local-max logic from CELLECT.",
     )
+    parser.add_argument(
+        "--center-refinement",
+        choices=("integer", "softargmax"),
+        default="integer",
+        help="Post-process detected peaks. integer preserves old pixel-grid centers; softargmax returns sub-pixel x/y centers.",
+    )
+    parser.add_argument(
+        "--center-refinement-radius",
+        type=int,
+        default=1,
+        help="Radius of the score-map window used by --center-refinement softargmax.",
+    )
+    parser.add_argument(
+        "--eval-sources-csv",
+        default=None,
+        help="Path for per-source eval detections with pixel and RA/Dec columns. Default: <out-dir>/eval_sources.csv.",
+    )
+    parser.add_argument(
+        "--no-eval-sources-csv",
+        action="store_true",
+        help="Disable writing the per-source CSV in --mode eval.",
+    )
     parser.add_argument("--center-tolerance-arcsec", type=float, default=0.5)
     parser.add_argument("--pixel-scale-arcsec", type=float, default=0.168)
     parser.add_argument(
@@ -313,8 +700,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     # Shut down the time consuming center loss by default since confidence map supervision is usually sufficient for good center detection, and the center loss can be a significant bottleneck when training with many small sources.
     parser.add_argument("--center-loss-weight", type=float, default=0.0)
-    parser.add_argument("--segmentation-class-weights", type=float, nargs=3, default=(1.0, 32.0, 1.0))
+    parser.add_argument(
+        "--segmentation-class-weights",
+        type=float,
+        nargs="+",
+        default=(1.0, 32.0),
+        help="Binary PU segmentation class weights: background foreground. "
+        "If three values are supplied for an old command, the third core-class weight is ignored.",
+    )
+    parser.add_argument(
+        "--seg-loss-weight",
+        type=float,
+        default=None,
+        help="Outer weight for segmentation loss. Defaults to 1.0 normally and 0.0 with --detection-only.",
+    )
+    parser.add_argument(
+        "--seg-loss-stride",
+        type=int,
+        default=1,
+        help="Compute segmentation loss on an avg/max-pooled grid with this stride. "
+        "Use 2 or 4 when segmentation is only a light regularizer for detector training.",
+    )
     parser.add_argument("--confidence-pos-weight", type=float, default=32.0)
+    parser.add_argument("--shape-loss-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--shape-angle-weight",
+        type=float,
+        default=4.0,
+        help="Weight for angular shape loss 1-cos(delta theta) relative to the two axis-length MSE channels.",
+    )
     parser.add_argument("--triplet-outer-weight", type=float, default=10.0)
     parser.add_argument("--enable-triplet", action="store_true")
     parser.add_argument(
@@ -338,16 +752,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Disable EX cross-band classification loss. By default EX is trained for per_band multi-band runs.",
     )
     parser.add_argument(
+        "--detection-only",
+        action="store_true",
+        help="Train dense detection only: disable segmentation loss, shape loss, EX loss/linking, while leaving confidence and optional EN active.",
+    )
+    parser.add_argument(
         "--ex-core-band",
         default="HSC-I",
-        help="Core band used as EX anchor when --ex-band-pairs is not set. Short names like I are accepted.",
+        help="Core band used only when --ex-band-pairs core is set. Short names like I are accepted.",
     )
     parser.add_argument(
         "--ex-band-pairs",
         nargs="*",
         default=None,
         help="Directed EX training pairs such as HSC-I:HSC-G HSC-I:HSC-R. "
-        "Use 'all' to restore all directed cross-band pairs.",
+        "Default uses adjacent bidirectional wavelength pairs in --bands order; use 'all' for all directed pairs "
+        "or 'core' for the legacy --ex-core-band -> all-other-bands pattern.",
     )
     parser.add_argument(
         "--enable-en-loss",
@@ -367,6 +787,39 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "When enabled, detection metrics are object-level instead of band-level.",
     )
     parser.add_argument("--ex-link-threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--detect-every",
+        type=int,
+        default=5,
+        help="During training, run full validation detection every N epochs using the validation forward pass. "
+        "Set <=0 to disable train-time detection.",
+    )
+    parser.add_argument(
+        "--train-detect-ex-link",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include EX linking and link_metrics in train-time periodic detection when the model supports EX.",
+    )
+    parser.add_argument(
+        "--ignore-mask-during-detection",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Ignore predicted centers that fall inside target ignore_mask when computing detection metrics.",
+    )
+    parser.add_argument(
+        "--enable-pu-self-training",
+        action="store_true",
+        help="Every --pu-self-train-every epochs, run best.pt on the train set and add high-confidence unmatched detections as specially marked pseudo labels.",
+    )
+    parser.add_argument("--pu-self-train-every", type=int, default=5)
+    parser.add_argument("--pu-pseudo-score-percentile-start", type=float, default=99.0)
+    parser.add_argument("--pu-pseudo-score-percentile-end", type=float, default=60.0)
+    parser.add_argument("--pu-pseudo-clean-iou-threshold", type=float, default=0.33)
+    parser.add_argument("--pu-pseudo-axis-ratio-min", type=float, default=0.1)
+    parser.add_argument("--pu-pseudo-conf-weight", type=float, default=0.35)
+    parser.add_argument("--pu-pseudo-seg-weight", type=float, default=0.25)
+    parser.add_argument("--pu-pseudo-shape-weight", type=float, default=0.15)
+    parser.add_argument("--pu-pseudo-max-per-record-band", type=int, default=512)
     parser.add_argument("--matcher-candidate-count", type=int, default=5)
     parser.add_argument(
         "--matcher-max-anchors-per-band",
@@ -394,6 +847,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Distributed backend. auto uses nccl for CUDA and gloo for CPU.",
     )
     parser.add_argument(
+        "--ddp-timeout-minutes",
+        type=float,
+        default=60.0,
+        help="Process-group timeout for long rank0-only work such as full validation detection or PU pseudo-label generation.",
+    )
+    parser.add_argument(
         "--patch-val",
         action="store_true",
         help="Split training and validation by random patch instead of random cutout. This is a coarser split that may better reflect generalization to new sky areas, but results in higher variance.",
@@ -405,6 +864,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
+    if args.seg_loss_weight is None:
+        args.seg_loss_weight = 0.0 if args.detection_only else 1.0
+    if args.single_band_detector:
+        if args.use_ex_link_postprocess or args.train_detect_ex_link or not args.disable_ex_loss:
+            print("single-band detector mode: forcing model_variant=per_band and disabling EX loss/linking")
+        args.model_variant = "per_band"
+        args.disable_ex_loss = True
+        args.use_ex_link_postprocess = False
+        args.train_detect_ex_link = False
+    if args.detection_only:
+        args.shape_loss_weight = 0.0
+        args.disable_ex_loss = True
+        args.use_ex_link_postprocess = False
+        args.train_detect_ex_link = False
+    if len(args.segmentation_class_weights) < 2:
+        raise ValueError("--segmentation-class-weights requires at least background and foreground weights")
+    if int(args.seg_classes) < 2:
+        raise ValueError("--seg-classes must be >= 2")
     distributed, rank, world_size, local_rank, device, backend = _setup_distributed(args)
     is_main = _is_main(rank)
 
@@ -432,13 +909,16 @@ def main() -> None:
             return
 
         eval_patch_specs = _parse_patch_specs(args.eval_patches, args.eval_patches_file)
+        train_patch_specs = _parse_patch_specs(args.train_patches, args.train_patches_file)
+        val_patch_specs = _parse_patch_specs(args.val_patches, args.val_patches_file)
+        explicit_train_val_patches = args.mode == "train" and (bool(train_patch_specs) or bool(val_patch_specs))
         records = discover_cutout_records(
             root,
             reference_dir=reference_dir,
             cutout_dir=cutout_dir,
             band_reference_root=band_reference_root,
             bands=args.bands,
-            max_records=None if args.mode == "eval" and eval_patch_specs else args.max_records,
+            max_records=None if ((args.mode == "eval" and eval_patch_specs) or explicit_train_val_patches) else args.max_records,
         )
         if args.mode == "eval" and eval_patch_specs:
             before_count = len(records)
@@ -453,13 +933,59 @@ def main() -> None:
                     f"Eval patch filter selected {len(records)} / {before_count} records "
                     f"from patches: {selected_patches}"
                 )
-        train_records, val_records = split_records(
-            records,
-            args.val_fraction,
-            args.seed,
-            fixed_val_names=args.fixed_val_names,
-            patch_val=args.patch_val,
-        )
+        if explicit_train_val_patches:
+            all_records = list(records)
+            if train_patch_specs:
+                train_records = _filter_records_by_patches(all_records, train_patch_specs, root)
+            elif val_patch_specs:
+                val_records_tmp = _filter_records_by_patches(all_records, val_patch_specs, root)
+                val_names = {rec.name for rec in val_records_tmp}
+                train_records = [rec for rec in all_records if rec.name not in val_names]
+            else:
+                train_records = list(all_records)
+
+            if val_patch_specs:
+                val_records = _filter_records_by_patches(all_records, val_patch_specs, root)
+            else:
+                train_records, val_records = split_records(
+                    train_records,
+                    args.val_fraction,
+                    args.seed,
+                    fixed_val_names=args.fixed_val_names,
+                    patch_val=args.patch_val,
+                )
+
+            if args.max_records is not None:
+                train_records = train_records[: int(args.max_records)]
+            if not train_records:
+                raise RuntimeError(f"No train records matched requested patches: {sorted(train_patch_specs)}")
+            if not val_records:
+                raise RuntimeError(f"No validation records matched requested patches: {sorted(val_patch_specs)}")
+            train_names = {rec.name for rec in train_records}
+            val_names = {rec.name for rec in val_records}
+            overlap = sorted(train_names & val_names)
+            if overlap:
+                raise RuntimeError(
+                    "Train and validation patch filters overlap at the cutout level; "
+                    f"first overlaps: {overlap[:5]}"
+                )
+            if is_main:
+                train_selected = sorted({_record_patch_label(rec, root) for rec in train_records})
+                val_selected = sorted({_record_patch_label(rec, root) for rec in val_records})
+                print(
+                    f"Train patch filter selected {len(train_records)} records from patches: {train_selected}"
+                )
+                print(
+                    f"Validation patch filter selected {len(val_records)} records from patches: {val_selected}"
+                )
+        else:
+            train_records, val_records = split_records(
+                records,
+                args.val_fraction,
+                args.seed,
+                fixed_val_names=args.fixed_val_names,
+                patch_val=args.patch_val,
+            )
         available_record_names = set()
         for rec in records:
             available_record_names.update(_record_name_aliases(rec))
@@ -475,9 +1001,13 @@ def main() -> None:
             else float(args.center_tolerance_arcsec) / max(float(args.pixel_scale_arcsec), 1e-12)
         )
         weights = LossWeights(
-            segmentation_3cls=tuple(float(v) for v in args.segmentation_class_weights),
+            segmentation_binary=tuple(float(v) for v in args.segmentation_class_weights[:2]),
+            segmentation_outer_weight=float(args.seg_loss_weight),
+            segmentation_loss_stride=max(1, int(args.seg_loss_stride)),
             confidence_pos_weight=float(args.confidence_pos_weight),
+            shape_outer_weight=float(args.shape_loss_weight),
             center_position=float(args.center_loss_weight),
+            shape_angle_weight=float(args.shape_angle_weight),
             triplet_outer_weight=float(args.triplet_outer_weight),
             matcher_outer_weight=float(args.matcher_outer_weight),
         )
@@ -491,28 +1021,48 @@ def main() -> None:
             targets_dir=targets_dir,
             image_cache_dir=image_cache_dir,
         )
-        train_ds = AstroCutoutDataset(train_records, augment=True, **common_ds)
-        val_ds = AstroCutoutDataset(val_records, augment=False, **common_ds)
+        pseudo_label_path = out_dir / "pseudo_labels" / "latest.json" if args.enable_pu_self_training else None
+        train_ds = AstroCutoutDataset(
+            train_records,
+            augment=True,
+            pseudo_label_path=pseudo_label_path,
+            pseudo_confidence_weight=args.pu_pseudo_conf_weight,
+            pseudo_seg_weight=args.pu_pseudo_seg_weight,
+            pseudo_shape_weight=args.pu_pseudo_shape_weight,
+            **common_ds,
+        )
+        val_ds = AstroCutoutDataset(
+            val_records,
+            augment=False,
+            load_eval_ignore_sources=args.mode == "eval" or int(args.detect_every) > 0,
+            **common_ds,
+        )
+        pseudo_detect_loader = None
+        if args.enable_pu_self_training and is_main and args.mode == "train":
+            pseudo_detect_ds = AstroCutoutDataset(train_records, augment=False, **common_ds)
+            pseudo_kwargs = {
+                "batch_size": args.batch_size,
+                "shuffle": False,
+                "num_workers": args.num_workers,
+                "collate_fn": collate_cutouts,
+                "pin_memory": bool(args.pin_memory),
+            }
+            if int(args.num_workers) > 0:
+                pseudo_kwargs["persistent_workers"] = bool(args.persistent_workers)
+                pseudo_kwargs["prefetch_factor"] = max(1, int(args.prefetch_factor))
+            pseudo_detect_loader = DataLoader(pseudo_detect_ds, **pseudo_kwargs)
         train_sampler = (
             DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True, seed=args.seed)
             if distributed and args.mode == "train"
             else None
         )
-        train_loader = DataLoader(
-            train_ds,
-            batch_size=args.batch_size,
-            shuffle=train_sampler is None,
-            sampler=train_sampler,
-            num_workers=args.num_workers,
-            collate_fn=collate_cutouts,
+        val_loader_ds = (
+            Subset(val_ds, list(range(rank, len(val_ds), world_size)))
+            if distributed and args.mode == "train"
+            else val_ds
         )
-        val_loader = DataLoader(
-            val_ds,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-            collate_fn=collate_cutouts,
-        )
+        train_loader = DataLoader(train_ds, **_loader_kwargs(args, shuffle=train_sampler is None, sampler=train_sampler))
+        val_loader = DataLoader(val_loader_ds, **_loader_kwargs(args, shuffle=False))
 
         if args.model_variant == "auto":
             model_variant = "fused_encoder" if len(args.bands) > 1 or args.enable_en_loss else "fused"
@@ -523,6 +1073,7 @@ def main() -> None:
         en_enabled = matcher_variant and bool(args.enable_en_loss)
         en_postprocess_enabled = matcher_variant and (bool(args.use_en_postprocess) or en_enabled)
         ex_link_postprocess_enabled = matcher_variant and len(args.bands) > 1 and bool(args.use_ex_link_postprocess)
+        train_detect_ex_link_enabled = ex_enabled and bool(args.train_detect_ex_link)
         ex_band_pairs = (
             parse_matcher_ex_band_pairs(args.bands, core_band=args.ex_core_band, pair_specs=args.ex_band_pairs)
             if ex_enabled
@@ -532,7 +1083,7 @@ def main() -> None:
         if model_variant == "per_band":
             model = MultiBandAstroCELLECT2D(
                 num_bands=len(args.bands),
-                seg_classes=3,
+                seg_classes=args.seg_classes,
                 confidence_levels=5,
                 embedding_dim=args.embedding_dim,
                 base_channels=args.base_channels,
@@ -543,7 +1094,7 @@ def main() -> None:
         elif model_variant == "fused_encoder":
             model = FusedEncoderMultiBandAstroCELLECT2D(
                 num_bands=len(args.bands),
-                seg_classes=3,
+                seg_classes=args.seg_classes,
                 confidence_levels=5,
                 embedding_dim=args.embedding_dim,
                 base_channels=args.base_channels,
@@ -554,7 +1105,7 @@ def main() -> None:
         else:
             model = AstroUNet2D(
                 in_channels=len(args.bands),
-                seg_classes=3,
+                seg_classes=args.seg_classes,
                 confidence_levels=5,
                 embedding_dim=args.embedding_dim,
                 base_channels=args.base_channels,
@@ -578,10 +1129,9 @@ def main() -> None:
             )
 
         if args.mode == "eval":
-            dense = run_epoch(
+            dense, det = validate_epoch(
                 model,
                 val_loader,
-                optimizer=None,
                 device=device,
                 weights=weights,
                 triplet_loss_fn=HardTripletLoss(weights.triplet_margin),
@@ -594,26 +1144,47 @@ def main() -> None:
                 triplet_negative_scope=args.triplet_negative_scope,
                 ex_band_pairs=ex_band_pairs,
                 center_radius_px=center_radius_px,
-                show_progress=is_main,
-            )
-            det = evaluate_detection(
-                model,
-                val_loader,
-                device=device,
+                compute_detection=True,
                 threshold=args.confidence_threshold,
                 nms_radius=args.nms_radius,
                 confidence_score=args.confidence_score,
-                match_radius=center_radius_px,
+                center_refinement=args.center_refinement,
+                center_refinement_radius=args.center_refinement_radius,
                 use_en_postprocess=en_postprocess_enabled,
-                en_candidate_count=args.matcher_candidate_count,
                 en_threshold=args.en_postprocess_threshold,
                 use_ex_link_postprocess=ex_link_postprocess_enabled,
                 ex_link_threshold=args.ex_link_threshold,
-                ex_band_pairs=ex_band_pairs,
                 band_names=args.bands,
+                ignore_mask_during_detection=bool(args.ignore_mask_during_detection),
+                distributed=False,
                 show_progress=is_main,
             )
             if is_main:
+                if not args.no_eval_sources_csv:
+                    eval_csv = _expand_path(args.eval_sources_csv) if args.eval_sources_csv else out_dir / "eval_sources.csv"
+                    row_count = _write_eval_sources_csv(
+                        model,
+                        val_loader,
+                        eval_csv,
+                        device=device,
+                        fits_hdu=args.fits_hdu,
+                        threshold=args.confidence_threshold,
+                        nms_radius=args.nms_radius,
+                        confidence_score=args.confidence_score,
+                        center_refinement=args.center_refinement,
+                        center_refinement_radius=args.center_refinement_radius,
+                        match_radius=center_radius_px,
+                        use_en_postprocess=en_postprocess_enabled,
+                        en_candidate_count=args.matcher_candidate_count,
+                        en_threshold=args.en_postprocess_threshold,
+                        use_ex_link_postprocess=ex_link_postprocess_enabled,
+                        ex_link_threshold=args.ex_link_threshold,
+                        ex_band_pairs=ex_band_pairs,
+                        band_names=args.bands,
+                        show_progress=True,
+                    )
+                    det["sources_csv"] = str(eval_csv)
+                    det["sources_csv_rows"] = row_count
                 print(json.dumps({"dense": dense, "detection": det}, indent=2))
             _sync_distributed()
             return
@@ -630,14 +1201,22 @@ def main() -> None:
             "num_records": len(records),
             "num_train": len(train_records),
             "num_val": len(val_records),
+            "num_val_local": len(val_loader_ds),
             "fixed_val_names": list(args.fixed_val_names),
             "val_record_names": [rec.name for rec in val_records],
+            "train_patch_specs": sorted(train_patch_specs),
+            "val_patch_specs": sorted(val_patch_specs),
             "center_radius_px": center_radius_px,
+            "center_refinement": str(args.center_refinement),
+            "center_refinement_radius": int(args.center_refinement_radius),
             "targets_dir": str(targets_dir) if targets_dir is not None else None,
             "image_cache_dir": str(image_cache_dir) if image_cache_dir is not None else None,
             "band_reference_root": str(band_reference_root) if band_reference_root is not None else None,
             "model_variant": model_variant,
+            "single_band_detector": bool(args.single_band_detector),
+            "seg_classes": int(args.seg_classes),
             "distributed": distributed,
+            "distributed_validation": bool(distributed and args.mode == "train"),
             "world_size": world_size,
             "dist_backend": backend,
             "ex_enabled": ex_enabled,
@@ -647,13 +1226,19 @@ def main() -> None:
             "en_enabled": en_enabled,
             "en_postprocess_enabled": en_postprocess_enabled,
             "ex_link_postprocess_enabled": ex_link_postprocess_enabled,
+            "train_detect_ex_link_enabled": train_detect_ex_link_enabled,
+            "detect_every": int(args.detect_every),
             "ex_link_threshold": float(args.ex_link_threshold),
+            "pu_self_training_enabled": bool(args.enable_pu_self_training),
+            "pu_self_train_every": int(args.pu_self_train_every),
+            "pu_pseudo_label_path": str(pseudo_label_path) if pseudo_label_path is not None else None,
         }
         if is_main:
             (out_dir / "run_config.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         _sync_distributed()
 
         best_val = float("inf")
+        best_state_cpu: dict[str, torch.Tensor] | None = None
         for epoch in range(args.epochs):
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
@@ -677,48 +1262,41 @@ def main() -> None:
                 show_progress=is_main,
             )
 
-            if is_main:
-                eval_model = unwrap_model(model)
-                val_metrics = run_epoch(
-                    eval_model,
-                    val_loader,
-                    optimizer=None,
-                    device=device,
-                    weights=weights,
-                    triplet_loss_fn=triplet_loss_fn,
-                    triplet_enabled=args.enable_triplet,
-                    ex_enabled=ex_enabled,
-                    en_enabled=en_enabled,
-                    matcher_candidate_count=args.matcher_candidate_count,
-                    matcher_max_anchors_per_band=args.matcher_max_anchors_per_band,
-                    triplet_max_sources_per_group=args.triplet_max_sources_per_group,
-                    triplet_negative_scope=args.triplet_negative_scope,
-                    ex_band_pairs=ex_band_pairs,
-                    center_radius_px=center_radius_px,
-                    show_progress=True,
-                )
-                det_metrics = evaluate_detection(
-                    eval_model,
-                    val_loader,
-                    device=device,
-                    threshold=args.confidence_threshold,
-                    nms_radius=args.nms_radius,
-                    confidence_score=args.confidence_score,
-                    match_radius=center_radius_px,
-                    use_en_postprocess=en_postprocess_enabled,
-                    en_candidate_count=args.matcher_candidate_count,
-                    en_threshold=args.en_postprocess_threshold,
-                    use_ex_link_postprocess=ex_link_postprocess_enabled,
-                    ex_link_threshold=args.ex_link_threshold,
-                    ex_band_pairs=ex_band_pairs,
-                    band_names=args.bands,
-                    show_progress=True,
-                )
-                val_total = float(val_metrics["total"])
-            else:
-                val_metrics = {"total": 0.0}
-                det_metrics = {}
-                val_total = 0.0
+            eval_model = unwrap_model(model)
+            run_detect = int(args.detect_every) > 0 and ((epoch + 1) % int(args.detect_every) == 0)
+            val_metrics, det_metrics = validate_epoch(
+                eval_model,
+                val_loader,
+                device=device,
+                weights=weights,
+                triplet_loss_fn=triplet_loss_fn,
+                triplet_enabled=args.enable_triplet,
+                ex_enabled=ex_enabled,
+                en_enabled=en_enabled,
+                matcher_candidate_count=args.matcher_candidate_count,
+                matcher_max_anchors_per_band=args.matcher_max_anchors_per_band,
+                triplet_max_sources_per_group=args.triplet_max_sources_per_group,
+                triplet_negative_scope=args.triplet_negative_scope,
+                ex_band_pairs=ex_band_pairs,
+                center_radius_px=center_radius_px,
+                compute_detection=run_detect,
+                threshold=args.confidence_threshold,
+                nms_radius=args.nms_radius,
+                confidence_score=args.confidence_score,
+                center_refinement=args.center_refinement,
+                center_refinement_radius=args.center_refinement_radius,
+                use_en_postprocess=en_postprocess_enabled,
+                en_threshold=args.en_postprocess_threshold,
+                use_ex_link_postprocess=train_detect_ex_link_enabled,
+                ex_link_threshold=args.ex_link_threshold,
+                band_names=args.bands,
+                ignore_mask_during_detection=bool(args.ignore_mask_during_detection),
+                distributed=distributed,
+                show_progress=is_main,
+            )
+            if not run_detect:
+                det_metrics = {"skipped": True, "detect_every": int(args.detect_every)}
+            val_total = float(val_metrics["total"])
 
             val_total_tensor = torch.tensor([val_total], device=device, dtype=torch.float64)
             if distributed:
@@ -733,8 +1311,6 @@ def main() -> None:
                     "detection": det_metrics,
                     "lr": optimizer.param_groups[0]["lr"],
                 }
-                print(json.dumps(log_line, indent=2))
-
                 ckpt = _checkpoint_payload(
                     model,
                     model_variant=model_variant,
@@ -746,10 +1322,58 @@ def main() -> None:
                     det_metrics=det_metrics,
                 )
                 torch.save(ckpt, out_dir / "last.pt")
+                best_updated = False
                 if val_metrics["total"] < best_val:
                     best_val = val_metrics["total"]
+                    best_state_cpu = _state_dict_cpu_copy(eval_model)
                     torch.save(ckpt, out_dir / "best.pt")
+                    best_updated = True
+                log_line["best_updated"] = best_updated
+                if args.enable_pu_self_training and int(args.pu_self_train_every) > 0 and ((epoch + 1) % int(args.pu_self_train_every) == 0):
+                    if best_state_cpu is None:
+                        best_state_cpu = _state_dict_cpu_copy(eval_model)
+                        torch.save(ckpt, out_dir / "best.pt")
+                    current_state = _state_dict_cpu_copy(eval_model)
+                    eval_model.load_state_dict(best_state_cpu)
+                    pseudo_path = out_dir / "pseudo_labels" / f"epoch_{epoch + 1:04d}.json"
+                    pseudo_summary = generate_pu_pseudo_labels(
+                        eval_model,
+                        pseudo_detect_loader,
+                        device=device,
+                        epoch=epoch,
+                        total_epochs=args.epochs,
+                        output_path=pseudo_path,
+                        band_names=args.bands,
+                        score_percentile_start=args.pu_pseudo_score_percentile_start,
+                        score_percentile_end=args.pu_pseudo_score_percentile_end,
+                        min_center_distance_px=center_radius_px,
+                        clean_iou_threshold=args.pu_pseudo_clean_iou_threshold,
+                        axis_ratio_min=args.pu_pseudo_axis_ratio_min,
+                        nms_radius=args.nms_radius,
+                        confidence_score=args.confidence_score,
+                        ellipse_sigma=args.ellipse_sigma,
+                        max_pseudo_per_record_band=args.pu_pseudo_max_per_record_band,
+                        show_progress=True,
+                    )
+                    eval_model.load_state_dict(current_state)
+                    latest_path = out_dir / "pseudo_labels" / "latest.json"
+                    latest_path.write_text(pseudo_path.read_text(encoding="utf-8"), encoding="utf-8")
+                    (out_dir / "pseudo_labels" / "latest_summary.json").write_text(
+                        json.dumps(pseudo_summary, indent=2),
+                        encoding="utf-8",
+                    )
+                    log_line["pu_self_training"] = pseudo_summary
+                print(json.dumps(log_line, indent=2))
             _sync_distributed()
+            if (
+                args.enable_pu_self_training
+                and pseudo_label_path is not None
+                and args.mode == "train"
+                and int(args.pu_self_train_every) > 0
+                and ((epoch + 1) % int(args.pu_self_train_every) == 0)
+            ):
+                train_ds.reload_pseudo_labels(pseudo_label_path)
+                train_loader = DataLoader(train_ds, **_loader_kwargs(args, shuffle=train_sampler is None, sampler=train_sampler))
     finally:
         _cleanup_distributed()
 
