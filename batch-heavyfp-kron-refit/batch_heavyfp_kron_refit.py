@@ -14,6 +14,7 @@ from astropy.wcs import WCS
 
 CENTRAL_PIXEL_ER = 0.38259771140356325
 
+KRON_FLAGS = ["ext_photometryKron_KronFlux_flag_bad_radius", "ext_photometryKron_KronFlux_flag_used_psf_radius", "ext_photometryKron_KronFlux_flag_used_minimum_radius", "ext_photometryKron_KronFlux_flag_small_radius"]
 
 @dataclass(frozen=True)
 class ArchiveLookup:
@@ -529,6 +530,10 @@ def build_source_arrays(
         "base_sdss_shape_flag": flag("base_SdssShape_flag")[rows],
         "base_psf_flux_flag": flag("base_PsfFlux_flag")[rows],
     }
+    kron_info = {
+        flag_name: flag(flag_name)[rows] for flag_name in KRON_FLAGS
+    }
+    sources.update(kron_info)
     n = len(rows)
     sources["footprint_archive_found"] = np.zeros(n, dtype=bool)
     sources["spanset_archive_found"] = np.zeros(n, dtype=bool)
@@ -1044,6 +1049,8 @@ def build_output_rows(
             "footprint_area": int(sources["footprint_area"][index]),
             "heavy_row": int(sources["heavy_row"][index]),
         }
+        kron_info = {flag_name: bool(sources[flag_name][index]) for flag_name in KRON_FLAGS}
+        row.update(kron_info)
         for key, value in measurement.items():
             if isinstance(value, np.ndarray):
                 item = value[index]
