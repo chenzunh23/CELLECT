@@ -27,6 +27,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -178,6 +179,29 @@ def parse_args() -> argparse.Namespace:
         "--no-size-check",
         action="store_true",
         help="Do not issue HEAD requests to compare existing file sizes.",
+    )
+    parser.add_argument(
+        "--no-heavy-footprint-check",
+        action="store_true",
+        help=(
+            "Disable local meas FITS validation for heavy footprint archive HDUs. "
+            "By default, bad/too-small heavy-footprint meas files are redownloaded."
+        ),
+    )
+    parser.add_argument(
+        "--heavy-footprint-min-rows",
+        type=int,
+        default=1,
+        help="Minimum HeavyFootprintF rows required in meas FITS files. Default: 1.",
+    )
+    parser.add_argument(
+        "--heavy-footprint-min-ref-fraction",
+        type=float,
+        default=0.05,
+        help=(
+            "Minimum HeavyFootprintF row count divided by footprint-ref row count for meas FITS validation. "
+            "Default: 0.05. Set to 0 to disable the ratio check."
+        ),
     )
     parser.add_argument(
         "--no-progress",
@@ -443,6 +467,67 @@ def content_length_wget(
     return None
 
 
+def is_meas_fits_path(path: Path) -> bool:
+    name = path.name.lower()
+    if name.endswith(".part"):
+        name = name[: -len(".part")]
+    return (name.startswith("meas-") or re.search(r"(^|[-_.])meas([-_.]|$)", name) is not None) and (
+        name.endswith(".fits") or name.endswith(".fits.gz")
+    )
+
+
+def validate_heavy_footprints(
+    path: Path,
+    *,
+    min_rows: int,
+    min_ref_fraction: float,
+) -> tuple[bool, str]:
+    if not is_meas_fits_path(path):
+        return True, "not a meas FITS"
+    try:
+        from astropy.io import fits
+    except Exception as exc:  # noqa: BLE001 - downloader can still run without astropy.
+        return True, f"astropy unavailable; skipped heavy footprint check: {exc}"
+    if not path.exists():
+        return False, "file does not exist"
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with fits.open(path, memmap=True, ignore_missing_end=True) as hdul:
+                if len(hdul) < 7:
+                    return False, f"meas FITS has {len(hdul)} HDU(s), expected at least 7"
+                try:
+                    footprint_refs = hdul[3].data
+                    heavy_table = hdul[6].data
+                except Exception as exc:  # noqa: BLE001 - malformed/truncated HDUs should trigger retry.
+                    return False, f"failed to read footprint archive HDUs: {exc}"
+                ref_rows = len(footprint_refs) if footprint_refs is not None else 0
+                heavy_rows = len(heavy_table) if heavy_table is not None else 0
+                if heavy_rows < max(0, int(min_rows)):
+                    return False, f"HeavyFootprintF HDU too small: rows={heavy_rows}, min_rows={int(min_rows)}"
+                if min_ref_fraction > 0.0 and ref_rows > 0:
+                    fraction = heavy_rows / max(ref_rows, 1)
+                    if fraction < float(min_ref_fraction):
+                        return (
+                            False,
+                            "HeavyFootprintF HDU too small relative to footprint refs: "
+                            f"heavy_rows={heavy_rows}, ref_rows={ref_rows}, fraction={fraction:.4f}, "
+                            f"min_fraction={float(min_ref_fraction):.4f}",
+                        )
+                if heavy_table is not None and "image" in getattr(heavy_table, "names", ()):
+                    try:
+                        sample_count = min(16, heavy_rows)
+                        if sample_count:
+                            value_count = sum(len(heavy_table["image"][idx]) for idx in range(sample_count))
+                            if value_count <= 0:
+                                return False, "HeavyFootprintF image arrays are empty"
+                    except Exception as exc:  # noqa: BLE001
+                        return False, f"failed to inspect HeavyFootprintF image arrays: {exc}"
+                return True, f"heavy_rows={heavy_rows}, ref_rows={ref_rows}"
+    except Exception as exc:  # noqa: BLE001 - malformed/truncated files should trigger retry.
+        return False, f"failed to open meas FITS for heavy footprint validation: {exc}"
+
+
 def should_skip_existing(
     opener: urllib.request.OpenerDirector,
     task: DownloadTask,
@@ -450,10 +535,22 @@ def should_skip_existing(
     size_check: bool,
     overwrite: bool,
     overwrite_smaller: bool,
+    heavy_footprint_check: bool,
+    heavy_footprint_min_rows: int,
+    heavy_footprint_min_ref_fraction: float,
     content_length_func: Callable[[str], int | None] | None = None,
 ) -> bool:
     if overwrite or not task.dest.exists():
         return False
+    if heavy_footprint_check and is_meas_fits_path(task.dest):
+        ok, reason = validate_heavy_footprints(
+            task.dest,
+            min_rows=heavy_footprint_min_rows,
+            min_ref_fraction=heavy_footprint_min_ref_fraction,
+        )
+        if not ok:
+            print(f"REDOWNLOAD bad heavy footprint: {task.dest} ({reason})", file=sys.stderr)
+            return False
     if not size_check:
         return True
     remote_size = content_length_func(task.url) if content_length_func is not None else content_length(opener, task.url, timeout=timeout)
@@ -612,6 +709,9 @@ def download_one(
     overwrite: bool,
     overwrite_smaller: bool,
     size_check: bool,
+    heavy_footprint_check: bool,
+    heavy_footprint_min_rows: int,
+    heavy_footprint_min_ref_fraction: float,
     download_backend: str,
     wget_bin: str,
     username: str | None,
@@ -620,7 +720,18 @@ def download_one(
     content_length_func: Callable[[str], int | None] | None,
     progress: ProgressReporter | None,
 ) -> str:
-    if should_skip_existing(opener, task, timeout, size_check, overwrite, overwrite_smaller, content_length_func):
+    if should_skip_existing(
+        opener,
+        task,
+        timeout,
+        size_check,
+        overwrite,
+        overwrite_smaller,
+        heavy_footprint_check,
+        heavy_footprint_min_rows,
+        heavy_footprint_min_ref_fraction,
+        content_length_func,
+    ):
         if progress:
             progress.finish_file(task)
         return f"SKIP {task.dest}"
@@ -672,6 +783,14 @@ def download_one(
                     raise IOError(
                         f"incomplete download: wrote {bytes_written} byte(s), expected {expected_size} from Content-Length"
                     )
+            if heavy_footprint_check and is_meas_fits_path(part_path):
+                ok, reason = validate_heavy_footprints(
+                    part_path,
+                    min_rows=heavy_footprint_min_rows,
+                    min_ref_fraction=heavy_footprint_min_ref_fraction,
+                )
+                if not ok:
+                    raise IOError(f"bad heavy footprint after download: {reason}")
             part_path.replace(task.dest)
             if progress:
                 progress.finish_file(task)
@@ -807,6 +926,9 @@ def main() -> int:
                 args.overwrite,
                 args.overwrite_smaller,
                 size_check,
+                not args.no_heavy_footprint_check,
+                args.heavy_footprint_min_rows,
+                args.heavy_footprint_min_ref_fraction,
                 args.download_backend,
                 args.wget_bin,
                 username,

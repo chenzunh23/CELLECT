@@ -25,6 +25,7 @@ CATALOG_DIRS = {
     "clean": "band_reference_catalogs",
     "center_only": "band_reference_center_only",
     "ordinary_ignore": "band_reference_ignore",
+    "strict_center_only": "band_reference_strict_center_only",
     "strict_ignore": "band_reference_strict_ignore",
     "pu_all": "band_reference_pu_all",
 }
@@ -33,6 +34,7 @@ CLASS_COLORS = {
     "clean": "green",
     "center_only": "yellow",
     "ordinary_ignore": "red",
+    "strict_center_only": "magenta",
     "strict_ignore": "magenta",
     "pu_all": "cyan",
 }
@@ -68,10 +70,44 @@ def _ensure_ellipse_columns(table: Table, *, shape_source: str) -> Table:
 
 def _catalog_path(root: Path, tract: str, patch: str, band: str, class_name: str) -> Path:
     rel_dir = CATALOG_DIRS[class_name]
-    return root / tract / patch / rel_dir / band / f"meas-{band}-{tract}-{patch}.fits"
+    path = root / tract / patch / rel_dir / band / f"meas-{band}-{tract}-{patch}.fits"
+    if class_name == "strict_center_only" and not path.exists():
+        return root / tract / patch / CATALOG_DIRS["strict_ignore"] / band / f"meas-{band}-{tract}-{patch}.fits"
+    return path
 
 def _calexp_path(root: Path, tract: str, patch: str, band: str) -> Path:
     return root / tract / band / patch / f"calexp-{band}-{tract}-{patch}.fits"
+
+
+def _meas_catalog_path(root: Path, tract: str, patch: str, band: str) -> Path:
+    return root / tract / band / patch / f"meas-{band}-{tract}-{patch}.fits"
+
+
+def _patch_origin_from_calexp(path: Path) -> tuple[float, float]:
+    """Return full-pixel origin of a patch calexp.
+
+    HSC calexp images store the patch-local image with LTV offsets.  Source
+    catalogs use full-pixel tract coordinates, while DS9 image regions for a
+    patch calexp need patch-local coordinates.  CRVAL1A/CRVAL2A are alternate
+    WCS values and are not reliable patch origins.
+    """
+
+    if not path.exists():
+        print(f"[WARNING] Calexp file not found; assuming patch origin (0,0): {path}", flush=True)
+        return 0.0, 0.0
+    with fits.open(path, memmap=True, lazy_load_hdus=True, ignore_missing_end=True) as hdulist:
+        for hdu in hdulist:
+            header = hdu.header
+            if int(header.get("NAXIS", 0)) < 2:
+                continue
+            if "LTV1" in header and "LTV2" in header:
+                x0 = -float(header["LTV1"])
+                y0 = -float(header["LTV2"])
+                print(f"Found patch origin from LTV for {path}: x0={x0:g}, y0={y0:g}", flush=True)
+                return x0, y0
+    print(f"[WARNING] No LTV1/LTV2 found; assuming patch origin (0,0): {path}", flush=True)
+    return 0.0, 0.0
+
 
 def _parse_tile_origin(tile_name: Optional[str]) -> tuple[Optional[float], Optional[float]]:
     if not tile_name:
@@ -95,7 +131,7 @@ def _crop_mask(
     crop: bool = False,
 ) -> np.ndarray:
     valid = np.isfinite(x) & np.isfinite(y)
-    if x0 is None or y0 is None or crop is False:
+    if x0 is None or y0 is None:
         return valid
     if width is None or height is None:
         raise ValueError("--crop-width/--crop-height or --crop-size is required when using crop coordinates")
@@ -136,7 +172,14 @@ def _region_line(
     )
 
 
-def _write_reg(path: Path, rows: list[dict[str, object]], *, point_size: int, max_ellipse_area_as_point: float) -> None:
+def _write_reg(
+    path: Path,
+    rows: list[dict[str, object]],
+    *,
+    point_size: int,
+    max_ellipse_area_as_point: float,
+    coordinate_system: str,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         handle.write("# Region file format: DS9 version 4.1\n")
@@ -144,7 +187,7 @@ def _write_reg(path: Path, rows: list[dict[str, object]], *, point_size: int, ma
             'global color=green dashlist=8 3 width=2 font="helvetica 12 normal roman" '
             "select=1 highlite=1 dash=0 fixed=0 edit=1 move=1 delete=1 include=1 source=1\n"
         )
-        handle.write("image\n")
+        handle.write(f"{coordinate_system}\n")
         for row in rows:
             handle.write(
                 _region_line(
@@ -180,6 +223,12 @@ def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
         "ellipse_area",
         "mag",
         "pu_reason",
+        "ap2_flux",
+        "kron_flux",
+        "ap2_mag",
+        "kron_mag",
+        "ap2_minus_kron_mag",
+        "ap2_kron_filter",
     )
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -195,12 +244,15 @@ def _rows_from_table(
     patch: str,
     band: str,
     class_name: str,
-    x0: Optional[float],
-    y0: Optional[float],
+    patch_origin_x: float,
+    patch_origin_y: float,
+    crop_x0: Optional[float],
+    crop_y0: Optional[float],
     width: Optional[float],
     height: Optional[float],
     margin: float,
     local_coordinates: bool,
+    region_coordinates: str,
     shape_source: str,
     reg_width: int,
 ) -> list[dict[str, object]]:
@@ -219,7 +271,7 @@ def _rows_from_table(
     y_col = _find_column(table, ("base_SdssCentroid_y", "base_SdssShape_y", "slot_Centroid_y", "y"), role="y")
     x = np.asarray(table[x_col], dtype=np.float64)
     y = np.asarray(table[y_col], dtype=np.float64)
-    mask = _crop_mask(x, y, x0=x0, y0=y0, width=width, height=height, margin=margin, crop=local_coordinates)
+    mask = _crop_mask(x, y, x0=crop_x0, y0=crop_y0, width=width, height=height, margin=margin)
     major = np.asarray(table["ellipse_major_sigma"], dtype=np.float64)
     minor = np.asarray(table["ellipse_minor_sigma"], dtype=np.float64)
     theta = np.asarray(table["ellipse_theta"], dtype=np.float64)
@@ -229,13 +281,19 @@ def _rows_from_table(
 
     rows: list[dict[str, object]] = []
     for idx in np.flatnonzero(mask):
-        px = float(x[idx])
-        py = float(y[idx])
-        # Subtract tile origin
-        px = px - float(x0) if x0 is not None else px
-        py = py - float(y0) if y0 is not None else py
-        rx = px - float(x0) if local_coordinates and x0 is not None else px
-        ry = py - float(y0) if local_coordinates and y0 is not None else py
+        full_x = float(x[idx])
+        full_y = float(y[idx])
+        patch_x = full_x - float(patch_origin_x)
+        patch_y = full_y - float(patch_origin_y)
+        if region_coordinates == "physical":
+            rx = full_x
+            ry = full_y
+        elif local_coordinates and crop_x0 is not None and crop_y0 is not None:
+            rx = full_x - float(crop_x0)
+            ry = full_y - float(crop_y0)
+        else:
+            rx = patch_x
+            ry = patch_y
         row_major = float(major[idx])
         row_minor = float(minor[idx])
         row_theta = float(theta[idx])
@@ -248,8 +306,8 @@ def _rows_from_table(
                 "source_id": int(source_id[idx]) if np.isfinite(source_id[idx]) else "",
                 "x": rx,
                 "y": ry,
-                "patch_x": px,
-                "patch_y": py,
+                "patch_x": patch_x,
+                "patch_y": patch_y,
                 "major": row_major,
                 "minor": row_minor,
                 "theta": row_theta,
@@ -266,40 +324,124 @@ def _rows_from_table(
     return rows
 
 
+def _format_threshold(value: float) -> str:
+    text = f"{float(value):g}"
+    return text.replace("-", "m").replace(".", "p")
+
+
+def _safe_mag(flux: float, zeropoint: float) -> float:
+    if not np.isfinite(flux) or flux <= 0.0:
+        return float("nan")
+    return float(zeropoint) - 2.5 * math.log10(float(flux))
+
+
+def _load_ap2_kron_photometry(
+    *,
+    path: Path,
+    ids: Iterable[int],
+    ap2_flux_column: str,
+    kron_flux_column: str,
+    zeropoint: float,
+) -> dict[int, dict[str, float]]:
+    wanted = set(int(value) for value in ids if value != "")
+    if not wanted:
+        return {}
+    if not path.exists():
+        raise FileNotFoundError(f"meas catalog for ap2/kron filtering not found: {path}")
+    with fits.open(path, memmap=True, lazy_load_hdus=True, ignore_missing_end=True) as hdul:
+        table = hdul[1].data
+        names = set(table.columns.names)
+        for column in ("id", ap2_flux_column, kron_flux_column):
+            if column not in names:
+                raise KeyError(f"{path} missing required column for ap2/kron filtering: {column}")
+        ids_array = np.asarray(table["id"], dtype=np.int64)
+        mask = np.isin(ids_array, np.asarray(list(wanted), dtype=np.int64))
+        out: dict[int, dict[str, float]] = {}
+        for source_id, ap2_flux, kron_flux in zip(
+            ids_array[mask],
+            table[ap2_flux_column][mask],
+            table[kron_flux_column][mask],
+        ):
+            ap2_mag = _safe_mag(float(ap2_flux), zeropoint)
+            kron_mag = _safe_mag(float(kron_flux), zeropoint)
+            diff = ap2_mag - kron_mag if np.isfinite(ap2_mag) and np.isfinite(kron_mag) else float("nan")
+            out[int(source_id)] = {
+                "ap2_flux": float(ap2_flux),
+                "kron_flux": float(kron_flux),
+                "ap2_mag": ap2_mag,
+                "kron_mag": kron_mag,
+                "ap2_minus_kron_mag": diff,
+            }
+        return out
+
+
+def _apply_ap2_kron_filter(
+    rows: list[dict[str, object]],
+    *,
+    photometry: dict[int, dict[str, float]],
+    abs_max: float,
+) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
+    kept: list[dict[str, object]] = []
+    rejected: list[dict[str, object]] = []
+    invalid: list[dict[str, object]] = []
+    for row in rows:
+        item = dict(row)
+        try:
+            source_id = int(item["source_id"])
+        except Exception:
+            source_id = -1
+        phot = photometry.get(source_id)
+        if phot is None:
+            item["ap2_kron_filter"] = "invalid_missing_source_id"
+            invalid.append(item)
+            continue
+        for key, value in phot.items():
+            item[key] = value if np.isfinite(value) else ""
+        diff = phot["ap2_minus_kron_mag"]
+        if not np.isfinite(diff):
+            item["ap2_kron_filter"] = "invalid_flux"
+            invalid.append(item)
+        elif abs(float(diff)) <= float(abs_max):
+            item["ap2_kron_filter"] = "kept"
+            kept.append(item)
+        else:
+            item["ap2_kron_filter"] = "rejected_abs_gt_threshold"
+            rejected.append(item)
+    return kept, rejected, invalid
+
+
 def export_one(args: argparse.Namespace, *, patch: str, band: str) -> dict[str, object]:
     calexp_path = _calexp_path(Path(args.data), str(args.tract), patch, band)
+    patch_origin_x, patch_origin_y = _patch_origin_from_calexp(calexp_path)
 
-    # Read table header using fits
-    if not calexp_path.exists():
-        print(f'[WARNING] Calexp file not found for {args.tract}/{patch} {band}: {calexp_path}', flush=True)
-        calexp_header = {}
-    else:
-        with fits.open(calexp_path) as hdulist:
-            calexp_header = hdulist[1].header
-    x_patch, y_patch = 0, 0
-    if "CRVAL1A" in calexp_header and "CRVAL2A" in calexp_header:
-        x_patch, y_patch = calexp_header["CRVAL1A"], calexp_header["CRVAL2A"]
-        print(
-            f"Found WCS reference in calexp header for {args.tract}/{patch} {band}: "
-            f"CRVAL1A={calexp_header['CRVAL1A']}, CRVAL2A={calexp_header['CRVAL2A']}",
-            flush=True,
-        )
-    else:
-        print(f'[WARNING] No WCS reference found in calexp header for {args.tract}/{patch} {band}, setting origin to (0,0)', flush=True)
-    x0, y0 = _parse_tile_origin(args.tile_name)
+    crop_local_x0, crop_local_y0 = _parse_tile_origin(args.tile_name)
     if args.crop_x0 is not None:
-        x0 = float(args.crop_x0)
+        crop_local_x0 = float(args.crop_x0)
     if args.crop_y0 is not None:
-        y0 = float(args.crop_y0)
-    x0 = x0 + x_patch if x0 is not None else x_patch
-    y0 = y0 + y_patch if y0 is not None else y_patch
+        crop_local_y0 = float(args.crop_y0)
+    if crop_local_x0 is not None and crop_local_y0 is not None:
+        if args.crop_coordinates == "full":
+            crop_x0 = float(crop_local_x0)
+            crop_y0 = float(crop_local_y0)
+            crop_label_x0 = crop_x0
+            crop_label_y0 = crop_y0
+        else:
+            crop_x0 = float(crop_local_x0) + float(patch_origin_x)
+            crop_y0 = float(crop_local_y0) + float(patch_origin_y)
+            crop_label_x0 = float(crop_local_x0)
+            crop_label_y0 = float(crop_local_y0)
+    else:
+        crop_x0 = None
+        crop_y0 = None
+        crop_label_x0 = None
+        crop_label_y0 = None
     width = float(args.crop_size) if args.crop_size is not None else args.crop_width
     height = float(args.crop_size) if args.crop_size is not None else args.crop_height
 
     patch_label = patch.replace(",", "_")
     crop_suffix = ""
-    if x0 is not None and y0 is not None:
-        crop_suffix = f"_x{int(x0)}_y{int(y0)}"
+    if crop_label_x0 is not None and crop_label_y0 is not None:
+        crop_suffix = f"_x{int(crop_label_x0)}_y{int(crop_label_y0)}"
         if width is not None and height is not None:
             crop_suffix += f"_w{int(width)}_h{int(height)}"
 
@@ -313,22 +455,34 @@ def export_one(args: argparse.Namespace, *, patch: str, band: str) -> dict[str, 
                 class_counts[class_name] = 0
                 continue
             raise FileNotFoundError(f"{class_name} catalog not found: {path}")
+        table = _read_table(path)
+        if len(table) == 0:
+            print(f"WARNING: {patch} {band} {class_name} catalog is empty: {path}", flush=True)
         rows = _rows_from_table(
-            _read_table(path),
+            table,
             tract=str(args.tract),
             patch=patch,
             band=band,
             class_name=class_name,
-            x0=x0,
-            y0=y0,
+            patch_origin_x=patch_origin_x,
+            patch_origin_y=patch_origin_y,
+            crop_x0=crop_x0,
+            crop_y0=crop_y0,
             width=width,
             height=height,
             margin=float(args.crop_margin),
             local_coordinates=bool(args.local_coordinates),
+            region_coordinates=str(args.region_coordinates),
             shape_source=str(args.shape_source),
             reg_width=int(args.reg_width),
         )
         class_counts[class_name] = len(rows)
+        if len(table) and not rows:
+            print(
+                f"WARNING: {patch} {band} {class_name} catalog has {len(table)} rows but export selected 0. "
+                "Check crop coordinates and --crop-coordinates.",
+                flush=True,
+            )
         all_rows.extend(rows)
         if args.write_class_files:
             stem = f"{str(args.tract)}_{patch_label}_{band}_{class_name}{crop_suffix}"
@@ -337,6 +491,7 @@ def export_one(args: argparse.Namespace, *, patch: str, band: str) -> dict[str, 
                 rows,
                 point_size=int(args.point_size),
                 max_ellipse_area_as_point=float(args.max_ellipse_area_as_point),
+                coordinate_system=str(args.region_coordinates),
             )
             _write_csv(output_dir / f"{stem}.csv", rows)
 
@@ -348,8 +503,55 @@ def export_one(args: argparse.Namespace, *, patch: str, band: str) -> dict[str, 
         all_rows,
         point_size=int(args.point_size),
         max_ellipse_area_as_point=float(args.max_ellipse_area_as_point),
+        coordinate_system=str(args.region_coordinates),
     )
     _write_csv(csv_path, all_rows)
+    ap2_summary: dict[str, object] = {}
+    if args.ap2_kron_abs_max is not None:
+        threshold = float(args.ap2_kron_abs_max)
+        photometry = _load_ap2_kron_photometry(
+            path=_meas_catalog_path(Path(args.data), str(args.tract), patch, band),
+            ids=[int(row["source_id"]) for row in all_rows if row.get("source_id") != ""],
+            ap2_flux_column=str(args.ap2_flux_column),
+            kron_flux_column=str(args.kron_flux_column),
+            zeropoint=float(args.photometry_zeropoint),
+        )
+        kept, rejected, invalid = _apply_ap2_kron_filter(all_rows, photometry=photometry, abs_max=threshold)
+        suffix = f"_abs_ap2_minus_kron_le{_format_threshold(threshold)}"
+        kept_reg_path = output_dir / f"{combined_stem}{suffix}.reg"
+        kept_csv_path = output_dir / f"{combined_stem}{suffix}.csv"
+        rejected_reg_path = output_dir / f"{combined_stem}_abs_ap2_minus_kron_gt{_format_threshold(threshold)}.reg"
+        rejected_csv_path = output_dir / f"{combined_stem}_abs_ap2_minus_kron_gt{_format_threshold(threshold)}.csv"
+        invalid_reg_path = output_dir / f"{combined_stem}_ap2_kron_invalid.reg"
+        invalid_csv_path = output_dir / f"{combined_stem}_ap2_kron_invalid.csv"
+        for out_reg, out_csv, out_rows in (
+            (kept_reg_path, kept_csv_path, kept),
+            (rejected_reg_path, rejected_csv_path, rejected),
+            (invalid_reg_path, invalid_csv_path, invalid),
+        ):
+            _write_reg(
+                out_reg,
+                out_rows,
+                point_size=int(args.point_size),
+                max_ellipse_area_as_point=float(args.max_ellipse_area_as_point),
+                coordinate_system=str(args.region_coordinates),
+            )
+            _write_csv(out_csv, out_rows)
+        ap2_summary = {
+            "ap2_kron_abs_max": threshold,
+            "ap2_kron_kept_rows": len(kept),
+            "ap2_kron_rejected_rows": len(rejected),
+            "ap2_kron_invalid_rows": len(invalid),
+            "ap2_kron_kept_reg": str(kept_reg_path),
+            "ap2_kron_kept_csv": str(kept_csv_path),
+            "ap2_flux_column": str(args.ap2_flux_column),
+            "kron_flux_column": str(args.kron_flux_column),
+        }
+        print(
+            f"ap2/kron filter {patch} {band}: kept={len(kept)} rejected={len(rejected)} "
+            f"invalid={len(invalid)} threshold={threshold:g}",
+            flush=True,
+        )
     return {
         "patch": patch,
         "band": band,
@@ -357,6 +559,7 @@ def export_one(args: argparse.Namespace, *, patch: str, band: str) -> dict[str, 
         "class_counts": class_counts,
         "reg": str(reg_path),
         "csv": str(csv_path),
+        **ap2_summary,
     }
 
 
@@ -376,9 +579,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--crop-size", type=float, default=None)
     parser.add_argument("--crop-width", type=float, default=None)
     parser.add_argument("--crop-height", type=float, default=None)
+    parser.add_argument(
+        "--crop-coordinates",
+        choices=("local", "full"),
+        default="local",
+        help="Interpret --crop-x0/--crop-y0 and --tile-name origins as patch-local or full-pixel coordinates.",
+    )
     parser.add_argument("--crop-margin", type=float, default=0.0)
     parser.add_argument("--local-coordinates", action="store_true", help="Write x/y relative to crop origin.")
     parser.add_argument("--reg-width", type=int, default=2)
+    parser.add_argument(
+        "--region-coordinates",
+        choices=("physical", "image"),
+        default="physical",
+        help=(
+            "Coordinate system written in the DS9 REG file. physical writes catalog full-pixel coordinates, "
+            "which is usually what DS9 expects for HSC patch calexp files. image writes patch-local pixels."
+        ),
+    )
+    parser.add_argument(
+        "--ap2-kron-abs-max",
+        type=float,
+        default=None,
+        help=(
+            "Optional extra photometric cleanup. When set, write additional REG/CSV files that keep only "
+            "rows with abs(ap2_mag-kron_mag) <= this value, plus rejected and invalid files."
+        ),
+    )
+    parser.add_argument(
+        "--ap2-flux-column",
+        default="base_CircularApertureFlux_6_0_instFlux",
+        help="Fixed-aperture flux column used for ap2/kron cleanup. HSC 2 arcsec aperture is radius 6 pix.",
+    )
+    parser.add_argument("--kron-flux-column", default="ext_photometryKron_KronFlux_instFlux")
+    parser.add_argument("--photometry-zeropoint", type=float, default=27.0)
     parser.add_argument("--point-size", type=int, default=8)
     parser.add_argument("--max-ellipse-area-as-point", type=float, default=40000.0)
     parser.add_argument("--write-class-files", action="store_true", help="Also write one REG/CSV per class.")
@@ -404,10 +638,26 @@ def main() -> int:
     summary_path = Path(args.output_dir) / "summary.csv"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     with summary_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=("patch", "band", "rows", "class_counts", "reg", "csv"))
+        fieldnames = (
+            "patch",
+            "band",
+            "rows",
+            "class_counts",
+            "reg",
+            "csv",
+            "ap2_kron_abs_max",
+            "ap2_kron_kept_rows",
+            "ap2_kron_rejected_rows",
+            "ap2_kron_invalid_rows",
+            "ap2_kron_kept_reg",
+            "ap2_kron_kept_csv",
+            "ap2_flux_column",
+            "kron_flux_column",
+        )
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for row in summaries:
-            writer.writerow(row)
+            writer.writerow({name: row.get(name, "") for name in fieldnames})
     print(f"summary written to {summary_path}", flush=True)
     return 0
 

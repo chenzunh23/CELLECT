@@ -320,6 +320,16 @@ def _magnitude_from_flux(table: Table, *, column: str, zeropoint: float) -> np.n
     return mag
 
 
+def _magnitude_from_exact_flux_column(table: Table, *, column: str, zeropoint: float) -> np.ndarray:
+    mag = np.full(len(table), np.nan, dtype=np.float64)
+    if column not in table.colnames:
+        return mag
+    flux = np.asarray(table[column], dtype=np.float64)
+    valid = np.isfinite(flux) & (flux > 0.0)
+    mag[valid] = float(zeropoint) - 2.5 * np.log10(flux[valid])
+    return mag
+
+
 def _sample_unit_disk(grid: int = 9) -> np.ndarray:
     values = np.linspace(-1.0, 1.0, int(grid))
     pts = [(u, v) for u in values for v in values if u * u + v * v <= 1.0]
@@ -422,6 +432,32 @@ def classify_sources(table: Table, args: argparse.Namespace) -> dict[str, object
 
     mag_in_range = np.isfinite(mag) & (mag >= float(args.b_mag_min)) & (mag <= float(args.b_mag_max))
     removed_b = a_candidate & ~mag_in_range
+    axis_ratio_max = getattr(args, "b_axis_ratio_max", None)
+    axis_ratio = np.full(len(table), np.nan, dtype=np.float64)
+    if axis_ratio_max is not None and float(axis_ratio_max) > 0.0:
+        axis_min = np.minimum(np.abs(a), np.abs(b))
+        axis_max = np.maximum(np.abs(a), np.abs(b))
+        axis_valid = np.isfinite(axis_min) & np.isfinite(axis_max) & (axis_min > 0.0)
+        axis_ratio[axis_valid] = axis_max[axis_valid] / axis_min[axis_valid]
+        removed_b |= a_candidate & axis_valid & (axis_ratio > float(axis_ratio_max))
+    ap2_kron_abs_max = getattr(args, "ap2_kron_abs_max", None)
+    ap2_kron_diff = np.full(len(table), np.nan, dtype=np.float64)
+    if ap2_kron_abs_max is not None and float(ap2_kron_abs_max) >= 0.0:
+        ap2_mag = _magnitude_from_exact_flux_column(
+            table,
+            column=getattr(args, "ap2_flux_column", "base_CircularApertureFlux_6_0_instFlux"),
+            zeropoint=float(getattr(args, "input_zeropoint", 27.0)),
+        )
+        kron_mag = _magnitude_from_exact_flux_column(
+            table,
+            column=getattr(args, "ap2_kron_flux_column", "ext_photometryKron_KronFlux_instFlux"),
+            zeropoint=float(getattr(args, "input_zeropoint", 27.0)),
+        )
+        ap2_kron_diff = ap2_mag - kron_mag
+        ap2_kron_valid = np.isfinite(ap2_kron_diff) & (
+            np.abs(ap2_kron_diff) < float(ap2_kron_abs_max)
+        )
+        removed_b |= a_candidate & ~ap2_kron_valid
     if bool(getattr(args, "require_kron_refit_match", False)):
         removed_b |= base & ~refit_matched
     flag_removed, flag_reasons = _removed_by_b_flags(
@@ -447,6 +483,14 @@ def classify_sources(table: Table, args: argparse.Namespace) -> dict[str, object
                 reasons[int(idx)].append("B_mag_outside_range")
         if bool(getattr(args, "require_kron_refit_match", False)) and base[int(idx)] and not refit_matched[int(idx)]:
             reasons[int(idx)].append("B_missing_proxy_kron_refit")
+        if ap2_kron_abs_max is not None and float(ap2_kron_abs_max) >= 0.0:
+            if not np.isfinite(ap2_kron_diff[int(idx)]):
+                reasons[int(idx)].append("B_ap2_kron_mag_invalid")
+            elif abs(float(ap2_kron_diff[int(idx)])) >= float(ap2_kron_abs_max):
+                reasons[int(idx)].append(f"B_abs_ap2_minus_kron_mag_ge_{float(ap2_kron_abs_max):.2f}")
+        if axis_ratio_max is not None and float(axis_ratio_max) > 0.0:
+            if np.isfinite(axis_ratio[int(idx)]) and float(axis_ratio[int(idx)]) > float(axis_ratio_max):
+                reasons[int(idx)].append(f"B_axis_ratio_gt_{float(axis_ratio_max):.2f}")
         reasons[int(idx)].extend(flag_reasons[int(idx)])
 
     close_pair_count = 0
@@ -711,6 +755,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mag-column", default="base_PsfFlux_instFlux")
     parser.add_argument("--input-zeropoint", type=float, default=27.0)
     parser.add_argument(
+        "--ap2-kron-abs-max",
+        type=float,
+        default=None,
+        help="Optional B filter: require abs(ap2_mag-kron_mag) to be below this threshold.",
+    )
+    parser.add_argument("--ap2-flux-column", default="base_CircularApertureFlux_6_0_instFlux")
+    parser.add_argument("--ap2-kron-flux-column", default="ext_photometryKron_KronFlux_instFlux")
+    parser.add_argument(
         "--kron-refit-csv",
         type=Path,
         default=None,
@@ -737,6 +789,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--overlap-iou-threshold", type=float, default=0.33)
     parser.add_argument("--b-ellipse-area-max", type=float, default=None)
     parser.add_argument("--b-footprint-area-max", type=float, default=None)
+    parser.add_argument(
+        "--b-axis-ratio-max",
+        type=float,
+        default=5.0,
+        help="Optional B filter: move sources with max(axis)/min(axis) above this value to ignore. Use <=0 to disable.",
+    )
     parser.add_argument("--b-kron-radius-lt-sdss-major-ratio", type=float, default=0.75)
     parser.add_argument(
         "--drop-ellipse-area-min",

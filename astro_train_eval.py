@@ -263,6 +263,79 @@ def _radec_from_wcs(wcs: object | None, x: float, y: float) -> tuple[float, floa
         return float("nan"), float("nan")
 
 
+def _as_numpy_centers(obj: object) -> np.ndarray:
+    try:
+        if hasattr(obj, "detach"):
+            arr = obj.detach().cpu().numpy()  # type: ignore[attr-defined]
+        else:
+            arr = np.asarray(obj)
+    except Exception:
+        return np.zeros((0, 2), dtype=np.float32)
+    arr = np.asarray(arr, dtype=np.float32)
+    if arr.size == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    return arr.reshape(-1, 2)
+
+
+def _as_numpy_ids(obj: object) -> np.ndarray:
+    try:
+        if hasattr(obj, "detach"):
+            arr = obj.detach().cpu().numpy()  # type: ignore[attr-defined]
+        else:
+            arr = np.asarray(obj)
+    except Exception:
+        return np.zeros((0,), dtype=np.int64)
+    return np.asarray(arr).reshape(-1)
+
+
+def _as_numpy_mask(obj: object | None) -> np.ndarray | None:
+    if obj is None:
+        return None
+    try:
+        if hasattr(obj, "detach"):
+            arr = obj.detach().cpu().numpy()  # type: ignore[attr-defined]
+        else:
+            arr = np.asarray(obj)
+    except Exception:
+        return None
+    arr = np.asarray(arr, dtype=bool)
+    return arr if arr.ndim == 2 else None
+
+
+def _point_in_mask_np(mask_np: np.ndarray | None, x: float, y: float) -> bool:
+    if mask_np is None:
+        return False
+    xi = int(round(float(x)))
+    yi = int(round(float(y)))
+    if xi < 0 or yi < 0 or yi >= mask_np.shape[0] or xi >= mask_np.shape[1]:
+        return False
+    return bool(mask_np[yi, xi])
+
+
+def _greedy_point_mapping(pred_xy: np.ndarray, gt_xy: np.ndarray, radius: float) -> tuple[dict[int, int], dict[int, float]]:
+    pred_xy = _as_numpy_centers(pred_xy)
+    gt_xy = _as_numpy_centers(gt_xy)
+    if pred_xy.size == 0 or gt_xy.size == 0:
+        return {}, {}
+    dist = np.sqrt(((pred_xy[:, None, :] - gt_xy[None, :, :]) ** 2).sum(axis=2))
+    pairs: list[tuple[float, int, int]] = []
+    for pred_idx in range(dist.shape[0]):
+        gt_idx = int(np.argmin(dist[pred_idx]))
+        if float(dist[pred_idx, gt_idx]) <= float(radius):
+            pairs.append((float(dist[pred_idx, gt_idx]), pred_idx, gt_idx))
+    pairs.sort(key=lambda item: item[0])
+    mapping: dict[int, int] = {}
+    distances: dict[int, float] = {}
+    used_gt: set[int] = set()
+    for distance, pred_idx, gt_idx in pairs:
+        if pred_idx in mapping or gt_idx in used_gt:
+            continue
+        mapping[pred_idx] = gt_idx
+        distances[pred_idx] = distance
+        used_gt.add(gt_idx)
+    return mapping, distances
+
+
 def _flat_per_band_outputs(outputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     return {key: value.reshape(value.shape[0] * value.shape[1], *value.shape[2:]) for key, value in outputs.items()}
 
@@ -281,6 +354,7 @@ def _write_eval_sources_csv(
     center_refinement: str,
     center_refinement_radius: int,
     match_radius: float,
+    pixel_scale_arcsec: float,
     use_en_postprocess: bool,
     en_candidate_count: int,
     en_threshold: float,
@@ -308,6 +382,7 @@ def _write_eval_sources_csv(
         member_count: int = 1,
         member_bands: str = "",
         member_centers: object = "",
+        match_info: dict[str, object] | None = None,
     ) -> None:
         nonlocal source_id
         def _mask_at(mask_key: str, band_mask_key: str) -> bool:
@@ -347,6 +422,14 @@ def _write_eval_sources_csv(
         ra_deg, dec_deg = _radec_from_wcs(wcs, x, y)
         x0 = int(batch["x0"][item_idx])  # type: ignore[index]
         y0 = int(batch["y0"][item_idx])  # type: ignore[index]
+        match_info = match_info or {}
+        match_x = match_info.get("match_x_local", "")
+        match_y = match_info.get("match_y_local", "")
+        match_ra_deg = float("nan")
+        match_dec_deg = float("nan")
+        if match_x != "" and match_y != "":
+            match_ra_deg, match_dec_deg = _radec_from_wcs(wcs, float(match_x), float(match_y))
+        strict_center_only = _mask_at("strict_center_only_mask", "band_strict_center_only_mask")
         strict_ignored = _mask_at("strict_ignore_mask", "band_strict_ignore_mask")
         ignored = _mask_at("ignore_mask", "band_ignore_mask") or strict_ignored
         ordinary_ignored = ignored and not strict_ignored
@@ -370,14 +453,131 @@ def _write_eval_sources_csv(
                 "dec_deg": _format_float(dec_deg, 10),
                 "ignored_by_mask": int(ignored),
                 "ordinary_ignore": int(ordinary_ignored),
+                "strict_center_only": int(strict_center_only),
                 "strict_ignore": int(strict_ignored),
                 "eval_excluded_by_mask": int(ignored),
+                "match_status": match_info.get("match_status", ""),
+                "matched_catalog": match_info.get("matched_catalog", ""),
+                "matched_source_id": match_info.get("matched_source_id", ""),
+                "matched_source_index": match_info.get("matched_source_index", ""),
+                "match_distance_pix": match_info.get("match_distance_pix", ""),
+                "match_distance_arcsec": match_info.get("match_distance_arcsec", ""),
+                "matched_x_local": _format_float(float(match_x), 6) if match_x != "" else "",
+                "matched_y_local": _format_float(float(match_y), 6) if match_y != "" else "",
+                "matched_x_parent": _format_float(float(x0) + float(match_x), 6) if match_x != "" else "",
+                "matched_y_parent": _format_float(float(y0) + float(match_y), 6) if match_y != "" else "",
+                "matched_ra_deg": _format_float(match_ra_deg, 10),
+                "matched_dec_deg": _format_float(match_dec_deg, 10),
                 "member_count": int(member_count),
                 "member_bands": member_bands,
                 "member_centers": json.dumps(member_centers) if member_centers else "",
                 "image_path": image_path,
             }
         )
+
+    def _batch_centers(batch: dict[str, object], item_idx: int, band_idx: int, key: str, band_key: str) -> np.ndarray:
+        if band_idx >= 0 and band_key in batch:
+            try:
+                return _as_numpy_centers(batch[band_key][item_idx][band_idx])  # type: ignore[index]
+            except Exception:
+                pass
+        if key in batch:
+            try:
+                return _as_numpy_centers(batch[key][item_idx])  # type: ignore[index]
+            except Exception:
+                pass
+        return np.zeros((0, 2), dtype=np.float32)
+
+    def _batch_ids(batch: dict[str, object], item_idx: int, band_idx: int) -> np.ndarray:
+        if band_idx >= 0 and "band_ids" in batch:
+            try:
+                return _as_numpy_ids(batch["band_ids"][item_idx][band_idx])  # type: ignore[index]
+            except Exception:
+                pass
+        if "ids" in batch:
+            try:
+                return _as_numpy_ids(batch["ids"][item_idx])  # type: ignore[index]
+            except Exception:
+                pass
+        return np.zeros((0,), dtype=np.int64)
+
+    def _batch_mask(batch: dict[str, object], item_idx: int, band_idx: int, key: str, band_key: str) -> np.ndarray | None:
+        if band_idx >= 0 and band_key in batch:
+            try:
+                return _as_numpy_mask(batch[band_key][item_idx, band_idx])  # type: ignore[index]
+            except Exception:
+                pass
+        if key in batch:
+            try:
+                return _as_numpy_mask(batch[key][item_idx])  # type: ignore[index]
+            except Exception:
+                pass
+        return None
+
+    def _match_infos_for_predictions(
+        batch: dict[str, object],
+        item_idx: int,
+        band_idx: int,
+        pred_xy: np.ndarray,
+    ) -> list[dict[str, object]]:
+        pred_xy = _as_numpy_centers(pred_xy)
+        clean_xy = _batch_centers(batch, item_idx, band_idx, "centers", "band_centers")
+        ordinary_xy = _batch_centers(batch, item_idx, band_idx, "ignore_centers", "band_ignore_centers")
+        clean_ids = _batch_ids(batch, item_idx, band_idx)
+        strict_mask = _batch_mask(batch, item_idx, band_idx, "strict_ignore_mask", "band_strict_ignore_mask")
+        clean_mask = _batch_mask(batch, item_idx, band_idx, "clean_mask", "band_clean_mask")
+        background_mask = _batch_mask(batch, item_idx, band_idx, "background_mask", "band_background_mask")
+        clean_map, clean_dist = _greedy_point_mapping(pred_xy, clean_xy, match_radius)
+        unmatched = [idx for idx in range(len(pred_xy)) if idx not in clean_map and not _point_in_mask_np(strict_mask, pred_xy[idx, 0], pred_xy[idx, 1])]
+        if unmatched:
+            unmatched_xy = pred_xy[np.asarray(unmatched, dtype=np.int64)]
+            ordinary_rel_map, ordinary_rel_dist = _greedy_point_mapping(unmatched_xy, ordinary_xy, match_radius)
+            ordinary_map = {unmatched[rel_idx]: gt_idx for rel_idx, gt_idx in ordinary_rel_map.items()}
+            ordinary_dist = {unmatched[rel_idx]: dist for rel_idx, dist in ordinary_rel_dist.items()}
+        else:
+            ordinary_map = {}
+            ordinary_dist = {}
+
+        infos: list[dict[str, object]] = []
+        for pred_idx, xy in enumerate(pred_xy):
+            info: dict[str, object] = {
+                "match_status": "unmatched",
+                "matched_catalog": "",
+                "matched_source_id": "",
+                "matched_source_index": "",
+                "match_distance_pix": "",
+                "match_distance_arcsec": "",
+                "match_x_local": "",
+                "match_y_local": "",
+            }
+            if _point_in_mask_np(strict_mask, xy[0], xy[1]):
+                info["match_status"] = "strict_ignore_excluded"
+            elif pred_idx in clean_map:
+                gt_idx = clean_map[pred_idx]
+                info["match_status"] = "clean_tp"
+                info["matched_catalog"] = "clean"
+                info["matched_source_index"] = int(gt_idx)
+                if gt_idx < len(clean_ids):
+                    info["matched_source_id"] = str(clean_ids[gt_idx])
+                info["match_distance_pix"] = _format_float(clean_dist[pred_idx], 6)
+                info["match_distance_arcsec"] = _format_float(clean_dist[pred_idx] * float(pixel_scale_arcsec), 6)
+                info["match_x_local"] = float(clean_xy[gt_idx, 0])
+                info["match_y_local"] = float(clean_xy[gt_idx, 1])
+            elif pred_idx in ordinary_map:
+                gt_idx = ordinary_map[pred_idx]
+                info["match_status"] = "ordinary_ignore_tp"
+                info["matched_catalog"] = "ordinary_ignore"
+                info["matched_source_index"] = int(gt_idx)
+                info["match_distance_pix"] = _format_float(ordinary_dist[pred_idx], 6)
+                info["match_distance_arcsec"] = _format_float(ordinary_dist[pred_idx] * float(pixel_scale_arcsec), 6)
+                info["match_x_local"] = float(ordinary_xy[gt_idx, 0])
+                info["match_y_local"] = float(ordinary_xy[gt_idx, 1])
+            elif _point_in_mask_np(clean_mask, xy[0], xy[1]) or _point_in_mask_np(background_mask, xy[0], xy[1]):
+                info["match_status"] = "fp_clean_background"
+            else:
+                info["match_status"] = "fp_outside_eval_region"
+            infos.append(info)
+        return infos
 
     for batch in tqdm(loader, desc="eval-csv", leave=False, disable=not show_progress):
         image = batch["image"].to(device=device, dtype=torch.float32, non_blocking=True)  # type: ignore[union-attr]
@@ -399,8 +599,18 @@ def _write_eval_sources_csv(
                 band_pairs=ex_band_pairs,
             )
             for item_idx, pred_xy in enumerate(pred_list):
+                pred_arr = np.asarray(pred_xy, dtype=np.float32).reshape(-1, 2)
                 components = components_all[item_idx] if item_idx < len(components_all) else []
-                for source_index, xy in enumerate(np.asarray(pred_xy, dtype=np.float32)):
+                linked_band_indices: list[int] = []
+                for source_index in range(len(pred_arr)):
+                    component = components[source_index] if source_index < len(components) else {}
+                    members = component.get("members", []) if isinstance(component, dict) else []
+                    linked_band_indices.append(int(members[0][0]) if members else 0)
+                linked_match_infos = [
+                    _match_infos_for_predictions(batch, item_idx, band_idx, pred_arr[idx : idx + 1])[0]
+                    for idx, band_idx in enumerate(linked_band_indices)
+                ]
+                for source_index, xy in enumerate(pred_arr):
                     component = components[source_index] if source_index < len(components) else {}
                     members = component.get("members", []) if isinstance(component, dict) else []
                     band_idx = int(members[0][0]) if members else 0
@@ -419,6 +629,7 @@ def _write_eval_sources_csv(
                         member_count=len(members) if members else 1,
                         member_bands=",".join(member_band_names),
                         member_centers=member_centers,
+                        match_info=linked_match_infos[source_index],
                     )
             continue
 
@@ -459,7 +670,9 @@ def _write_eval_sources_csv(
             item_idx = list_idx // band_count if band_count else list_idx
             band_idx = list_idx % band_count if band_count else 0
             source_type = "band" if band_count else "fused"
-            for source_index, xy in enumerate(np.asarray(pred_xy, dtype=np.float32)):
+            pred_arr = np.asarray(pred_xy, dtype=np.float32).reshape(-1, 2)
+            match_infos = _match_infos_for_predictions(batch, item_idx, band_idx, pred_arr)
+            for source_index, xy in enumerate(pred_arr):
                 append_row(
                     batch,
                     item_idx,
@@ -469,6 +682,7 @@ def _write_eval_sources_csv(
                     band_idx=band_idx,
                     source_index=source_index,
                     member_bands=_band_name(band_idx, band_names) if band_count else "",
+                    match_info=match_infos[source_index],
                 )
 
     fieldnames = [
@@ -489,8 +703,21 @@ def _write_eval_sources_csv(
         "dec_deg",
         "ignored_by_mask",
         "ordinary_ignore",
+        "strict_center_only",
         "strict_ignore",
         "eval_excluded_by_mask",
+        "match_status",
+        "matched_catalog",
+        "matched_source_id",
+        "matched_source_index",
+        "match_distance_pix",
+        "match_distance_arcsec",
+        "matched_x_local",
+        "matched_y_local",
+        "matched_x_parent",
+        "matched_y_parent",
+        "matched_ra_deg",
+        "matched_dec_deg",
         "member_count",
         "member_bands",
         "member_centers",
@@ -859,6 +1086,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dist-url", default="env://", help="Distributed init method, normally env:// for torchrun.")
     parser.add_argument("--local-rank", type=int, default=0, help="Local rank fallback when LOCAL_RANK is not set.")
+    parser.add_argument("--ckpt-interval", type=int, default=-1, help="Epoch interval for saving checkpoints. Set <=0 to disable intermediate checkpoints.")
     return parser
 
 
@@ -1174,6 +1402,7 @@ def main() -> None:
                         center_refinement=args.center_refinement,
                         center_refinement_radius=args.center_refinement_radius,
                         match_radius=center_radius_px,
+                        pixel_scale_arcsec=float(args.pixel_scale_arcsec),
                         use_en_postprocess=en_postprocess_enabled,
                         en_candidate_count=args.matcher_candidate_count,
                         en_threshold=args.en_postprocess_threshold,
@@ -1321,7 +1550,10 @@ def main() -> None:
                     val_metrics=val_metrics,
                     det_metrics=det_metrics,
                 )
-                torch.save(ckpt, out_dir / "last.pt")
+                if args.ckpt_interval < 0:
+                    torch.save(ckpt, out_dir / "last.pt")
+                elif (epoch + 1) % int(args.ckpt_interval) == 0:
+                    torch.save(ckpt, out_dir / f"epoch_{epoch + 1:04d}.pt")
                 best_updated = False
                 if val_metrics["total"] < best_val:
                     best_val = val_metrics["total"]

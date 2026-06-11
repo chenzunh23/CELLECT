@@ -64,19 +64,17 @@ def astro_zscale_preprocess(
     contrast: float = 0.25,
     clip_sigma: float = 3.0,
     sigma_iters: int = -1,
-    z_clip: Optional[Tuple[float, float]] = (-5.0, 10.0),
+    z_clip: Optional[Tuple[float, float]] = None, # (-5.0, 10.0) for tasks focusing on very dim sources.
 ) -> Tensor:
-    """Astropy zscale + sigma-clipped normalization for CHW or BCHW data.
+    """Two-stage sigma-clipped z-score normalization for CHW or BCHW data.
 
     This follows the spirit of the local SAM astro_preprocess implementation:
     normalize each image/band independently, replace non-finite pixels safely,
-    use astropy statistics, and produce float32 tensors. The difference is that
-    clipping limits come from astropy.visualization.ZScaleInterval instead of
-    a median-plus-sigma upper bound.
+    first clip raw pixels to raw mean +/- 3 raw sigma, estimate robust
+    median/std on the clipped image, and finally clamp the z-score range.
     """
     try:
         from astropy.stats import sigma_clipped_stats
-        from astropy.visualization import ZScaleInterval
     except Exception as exc:
         raise RuntimeError("astro_zscale_preprocess requires astropy.") from exc
 
@@ -94,7 +92,6 @@ def astro_zscale_preprocess(
 
     out = torch.empty_like(work)
     maxiters = None if sigma_iters < 0 else int(sigma_iters)
-    interval = ZScaleInterval(contrast=float(contrast))
 
     for b in range(work.shape[0]):
         for c in range(work.shape[1]):
@@ -105,11 +102,10 @@ def astro_zscale_preprocess(
                 continue
 
             arr = vals[finite].detach().cpu().numpy().astype(np.float64, copy=False)
-            raw_mean = np.mean(arr)
-            raw_std = np.std(arr)
-            # lo, hi = interval.get_limits(arr)
-            lo = raw_mean - 3 * raw_std
-            hi = raw_mean + 3 * raw_std
+            raw_mean = float(np.mean(arr))
+            raw_std = float(np.std(arr))
+            lo = raw_mean - 3.0 * raw_std
+            hi = raw_mean + 3.0 * raw_std
             if not np.isfinite(lo):
                 lo = float(np.nanpercentile(arr, 0.5))
             if not np.isfinite(hi) or hi <= lo:
@@ -128,14 +124,14 @@ def astro_zscale_preprocess(
                 sigma=float(clip_sigma),
                 maxiters=maxiters,
             )
-            if not np.isfinite(mean):
-                mean = float(np.nanmean(clipped_arr))
+            if not np.isfinite(_median):
+                _median = float(np.nanmean(clipped_arr))
             if not np.isfinite(std) or std <= 0:
                 std = float(np.nanstd(clipped_arr))
             if not np.isfinite(std) or std <= 0:
                 std = 1.0
 
-            mean_t = torch.tensor(float(mean), dtype=vals.dtype, device=vals.device)
+            mean_t = torch.tensor(float(_median), dtype=vals.dtype, device=vals.device)
             std_t = torch.tensor(float(std), dtype=vals.dtype, device=vals.device)
             z = (clipped - mean_t) / std_t
             if z_clip is not None:

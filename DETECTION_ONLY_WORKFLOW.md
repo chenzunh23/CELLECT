@@ -45,8 +45,8 @@ batch-heavyfp-kron-refit/refit/{tract}/{band}/{patch}/batch_heavyfp_kron_refit/k
 
 - 使用 PU label mode。
 - 使用每个 band 的极限星等 `[m-5, m)` 作为监督源范围。
-- 使用 HSC 官方 saturation magnitude 筛亮源，亮源 `mag < saturation_mag` 的 `proxy_flux_aperture` 区域写入 `strict_ignore_mask`。
-- `strict_ignore_mask` 同时并入 `ignore_mask`，训练和 eval metrics 都不统计。
+- 使用 HSC 官方 saturation magnitude 筛亮源，亮源 `mag < saturation_mag` 的 `proxy_flux_aperture` 区域写入 `strict_center_only_mask`。
+- `strict_center_only_mask` 是 `center_only_mask` 的诊断子集：保留低权重中心监督，不再并入 `ignore_mask`。
 - zscale、targets、catalog metadata 写到 SSD。
 
 HSC 默认极限星等：
@@ -83,9 +83,9 @@ conda run -n cellect python astro_data_preprocessing.py \
   --pu-band-limit-b-min-offset -5.0 \
   --pu-band-limit-b-max-offset 0.0 \
   --pu-keep-all-ab-clean \
-  --pu-enable-strict-bright-ignore \
-  --pu-strict-ignore-saturation-mags HSC-G=18.0 HSC-R=18.2 HSC-I=18.6 HSC-Z=17.7 HSC-Y=17.4 \
-  --pu-strict-ignore-radius-column proxy_nan0_flux_aperture_radius \
+  --pu-enable-strict-bright-center-only \
+  --pu-strict-bright-center-only-saturation-mags HSC-G=18.0 HSC-R=18.2 HSC-I=18.6 HSC-Z=17.7 HSC-Y=17.4 \
+  --pu-strict-bright-center-only-radius-column proxy_nan0_flux_aperture_radius \
   --pu-kron-refit-csv 'batch-heavyfp-kron-refit/refit/{tract}/{band}/{patch}/batch_heavyfp_kron_refit/kron_refit_rows.csv' \
   --pu-kron-refit-radius-column proxy_nan0_determine_radius_returned_radius \
   --bad-band-catalog-policy error \
@@ -99,7 +99,7 @@ conda run -n cellect python astro_data_preprocessing.py \
 --pu-require-kron-refit-match
 ```
 
-如果还没有 refit CSV，不要传 `--pu-kron-refit-csv`。这时 strict bright ignore 会回退到 catalog 自带 Kron 半径，而不是 proxy flux aperture 半径。
+如果还没有 refit CSV，不要传 `--pu-kron-refit-csv`。这时 strict bright center-only 会回退到 catalog 自带 Kron 半径，而不是 proxy flux aperture 半径。
 
 ## 3. Detection-only DDP 训练
 
@@ -170,24 +170,25 @@ CUDA_VISIBLE_DEVICES=0 python astro_train_eval.py \
   2>&1 | tee ${OUT_DIR}/eval_4,5_6,1.log
 ```
 
-eval metrics 默认启用 `--ignore-mask-during-detection`，因此落在 `ignore_mask` 或 `strict_ignore_mask` 内的预测中心不会计入 TP/FP。
+eval metrics 默认启用 `--ignore-mask-during-detection`，因此落在普通 `ignore_mask` 内的预测中心不会计入 TP/FP。`strict_center_only_mask` 不再作为 ignore mask。
 
 `eval_sources.csv` 会保留这些预测，并输出：
 
 ```text
 x_local, y_local, x_parent, y_parent, ra_deg, dec_deg,
-ignored_by_mask, ordinary_ignore, strict_ignore, eval_excluded_by_mask
+ignored_by_mask, ordinary_ignore, strict_center_only, strict_ignore, eval_excluded_by_mask
 ```
 
 其中：
 
 - `ordinary_ignore=1`：预测落在普通 ignore 区域，不计入 eval 指标。
-- `strict_ignore=1`：预测落在亮源 strict ignore 区域，不计入 eval 指标。
+- `strict_center_only=1`：预测落在亮源 strict center-only 区域；它本身不导致 eval 排除。
+- `strict_ignore=1`：仅用于旧数据兼容，预测落在历史 strict ignore 区域时不计入 eval 指标。
 - `eval_excluded_by_mask=1`：该预测已被 mask 从 metrics 中排除。
 
 ## 5. 常用检查
 
-确认 strict ignore 已写入 targets：
+确认 strict center-only 已写入 targets：
 
 ```bash
 python - <<'PY'
@@ -195,11 +196,11 @@ import numpy as np
 from pathlib import Path
 p = next((Path("/nvme0/zc/scarlet/preprocessed/9813/4,5/targets")).glob("*.npz"))
 with np.load(p) as d:
-    strict = d["strict_ignore_mask"] if "strict_ignore_mask" in d else np.zeros_like(d["ignore_mask"])
+    strict = d["strict_center_only_mask"] if "strict_center_only_mask" in d else np.zeros_like(d["ignore_mask"])
     print("file:", p)
     print("keys:", sorted(k for k in d.keys() if "ignore" in k or "mask" in k))
     print("ignore pixels:", int(d["ignore_mask"].sum()))
-    print("strict ignore pixels:", int(strict.sum()))
+    print("strict center-only pixels:", int(strict.sum()))
     print("background pixels:", int(d["background_mask"].sum()))
 PY
 ```
@@ -213,7 +214,7 @@ p = "output/detection_only_b5/eval_sources_4,5_6,1.csv"
 df = pd.read_csv(p)
 print("all predictions:", len(df))
 print("ordinary ignore:", int(df["ordinary_ignore"].sum()))
-print("strict ignore:", int(df["strict_ignore"].sum()))
+print("strict center-only:", int(df["strict_center_only"].sum()))
 print("used by metrics:", int((df["eval_excluded_by_mask"] == 0).sum()))
 PY
 ```

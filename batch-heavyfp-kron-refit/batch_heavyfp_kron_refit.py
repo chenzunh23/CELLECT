@@ -558,6 +558,7 @@ def prepare_heavy_lookups(
 ) -> None:
     footprint_ids = sources["footprint_id"]
     footprint_lookup = archive_index.lookup(footprint_ids, archive_number=1, name=None)
+    # print(f'[DEBUG] footprint found {footprint_lookup.found.sum()} / {len(footprint_ids)}')
     sources["footprint_archive_found"] = footprint_lookup.found
     sources["footprint_ref_row"] = footprint_lookup.row0
 
@@ -671,12 +672,34 @@ def measure_sources(
         total_pixels += int(block_result["total_expanded_pixels"])
         if int(block_result["max_pixels_per_source"]) > max_pixels:
             max_pixels = int(block_result["max_pixels_per_source"])
-        for key in out:
-            out[key][block] = block_result[key]
+        for key, value in block_result.items():
+            if key in out:
+                out[key][block] = value
 
+    original_returned_radius = out[
+        "heavyfp_nan0_determine_radius_returned_radius"
+    ].copy()
     out["heavyfp_nan0_flux_aperture_radius"] = out[
         "heavyfp_nan0_determine_radius_returned_radius"
     ] * float(n_radius_for_flux)
+    original_flux_aperture_radius = out["heavyfp_nan0_flux_aperture_radius"].copy()
+    official_radius = np.asarray(sources["catalog_kron_radius"], dtype=np.float64)
+    # Take the smaller radius between the official and refit radius, because our primary goal is to refit abnormally large Kron radii. 
+    fallback = (
+        out["heavyfp_nan0_good"]
+        & np.isfinite(official_radius)
+        & (official_radius > 0.0)
+        & np.isfinite(out["heavyfp_nan0_flux_aperture_radius"])
+        & (out["heavyfp_nan0_flux_aperture_radius"] > n_radius_for_flux * official_radius)
+    )
+    if np.any(fallback):
+        out["heavyfp_nan0_flux_aperture_radius"][fallback] = n_radius_for_flux * official_radius[fallback]
+        out["heavyfp_nan0_determine_radius_returned_radius"][fallback] = (
+            out["heavyfp_nan0_flux_aperture_radius"][fallback] / float(n_radius_for_flux)
+        )
+    out["heavyfp_nan0_original_determine_radius_returned_radius"] = original_returned_radius
+    out["heavyfp_nan0_original_flux_aperture_radius"] = original_flux_aperture_radius
+    out["heavyfp_nan0_fallback_large_aperture"] = fallback
     return {
         **out,
         "total_expanded_pixels": int(total_pixels),
@@ -696,6 +719,8 @@ def init_measurement_arrays(n: int) -> dict[str, np.ndarray]:
         "heavyfp_nan0_candidate_radius",
         "heavyfp_nan0_determine_radius_returned_radius",
         "heavyfp_nan0_flux_aperture_radius",
+        "heavyfp_nan0_original_determine_radius_returned_radius",
+        "heavyfp_nan0_original_flux_aperture_radius",
         "heavyfp_nan0_computed_span_area",
     ]
     int_keys = [
@@ -711,6 +736,7 @@ def init_measurement_arrays(n: int) -> dict[str, np.ndarray]:
     out.update({key: np.zeros(n, dtype=np.int64) for key in int_keys})
     out["heavyfp_nan0_candidate_le_initial_radius"] = np.zeros(n, dtype=bool)
     out["heavyfp_nan0_good"] = np.zeros(n, dtype=bool)
+    out["heavyfp_nan0_fallback_large_aperture"] = np.zeros(n, dtype=bool)
     out["span_area_matches_catalog"] = np.zeros(n, dtype=bool)
     return out
 
@@ -1070,6 +1096,15 @@ def build_output_rows(
         )
         row["proxy_nan0_flux_aperture_radius"] = row.get(
             "heavyfp_nan0_flux_aperture_radius"
+        )
+        row["proxy_nan0_original_determine_radius_returned_radius"] = row.get(
+            "heavyfp_nan0_original_determine_radius_returned_radius"
+        )
+        row["proxy_nan0_original_flux_aperture_radius"] = row.get(
+            "heavyfp_nan0_original_flux_aperture_radius"
+        )
+        row["proxy_nan0_fallback_large_aperture"] = row.get(
+            "heavyfp_nan0_fallback_large_aperture"
         )
         row["proxy_nan0_candidate_le_initial_radius"] = row.get(
             "heavyfp_nan0_candidate_le_initial_radius"

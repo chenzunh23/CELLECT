@@ -26,8 +26,8 @@ RUN_PREPROCESS="${RUN_PREPROCESS:-1}"
 SKIP_EXISTING_REFIT="${SKIP_EXISTING_REFIT:-1}"
 REFIT_CSV_ONLY="${REFIT_CSV_ONLY:-1}"
 COPY_REFIT_INPUTS_TO_TMP="${COPY_REFIT_INPUTS_TO_TMP:-0}"
-REFIT_INCLUDE_SHAPE_FLAGGED="${REFIT_INCLUDE_SHAPE_FLAGGED:-1}"
-REFIT_INCLUDE_CENTROID_FLAGGED="${REFIT_INCLUDE_CENTROID_FLAGGED:-1}"
+REFIT_INCLUDE_SHAPE_FLAGGED="${REFIT_INCLUDE_SHAPE_FLAGGED:-0}"
+REFIT_INCLUDE_CENTROID_FLAGGED="${REFIT_INCLUDE_CENTROID_FLAGGED:-0}"
 
 REFIT_ROOT="${REFIT_ROOT:-/nvme0/zc/scarlet/refit}"
 REFIT_WORKERS="${REFIT_WORKERS:-1}"
@@ -40,7 +40,9 @@ MAG_MAX="${MAG_MAX:-35}"
 PU_REQUIRE_KRON_REFIT_MATCH="${PU_REQUIRE_KRON_REFIT_MATCH:-1}"
 PU_B_MAG_MIN="${PU_B_MAG_MIN:-18}"
 PU_B_MAG_MAX="${PU_B_MAG_MAX:-30}"
+USE_BAND_LIMIT_B_FILTER="${USE_BAND_LIMIT_B_FILTER:-1}"
 PU_B_CLOSE_CENTER_ARCSEC="${PU_B_CLOSE_CENTER_ARCSEC:-0.5}"
+PU_B_AXIS_RATIO_MAX="${PU_B_AXIS_RATIO_MAX:-5}"
 PU_CONTAINMENT_THRESHOLD="${PU_CONTAINMENT_THRESHOLD:-0.80}"
 PU_B_FLAGS="${PU_B_FLAGS:-base_SdssShape_flag base_SdssCentroid_flag}" #detect_isPrimary
 BAD_BAND_CATALOG_POLICY="${BAD_BAND_CATALOG_POLICY:-error}"
@@ -57,8 +59,11 @@ LSST_BACKGROUND_DETECT_CUTOUTS="${LSST_BACKGROUND_DETECT_CUTOUTS:-0}"
 USE_LSST_DETECTION_CALEXP_CUTOUTS="${USE_LSST_DETECTION_CALEXP_CUTOUTS:-0}"
 
 BAND_LIMIT_MAGS="${BAND_LIMIT_MAGS:-HSC-G=27.4 HSC-R=27.1 HSC-I=26.9 HSC-Z=26.3 HSC-Y=25.3}"
-STRICT_IGNORE_SATURATION_MAGS="${STRICT_IGNORE_SATURATION_MAGS:-HSC-G=18.0 HSC-R=18.2 HSC-I=18.6 HSC-Z=17.7 HSC-Y=17.4}"
-ENABLE_STRICT_BRIGHT_IGNORE="${ENABLE_STRICT_BRIGHT_IGNORE:-0}"
+STRICT_CENTER_ONLY_SATURATION_MAGS="${STRICT_CENTER_ONLY_SATURATION_MAGS:-${STRICT_IGNORE_SATURATION_MAGS:-HSC-G=18.0 HSC-R=18.2 HSC-I=18.6 HSC-Z=17.7 HSC-Y=17.4}}"
+ENABLE_STRICT_BRIGHT_CENTER_ONLY="${ENABLE_STRICT_BRIGHT_CENTER_ONLY:-0}"
+PU_AP2_KRON_ABS_MAX="${PU_AP2_KRON_ABS_MAX:-1.0}"
+PU_AP2_FLUX_COLUMN="${PU_AP2_FLUX_COLUMN:-base_CircularApertureFlux_6_0_instFlux}"
+PU_AP2_KRON_FLUX_COLUMN="${PU_AP2_KRON_FLUX_COLUMN:-ext_photometryKron_KronFlux_instFlux}"
 
 WRITE_CLEAN_REGIONS="${WRITE_CLEAN_REGIONS:-0}"
 CLEAN_REGION_OUT_DIR="${CLEAN_REGION_OUT_DIR:-output/preprocessed_clean_regions}"
@@ -74,6 +79,10 @@ CLEAN_REGION_HEIGHT="${CLEAN_REGION_HEIGHT:-}"
 CLEAN_REGION_MARGIN="${CLEAN_REGION_MARGIN:-0}"
 CLEAN_REGION_LOCAL_COORDS="${CLEAN_REGION_LOCAL_COORDS:-0}"
 CLEAN_REGION_WRITE_CLASS_FILES="${CLEAN_REGION_WRITE_CLASS_FILES:-0}"
+CLEAN_REGION_AP2_KRON_ABS_MAX="${CLEAN_REGION_AP2_KRON_ABS_MAX:-}"
+CLEAN_REGION_AP2_FLUX_COLUMN="${CLEAN_REGION_AP2_FLUX_COLUMN:-base_CircularApertureFlux_6_0_instFlux}"
+CLEAN_REGION_KRON_FLUX_COLUMN="${CLEAN_REGION_KRON_FLUX_COLUMN:-ext_photometryKron_KronFlux_instFlux}"
+CLEAN_REGION_PHOTOMETRY_ZEROPOINT="${CLEAN_REGION_PHOTOMETRY_ZEROPOINT:-27.0}"
 
 LOG_DIR="${LOG_DIR:-output/data_preprocessing_logs}"
 mkdir -p "${LOG_DIR}"
@@ -255,7 +264,7 @@ run_preprocess() {
   local bands_array=("${SPLIT_WORDS_OUT[@]}")
   split_words "${BAND_LIMIT_MAGS}"
   local band_limit_args=("${SPLIT_WORDS_OUT[@]}")
-  split_words "${STRICT_IGNORE_SATURATION_MAGS}"
+  split_words "${STRICT_CENTER_ONLY_SATURATION_MAGS}"
   local saturation_args=("${SPLIT_WORDS_OUT[@]}")
   split_words "${PU_B_FLAGS}"
   local pu_b_flags_args=("${SPLIT_WORDS_OUT[@]}")
@@ -306,11 +315,17 @@ run_preprocess() {
   if [[ "${USE_LSST_DETECTION_CALEXP_CUTOUTS}" == "1" ]]; then
     optional_args+=(--use-lsst-detection-calexp-cutouts)
   fi
-  if [[ "${ENABLE_STRICT_BRIGHT_IGNORE}" == "1" ]]; then
+  if [[ "${ENABLE_STRICT_BRIGHT_CENTER_ONLY}" == "1" ]]; then
     optional_args+=(
-      --pu-enable-strict-bright-ignore
-      --pu-strict-ignore-saturation-mags "${saturation_args[@]}"
-      --pu-strict-ignore-radius-column proxy_nan0_flux_aperture_radius
+      --pu-enable-strict-bright-center-only
+      --pu-strict-bright-center-only-saturation-mags "${saturation_args[@]}"
+      --pu-strict-bright-center-only-radius-column proxy_nan0_flux_aperture_radius
+    )
+  fi
+  if [[ "${USE_BAND_LIMIT_B_FILTER}" == "1" ]]; then
+    optional_args+=(
+      --pu-use-band-limit-b-filter
+      --pu-band-limit-mags "${band_limit_args[@]}"
     )
   fi
 
@@ -331,9 +346,11 @@ run_preprocess() {
     --source-filter nchild0 \
     --pu-b-mag-min "${PU_B_MAG_MIN}" \
     --pu-b-mag-max "${PU_B_MAG_MAX}" \
-    --pu-use-band-limit-b-filter \
-    --pu-band-limit-mags "${band_limit_args[@]}" \
+    --pu-ap2-kron-abs-max "${PU_AP2_KRON_ABS_MAX}" \
+    --pu-ap2-flux-column "${PU_AP2_FLUX_COLUMN}" \
+    --pu-ap2-kron-flux-column "${PU_AP2_KRON_FLUX_COLUMN}" \
     --pu-b-close-center-arcsec "${PU_B_CLOSE_CENTER_ARCSEC}" \
+    --pu-b-axis-ratio-max "${PU_B_AXIS_RATIO_MAX}" \
     --pu-containment-threshold "${PU_CONTAINMENT_THRESHOLD}" \
     --pu-keep-all-ab-clean \
     --pu-b-flags "${pu_b_flags_args[@]}" \
@@ -383,9 +400,18 @@ write_clean_regions() {
   if [[ "${CLEAN_REGION_WRITE_CLASS_FILES}" == "1" ]]; then
     optional_args+=(--write-class-files)
   fi
+  if [[ -n "${CLEAN_REGION_AP2_KRON_ABS_MAX}" ]]; then
+    optional_args+=(
+      --ap2-kron-abs-max "${CLEAN_REGION_AP2_KRON_ABS_MAX}"
+      --ap2-flux-column "${CLEAN_REGION_AP2_FLUX_COLUMN}"
+      --kron-flux-column "${CLEAN_REGION_KRON_FLUX_COLUMN}"
+      --photometry-zeropoint "${CLEAN_REGION_PHOTOMETRY_ZEROPOINT}"
+    )
+  fi
 
   echo "[clean-regions] start patches=${clean_region_patches[*]} bands=${clean_region_bands[*]} classes=${clean_region_classes[*]}"
   run_python export_preprocessed_clean_regions.py \
+    --data "${RAW_ROOT}" \
     --root "${PREP_ROOT}" \
     --tract "${TRACT}" \
     --patches "${clean_region_patches[@]}" \
@@ -409,10 +435,12 @@ main() {
   echo "BANDS=${BANDS}"
   echo "PATCHES=${PATCHES} PATCH_FILE=${PATCH_FILE:-<none>} expanded_patch_count=${#PATCH_LIST[@]}"
   echo "PU_B_MAG_MIN=${PU_B_MAG_MIN} PU_B_MAG_MAX=${PU_B_MAG_MAX}"
-  echo "PU_B_CLOSE_CENTER_ARCSEC=${PU_B_CLOSE_CENTER_ARCSEC} PU_CONTAINMENT_THRESHOLD=${PU_CONTAINMENT_THRESHOLD}"
+  echo "USE_BAND_LIMIT_B_FILTER=${USE_BAND_LIMIT_B_FILTER} BAND_LIMIT_MAGS=${BAND_LIMIT_MAGS}"
+  echo "PU_B_CLOSE_CENTER_ARCSEC=${PU_B_CLOSE_CENTER_ARCSEC} PU_B_AXIS_RATIO_MAX=${PU_B_AXIS_RATIO_MAX} PU_CONTAINMENT_THRESHOLD=${PU_CONTAINMENT_THRESHOLD}"
   echo "PU_B_FLAGS=${PU_B_FLAGS}"
   echo "PU_REQUIRE_KRON_REFIT_MATCH=${PU_REQUIRE_KRON_REFIT_MATCH}"
-  echo "ENABLE_STRICT_BRIGHT_IGNORE=${ENABLE_STRICT_BRIGHT_IGNORE}"
+  echo "ENABLE_STRICT_BRIGHT_CENTER_ONLY=${ENABLE_STRICT_BRIGHT_CENTER_ONLY}"
+  echo "STRICT_CENTER_ONLY_SATURATION_MAGS=${STRICT_CENTER_ONLY_SATURATION_MAGS}"
   echo "LSST_BACKGROUND_POLICY=${LSST_BACKGROUND_POLICY}"
   echo "LSST_BACKGROUND_DETECT_CUTOUTS=${LSST_BACKGROUND_DETECT_CUTOUTS}"
   echo "USE_LSST_DETECTION_CALEXP_CUTOUTS=${USE_LSST_DETECTION_CALEXP_CUTOUTS}"

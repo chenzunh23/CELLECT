@@ -520,7 +520,7 @@ _DEFAULT_PU_BAND_LIMIT_MAGS = {
     "HSC-Y": 25.3,
 }
 
-_DEFAULT_PU_STRICT_IGNORE_SATURATION_MAGS = {
+_DEFAULT_PU_STRICT_CENTER_ONLY_SATURATION_MAGS = {
     "HSC-G": 18.0,
     "HSC-R": 18.2,
     "HSC-I": 18.6,
@@ -557,18 +557,27 @@ def _parse_band_limit_mags(values: Optional[Sequence[str]]) -> Dict[str, float]:
     return _parse_band_mags(values, _DEFAULT_PU_BAND_LIMIT_MAGS, label="band limit")
 
 
-def _parse_strict_ignore_saturation_mags(values: Optional[Sequence[str]]) -> Dict[str, float]:
-    return _parse_band_mags(values, _DEFAULT_PU_STRICT_IGNORE_SATURATION_MAGS, label="strict ignore saturation magnitude")
+def _parse_strict_center_only_saturation_mags(values: Optional[Sequence[str]]) -> Dict[str, float]:
+    return _parse_band_mags(
+        values,
+        _DEFAULT_PU_STRICT_CENTER_ONLY_SATURATION_MAGS,
+        label="strict center-only saturation magnitude",
+    )
 
 
-def _strict_ignore_mag_threshold(args: argparse.Namespace, *, band: Optional[str]) -> float:
-    override = getattr(args, "pu_strict_ignore_mag_threshold", None)
+def _strict_center_only_mag_threshold(args: argparse.Namespace, *, band: Optional[str]) -> float:
+    override = getattr(args, "pu_strict_bright_center_only_mag_threshold", None)
+    if override is None:
+        override = getattr(args, "pu_strict_ignore_mag_threshold", None)
     if override is not None:
         return float(override)
     band_name = _normalize_band_name(band or getattr(args, "catalog_band", ""))
-    limits = _parse_strict_ignore_saturation_mags(getattr(args, "pu_strict_ignore_saturation_mags", None))
+    limits = _parse_strict_center_only_saturation_mags(
+        getattr(args, "pu_strict_bright_center_only_saturation_mags", None)
+        or getattr(args, "pu_strict_ignore_saturation_mags", None)
+    )
     if band_name not in limits:
-        raise ValueError(f"No strict ignore saturation magnitude configured for {band_name!r}")
+        raise ValueError(f"No strict center-only saturation magnitude configured for {band_name!r}")
     return float(limits[band_name])
 
 
@@ -600,11 +609,15 @@ def _pu_args(args: argparse.Namespace, *, band: Optional[str] = None) -> argpars
         a_faint_mag_min=args.pu_a_faint_mag_min,
         b_mag_min=b_mag_min,
         b_mag_max=b_mag_max,
+        ap2_kron_abs_max=args.pu_ap2_kron_abs_max,
+        ap2_flux_column=args.pu_ap2_flux_column,
+        ap2_kron_flux_column=args.pu_ap2_kron_flux_column,
         pixel_scale_arcsec=args.pixel_scale_arcsec,
         b_close_center_arcsec=args.pu_b_close_center_arcsec,
         overlap_iou_threshold=args.pu_overlap_iou_threshold,
         b_ellipse_area_max=args.pu_b_ellipse_area_max,
         b_footprint_area_max=args.pu_b_footprint_area_max,
+        b_axis_ratio_max=args.pu_b_axis_ratio_max,
         b_kron_radius_lt_sdss_major_ratio=args.pu_b_kron_radius_lt_sdss_major_ratio,
         drop_ellipse_area_min=args.pu_drop_ellipse_area_min,
         ambiguous_area_max=args.pu_ambiguous_area_max,
@@ -679,21 +692,21 @@ def _magnitude_from_catalog(table: Table, *, mag_column: str, zeropoint: float) 
     return mag
 
 
-def _strict_bright_ignore_catalog(
+def _strict_bright_center_only_catalog(
     table: Table,
     args: argparse.Namespace,
     *,
     band: Optional[str] = None,
     patch: Optional[str] = None,
 ) -> Table:
-    if not bool(getattr(args, "pu_enable_strict_bright_ignore", False)):
+    if not bool(getattr(args, "pu_enable_strict_bright_center_only", False)):
         return table[:0].copy(copy_data=True)
     table = _attach_pu_kron_refit(
         table,
         args,
         band=band,
         patch=patch,
-        radius_column=getattr(args, "pu_strict_ignore_radius_column", "proxy_nan0_flux_aperture_radius"),
+        radius_column=getattr(args, "pu_strict_bright_center_only_radius_column", "proxy_nan0_flux_aperture_radius"),
         output_column="pu_refit_kron_radius",
     )
     shaped = add_ellipse_columns(table, shape_source=args.target_shape_source)
@@ -710,19 +723,66 @@ def _strict_bright_ignore_catalog(
     valid &= source_selection_mask(shaped, getattr(args, "source_filter", "nchild0"))
     if bool(getattr(args, "pu_require_kron_refit_match", False)) and "pu_refit_kron_radius_matched" in shaped.colnames:
         valid &= np.asarray(shaped["pu_refit_kron_radius_matched"], dtype=bool)
-    threshold = _strict_ignore_mag_threshold(args, band=band)
+    threshold = _strict_center_only_mag_threshold(args, band=band)
     valid &= mag < threshold
     out = shaped[valid]
     if len(out):
-        out["pu_class"] = np.asarray(["strict_ignore"] * len(out), dtype=str)
-        out["pu_reason"] = np.asarray(["strict_bright_source"] * len(out), dtype=str)
+        out["pu_class"] = np.asarray(["strict_center_only"] * len(out), dtype=str)
+        out["pu_reason"] = np.asarray(["strict_bright_center_only"] * len(out), dtype=str)
         out["pu_mag"] = mag[valid].astype(np.float32)
-        out["pu_strict_ignore_mag_threshold"] = np.full(len(out), float(threshold), dtype=np.float32)
-        out["pu_strict_ignore_radius_column"] = np.asarray(
-            [str(getattr(args, "pu_strict_ignore_radius_column", "proxy_nan0_flux_aperture_radius"))] * len(out),
+        out["pu_strict_center_only_mag_threshold"] = np.full(len(out), float(threshold), dtype=np.float32)
+        out["pu_strict_center_only_radius_column"] = np.asarray(
+            [str(getattr(args, "pu_strict_bright_center_only_radius_column", "proxy_nan0_flux_aperture_radius"))] * len(out),
             dtype=str,
         )
     return out
+
+
+def _move_bright_clean_to_center_only(
+    clean: Table,
+    center_only: Table,
+    args: argparse.Namespace,
+    *,
+    band: Optional[str] = None,
+) -> Tuple[Table, Table, Table]:
+    if not bool(getattr(args, "pu_enable_strict_bright_center_only", False)) or len(clean) == 0:
+        return clean, center_only, clean[:0].copy(copy_data=True)
+    threshold = _strict_center_only_mag_threshold(args, band=band)
+    mag = _magnitude_from_catalog(
+        clean,
+        mag_column=getattr(args, "pu_mag_column", "ext_photometryKron_KronFlux_instFlux"),
+        zeropoint=float(getattr(args, "pu_input_zeropoint", 27.0)),
+    )
+    bright_mask = np.isfinite(mag) & (mag < threshold)
+    if not np.any(bright_mask):
+        return clean, center_only, clean[:0].copy(copy_data=True)
+
+    remaining_clean = clean[~bright_mask]
+    bright_center = clean[bright_mask].copy(copy_data=True)
+    bright_center["pu_class"] = np.asarray(["strict_center_only"] * len(bright_center), dtype=str)
+    if "pu_reason" in bright_center.colnames:
+        reasons = np.asarray(bright_center["pu_reason"], dtype=str)
+        reasons = np.asarray(
+            [
+                "strict_bright_center_only" if not item or item == "--" else f"{item};strict_bright_center_only"
+                for item in reasons
+            ],
+            dtype=str,
+        )
+    else:
+        reasons = np.asarray(["strict_bright_center_only"] * len(bright_center), dtype=str)
+    bright_center["pu_reason"] = reasons
+    bright_center["pu_mag"] = mag[bright_mask].astype(np.float32)
+    bright_center["pu_strict_center_only_mag_threshold"] = np.full(
+        len(bright_center),
+        float(threshold),
+        dtype=np.float32,
+    )
+    if len(center_only):
+        merged_center = vstack([center_only, bright_center], metadata_conflicts="silent")
+    else:
+        merged_center = bright_center
+    return remaining_clean, merged_center, bright_center
 
 
 def _exclude_catalog_rows_by_id(table: Table, excluded: Table) -> Table:
@@ -1215,8 +1275,8 @@ def make_pu_dense_targets(
     core_radius: int,
     center_only_weight: float,
     lsst_background_mask: Optional[np.ndarray] = None,
-    strict_ignore_sources: Optional[Table] = None,
-    strict_ignore_ellipse_sigma: float = 1.0,
+    strict_center_only_sources: Optional[Table] = None,
+    strict_center_only_ellipse_sigma: float = 1.0,
 ) -> Dict[str, np.ndarray]:
     targets = make_dense_targets(
         clean_sources,
@@ -1231,7 +1291,8 @@ def make_pu_dense_targets(
     clean_mask = (targets["seg"] > 0).astype(np.uint8)
     center_only_mask = np.zeros((h, w), dtype=np.uint8)
     ignore_mask = np.zeros((h, w), dtype=np.uint8)
-    strict_ignore_mask = np.zeros((h, w), dtype=np.uint8)
+    strict_center_only_mask = np.zeros((h, w), dtype=np.uint8)
+    legacy_strict_ignore_mask = np.zeros((h, w), dtype=np.uint8)
     a_failed_mask = np.zeros((h, w), dtype=np.uint8)
     if "pu_class" in ignore_sources.colnames:
         classes = np.asarray(ignore_sources["pu_class"], dtype=str)
@@ -1243,33 +1304,32 @@ def make_pu_dense_targets(
     _paint_ellipse_mask(center_only_mask, center_only_sources, spec, x_col=x_col, y_col=y_col, ellipse_sigma=ellipse_sigma)
     _paint_ellipse_mask(ignore_mask, ordinary_ignore_sources, spec, x_col=x_col, y_col=y_col, ellipse_sigma=ellipse_sigma)
     _paint_ellipse_mask(a_failed_mask, a_failed_sources, spec, x_col=x_col, y_col=y_col, ellipse_sigma=ellipse_sigma)
-    if strict_ignore_sources is not None and len(strict_ignore_sources):
+    if strict_center_only_sources is not None and len(strict_center_only_sources):
         _paint_ellipse_mask(
-            strict_ignore_mask,
-            strict_ignore_sources,
+            strict_center_only_mask,
+            strict_center_only_sources,
             spec,
             x_col=x_col,
             y_col=y_col,
-            ellipse_sigma=strict_ignore_ellipse_sigma,
+            ellipse_sigma=strict_center_only_ellipse_sigma,
         )
     clean_bool = clean_mask > 0
-    strict_bool = strict_ignore_mask > 0
-    clean_bool &= ~strict_bool
-    center_bool = (center_only_mask > 0) & ~clean_bool & ~strict_bool
-    ignore_bool = ((ignore_mask > 0) | strict_bool) & ~clean_bool & ~center_bool
+    strict_center_only_bool = strict_center_only_mask > 0
+    center_bool = ((center_only_mask > 0) | strict_center_only_bool) & ~clean_bool
+    ignore_bool = (ignore_mask > 0) & ~clean_bool & ~center_bool
     a_failed_bool = (a_failed_mask > 0) & ~clean_bool & ~center_bool & ~ignore_bool
     if lsst_background_mask is not None:
         lsst_background_bool = np.asarray(lsst_background_mask, dtype=bool)
         if lsst_background_bool.shape != (h, w):
             raise ValueError(f"lsst_background_mask shape {lsst_background_bool.shape} != {(h, w)}")
-        background_bool = lsst_background_bool & ~clean_bool & ~center_bool & ~ignore_bool & ~strict_bool
+        background_bool = lsst_background_bool & ~clean_bool & ~center_bool & ~ignore_bool
         ignore_bool = ignore_bool | (~background_bool & ~clean_bool & ~center_bool)
     else:
         background_bool = np.zeros((h, w), dtype=bool)
-        ignore_bool = ignore_bool | (~clean_bool & ~center_bool & ~strict_bool)
+        ignore_bool = ignore_bool | (~clean_bool & ~center_bool)
     clean_mask = clean_bool.astype(np.uint8)
     center_only_mask = center_bool.astype(np.uint8)
-    strict_ignore_mask = strict_bool.astype(np.uint8)
+    strict_center_only_mask = (strict_center_only_bool & center_bool).astype(np.uint8)
     ignore_mask = ignore_bool.astype(np.uint8)
 
     source_union_mask = (clean_bool | center_bool | ignore_bool).astype(np.uint8)
@@ -1279,7 +1339,7 @@ def make_pu_dense_targets(
     pu_class_mask[center_bool] = 2
     pu_class_mask[ignore_bool] = 3
     pu_class_mask[background_bool] = 4
-    pu_class_mask[strict_bool] = 5
+    pu_class_mask[strict_center_only_mask > 0] = 5
 
     confidence_weight = np.ones((h, w), dtype=np.float32)
     seg_loss_weight = np.ones((h, w), dtype=np.float32)
@@ -1313,7 +1373,8 @@ def make_pu_dense_targets(
             "clean_mask": clean_mask,
             "center_only_mask": center_only_mask,
             "ignore_mask": ignore_mask,
-            "strict_ignore_mask": strict_ignore_mask,
+            "strict_center_only_mask": strict_center_only_mask,
+            "strict_ignore_mask": legacy_strict_ignore_mask,
             "source_union_mask": source_union_mask,
             "background_mask": background_mask,
             "pu_class_mask": pu_class_mask,
@@ -1346,6 +1407,7 @@ def write_targets(targets: Dict[str, np.ndarray], output_npz: Path, output_fits_
         "clean_mask",
         "center_only_mask",
         "ignore_mask",
+        "strict_center_only_mask",
         "strict_ignore_mask",
         "source_union_mask",
         "background_mask",
@@ -1690,7 +1752,7 @@ def _preprocess_patch(
     pu_result: Optional[Dict[str, object]] = None
     center_only = Table()
     ignore_sources = Table()
-    strict_ignore_sources = Table()
+    strict_center_only_sources = Table()
     if args.label_mode == "pu":
         filtered, center_only, ignore_sources, pu_all, pu_result = _classify_pu_catalog(
             table,
@@ -1698,11 +1760,13 @@ def _preprocess_patch(
             band=args.catalog_band,
             patch=patch,
         )
-        strict_ignore_sources = _strict_bright_ignore_catalog(table, args, band=args.catalog_band, patch=patch)
-        filtered = _exclude_catalog_rows_by_id(filtered, strict_ignore_sources)
-        center_only = _exclude_catalog_rows_by_id(center_only, strict_ignore_sources)
-        ignore_sources = _exclude_catalog_rows_by_id(ignore_sources, strict_ignore_sources)
-        rejected_parts = [part for part in (center_only, ignore_sources, strict_ignore_sources) if len(part)]
+        filtered, center_only, strict_center_only_sources = _move_bright_clean_to_center_only(
+            filtered,
+            center_only,
+            args,
+            band=args.catalog_band,
+        )
+        rejected_parts = [part for part in (center_only, ignore_sources) if len(part)]
         rejected = vstack(rejected_parts) if len(rejected_parts) >= 2 else (rejected_parts[0] if rejected_parts else Table())
     else:
         filtered, rejected = _filter_catalog(table, args)
@@ -1722,7 +1786,7 @@ def _preprocess_patch(
             write_table_pair(filtered, sources_dir / "sources_pu_clean.fits", None)
             write_table_pair(center_only, sources_dir / "sources_pu_center_only.fits", None)
             write_table_pair(ignore_sources, sources_dir / "sources_pu_ignore.fits", None)
-            write_table_pair(strict_ignore_sources, sources_dir / "sources_pu_strict_ignore.fits", None)
+            write_table_pair(strict_center_only_sources, sources_dir / "sources_pu_strict_center_only.fits", None)
             write_table_pair(pu_all, sources_dir / "sources_pu_all.fits", None)
 
     band_catalog_warnings: List[Dict[str, str]] = []
@@ -1740,11 +1804,14 @@ def _preprocess_patch(
                         band=band,
                         patch=patch,
                     )
-                    band_strict_ignore = _strict_bright_ignore_catalog(band_table, args, band=band, patch=patch)
-                    band_filtered = _exclude_catalog_rows_by_id(band_filtered, band_strict_ignore)
-                    band_center_only = _exclude_catalog_rows_by_id(band_center_only, band_strict_ignore)
-                    band_ignore = _exclude_catalog_rows_by_id(band_ignore, band_strict_ignore)
-                    band_rejected_parts = [part for part in (band_center_only, band_ignore, band_strict_ignore) if len(part)]
+                    band_strict_center_only = Table()
+                    band_filtered, band_center_only, band_strict_center_only = _move_bright_clean_to_center_only(
+                        band_filtered,
+                        band_center_only,
+                        args,
+                        band=band,
+                    )
+                    band_rejected_parts = [part for part in (band_center_only, band_ignore) if len(part)]
                     band_rejected = (
                         vstack(band_rejected_parts)
                         if len(band_rejected_parts) >= 2
@@ -1757,7 +1824,7 @@ def _preprocess_patch(
                         band_rejected = add_ellipse_columns(band_rejected, shape_source=args.target_shape_source)
                     band_center_only = Table()
                     band_ignore = Table()
-                    band_strict_ignore = Table()
+                    band_strict_center_only = Table()
                     band_pu_all = Table()
             except Exception as exc:
                 policy = str(args.bad_band_catalog_policy)
@@ -1786,9 +1853,9 @@ def _preprocess_patch(
                 band_filtered, band_rejected = filtered, rejected
                 band_center_only = center_only
                 band_ignore = ignore_sources
-                band_strict_ignore = strict_ignore_sources
+                band_strict_center_only = strict_center_only_sources
                 band_pu_all = pu_all if args.label_mode == "pu" else Table()
-            band_target_sources[band] = (band_filtered, band_center_only, band_ignore, band_strict_ignore)
+            band_target_sources[band] = (band_filtered, band_center_only, band_ignore, band_strict_center_only)
             band_ref_dir = output_root / "band_reference_catalogs" / band
             write_table_pair(
                 band_filtered,
@@ -1813,8 +1880,8 @@ def _preprocess_patch(
                     None,
                 )
                 write_table_pair(
-                    band_strict_ignore,
-                    output_root / "band_reference_strict_ignore" / band / f"meas-{band}-{args.tract}-{patch}.fits",
+                    band_strict_center_only,
+                    output_root / "band_reference_strict_center_only" / band / f"meas-{band}-{args.tract}-{patch}.fits",
                     None,
                 )
                 write_table_pair(
@@ -1895,8 +1962,8 @@ def _preprocess_patch(
                 y_col=args.y_col,
                 margin=0.0,
             )
-            tile_strict_ignore = crop_catalog_for_tile(
-                strict_ignore_sources,
+            tile_strict_center_only = crop_catalog_for_tile(
+                strict_center_only_sources,
                 spec,
                 x_col=args.x_col,
                 y_col=args.y_col,
@@ -1916,8 +1983,8 @@ def _preprocess_patch(
                 y_col=args.y_col,
                 margin=args.mask_margin,
             )
-            strict_ignore_mask_sources = crop_catalog_for_tile(
-                strict_ignore_sources,
+            strict_center_only_mask_sources = crop_catalog_for_tile(
+                strict_center_only_sources,
                 spec,
                 x_col=args.x_col,
                 y_col=args.y_col,
@@ -1926,10 +1993,10 @@ def _preprocess_patch(
         else:
             tile_center_only = Table()
             tile_ignore = Table()
-            tile_strict_ignore = Table()
+            tile_strict_center_only = Table()
             center_only_mask_sources = Table()
             ignore_mask_sources = Table()
-            strict_ignore_mask_sources = Table()
+            strict_center_only_mask_sources = Table()
 
         band_paths: Dict[str, str] = {}
         for band in bands:
@@ -2017,8 +2084,8 @@ def _preprocess_patch(
                 )
                 if first_band in lsst_background_masks
                 else tile_lsst_background_masks.get(first_band),
-                strict_ignore_sources=strict_ignore_mask_sources,
-                strict_ignore_ellipse_sigma=args.pu_strict_ignore_ellipse_sigma,
+                strict_center_only_sources=strict_center_only_mask_sources,
+                strict_center_only_ellipse_sigma=args.pu_strict_bright_center_only_ellipse_sigma,
             )
         else:
             targets = make_dense_targets(
@@ -2033,7 +2100,7 @@ def _preprocess_patch(
 
         band_targets: Dict[str, Dict[str, np.ndarray]] = {}
         band_tile_catalogs: Dict[str, Table] = {}
-        for band, (band_filtered, band_center_only, band_ignore, band_strict_ignore) in band_target_sources.items():
+        for band, (band_filtered, band_center_only, band_ignore, band_strict_center_only) in band_target_sources.items():
             band_tile_catalogs[band] = crop_catalog_for_tile(
                 band_filtered,
                 spec,
@@ -2065,8 +2132,8 @@ def _preprocess_patch(
                     y_col=args.y_col,
                     margin=args.mask_margin,
                 )
-                band_strict_ignore_mask_sources = crop_catalog_for_tile(
-                    band_strict_ignore,
+                band_strict_center_only_mask_sources = crop_catalog_for_tile(
+                    band_strict_center_only,
                     spec,
                     x_col=args.x_col,
                     y_col=args.y_col,
@@ -2088,8 +2155,8 @@ def _preprocess_patch(
                     )
                     if band in lsst_background_masks
                     else tile_lsst_background_masks.get(band),
-                    strict_ignore_sources=band_strict_ignore_mask_sources,
-                    strict_ignore_ellipse_sigma=args.pu_strict_ignore_ellipse_sigma,
+                    strict_center_only_sources=band_strict_center_only_mask_sources,
+                    strict_center_only_ellipse_sigma=args.pu_strict_bright_center_only_ellipse_sigma,
                 )
             else:
                 band_targets[band] = make_dense_targets(
@@ -2106,7 +2173,7 @@ def _preprocess_patch(
         ref_csv = output_root / "reference_catalogs_csv" / f"{spec.name}_meas.csv"
         center_ref_path = output_root / "center_only_catalogs" / f"{spec.name}_meas.fits"
         ignore_ref_path = output_root / "ignore_catalogs" / f"{spec.name}_meas.fits"
-        strict_ignore_ref_path = output_root / "strict_ignore_catalogs" / f"{spec.name}_meas.fits"
+        strict_center_only_ref_path = output_root / "strict_center_only_catalogs" / f"{spec.name}_meas.fits"
         target_path = output_root / "targets" / f"{spec.name}.npz"
         target_fits_prefix = output_root / "target_fits" / spec.name if args.write_target_fits else None
         if not args.dry_run:
@@ -2114,7 +2181,7 @@ def _preprocess_patch(
             if args.label_mode == "pu":
                 write_table_pair(tile_center_only, center_ref_path, None)
                 write_table_pair(tile_ignore, ignore_ref_path, None)
-                write_table_pair(tile_strict_ignore, strict_ignore_ref_path, None)
+                write_table_pair(tile_strict_center_only, strict_center_only_ref_path, None)
             write_targets(targets, target_path, target_fits_prefix)
             write_catalog_metadata(tile_catalog, output_root / "tile_metadata" / f"{spec.name}.npz")
             for band, band_tile_catalog in band_tile_catalogs.items():
@@ -2143,12 +2210,12 @@ def _preprocess_patch(
                 "n_center_only_for_mask_with_margin": len(center_only_mask_sources),
                 "n_ignore_center_in_tile": len(tile_ignore),
                 "n_ignore_for_mask_with_margin": len(ignore_mask_sources),
-                "n_strict_ignore_center_in_tile": len(tile_strict_ignore),
-                "n_strict_ignore_for_mask_with_margin": len(strict_ignore_mask_sources),
+                "n_strict_center_only_center_in_tile": len(tile_strict_center_only),
+                "n_strict_center_only_for_mask_with_margin": len(strict_center_only_mask_sources),
                 "seg_foreground_pixels": int((targets["seg"] > 0).sum()),
                 "overlap_pixels": int((targets["overlap_count"] >= 2).sum()),
                 "source_union_pixels": int(targets["source_union_mask"].sum()) if "source_union_mask" in targets else None,
-                "strict_ignore_pixels": int(targets["strict_ignore_mask"].sum()) if "strict_ignore_mask" in targets else None,
+                "strict_center_only_pixels": int(targets["strict_center_only_mask"].sum()) if "strict_center_only_mask" in targets else None,
                 "background_pixels": int(targets["background_mask"].sum()) if "background_mask" in targets else None,
                 "band_target_paths": {
                     band: str(output_root / "band_targets" / band / f"{spec.name}.npz") for band in sorted(band_targets)
@@ -2473,6 +2540,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pu-b-mag-min", type=float, default=18.0)
     parser.add_argument("--pu-b-mag-max", type=float, default=30.0)
     parser.add_argument(
+        "--pu-ap2-kron-abs-max",
+        type=float,
+        default=1.0,
+        help=(
+            "PU B filter for direct training catalogs: require abs(ap2_mag-kron_mag) to be below "
+            "this threshold. Use a negative value to disable."
+        ),
+    )
+    parser.add_argument("--pu-ap2-flux-column", default="base_CircularApertureFlux_6_0_instFlux")
+    parser.add_argument("--pu-ap2-kron-flux-column", default="ext_photometryKron_KronFlux_instFlux")
+    parser.add_argument(
         "--pu-use-band-limit-b-filter",
         action="store_true",
         help="Use per-band limiting magnitudes for the PU B filter instead of --pu-b-mag-min/max.",
@@ -2486,43 +2564,76 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pu-band-limit-b-min-offset", type=float, default=-5.0)
     parser.add_argument("--pu-band-limit-b-max-offset", type=float, default=0.0)
     parser.add_argument(
-        "--pu-enable-strict-bright-ignore",
+        "--pu-enable-strict-bright-center-only",
         action="store_true",
         help=(
-            "Add a separate strict_ignore_mask for bright-source regions. The mask is also folded into "
-            "ignore_mask so training and eval detection metrics ignore these pixels."
+            "Move clean sources brighter than the strict bright threshold to center_only. "
+            "They keep low-weight center supervision instead of becoming strict ignore regions."
         ),
     )
     parser.add_argument(
-        "--pu-strict-ignore-mag-threshold",
+        "--pu-strict-bright-center-only-mag-threshold",
         type=float,
         default=None,
         help=(
-            "Optional global magnitude threshold for strict bright-source ignore. "
+            "Optional global magnitude threshold for strict bright-source center_only labels. "
             "When unset, per-band HSC saturation magnitudes are used."
         ),
     )
     parser.add_argument(
-        "--pu-strict-ignore-saturation-mags",
+        "--pu-strict-ignore-mag-threshold",
+        dest="pu_strict_ignore_mag_threshold",
+        type=float,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--pu-strict-bright-center-only-saturation-mags",
         nargs="*",
         default=None,
-        help="Per-band strict ignore saturation magnitudes, e.g. HSC-G=18.0 HSC-R=18.2 HSC-I=18.6 HSC-Z=17.7 HSC-Y=17.4.",
+        help="Per-band strict center_only saturation magnitudes, e.g. HSC-G=18.0 HSC-R=18.2 HSC-I=18.6 HSC-Z=17.7 HSC-Y=17.4.",
+    )
+    parser.add_argument(
+        "--pu-strict-ignore-saturation-mags",
+        dest="pu_strict_ignore_saturation_mags",
+        nargs="*",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--pu-strict-bright-center-only-radius-column",
+        default="proxy_nan0_flux_aperture_radius",
+        help="Radius column from --pu-kron-refit-csv used for strict bright-source center_only apertures.",
     )
     parser.add_argument(
         "--pu-strict-ignore-radius-column",
-        default="proxy_nan0_flux_aperture_radius",
-        help="Radius column from --pu-kron-refit-csv used for strict bright-source ignore apertures.",
+        dest="pu_strict_bright_center_only_radius_column",
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--pu-strict-bright-center-only-ellipse-sigma",
+        type=float,
+        default=1.0,
+        help="Scale applied when rasterizing strict bright-source center_only apertures.",
     )
     parser.add_argument(
         "--pu-strict-ignore-ellipse-sigma",
+        dest="pu_strict_bright_center_only_ellipse_sigma",
         type=float,
-        default=1.0,
-        help="Scale applied when rasterizing strict bright-source ignore apertures.",
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--pu-b-close-center-arcsec", type=float, default=0.5)
     parser.add_argument("--pu-overlap-iou-threshold", type=float, default=0.33)
     parser.add_argument("--pu-b-ellipse-area-max", type=float, default=None)
     parser.add_argument("--pu-b-footprint-area-max", type=float, default=None)
+    parser.add_argument(
+        "--pu-b-axis-ratio-max",
+        type=float,
+        default=5.0,
+        help="PU B filter: move sources with max(axis)/min(axis) above this value to ordinary ignore. Use <=0 to disable.",
+    )
     parser.add_argument("--pu-b-kron-radius-lt-sdss-major-ratio", type=float, default=0.5)
     parser.add_argument(
         "--pu-drop-ellipse-area-min",

@@ -32,6 +32,7 @@ class CutoutRecord:
     band_meas_paths: Tuple[str, ...] = ()
     band_rejected_paths: Tuple[str, ...] = ()
     band_ignore_paths: Tuple[str, ...] = ()
+    band_strict_center_only_paths: Tuple[str, ...] = ()
     band_strict_ignore_paths: Tuple[str, ...] = ()
     band_target_paths: Tuple[str, ...] = ()
     band_metadata_paths: Tuple[str, ...] = ()
@@ -43,6 +44,7 @@ class CutoutRecord:
     target_path: str = ""
     metadata_path: str = ""
     ignore_path: str = ""
+    strict_center_only_path: str = ""
     strict_ignore_path: str = ""
 
 
@@ -233,6 +235,9 @@ def discover_cutout_records(
         local_band_ignore_root = patch_root / "band_reference_ignore"
         if not local_band_ignore_root.exists():
             local_band_ignore_root = None
+        local_band_strict_center_only_root = patch_root / "band_reference_strict_center_only"
+        if not local_band_strict_center_only_root.exists():
+            local_band_strict_center_only_root = None
         local_band_strict_ignore_root = patch_root / "band_reference_strict_ignore"
         if not local_band_strict_ignore_root.exists():
             local_band_strict_ignore_root = None
@@ -276,6 +281,14 @@ def discover_cutout_records(
                 if local_band_strict_ignore_root is not None
                 else ()
             )
+            band_strict_center_only_paths = (
+                tuple(
+                    _find_optional_band_meas(local_band_strict_center_only_root, band, tract=tract, patch=patch)
+                    for band in band_order
+                )
+                if local_band_strict_center_only_root is not None
+                else band_strict_ignore_paths
+            )
             band_target_paths = tuple(
                 str(patch_root / "band_targets" / band / f"{tile_name}.npz")
                 if (patch_root / "band_targets" / band / f"{tile_name}.npz").exists()
@@ -298,6 +311,7 @@ def discover_cutout_records(
             target_path = patch_root / "targets" / f"{tile_name}.npz"
             metadata_path = patch_root / "tile_metadata" / f"{tile_name}.npz"
             ignore_path = patch_root / "ignore_catalogs" / f"{tile_name}_meas.fits"
+            strict_center_only_path = patch_root / "strict_center_only_catalogs" / f"{tile_name}_meas.fits"
             strict_ignore_path = patch_root / "strict_ignore_catalogs" / f"{tile_name}_meas.fits"
             records.append(
                 CutoutRecord(
@@ -309,6 +323,7 @@ def discover_cutout_records(
                     band_meas_paths=band_meas_paths,
                     band_rejected_paths=band_rejected_paths,
                     band_ignore_paths=band_ignore_paths,
+                    band_strict_center_only_paths=band_strict_center_only_paths,
                     band_strict_ignore_paths=band_strict_ignore_paths,
                     band_target_paths=band_target_paths,
                     band_metadata_paths=band_metadata_paths,
@@ -320,6 +335,11 @@ def discover_cutout_records(
                     target_path=str(target_path) if target_path.exists() else "",
                     metadata_path=str(metadata_path) if metadata_path.exists() else "",
                     ignore_path=str(ignore_path) if ignore_path.exists() else "",
+                    strict_center_only_path=(
+                        str(strict_center_only_path)
+                        if strict_center_only_path.exists()
+                        else (str(strict_ignore_path) if strict_ignore_path.exists() else "")
+                    ),
                     strict_ignore_path=str(strict_ignore_path) if strict_ignore_path.exists() else "",
                 )
             )
@@ -666,6 +686,7 @@ _SPATIAL_TARGET_KEYS = (
     "clean_mask",
     "center_only_mask",
     "ignore_mask",
+    "strict_center_only_mask",
     "strict_ignore_mask",
     "source_union_mask",
     "background_mask",
@@ -684,6 +705,7 @@ def _target_defaults(targets: Dict[str, Tensor]) -> Dict[str, Tensor]:
     targets.setdefault("clean_mask", (targets["shape_weight"] > 0).to(dtype=torch.uint8))
     targets.setdefault("center_only_mask", torch.zeros((h, w), dtype=torch.uint8, device=device))
     targets.setdefault("ignore_mask", torch.zeros((h, w), dtype=torch.uint8, device=device))
+    targets.setdefault("strict_center_only_mask", torch.zeros((h, w), dtype=torch.uint8, device=device))
     targets.setdefault("strict_ignore_mask", torch.zeros((h, w), dtype=torch.uint8, device=device))
     targets["ignore_mask"] = ((targets["ignore_mask"] > 0) | (targets["strict_ignore_mask"] > 0)).to(dtype=torch.uint8)
     targets.setdefault("source_union_mask", (targets["clean_mask"] > 0).to(dtype=torch.uint8))
@@ -711,6 +733,7 @@ def _read_target_npz(path: Path) -> Dict[str, Tensor]:
             "clean_mask",
             "center_only_mask",
             "ignore_mask",
+            "strict_center_only_mask",
             "strict_ignore_mask",
             "source_union_mask",
             "background_mask",
@@ -952,10 +975,19 @@ class AstroCutoutDataset(Dataset):
             if self.load_eval_ignore_sources
             else np.zeros((0, 2), dtype=np.float32)
         )
+        strict_center_only_centers = torch.from_numpy(
+            load_catalog_centers(rec.strict_center_only_path, x0=rec.x0, y0=rec.y0, image_shape=(h, w))
+            if self.load_eval_ignore_sources
+            else np.zeros((0, 2), dtype=np.float32)
+        )
         if self.load_eval_ignore_sources:
             band_ignore_centers = [
                 torch.from_numpy(load_catalog_centers(path, x0=rec.x0, y0=rec.y0, image_shape=(h, w)))
                 for path in rec.band_ignore_paths
+            ]
+            band_strict_center_only_centers = [
+                torch.from_numpy(load_catalog_centers(path, x0=rec.x0, y0=rec.y0, image_shape=(h, w)))
+                for path in rec.band_strict_center_only_paths
             ]
             band_strict_ignore_centers = [
                 torch.from_numpy(load_catalog_centers(path, x0=rec.x0, y0=rec.y0, image_shape=(h, w)))
@@ -963,12 +995,18 @@ class AstroCutoutDataset(Dataset):
             ]
         else:
             band_ignore_centers = []
+            band_strict_center_only_centers = []
             band_strict_ignore_centers = []
         if len(band_ignore_centers) < len(band_meas_paths):
             band_ignore_centers.extend(torch.empty((0, 2), dtype=torch.float32) for _ in range(len(band_meas_paths) - len(band_ignore_centers)))
         if len(band_strict_ignore_centers) < len(band_meas_paths):
             band_strict_ignore_centers.extend(
                 torch.empty((0, 2), dtype=torch.float32) for _ in range(len(band_meas_paths) - len(band_strict_ignore_centers))
+            )
+        if len(band_strict_center_only_centers) < len(band_meas_paths):
+            band_strict_center_only_centers.extend(
+                torch.empty((0, 2), dtype=torch.float32)
+                for _ in range(len(band_meas_paths) - len(band_strict_center_only_centers))
             )
         rejected_id_paths = rec.band_rejected_id_paths if any(rec.band_rejected_id_paths) else rec.band_rejected_paths
         if rejected_id_paths:
@@ -1004,6 +1042,9 @@ class AstroCutoutDataset(Dataset):
             strict_ignore_centers = strict_ignore_centers.clone()
             if strict_ignore_centers.numel():
                 strict_ignore_centers[:, 0] = float(w - 1) - strict_ignore_centers[:, 0]
+            strict_center_only_centers = strict_center_only_centers.clone()
+            if strict_center_only_centers.numel():
+                strict_center_only_centers[:, 0] = float(w - 1) - strict_center_only_centers[:, 0]
             band_centers = [center.clone() for center in band_centers]
             for center in band_centers:
                 center[:, 0] = float(w - 1) - center[:, 0]
@@ -1013,6 +1054,10 @@ class AstroCutoutDataset(Dataset):
                     center[:, 0] = float(w - 1) - center[:, 0]
             band_strict_ignore_centers = [center.clone() for center in band_strict_ignore_centers]
             for center in band_strict_ignore_centers:
+                if center.numel():
+                    center[:, 0] = float(w - 1) - center[:, 0]
+            band_strict_center_only_centers = [center.clone() for center in band_strict_center_only_centers]
+            for center in band_strict_center_only_centers:
                 if center.numel():
                     center[:, 0] = float(w - 1) - center[:, 0]
 
@@ -1027,6 +1072,7 @@ class AstroCutoutDataset(Dataset):
             "clean_mask": targets["clean_mask"],
             "center_only_mask": targets["center_only_mask"],
             "ignore_mask": targets["ignore_mask"],
+            "strict_center_only_mask": targets["strict_center_only_mask"],
             "strict_ignore_mask": targets["strict_ignore_mask"],
             "source_union_mask": targets["source_union_mask"],
             "background_mask": targets["background_mask"],
@@ -1041,6 +1087,7 @@ class AstroCutoutDataset(Dataset):
             "band_clean_mask": torch.stack([target["clean_mask"] for target in band_targets]),
             "band_center_only_mask": torch.stack([target["center_only_mask"] for target in band_targets]),
             "band_ignore_mask": torch.stack([target["ignore_mask"] for target in band_targets]),
+            "band_strict_center_only_mask": torch.stack([target["strict_center_only_mask"] for target in band_targets]),
             "band_strict_ignore_mask": torch.stack([target["strict_ignore_mask"] for target in band_targets]),
             "band_source_union_mask": torch.stack([target["source_union_mask"] for target in band_targets]),
             "band_background_mask": torch.stack([target["background_mask"] for target in band_targets]),
@@ -1049,10 +1096,12 @@ class AstroCutoutDataset(Dataset):
             "centers": centers,
             "ids": torch.from_numpy(catalog["ids"]),
             "ignore_centers": ignore_centers,
+            "strict_center_only_centers": strict_center_only_centers,
             "strict_ignore_centers": strict_ignore_centers,
             "band_centers": band_centers,
             "band_ids": band_ids,
             "band_ignore_centers": band_ignore_centers,
+            "band_strict_center_only_centers": band_strict_center_only_centers,
             "band_strict_ignore_centers": band_strict_ignore_centers,
             "band_rejected_ids": band_rejected_ids,
             "name": rec.name,
@@ -1215,6 +1264,7 @@ def collate_cutouts(batch: Sequence[Dict[str, object]]) -> Dict[str, object]:
         "clean_mask": torch.stack([item["clean_mask"] for item in batch]),  # type: ignore[index]
         "center_only_mask": torch.stack([item["center_only_mask"] for item in batch]),  # type: ignore[index]
         "ignore_mask": torch.stack([item["ignore_mask"] for item in batch]),  # type: ignore[index]
+        "strict_center_only_mask": torch.stack([item["strict_center_only_mask"] for item in batch]),  # type: ignore[index]
         "strict_ignore_mask": torch.stack([item["strict_ignore_mask"] for item in batch]),  # type: ignore[index]
         "source_union_mask": torch.stack([item["source_union_mask"] for item in batch]),  # type: ignore[index]
         "background_mask": torch.stack([item["background_mask"] for item in batch]),  # type: ignore[index]
@@ -1229,6 +1279,7 @@ def collate_cutouts(batch: Sequence[Dict[str, object]]) -> Dict[str, object]:
         "band_clean_mask": torch.stack([item["band_clean_mask"] for item in batch]),  # type: ignore[index]
         "band_center_only_mask": torch.stack([item["band_center_only_mask"] for item in batch]),  # type: ignore[index]
         "band_ignore_mask": torch.stack([item["band_ignore_mask"] for item in batch]),  # type: ignore[index]
+        "band_strict_center_only_mask": torch.stack([item["band_strict_center_only_mask"] for item in batch]),  # type: ignore[index]
         "band_strict_ignore_mask": torch.stack([item["band_strict_ignore_mask"] for item in batch]),  # type: ignore[index]
         "band_source_union_mask": torch.stack([item["band_source_union_mask"] for item in batch]),  # type: ignore[index]
         "band_background_mask": torch.stack([item["band_background_mask"] for item in batch]),  # type: ignore[index]
@@ -1237,10 +1288,12 @@ def collate_cutouts(batch: Sequence[Dict[str, object]]) -> Dict[str, object]:
         "centers": [item["centers"] for item in batch],
         "ids": [item["ids"] for item in batch],
         "ignore_centers": [item["ignore_centers"] for item in batch],
+        "strict_center_only_centers": [item["strict_center_only_centers"] for item in batch],
         "strict_ignore_centers": [item["strict_ignore_centers"] for item in batch],
         "band_centers": [item["band_centers"] for item in batch],
         "band_ids": [item["band_ids"] for item in batch],
         "band_ignore_centers": [item["band_ignore_centers"] for item in batch],
+        "band_strict_center_only_centers": [item["band_strict_center_only_centers"] for item in batch],
         "band_strict_ignore_centers": [item["band_strict_ignore_centers"] for item in batch],
         "band_rejected_ids": [item["band_rejected_ids"] for item in batch],
         "name": [item["name"] for item in batch],

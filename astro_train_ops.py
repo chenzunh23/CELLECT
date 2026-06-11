@@ -1351,7 +1351,12 @@ def detect_centers(
         smoothed = _cellect_confidence_smooth_2d(outputs["confidence"])
         local_score = smoothed.max(dim=1).values
         center_score = smoothed[:, -1]
-        pooled = F.max_pool2d(local_score.unsqueeze(1), kernel_size=2 * nms_radius + 1, stride=1, padding=1).squeeze(1)
+        pooled = F.max_pool2d(
+            local_score.unsqueeze(1),
+            kernel_size=2 * nms_radius + 1,
+            stride=1,
+            padding=nms_radius,
+        ).squeeze(1)
         peaks = (pooled == center_score) & _cellect_foreground_gate_2d(outputs["seg_logits"]) & (center_score > threshold)
         conf = center_score
     else:
