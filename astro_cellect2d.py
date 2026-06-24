@@ -8,6 +8,8 @@ Main differences from the microscopy model:
   - no division branch is produced or trained;
   - confidence maps are still ordinal center maps with 0..4 levels;
   - EX/EN matching modules are retained without division features/logits.
+
+TODO: Merge this file into model backbone directory
 """
 
 from __future__ import annotations

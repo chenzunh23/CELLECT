@@ -41,6 +41,7 @@ class CutoutRecord:
     tract: str = ""
     patch: str = ""
     relative_root: str = ""
+    dataset_source: str = "coadd"
     target_path: str = ""
     metadata_path: str = ""
     ignore_path: str = ""
@@ -149,13 +150,37 @@ def _record_name(tile_name: str, relative_root: str) -> str:
     return f"{relative_root}/{tile_name}" if relative_root else tile_name
 
 
-def _relative_root_parts(relative_root: str) -> Tuple[str, str]:
+def _relative_root_parts(relative_root: str) -> Tuple[str, str, str]:
     parts = Path(relative_root).parts
+    if len(parts) >= 3:
+        first = str(parts[0])
+        if not re.fullmatch(r"\d+", first):
+            return str(parts[1]), str(parts[2]), first
     if len(parts) >= 2:
-        return str(parts[0]), str(parts[1])
+        return str(parts[0]), str(parts[1]), "coadd"
     if len(parts) == 1 and str(parts[0]) not in ("", "."):
-        return "", str(parts[0])
-    return "", ""
+        return "", str(parts[0]), "coadd"
+    return "", "", "coadd"
+
+
+def _variant_base_tile_map(patch_root: Path) -> Dict[str, str]:
+    tiles_csv = patch_root / "tiles.csv"
+    if not tiles_csv.exists():
+        return {}
+    out: Dict[str, str] = {}
+    try:
+        import csv
+
+        with tiles_csv.open("r", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                name = str(row.get("name", "")).strip()
+                base = str(row.get("base_tile_name", "")).strip()
+                if name and base:
+                    out[name] = base
+    except Exception:
+        return {}
+    return out
 
 
 def _discover_dataset_roots(
@@ -163,7 +188,7 @@ def _discover_dataset_roots(
     *,
     reference_dir: Optional[Path],
     cutout_dir: Optional[Path],
-) -> List[Tuple[Path, Path, Path, str]]:
+) -> List[Tuple[Path, Path, Path, str, Path]]:
     if reference_dir is not None or cutout_dir is not None:
         ref_dir = reference_dir or (root / "reference_catalogs")
         img_dir = cutout_dir or (root / "cutouts")
@@ -174,22 +199,22 @@ def _discover_dataset_roots(
             relative_root = ""
         if relative_root == ".":
             relative_root = ""
-        return [(patch_root, ref_dir, img_dir, relative_root)]
+        return [(patch_root, ref_dir, img_dir, relative_root, patch_root)]
 
-    dataset_roots: List[Tuple[Path, Path, Path, str]] = []
+    dataset_roots: List[Tuple[Path, Path, Path, str, Path]] = []
     seen: set[Path] = set()
 
     flat_ref = root / "reference_catalogs"
     flat_cutouts = root / "cutouts"
     if flat_ref.exists():
-        dataset_roots.append((root, flat_ref, flat_cutouts, ""))
-        seen.add(flat_ref.resolve())
+        dataset_roots.append((root, flat_ref, flat_cutouts, "", root))
+        seen.add(root.resolve())
 
     for ref_dir in sorted(root.rglob("reference_catalogs")):
-        resolved = ref_dir.resolve()
+        patch_root = ref_dir.parent
+        resolved = patch_root.resolve()
         if resolved in seen:
             continue
-        patch_root = ref_dir.parent
         img_dir = patch_root / "cutouts"
         try:
             relative_root = str(patch_root.relative_to(root))
@@ -197,7 +222,38 @@ def _discover_dataset_roots(
             relative_root = ""
         if relative_root == ".":
             relative_root = ""
-        dataset_roots.append((patch_root, ref_dir, img_dir, relative_root))
+        tract, patch, dataset_source = _relative_root_parts(relative_root)
+        label_root = patch_root
+        if dataset_source != "coadd" and tract and patch:
+            shared = root / tract / patch
+            if (shared / "reference_catalogs").exists():
+                label_root = shared
+                ref_dir = shared / "reference_catalogs"
+        dataset_roots.append((patch_root, ref_dir, img_dir, relative_root, label_root))
+        seen.add(resolved)
+
+    for manifest_path in sorted(root.rglob("manifest.json")):
+        patch_root = manifest_path.parent
+        resolved = patch_root.resolve()
+        if resolved in seen:
+            continue
+        img_dir = patch_root / "cutouts"
+        if not img_dir.exists():
+            continue
+        try:
+            relative_root = str(patch_root.relative_to(root))
+        except ValueError:
+            relative_root = ""
+        if relative_root == ".":
+            relative_root = ""
+        tract, patch, dataset_source = _relative_root_parts(relative_root)
+        if dataset_source == "coadd" or not tract or not patch:
+            continue
+        label_root = root / tract / patch
+        ref_dir = label_root / "reference_catalogs"
+        if not ref_dir.exists():
+            continue
+        dataset_roots.append((patch_root, ref_dir, img_dir, relative_root, label_root))
         seen.add(resolved)
 
     return dataset_roots
@@ -222,29 +278,37 @@ def discover_cutout_records(
         )
 
     records: List[CutoutRecord] = []
-    for patch_root, ref_dir, img_dir, relative_root in dataset_roots:
+    for patch_root, ref_dir, img_dir, relative_root, label_root in dataset_roots:
         if not ref_dir.exists():
             raise FileNotFoundError(f"Reference catalog directory does not exist: {ref_dir}")
 
         local_band_reference_root = band_reference_root
-        if local_band_reference_root is None and (patch_root / "band_reference_catalogs").exists():
-            local_band_reference_root = patch_root / "band_reference_catalogs"
-        local_band_rejected_root = patch_root / "band_reference_rejected"
+        if local_band_reference_root is None and (label_root / "band_reference_catalogs").exists():
+            local_band_reference_root = label_root / "band_reference_catalogs"
+        local_band_rejected_root = label_root / "band_reference_rejected"
         if not local_band_rejected_root.exists():
             local_band_rejected_root = None
-        local_band_ignore_root = patch_root / "band_reference_ignore"
+        local_band_ignore_root = label_root / "band_reference_ignore"
         if not local_band_ignore_root.exists():
             local_band_ignore_root = None
-        local_band_strict_center_only_root = patch_root / "band_reference_strict_center_only"
+        local_band_strict_center_only_root = label_root / "band_reference_strict_center_only"
         if not local_band_strict_center_only_root.exists():
             local_band_strict_center_only_root = None
-        local_band_strict_ignore_root = patch_root / "band_reference_strict_ignore"
+        local_band_strict_ignore_root = label_root / "band_reference_strict_ignore"
         if not local_band_strict_ignore_root.exists():
             local_band_strict_ignore_root = None
-        tract, patch = _relative_root_parts(relative_root)
+        tract, patch, dataset_source = _relative_root_parts(relative_root)
 
-        for meas_path in sorted(ref_dir.glob("*_meas.fits")):
-            tile_name = meas_path.name[: -len("_meas.fits")]
+        base_tile_by_tile = _variant_base_tile_map(patch_root) if dataset_source != "coadd" else {}
+        if dataset_source != "coadd" and img_dir.exists():
+            candidate_tile_names = sorted(path.name for path in img_dir.iterdir() if path.is_dir())
+        else:
+            candidate_tile_names = sorted(path.name[: -len("_meas.fits")] for path in ref_dir.glob("*_meas.fits"))
+        for tile_name in candidate_tile_names:
+            base_tile_name = base_tile_by_tile.get(tile_name, tile_name)
+            meas_path = ref_dir / f"{base_tile_name}_meas.fits"
+            if not meas_path.exists():
+                continue
             tile_dir = img_dir / tile_name
             has_cutout_tile = tile_dir.exists()
             if has_cutout_tile:
@@ -290,29 +354,29 @@ def discover_cutout_records(
                 else band_strict_ignore_paths
             )
             band_target_paths = tuple(
-                str(patch_root / "band_targets" / band / f"{tile_name}.npz")
-                if (patch_root / "band_targets" / band / f"{tile_name}.npz").exists()
+                str(label_root / "band_targets" / band / f"{base_tile_name}.npz")
+                if (label_root / "band_targets" / band / f"{base_tile_name}.npz").exists()
                 else ""
                 for band in band_order
             )
             band_metadata_paths = tuple(
-                str(patch_root / "band_tile_metadata" / band / f"{tile_name}.npz")
-                if (patch_root / "band_tile_metadata" / band / f"{tile_name}.npz").exists()
+                str(label_root / "band_tile_metadata" / band / f"{base_tile_name}.npz")
+                if (label_root / "band_tile_metadata" / band / f"{base_tile_name}.npz").exists()
                 else ""
                 for band in band_order
             )
             band_rejected_id_paths = tuple(
-                str(patch_root / "band_rejected_ids" / f"{band}.npz")
-                if (patch_root / "band_rejected_ids" / f"{band}.npz").exists()
+                str(label_root / "band_rejected_ids" / f"{band}.npz")
+                if (label_root / "band_rejected_ids" / f"{band}.npz").exists()
                 else ""
                 for band in band_order
             )
             x0, y0 = _parse_tile_origin(tile_name)
-            target_path = patch_root / "targets" / f"{tile_name}.npz"
-            metadata_path = patch_root / "tile_metadata" / f"{tile_name}.npz"
-            ignore_path = patch_root / "ignore_catalogs" / f"{tile_name}_meas.fits"
-            strict_center_only_path = patch_root / "strict_center_only_catalogs" / f"{tile_name}_meas.fits"
-            strict_ignore_path = patch_root / "strict_ignore_catalogs" / f"{tile_name}_meas.fits"
+            target_path = label_root / "targets" / f"{base_tile_name}.npz"
+            metadata_path = label_root / "tile_metadata" / f"{base_tile_name}.npz"
+            ignore_path = label_root / "ignore_catalogs" / f"{base_tile_name}_meas.fits"
+            strict_center_only_path = label_root / "strict_center_only_catalogs" / f"{base_tile_name}_meas.fits"
+            strict_ignore_path = label_root / "strict_ignore_catalogs" / f"{base_tile_name}_meas.fits"
             records.append(
                 CutoutRecord(
                     name=_record_name(tile_name, relative_root),
@@ -332,6 +396,7 @@ def discover_cutout_records(
                     tract=tract,
                     patch=patch,
                     relative_root=relative_root,
+                    dataset_source=dataset_source,
                     target_path=str(target_path) if target_path.exists() else "",
                     metadata_path=str(metadata_path) if metadata_path.exists() else "",
                     ignore_path=str(ignore_path) if ignore_path.exists() else "",
@@ -707,14 +772,27 @@ def _target_defaults(targets: Dict[str, Tensor]) -> Dict[str, Tensor]:
     targets.setdefault("ignore_mask", torch.zeros((h, w), dtype=torch.uint8, device=device))
     targets.setdefault("strict_center_only_mask", torch.zeros((h, w), dtype=torch.uint8, device=device))
     targets.setdefault("strict_ignore_mask", torch.zeros((h, w), dtype=torch.uint8, device=device))
-    targets["ignore_mask"] = ((targets["ignore_mask"] > 0) | (targets["strict_ignore_mask"] > 0)).to(dtype=torch.uint8)
+    strict_as_center = ((targets["strict_center_only_mask"] > 0) | (targets["strict_ignore_mask"] > 0)).to(dtype=torch.bool)
+    clean_bool = targets["clean_mask"] > 0
+    center_only_bool = ((targets["center_only_mask"] > 0) | strict_as_center) & ~clean_bool
+    ignore_bool = (targets["ignore_mask"] > 0) & ~clean_bool & ~center_only_bool
+    targets["center_only_mask"] = center_only_bool.to(dtype=torch.uint8)
+    targets["ignore_mask"] = ignore_bool.to(dtype=torch.uint8)
     targets.setdefault("source_union_mask", (targets["clean_mask"] > 0).to(dtype=torch.uint8))
+    targets["source_union_mask"] = (
+        (targets["source_union_mask"] > 0) | clean_bool | center_only_bool | ignore_bool
+    ).to(dtype=torch.uint8)
     targets.setdefault("background_mask", (targets["source_union_mask"] == 0).to(dtype=torch.uint8))
+    targets["background_mask"] = ((targets["background_mask"] > 0) & (targets["source_union_mask"] == 0)).to(dtype=torch.uint8)
     targets.setdefault("pu_class_mask", targets["clean_mask"].to(dtype=torch.uint8))
     targets.setdefault("pseudo_mask", torch.zeros((h, w), dtype=torch.uint8, device=device))
     if not has_confidence_weight:
-        uncertain = (targets["ignore_mask"] > 0).to(dtype=torch.bool)
-        targets["confidence_weight"] = (~uncertain).to(dtype=torch.float32)
+        targets["confidence_weight"] = clean_bool.to(dtype=torch.float32)
+    center_only_confidence = center_only_bool & (targets["confidence"] > 0)
+    targets["confidence_weight"] = torch.maximum(
+        targets["confidence_weight"].to(dtype=torch.float32),
+        center_only_confidence.to(dtype=torch.float32) * 0.25,
+    )
     if not has_seg_loss_weight:
         reliable = ((targets["clean_mask"] > 0) | (targets["background_mask"] > 0)).to(dtype=torch.bool)
         targets["seg_loss_weight"] = reliable.to(dtype=torch.float32)
@@ -1109,6 +1187,7 @@ class AstroCutoutDataset(Dataset):
             "tract": rec.tract,
             "patch": rec.patch,
             "relative_root": rec.relative_root,
+            "dataset_source": rec.dataset_source,
             "x0": rec.x0,
             "y0": rec.y0,
             "image_paths": rec.image_paths,
@@ -1301,6 +1380,7 @@ def collate_cutouts(batch: Sequence[Dict[str, object]]) -> Dict[str, object]:
         "tract": [item["tract"] for item in batch],
         "patch": [item["patch"] for item in batch],
         "relative_root": [item["relative_root"] for item in batch],
+        "dataset_source": [item["dataset_source"] for item in batch],
         "x0": [item["x0"] for item in batch],
         "y0": [item["y0"] for item in batch],
         "image_paths": [item["image_paths"] for item in batch],
@@ -1345,9 +1425,15 @@ def _record_name_aliases(rec: CutoutRecord) -> set[str]:
     aliases = {rec.name}
     if rec.tile_name:
         aliases.add(rec.tile_name)
+        aliases.add(f"{rec.dataset_source}:{rec.tile_name}")
     basename = Path(rec.name).name
     if basename:
         aliases.add(basename)
+        aliases.add(f"{rec.dataset_source}:{basename}")
+    if rec.patch:
+        aliases.add(f"{rec.dataset_source}:{rec.patch}/{basename}" if basename else f"{rec.dataset_source}:{rec.patch}")
+        if rec.tract:
+            aliases.add(f"{rec.dataset_source}:{rec.tract}/{rec.patch}/{basename}" if basename else f"{rec.dataset_source}:{rec.tract}/{rec.patch}")
     return aliases
 
 

@@ -39,6 +39,11 @@ import numpy as np
 from astropy.io import fits
 from astropy.table import Table, vstack
 
+try:
+    from tqdm import tqdm as _tqdm
+except Exception:  # pragma: no cover - tqdm is optional for preprocessing.
+    _tqdm = None
+
 from astro_pu_source_filter import (
     DEFAULT_A_FLAGS as DEFAULT_PU_A_FLAGS,
     DEFAULT_B_FLAGS as DEFAULT_PU_B_FLAGS,
@@ -56,6 +61,7 @@ DEFAULT_OUTPUT_ROOT = Path("./output/hsc_astro_preprocessed")
 DEFAULT_PARENT_ORIGIN = (15900, 19900)
 DEFAULT_COMPARE_ORIGIN = (18204, 20924)
 DEFAULT_CATALOG_BAND = "HSC-I"
+_THREADPOOL_LIMITER = None
 
 
 @dataclass(frozen=True)
@@ -79,6 +85,64 @@ class TileSpec:
 
 def _expand(path: Path | str) -> Path:
     return Path(path).expanduser().resolve()
+
+
+def _progress_iter(
+    iterable,
+    *,
+    total: int,
+    desc: str,
+    unit: str,
+    enabled: bool = True,
+):
+    if not enabled or _tqdm is None:
+        return iterable
+    return _tqdm(iterable, total=total, desc=desc, unit=unit, dynamic_ncols=True, leave=True)
+
+
+def _configure_worker_threads(num_threads: int) -> None:
+    global _THREADPOOL_LIMITER
+    threads = max(1, int(num_threads))
+    for name in (
+        "OMP_NUM_THREADS",
+        "OMP_THREAD_LIMIT",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "BLIS_NUM_THREADS",
+        "NUMBA_NUM_THREADS",
+        "TORCH_NUM_THREADS",
+    ):
+        os.environ[name] = str(threads)
+    try:
+        import torch
+
+        torch.set_num_threads(threads)
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            pass
+    except Exception:
+        pass
+    try:
+        from threadpoolctl import threadpool_limits
+
+        if _THREADPOOL_LIMITER is not None:
+            try:
+                _THREADPOOL_LIMITER.__exit__(None, None, None)
+            except Exception:
+                pass
+        _THREADPOOL_LIMITER = threadpool_limits(limits=threads)
+        _THREADPOOL_LIMITER.__enter__()
+    except Exception:
+        pass
+    try:
+        import cv2
+
+        cv2.setNumThreads(threads)
+    except Exception:
+        pass
 
 
 def _origin_from_ltv(header: fits.Header) -> Tuple[int, int]:
@@ -469,6 +533,10 @@ def _expand_patch_specs(values: Iterable[str], patch_file: Optional[Path]) -> Li
 
 def _patch_output_root(output_root: Path, tract: int, patch: str) -> Path:
     return output_root / str(tract) / patch
+
+
+def _variant_patch_output_root(output_root: Path, variant: str, tract: int, patch: str) -> Path:
+    return output_root / variant / str(tract) / patch
 
 
 def _catalog_path_for_patch(args: argparse.Namespace, catalog_root: Path, patch: str, num_patches: int) -> Path:
@@ -1474,8 +1542,11 @@ def _zscale_cache_path(
     tile_name: str,
     bands: Sequence[str],
     fits_hdu: int,
+    relative_root: Optional[str] = None,
 ) -> Path:
     band_key = "_".join(bands)
+    if relative_root:
+        return zscale_root / relative_root / "cutouts" / f"{tile_name}__{band_key}__hdu{fits_hdu}.pt"
     return zscale_root / str(tract) / patch / "cutouts" / f"{tile_name}__{band_key}__hdu{fits_hdu}.pt"
 
 
@@ -1514,10 +1585,14 @@ def mirror_fast_outputs(source_root: Path, fast_root: Path) -> None:
         "reference_catalogs_csv",
         "center_only_catalogs",
         "ignore_catalogs",
+        "strict_center_only_catalogs",
+        "strict_ignore_catalogs",
         "band_reference_catalogs",
         "band_reference_rejected",
         "band_reference_center_only",
         "band_reference_ignore",
+        "band_reference_strict_center_only",
+        "band_reference_strict_ignore",
         "band_reference_pu_all",
         "band_targets",
         "band_tile_metadata",
@@ -1536,6 +1611,231 @@ def mirror_fast_outputs(source_root: Path, fast_root: Path) -> None:
         dst = fast_root / filename
         if src.exists() and src.resolve() != dst.resolve():
             shutil.copy2(src, dst)
+
+
+def _read_existing_tile_specs(patch_root: Path) -> List[TileSpec]:
+    tiles_csv = patch_root / "tiles.csv"
+    if not tiles_csv.exists():
+        raise FileNotFoundError(f"Existing coadd preprocessed patch has no tiles.csv: {tiles_csv}")
+
+    def _int_field(row: Dict[str, str], key: str, default: int) -> int:
+        text = str(row.get(key, "")).strip()
+        return int(float(text)) if text not in {"", "None"} else int(default)
+
+    specs: List[TileSpec] = []
+    with tiles_csv.open("r", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            name = str(row.get("name", "")).strip()
+            if not name:
+                continue
+            specs.append(
+                TileSpec(
+                    name=name,
+                    x0=_int_field(row, "x0", 0),
+                    y0=_int_field(row, "y0", 0),
+                    size=_int_field(row, "size", 512),
+                    row=_int_field(row, "row", 0) if str(row.get("row", "")).strip() not in {"", "None"} else None,
+                    col=_int_field(row, "col", 0) if str(row.get("col", "")).strip() not in {"", "None"} else None,
+                    kind=str(row.get("kind", "grid") or "grid"),
+                )
+            )
+    if not specs:
+        raise RuntimeError(f"No tile specs found in {tiles_csv}")
+    return specs
+
+
+def _find_denoised_patch_dir(denoised_root: Path, patch: str) -> Optional[Path]:
+    x_str, y_str = patch.split(",", 1)
+    candidates = (
+        denoised_root / f"patch_{x_str}_{y_str}",
+        denoised_root / patch,
+        denoised_root / patch.replace(",", "_"),
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _write_variant_tiles_csv(variant_root: Path, rows: Sequence[Dict[str, object]]) -> None:
+    if not rows:
+        return
+    fieldnames = ["name", "kind", "row", "col", "x0", "y0", "x1", "y1", "size", "variant_group", "base_tile_name"]
+    variant_root.mkdir(parents=True, exist_ok=True)
+    with (variant_root / "tiles.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _preprocess_image_variant_patch(
+    args: argparse.Namespace,
+    *,
+    coadd_patch_root: Path,
+    denoised_patch_dir: Path,
+    variant: str,
+    output_root: Path,
+    bands: Sequence[str],
+    patch: str,
+) -> Dict[str, object]:
+    specs = _read_existing_tile_specs(coadd_patch_root)
+    groups = sorted(path for path in denoised_patch_dir.iterdir() if path.is_dir() and path.name.startswith("group_"))
+    if not groups:
+        groups = sorted(path for path in denoised_patch_dir.iterdir() if path.is_dir())
+    if not groups:
+        raise FileNotFoundError(f"No denoised/noisy group directories found in {denoised_patch_dir}")
+
+    if not args.dry_run:
+        output_root.mkdir(parents=True, exist_ok=True)
+
+    rows: List[Dict[str, object]] = []
+    cutout_paths: Dict[str, Dict[str, str]] = {}
+    effective_count_paths: Dict[str, Dict[str, str]] = {}
+    zscale_written = 0
+    zscale_skipped = 0
+    missing: List[str] = []
+
+    for group_dir in groups:
+        group_name = group_dir.name
+        for spec in specs:
+            tile_name = f"{group_name}_{spec.name}"
+            band_paths: Dict[str, str] = {}
+            effective_paths: Dict[str, str] = {}
+            for band in bands:
+                src = group_dir / band / f"{variant}.fits"
+                if not src.exists():
+                    missing.append(str(src))
+                    continue
+                dst = output_root / "cutouts" / tile_name / band / f"{variant}-{band}-{args.tract}-{patch}-{group_name}.fits"
+                band_paths[band] = str(dst)
+                if not args.skip_cutouts and not args.dry_run and (args.overwrite or not dst.exists()):
+                    crop_exposure_cutout(
+                        source_path=src,
+                        output_path=dst,
+                        parent_x0=spec.x0,
+                        parent_y0=spec.y0,
+                        size=spec.size,
+                        clean_nonfinite=not args.no_clean_nonfinite,
+                        overwrite=True,
+                    )
+                eff_src = group_dir / band / "effective_count.fits"
+                if eff_src.exists():
+                    eff_dst = (
+                        output_root
+                        / "effective_count"
+                        / "cutouts"
+                        / tile_name
+                        / band
+                        / f"effective_count-{band}-{args.tract}-{patch}-{group_name}.fits"
+                    )
+                    effective_paths[band] = str(eff_dst)
+                    if not args.skip_cutouts and not args.dry_run and (args.overwrite or not eff_dst.exists()):
+                        crop_exposure_cutout(
+                            source_path=eff_src,
+                            output_path=eff_dst,
+                            parent_x0=spec.x0,
+                            parent_y0=spec.y0,
+                            size=spec.size,
+                            clean_nonfinite=False,
+                            overwrite=True,
+                        )
+            if len(band_paths) == len(bands):
+                cutout_paths[tile_name] = band_paths
+                if effective_paths:
+                    effective_count_paths[tile_name] = effective_paths
+                if args.zscale_root is not None and not args.dry_run:
+                    zscale_path = _zscale_cache_path(
+                        _expand(args.zscale_root),
+                        tract=args.tract,
+                        patch=patch,
+                        tile_name=tile_name,
+                        bands=bands,
+                        fits_hdu=args.zscale_fits_hdu,
+                        relative_root=f"{variant}/{args.tract}/{patch}",
+                    )
+                    existed = zscale_path.exists()
+                    write_zscale_cache(
+                        [band_paths[band] for band in bands],
+                        zscale_path,
+                        fits_hdu=args.zscale_fits_hdu,
+                        overwrite=args.overwrite_zscale,
+                    )
+                    if existed and not args.overwrite_zscale:
+                        zscale_skipped += 1
+                    else:
+                        zscale_written += 1
+                rows.append(
+                    {
+                        "name": tile_name,
+                        "kind": spec.kind,
+                        "row": spec.row,
+                        "col": spec.col,
+                        "x0": spec.x0,
+                        "y0": spec.y0,
+                        "x1": spec.x1,
+                        "y1": spec.y1,
+                        "size": spec.size,
+                        "variant_group": group_name,
+                        "base_tile_name": spec.name,
+                    }
+                )
+
+    if missing:
+        examples = "\n".join(missing[:10])
+        raise FileNotFoundError(f"{variant} patch {patch} is missing {len(missing)} band image(s). First examples:\n{examples}")
+
+    metadata: Dict[str, object] = {}
+    source_manifest = coadd_patch_root / "manifest.json"
+    if source_manifest.exists():
+        try:
+            metadata = json.loads(source_manifest.read_text(encoding="utf-8"))
+        except Exception:
+            metadata = {}
+    metadata.update(
+        {
+            "dataset_source": variant,
+            "variant_source_root": str(denoised_patch_dir),
+            "output_root": str(output_root),
+            "bands": list(bands),
+            "tract": args.tract,
+            "patch": patch,
+            "num_tiles": len(cutout_paths),
+            "variant_groups": [group.name for group in groups],
+            "base_patch_root": str(coadd_patch_root),
+            "shared_label_root": str(coadd_patch_root),
+            "shared_label_policy": "coadd_preprocessed",
+            "zscale_root": str(_expand(args.zscale_root)) if args.zscale_root is not None else None,
+            "zscale_written": zscale_written,
+            "zscale_skipped": zscale_skipped,
+            "args": _jsonable_args(args),
+        }
+    )
+    if not args.dry_run:
+        _write_variant_tiles_csv(output_root, rows)
+        (output_root / "cutout_paths.json").write_text(json.dumps(cutout_paths, indent=2), encoding="utf-8")
+        if effective_count_paths:
+            (output_root / "effective_count_paths.json").write_text(
+                json.dumps(effective_count_paths, indent=2),
+                encoding="utf-8",
+            )
+        (output_root / "manifest.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        if args.fast_root is not None:
+            fast_root = _variant_patch_output_root(_expand(args.fast_root), variant, args.tract, patch)
+            fast_root.mkdir(parents=True, exist_ok=True)
+            for filename in ("manifest.json", "tiles.csv", "cutout_paths.json"):
+                src = output_root / filename
+                if src.exists():
+                    shutil.copy2(src, fast_root / filename)
+            if (output_root / "effective_count_paths.json").exists():
+                shutil.copy2(output_root / "effective_count_paths.json", fast_root / "effective_count_paths.json")
+
+    print(
+        f"patch {patch}: prepared {len(cutout_paths)} {variant} tiles from {len(groups)} group(s); "
+        f"zscale_written={zscale_written}, zscale_skipped={zscale_skipped}; output={output_root}",
+        flush=True,
+    )
+    return metadata
 
 
 def _jsonable_args(args: argparse.Namespace) -> Dict[str, object]:
@@ -1612,6 +1912,7 @@ def preprocess(args: argparse.Namespace) -> None:
     coadd_root = _expand(args.coadd_root)
     catalog_root = _expand(args.catalog_root)
     data_root = _expand(args.output_root)
+    denoised_fits_root = _expand(args.denoised_fits_root) if args.denoised_fits_root is not None else None
     bands = tuple(args.bands)
     patch_values = args.patches if args.patches else [args.patch]
     patches = _expand_patch_specs(patch_values, args.patch_file)
@@ -1629,8 +1930,16 @@ def preprocess(args: argparse.Namespace) -> None:
     summaries_by_patch: Dict[str, Dict[str, object]] = {}
     failed_patch_rows: List[Dict[str, str]] = []
     worker_fn = _sync_existing_patch if args.reuse_existing_preprocessed else _preprocess_patch
+    show_progress = not bool(getattr(args, "no_progress", False))
+    _configure_worker_threads(int(getattr(args, "worker_threads", 1)))
     if num_workers == 1:
-        for patch, catalog_path, patch_output_root in tasks:
+        for patch, catalog_path, patch_output_root in _progress_iter(
+            tasks,
+            total=len(tasks),
+            desc="preprocess patches",
+            unit="patch",
+            enabled=show_progress,
+        ):
             try:
                 summaries_by_patch[patch] = worker_fn(
                     args,
@@ -1648,7 +1957,11 @@ def preprocess(args: argparse.Namespace) -> None:
             data_root.mkdir(parents=True, exist_ok=True)
         print(f"processing {len(tasks)} patch(es) with {num_workers} worker(s)")
         task_by_patch = {patch: (catalog_path, patch_output_root) for patch, catalog_path, patch_output_root in tasks}
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        with ProcessPoolExecutor(
+            max_workers=num_workers,
+            initializer=_configure_worker_threads,
+            initargs=(int(getattr(args, "worker_threads", 1)),),
+        ) as executor:
             future_to_patch = {
                 executor.submit(
                     worker_fn,
@@ -1662,7 +1975,13 @@ def preprocess(args: argparse.Namespace) -> None:
                 for patch, catalog_path, patch_output_root in tasks
             }
             completed = 0
-            for future in as_completed(future_to_patch):
+            for future in _progress_iter(
+                as_completed(future_to_patch),
+                total=len(future_to_patch),
+                desc="preprocess patches",
+                unit="patch",
+                enabled=show_progress,
+            ):
                 patch = future_to_patch[future]
                 try:
                     summaries_by_patch[patch] = future.result()
@@ -1674,6 +1993,129 @@ def preprocess(args: argparse.Namespace) -> None:
                 print(f"completed patch {patch} ({completed}/{len(tasks)})", flush=True)
 
     summaries = [summaries_by_patch[patch] for patch in patches if patch in summaries_by_patch]
+
+    variant_summaries: List[Dict[str, object]] = []
+    variant_failed_rows: List[Dict[str, str]] = []
+    if denoised_fits_root is not None:
+        variants = tuple(str(item).strip() for item in args.image_variants if str(item).strip())
+        variant_tasks: List[Tuple[str, str, Path, Path]] = []
+        for patch in patches:
+            if patch not in summaries_by_patch:
+                continue
+            coadd_patch_root = _patch_output_root(data_root, args.tract, patch)
+            denoised_patch_dir = _find_denoised_patch_dir(denoised_fits_root, patch)
+            if denoised_patch_dir is None:
+                variant_failed_rows.append(
+                    {
+                        "patch": patch,
+                        "catalog": str(_catalog_path_for_patch(args, catalog_root, patch, len(patches))),
+                        "output_root": str(coadd_patch_root),
+                        "error_type": "FileNotFoundError",
+                        "error": f"denoised/noisy patch directory not found under {denoised_fits_root}",
+                        "traceback": "",
+                    }
+                )
+                print(f"FAILED patch {patch}: denoised/noisy patch directory not found under {denoised_fits_root}", flush=True)
+                continue
+            for variant in variants:
+                variant_tasks.append(
+                    (
+                        patch,
+                        variant,
+                        denoised_patch_dir,
+                        _variant_patch_output_root(data_root, variant, args.tract, patch),
+                    )
+                )
+
+        variant_workers = _worker_count(
+            int(getattr(args, "variant_num_workers", 0)),
+            len(variant_tasks),
+        )
+        if variant_tasks:
+            print(
+                f"processing {len(variant_tasks)} image-variant patch task(s) "
+                f"from {denoised_fits_root}: variants={list(variants)} with {variant_workers} worker(s)",
+                flush=True,
+            )
+        if variant_workers == 1:
+            for patch, variant, denoised_patch_dir, variant_output_root in _progress_iter(
+                variant_tasks,
+                total=len(variant_tasks),
+                desc="image variants",
+                unit="task",
+                enabled=show_progress,
+            ):
+                try:
+                    variant_summaries.append(
+                        _preprocess_image_variant_patch(
+                            args,
+                            coadd_patch_root=_patch_output_root(data_root, args.tract, patch),
+                            denoised_patch_dir=denoised_patch_dir,
+                            variant=variant,
+                            output_root=variant_output_root,
+                            bands=bands,
+                            patch=patch,
+                        )
+                    )
+                except Exception as exc:
+                    variant_failed_rows.append(
+                        _patch_failure_row(
+                            f"{variant}:{patch}",
+                            _catalog_path_for_patch(args, catalog_root, patch, len(patches)),
+                            variant_output_root,
+                            exc,
+                        )
+                    )
+                    print(f"FAILED patch {variant}:{patch}: {_compact_exception_message(exc, limit=500)}", flush=True)
+        elif variant_tasks:
+            task_by_key = {
+                f"{variant}:{patch}": (patch, variant, variant_output_root)
+                for patch, variant, _denoised_patch_dir, variant_output_root in variant_tasks
+            }
+            with ProcessPoolExecutor(
+                max_workers=variant_workers,
+                initializer=_configure_worker_threads,
+                initargs=(int(getattr(args, "worker_threads", 1)),),
+            ) as executor:
+                future_to_key = {
+                    executor.submit(
+                        _preprocess_image_variant_patch,
+                        args,
+                        coadd_patch_root=_patch_output_root(data_root, args.tract, patch),
+                        denoised_patch_dir=denoised_patch_dir,
+                        variant=variant,
+                        output_root=variant_output_root,
+                        bands=bands,
+                        patch=patch,
+                    ): f"{variant}:{patch}"
+                    for patch, variant, denoised_patch_dir, variant_output_root in variant_tasks
+                }
+                completed = 0
+                for future in _progress_iter(
+                    as_completed(future_to_key),
+                    total=len(future_to_key),
+                    desc="image variants",
+                    unit="task",
+                    enabled=show_progress,
+                ):
+                    key = future_to_key[future]
+                    patch, variant, variant_output_root = task_by_key[key]
+                    try:
+                        variant_summaries.append(future.result())
+                    except Exception as exc:
+                        variant_failed_rows.append(
+                            _patch_failure_row(
+                                key,
+                                _catalog_path_for_patch(args, catalog_root, patch, len(patches)),
+                                variant_output_root,
+                                exc,
+                            )
+                        )
+                        print(f"FAILED patch {key}: {_compact_exception_message(exc, limit=500)}", flush=True)
+                    completed += 1
+                    print(f"completed image variant {key} ({completed}/{len(variant_tasks)})", flush=True)
+        summaries.extend(variant_summaries)
+        failed_patch_rows.extend(variant_failed_rows)
 
     if not args.dry_run:
         data_root.mkdir(parents=True, exist_ok=True)
@@ -2736,6 +3178,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Regenerate zscale cache files that already exist. --overwrite only controls FITS cutouts.",
     )
     parser.add_argument(
+        "--denoised-fits-root",
+        type=Path,
+        default=None,
+        help=(
+            "Optional root containing denoised/noisy full-patch FITS, e.g. "
+            "<root>/patch_8_4/group_00/HSC-I/denoised.fits. When set, existing coadd "
+            "preprocessed labels are mirrored into <output-root>/<variant>/<tract>/<patch>."
+        ),
+    )
+    parser.add_argument(
+        "--image-variants",
+        nargs="+",
+        default=("denoised", "noisy"),
+        help="Image variant FITS basenames to crop from --denoised-fits-root. Default: denoised noisy.",
+    )
+    parser.add_argument(
         "--fast-root",
         type=Path,
         default=None,
@@ -2761,6 +3219,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=1,
         help="Number of patch-level worker processes. Use 0 to auto-select up to the number of patches/CPU cores.",
     )
+    parser.add_argument(
+        "--variant-num-workers",
+        type=int,
+        default=0,
+        help=(
+            "Number of worker processes for --denoised-fits-root image variants. "
+            "Use 0 to auto-select up to the number of variant tasks/CPU cores."
+        ),
+    )
+    parser.add_argument(
+        "--worker-threads",
+        type=int,
+        default=1,
+        help=(
+            "Intra-process CPU threads used by torch/OpenMP/BLAS inside each preprocessing worker. "
+            "Default 1 avoids oversubscription when many patch workers are active."
+        ),
+    )
+    parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars.")
     return parser
 
 

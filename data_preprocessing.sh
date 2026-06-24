@@ -23,6 +23,7 @@ PATCH_FILE="${PATCH_FILE:-}"
 CONDA_ENV="${CONDA_ENV:-cellect}"
 RUN_REFIT="${RUN_REFIT:-1}"
 RUN_PREPROCESS="${RUN_PREPROCESS:-1}"
+REUSE_EXISTING_PREPROCESSED="${REUSE_EXISTING_PREPROCESSED:-0}"
 SKIP_EXISTING_REFIT="${SKIP_EXISTING_REFIT:-1}"
 REFIT_CSV_ONLY="${REFIT_CSV_ONLY:-1}"
 COPY_REFIT_INPUTS_TO_TMP="${COPY_REFIT_INPUTS_TO_TMP:-0}"
@@ -33,6 +34,8 @@ REFIT_ROOT="${REFIT_ROOT:-/nvme0/zc/scarlet/refit}"
 REFIT_WORKERS="${REFIT_WORKERS:-1}"
 REFIT_OMP_THREADS="${REFIT_OMP_THREADS:-}"
 PREPROCESS_WORKERS="${PREPROCESS_WORKERS:-8}"
+VARIANT_PREPROCESS_WORKERS="${VARIANT_PREPROCESS_WORKERS:-${PREPROCESS_WORKERS}}"
+PREPROCESS_WORKER_THREADS="${PREPROCESS_WORKER_THREADS:-1}"
 
 MAG_MIN="${MAG_MIN:-15}"
 MAG_MAX="${MAG_MAX:-35}"
@@ -57,6 +60,8 @@ OVERWRITE_LSST_BACKGROUND="${OVERWRITE_LSST_BACKGROUND:-0}"
 WRITE_LSST_BACKGROUND_PRODUCTS="${WRITE_LSST_BACKGROUND_PRODUCTS:-0}"
 LSST_BACKGROUND_DETECT_CUTOUTS="${LSST_BACKGROUND_DETECT_CUTOUTS:-0}"
 USE_LSST_DETECTION_CALEXP_CUTOUTS="${USE_LSST_DETECTION_CALEXP_CUTOUTS:-0}"
+DENOISED_FITS_ROOT="${DENOISED_FITS_ROOT:-}"
+IMAGE_VARIANTS="${IMAGE_VARIANTS:-denoised noisy}"
 
 BAND_LIMIT_MAGS="${BAND_LIMIT_MAGS:-HSC-G=27.4 HSC-R=27.1 HSC-I=26.9 HSC-Z=26.3 HSC-Y=25.3}"
 STRICT_CENTER_ONLY_SATURATION_MAGS="${STRICT_CENTER_ONLY_SATURATION_MAGS:-${STRICT_IGNORE_SATURATION_MAGS:-HSC-G=18.0 HSC-R=18.2 HSC-I=18.6 HSC-Z=17.7 HSC-Y=17.4}}"
@@ -260,6 +265,17 @@ run_refit_all() {
 }
 
 run_preprocess() {
+  export OMP_NUM_THREADS="${PREPROCESS_WORKER_THREADS}"
+  export OMP_THREAD_LIMIT="${PREPROCESS_WORKER_THREADS}"
+  export MKL_NUM_THREADS="${PREPROCESS_WORKER_THREADS}"
+  export OPENBLAS_NUM_THREADS="${PREPROCESS_WORKER_THREADS}"
+  export NUMEXPR_NUM_THREADS="${PREPROCESS_WORKER_THREADS}"
+  export VECLIB_MAXIMUM_THREADS="${PREPROCESS_WORKER_THREADS}"
+  export BLIS_NUM_THREADS="${PREPROCESS_WORKER_THREADS}"
+  export NUMBA_NUM_THREADS="${PREPROCESS_WORKER_THREADS}"
+  export TORCH_NUM_THREADS="${PREPROCESS_WORKER_THREADS}"
+  export TORCH_NUM_INTEROP_THREADS=1
+
   split_words "${BANDS}"
   local bands_array=("${SPLIT_WORDS_OUT[@]}")
   split_words "${BAND_LIMIT_MAGS}"
@@ -290,6 +306,9 @@ run_preprocess() {
   fi
   if [[ "${SKIP_CUTOUTS}" == "1" ]]; then
     optional_args+=(--skip-cutouts)
+  fi
+  if [[ "${REUSE_EXISTING_PREPROCESSED}" == "1" ]]; then
+    optional_args+=(--reuse-existing-preprocessed)
   fi
   if [[ "${WRITE_TARGET_FITS}" == "1" ]]; then
     optional_args+=(--write-target-fits)
@@ -328,6 +347,14 @@ run_preprocess() {
       --pu-band-limit-mags "${band_limit_args[@]}"
     )
   fi
+  if [[ -n "${DENOISED_FITS_ROOT}" ]]; then
+    split_words "${IMAGE_VARIANTS}"
+    local image_variant_args=("${SPLIT_WORDS_OUT[@]}")
+    optional_args+=(
+      --denoised-fits-root "${DENOISED_FITS_ROOT}"
+      --image-variants "${image_variant_args[@]}"
+    )
+  fi
 
   mkdir -p "${LOG_DIR}"
   echo "[preprocess] start patches=${PATCHES} workers=${PREPROCESS_WORKERS}"
@@ -359,6 +386,8 @@ run_preprocess() {
     --lsst-background-policy "${LSST_BACKGROUND_POLICY}" \
     --bad-band-catalog-policy "${BAD_BAND_CATALOG_POLICY}" \
     --num-workers "${PREPROCESS_WORKERS}" \
+    --variant-num-workers "${VARIANT_PREPROCESS_WORKERS}" \
+    --worker-threads "${PREPROCESS_WORKER_THREADS}" \
     "${optional_args[@]}" \
     2>&1 | tee "${LOG_DIR}/astro_data_preprocessing.log"
   echo "[preprocess] done"
