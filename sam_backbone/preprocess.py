@@ -28,7 +28,7 @@ def astro_preprocess(
     sigma_iters: int = -1,
     z_clip: Optional[Tuple[float, float]] = None,
 ) -> Tensor:
-    """SAM-astro-compatible per-image, per-band normalization.
+    """SAM-style per-image, per-band normalization.
 
     Input and output are CHW or BCHW.  If ``zscale_cache`` is supplied and
     ``cache_is_preprocessed`` is true, the cache is returned after finite-value
@@ -92,7 +92,7 @@ def astro_sigma_clipped_mean_std(
     clip_sigma: float,
     sigma_iters: int,
 ) -> Tuple[Tensor, Tensor]:
-    """Match SAM-astro's astropy-backed sigma-clipped mean/std helper."""
+    """Match the astropy-backed sigma-clipped mean/std helper used for SAM preprocessing."""
 
     try:
         from astropy.stats import sigma_clipped_stats

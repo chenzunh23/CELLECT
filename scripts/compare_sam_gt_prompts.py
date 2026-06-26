@@ -14,17 +14,14 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 CELLECT_ROOT = Path("/home/czh23/CELLECT")
-SAM_ROOT = Path("/home/czh23/SAM-astro")
-for root in (CELLECT_ROOT, SAM_ROOT):
-    root_str = str(root)
-    if root_str in sys.path:
-        sys.path.remove(root_str)
+root_str = str(CELLECT_ROOT)
+if root_str in sys.path:
+    sys.path.remove(root_str)
 sys.path.insert(0, str(CELLECT_ROOT))
-sys.path.insert(0, str(SAM_ROOT))
 
-from segment_anything import SamPredictor, sam_model_registry  # noqa: E402
 from astro_train_data import AstroCutoutDataset, collate_cutouts, discover_cutout_records  # noqa: E402
 from sam_backbone.losses import _boxes_from_centers_shapes  # noqa: E402
+from sam_backbone import SamPredictor, sam_model_registry  # noqa: E402
 
 
 DEFAULT_DATA_ROOT = (

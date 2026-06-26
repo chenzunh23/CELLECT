@@ -28,10 +28,12 @@ from utils.eval_metrics_utils import (
     _ellipse_mask_np,
     _evaluate_link_components,
     _finalize_detection_totals,
+    _init_candidate_stats_bucket,
     _init_detection_totals,
     _max_iou_with_labeled_mask,
     _merge_detection_totals,
     _min_distance_to_points,
+    _update_candidate_stats_bucket,
 )
 from utils.train_ops_utils import (
     binary_segmentation_logits as _binary_segmentation_logits,
@@ -458,6 +460,71 @@ def _confidence_score_at_centers(outputs: Dict[str, Tensor], centers: Tensor, *,
     x = xy[:, 0].clamp(0, w - 1)
     y = xy[:, 1].clamp(0, h - 1)
     return score_map[y, x]
+
+
+def _compute_detection_peak_maps(
+    outputs: Dict[str, Tensor],
+    *,
+    threshold: float,
+    nms_radius: int,
+    confidence_score: str,
+) -> Tuple[Tensor, Tensor, Dict[str, object]]:
+    if confidence_score == "cellect":
+        smoothed = _cellect_confidence_smooth_2d(outputs["confidence"])
+        local_score = smoothed.max(dim=1).values
+        center_score = smoothed[:, -1]
+        pooled = F.max_pool2d(
+            local_score.unsqueeze(1),
+            kernel_size=2 * nms_radius + 1,
+            stride=1,
+            padding=nms_radius,
+        ).squeeze(1)
+        foreground_gate = (
+            _cellect_foreground_gate_2d(outputs["seg_logits"])
+            if "seg_logits" in outputs
+            else torch.ones_like(center_score, dtype=torch.bool)
+        )
+        top_channel_argmax = center_score == local_score
+        spatial_localmax = pooled == local_score
+        seed_candidates = pooled == center_score
+        threshold_pass = center_score > threshold
+        peaks = seed_candidates & foreground_gate & threshold_pass
+        return center_score, peaks, {
+            "center_score": center_score,
+            "top_channel_argmax": top_channel_argmax,
+            "spatial_localmax": spatial_localmax,
+            "seed_candidates": seed_candidates,
+            "foreground_gate": foreground_gate,
+            "threshold_pass": threshold_pass,
+            "final_peaks": peaks,
+            "foreground_gate_active": bool("seg_logits" in outputs),
+        }
+
+    center_score = _confidence_detection_score(outputs, confidence_score)
+    foreground_gate = (
+        outputs["seg_logits"].argmax(dim=1) > 0
+        if "seg_logits" in outputs
+        else torch.ones_like(center_score, dtype=torch.bool)
+    )
+    pooled = F.max_pool2d(
+        center_score.unsqueeze(1),
+        kernel_size=2 * nms_radius + 1,
+        stride=1,
+        padding=nms_radius,
+    ).squeeze(1)
+    seed_candidates = center_score == pooled
+    threshold_pass = center_score > threshold
+    peaks = seed_candidates & foreground_gate & threshold_pass
+    return center_score, peaks, {
+        "center_score": center_score,
+        "top_channel_argmax": None,
+        "spatial_localmax": seed_candidates,
+        "seed_candidates": seed_candidates,
+        "foreground_gate": foreground_gate,
+        "threshold_pass": threshold_pass,
+        "final_peaks": peaks,
+        "foreground_gate_active": bool("seg_logits" in outputs),
+    }
 
 
 @torch.no_grad()
@@ -1223,33 +1290,12 @@ def detect_centers(
 ) -> List[np.ndarray]:
     """Detect center candidates from confidence maps."""
 
-    if confidence_score == "cellect":
-        smoothed = _cellect_confidence_smooth_2d(outputs["confidence"])
-        local_score = smoothed.max(dim=1).values
-        center_score = smoothed[:, -1]
-        pooled = F.max_pool2d(
-            local_score.unsqueeze(1),
-            kernel_size=2 * nms_radius + 1,
-            stride=1,
-            padding=nms_radius,
-        ).squeeze(1)
-        foreground_gate = (
-            _cellect_foreground_gate_2d(outputs["seg_logits"])
-            if "seg_logits" in outputs
-            else torch.ones_like(center_score, dtype=torch.bool)
-        )
-        peaks = (pooled == center_score) & foreground_gate & (center_score > threshold)
-        conf = center_score
-    else:
-        conf = _confidence_detection_score(outputs, confidence_score)
-        fg = outputs["seg_logits"].argmax(dim=1) > 0 if "seg_logits" in outputs else torch.ones_like(conf, dtype=torch.bool)
-        pooled = F.max_pool2d(
-            conf.unsqueeze(1),
-            kernel_size=2 * nms_radius + 1,
-            stride=1,
-            padding=nms_radius,
-        ).squeeze(1)
-        peaks = (conf == pooled) & fg & (conf > threshold)
+    conf, peaks, _ = _compute_detection_peak_maps(
+        outputs,
+        threshold=threshold,
+        nms_radius=nms_radius,
+        confidence_score=confidence_score,
+    )
 
     result: List[np.ndarray] = []
     for b in range(conf.shape[0]):
@@ -1277,23 +1323,12 @@ def detect_centers_with_scores(
 ) -> List[Dict[str, np.ndarray]]:
     """Detect centers and return ``xy`` plus scalar confidence scores."""
 
-    if confidence_score == "cellect":
-        smoothed = _cellect_confidence_smooth_2d(outputs["confidence"])
-        local_score = smoothed.max(dim=1).values
-        center_score = smoothed[:, -1]
-        pooled = F.max_pool2d(local_score.unsqueeze(1), kernel_size=2 * nms_radius + 1, stride=1, padding=nms_radius).squeeze(1)
-        foreground_gate = (
-            _cellect_foreground_gate_2d(outputs["seg_logits"])
-            if "seg_logits" in outputs
-            else torch.ones_like(center_score, dtype=torch.bool)
-        )
-        peaks = (pooled == center_score) & foreground_gate & (center_score > threshold)
-        conf = center_score
-    else:
-        conf = _confidence_detection_score(outputs, confidence_score)
-        fg = outputs["seg_logits"].argmax(dim=1) > 0 if "seg_logits" in outputs else torch.ones_like(conf, dtype=torch.bool)
-        pooled = F.max_pool2d(conf.unsqueeze(1), kernel_size=2 * nms_radius + 1, stride=1, padding=nms_radius).squeeze(1)
-        peaks = (conf == pooled) & fg & (conf > threshold)
+    conf, peaks, _ = _compute_detection_peak_maps(
+        outputs,
+        threshold=threshold,
+        nms_radius=nms_radius,
+        confidence_score=confidence_score,
+    )
 
     result: List[Dict[str, np.ndarray]] = []
     for b in range(conf.shape[0]):
@@ -1798,7 +1833,16 @@ def _update_detection_totals(
             merged.append(torch.unique(centers, dim=0))
         return merged
 
+    candidate_debug: Dict[str, object]
+
     if use_en_postprocess and hasattr(base_model, "EN"):
+        candidate_outputs = _flatten_per_band_outputs(outputs) if per_band_outputs else outputs
+        _, _, candidate_debug = _compute_detection_peak_maps(
+            candidate_outputs,
+            threshold=threshold,
+            nms_radius=nms_radius,
+            confidence_score=confidence_score,
+        )
         pred_list = detect_centers_with_en(
             base_model,
             outputs,
@@ -1841,6 +1885,12 @@ def _update_detection_totals(
         ordinary_ignore_list = _merge_center_lists(ordinary_base, strict_center_list, strict_ignore_list)
     elif per_band_outputs:
         flat_outputs = _flatten_per_band_outputs(outputs)
+        _, _, candidate_debug = _compute_detection_peak_maps(
+            flat_outputs,
+            threshold=threshold,
+            nms_radius=nms_radius,
+            confidence_score=confidence_score,
+        )
         pred_list = detect_centers(
             flat_outputs,
             threshold=threshold,
@@ -1878,6 +1928,12 @@ def _update_detection_totals(
         )
         ordinary_ignore_list = _merge_center_lists(ordinary_base, strict_center_list, strict_ignore_list)
     else:
+        _, _, candidate_debug = _compute_detection_peak_maps(
+            outputs,
+            threshold=threshold,
+            nms_radius=nms_radius,
+            confidence_score=confidence_score,
+        )
         pred_list = detect_centers(
             outputs,
             threshold=threshold,
@@ -1901,6 +1957,69 @@ def _update_detection_totals(
 
     per_band_counts = totals["per_band_counts"]
     assert isinstance(per_band_counts, dict)
+    candidate_stats_total = totals.get("candidate_stats")
+    candidate_center_score = candidate_debug.get("center_score")
+    candidate_spatial_localmax = candidate_debug.get("spatial_localmax")
+    candidate_seed = candidate_debug.get("seed_candidates")
+    candidate_foreground_gate = candidate_debug.get("foreground_gate")
+    candidate_threshold_pass = candidate_debug.get("threshold_pass")
+    candidate_final = candidate_debug.get("final_peaks")
+    candidate_top_channel = candidate_debug.get("top_channel_argmax")
+    candidate_foreground_gate_active = bool(candidate_debug.get("foreground_gate_active", False))
+    if (
+        isinstance(candidate_stats_total, dict)
+        and isinstance(candidate_center_score, Tensor)
+        and isinstance(candidate_spatial_localmax, Tensor)
+        and isinstance(candidate_seed, Tensor)
+        and isinstance(candidate_foreground_gate, Tensor)
+        and isinstance(candidate_threshold_pass, Tensor)
+        and isinstance(candidate_final, Tensor)
+    ):
+        for map_idx, band_idx in enumerate(band_indices):
+            top_channel_map = candidate_top_channel[map_idx] if isinstance(candidate_top_channel, Tensor) else None
+            _update_candidate_stats_bucket(
+                candidate_stats_total,
+                center_score=candidate_center_score[map_idx],
+                top_channel_argmax=top_channel_map,
+                spatial_localmax=candidate_spatial_localmax[map_idx],
+                seed_candidates=candidate_seed[map_idx],
+                foreground_gate=candidate_foreground_gate[map_idx],
+                threshold_pass=candidate_threshold_pass[map_idx],
+                final_peaks=candidate_final[map_idx],
+                foreground_gate_active=candidate_foreground_gate_active,
+                threshold=threshold,
+            )
+            if band_idx is not None and band_names:
+                band_name = str(band_names[int(band_idx)])
+                band_bucket = per_band_counts.setdefault(
+                    band_name,
+                    {
+                        "tp": 0,
+                        "fp": 0,
+                        "clean_region_fp": 0,
+                        "fn": 0,
+                        "ordinary_ignore_tp": 0,
+                        "ordinary_ignore_fn": 0,
+                        "ordinary_ignore_total": 0,
+                        "strict_ignored_pred": 0,
+                        "candidate_stats": _init_candidate_stats_bucket(),
+                    },
+                )
+                assert isinstance(band_bucket, dict)
+                band_candidate_stats = band_bucket.get("candidate_stats")
+                if isinstance(band_candidate_stats, dict):
+                    _update_candidate_stats_bucket(
+                        band_candidate_stats,
+                        center_score=candidate_center_score[map_idx],
+                        top_channel_argmax=top_channel_map,
+                        spatial_localmax=candidate_spatial_localmax[map_idx],
+                        seed_candidates=candidate_seed[map_idx],
+                        foreground_gate=candidate_foreground_gate[map_idx],
+                        threshold_pass=candidate_threshold_pass[map_idx],
+                        final_peaks=candidate_final[map_idx],
+                        foreground_gate_active=candidate_foreground_gate_active,
+                        threshold=threshold,
+                    )
     for pred_xy, gt_xy, band_idx, clean_mask, background_mask, ordinary_ignore_xy in zip(
         pred_list, gt_list, band_indices, clean_masks, background_masks, ordinary_ignore_list
     ):
@@ -1935,6 +2054,7 @@ def _update_detection_totals(
                     "ordinary_ignore_fn": 0,
                     "ordinary_ignore_total": 0,
                     "strict_ignored_pred": 0,
+                    "candidate_stats": _init_candidate_stats_bucket(),
                 },
             )
             assert isinstance(counts, dict)

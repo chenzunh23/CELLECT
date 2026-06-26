@@ -24,7 +24,6 @@ EOF
   exit 0
 fi
 
-SAM_ASTRO_ROOT="${SAM_ASTRO_ROOT:-/home/czh23/SAM-astro}"
 CELLECT_ROOT="${CELLECT_ROOT:-/home/czh23/CELLECT}"
 DATA_ROOT="${DATA_ROOT:-${CELLECT_ROOT}/output/sam_cellect_combination_260611/preprocessing_diagnostics_260611/zangetsu_preprocessed_cutouts_260611}"
 DATASET="${DATASET:-denoised}"
@@ -72,7 +71,7 @@ fi
 mkdir -p "${OUT_DIR}"
 read -r -a ASTRO_PREPROCESS_Z_CLIP_VALUES <<< "${ASTRO_PREPROCESS_Z_CLIP}"
 AMG_ARGS=(
-  "${SAM_ASTRO_ROOT}/scripts/amg_fits_core.py"
+  "${CELLECT_ROOT}/sam_astro_local/scripts/amg_fits_core.py"
   --input "${FITS_FILE}" "${FITS_FILE}" "${FITS_FILE}"
   --output "${OUT_DIR}"
   --model-type "${MODEL_TYPE}"

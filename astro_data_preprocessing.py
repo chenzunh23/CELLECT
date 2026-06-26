@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import sys
 import traceback
+import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -38,6 +39,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 from astropy.io import fits
 from astropy.table import Table, vstack
+from astropy.units import UnitsWarning
 
 try:
     from tqdm import tqdm as _tqdm
@@ -557,7 +559,18 @@ def _worker_count(requested: int, num_patches: int) -> int:
 
 def _read_table(path: Path, *, hdu: int, role: str, patch: str, band: Optional[str] = None) -> Table:
     try:
-        return Table.read(path, hdu=hdu)
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=".*Unit 'second' not supported by the FITS standard.*",
+                category=UnitsWarning,
+            )
+            warnings.filterwarnings(
+                "ignore",
+                message=".*'second' did not parse as fits unit.*",
+                category=UnitsWarning,
+            )
+            return Table.read(path, hdu=hdu)
     except Exception as exc:
         band_text = f", band={band}" if band else ""
         raise RuntimeError(f"Failed to read {role} catalog for patch={patch}{band_text}: {path}") from exc
@@ -1534,6 +1547,205 @@ def write_ids_metadata(table: Table, output_npz: Path) -> None:
     np.savez_compressed(output_npz, ids=ids.astype(np.int64))
 
 
+def _read_exposure_image_plane(source_path: Path, *, clean_nonfinite: bool = True) -> Tuple[np.ndarray, Tuple[int, int]]:
+    with fits.open(source_path, memmap=False) as hdul:
+        plane_indices = _plane_hdu_indices(hdul)
+        hdu = hdul[plane_indices["IMAGE"]]
+        data = np.asarray(hdu.data, dtype=np.float32).copy()
+        if clean_nonfinite and not np.all(np.isfinite(data)):
+            fill = _finite_replacement(data)
+            data = np.nan_to_num(data, nan=fill, posinf=fill, neginf=fill).astype(np.float32, copy=False)
+        return data, _origin_from_ltv(hdu.header)
+
+
+def _aperture_annulus_snr(
+    image: np.ndarray,
+    centers: np.ndarray,
+    *,
+    ap_radius: float = 6.0,
+    annulus_r_in: float = 10.0,
+    annulus_r_out: float = 15.0,
+) -> np.ndarray:
+    image = np.asarray(image, dtype=np.float32)
+    centers = np.asarray(centers, dtype=np.float32).reshape(-1, 2)
+    snr = np.full((centers.shape[0],), np.nan, dtype=np.float32)
+    if image.ndim != 2 or centers.size == 0:
+        return snr
+    h, w = image.shape
+    rmax = float(max(ap_radius, annulus_r_out))
+    for idx, (cx, cy) in enumerate(centers):
+        if not (np.isfinite(cx) and np.isfinite(cy)):
+            continue
+        x0 = max(0, int(math.floor(float(cx) - rmax - 1.0)))
+        x1 = min(w, int(math.ceil(float(cx) + rmax + 2.0)))
+        y0 = max(0, int(math.floor(float(cy) - rmax - 1.0)))
+        y1 = min(h, int(math.ceil(float(cy) + rmax + 2.0)))
+        if x0 >= x1 or y0 >= y1:
+            continue
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        rr = np.sqrt((xx.astype(np.float32) - float(cx)) ** 2 + (yy.astype(np.float32) - float(cy)) ** 2)
+        patch = image[y0:y1, x0:x1]
+        finite = np.isfinite(patch)
+        ap_mask = (rr <= float(ap_radius)) & finite
+        ann_mask = (rr >= float(annulus_r_in)) & (rr < float(annulus_r_out)) & finite
+        ap_vals = patch[ap_mask]
+        ann_vals = patch[ann_mask]
+        if ap_vals.size == 0 or ann_vals.size < 2:
+            continue
+        bkg = float(np.median(ann_vals))
+        sigma = float(np.std(ann_vals.astype(np.float64), ddof=1))
+        if not math.isfinite(sigma) or sigma <= 0.0:
+            continue
+        flux = float(np.sum(ap_vals.astype(np.float64))) - bkg * float(ap_vals.size)
+        noise = sigma * math.sqrt(float(ap_vals.size))
+        if noise > 0.0:
+            snr[idx] = float(flux / noise)
+    return snr
+
+
+def _centers_for_image_snr(
+    table: Table,
+    *,
+    image_origin: Tuple[int, int],
+    x_col: str,
+    y_col: str,
+) -> np.ndarray:
+    centers = np.zeros((len(table), 2), dtype=np.float32)
+    if len(table) == 0:
+        return centers
+    x, y = _require_position_columns(table, x_col, y_col)
+    centers[:, 0] = np.asarray(x, dtype=np.float32) - float(image_origin[0])
+    centers[:, 1] = np.asarray(y, dtype=np.float32) - float(image_origin[1])
+    return centers
+
+
+def _classify_clean_by_noncoadd_snr(
+    clean_sources: Table,
+    *,
+    image: np.ndarray,
+    image_origin: Tuple[int, int],
+    args: argparse.Namespace,
+) -> Tuple[Table, Table, Table, np.ndarray]:
+    if len(clean_sources) == 0:
+        empty = clean_sources.copy(copy_data=True)
+        return empty, empty.copy(copy_data=True), empty.copy(copy_data=True), np.zeros((0,), dtype=np.float32)
+    centers = _centers_for_image_snr(clean_sources, image_origin=image_origin, x_col=args.x_col, y_col=args.y_col)
+    snr = _aperture_annulus_snr(
+        image,
+        centers,
+        ap_radius=float(args.noncoadd_snr_ap_radius),
+        annulus_r_in=float(args.noncoadd_snr_annulus_r_in),
+        annulus_r_out=float(args.noncoadd_snr_annulus_r_out),
+    )
+    finite_snr = np.isfinite(snr)
+    normal_keep = finite_snr & (snr >= float(args.noncoadd_snr_center_only_thresh))
+    center_keep = finite_snr & (snr >= float(args.noncoadd_snr_ignore_thresh)) & (snr < float(args.noncoadd_snr_center_only_thresh))
+    ignore_keep = (~finite_snr) | (snr < float(args.noncoadd_snr_ignore_thresh))
+
+    annotated = clean_sources.copy(copy_data=True)
+    visibility_class = np.full(len(annotated), "normal", dtype="U16")
+    visibility_class[center_keep] = "center_only"
+    visibility_class[ignore_keep] = "ignore"
+    annotated["noncoadd_visibility_snr"] = snr.astype(np.float32)
+    annotated["noncoadd_visibility_class"] = visibility_class
+    return (
+        annotated[normal_keep],
+        annotated[center_keep],
+        annotated[ignore_keep],
+        snr.astype(np.float32),
+    )
+
+
+def _vstack_nonempty(parts: Sequence[Table]) -> Table:
+    nonempty = [part for part in parts if len(part)]
+    if not nonempty:
+        return Table()
+    if len(nonempty) == 1:
+        return nonempty[0].copy(copy_data=True)
+    return vstack(nonempty, join_type="outer", metadata_conflicts="silent")
+
+
+def _local_centers_from_catalog(table: Table) -> np.ndarray:
+    centers = np.zeros((len(table), 2), dtype=np.float32)
+    if len(table) == 0:
+        return centers
+    if "centroid_local_x" not in table.colnames or "centroid_local_y" not in table.colnames:
+        raise KeyError("visibility catalog must contain centroid_local_x/centroid_local_y")
+    centers[:, 0] = np.asarray(table["centroid_local_x"], dtype=np.float32)
+    centers[:, 1] = np.asarray(table["centroid_local_y"], dtype=np.float32)
+    return centers
+
+
+def _restore_center_only_shape_targets(
+    targets: Dict[str, np.ndarray],
+    center_only_sources: Table,
+    spec: TileSpec,
+    *,
+    x_col: str,
+    y_col: str,
+    ellipse_sigma: float,
+    confidence_levels: int,
+    core_radius: int,
+) -> None:
+    if len(center_only_sources) == 0:
+        return
+    center_targets = make_dense_targets(
+        center_only_sources,
+        spec,
+        x_col=x_col,
+        y_col=y_col,
+        ellipse_sigma=ellipse_sigma,
+        confidence_levels=confidence_levels,
+        core_radius=core_radius,
+    )
+    mask = center_targets["shape_weight"] > 0
+    if not np.any(mask):
+        return
+    targets["shape"][:, mask] = center_targets["shape"][:, mask]
+    targets["shape_weight"][mask] = np.maximum(targets["shape_weight"][mask], center_targets["shape_weight"][mask])
+
+
+def _coadd_target_background_mask(coadd_patch_root: Path, band: str, tile_name: str) -> Optional[np.ndarray]:
+    target_path = coadd_patch_root / "band_targets" / band / f"{tile_name}.npz"
+    if not target_path.exists():
+        target_path = coadd_patch_root / "targets" / f"{tile_name}.npz"
+    if not target_path.exists():
+        return None
+    try:
+        with np.load(target_path) as data:
+            if "background_mask" in data:
+                return np.asarray(data["background_mask"], dtype=bool)
+    except Exception:
+        return None
+    return None
+
+
+def _read_variant_label_sources(
+    coadd_patch_root: Path,
+    *,
+    band: str,
+    tract: int,
+    patch: str,
+    args: argparse.Namespace,
+) -> Tuple[Table, Table, Table, Table]:
+    filename = f"meas-{band}-{tract}-{patch}.fits"
+    clean_path = coadd_patch_root / "band_reference_catalogs" / band / filename
+    if not clean_path.exists():
+        raise FileNotFoundError(f"missing coadd band reference catalog for variant labels: {clean_path}")
+    clean = _read_table(clean_path, hdu=1, role="variant-band-clean", patch=patch, band=band)
+
+    def _optional(dirname: str) -> Table:
+        candidate = coadd_patch_root / dirname / band / filename
+        if candidate.exists():
+            return _read_table(candidate, hdu=1, role=f"variant-{dirname}", patch=patch, band=band)
+        return Table()
+
+    center_only = _optional("band_reference_center_only") if args.label_mode == "pu" else Table()
+    ignore = _optional("band_reference_ignore") if args.label_mode == "pu" else Table()
+    strict_center_only = _optional("band_reference_strict_center_only") if args.label_mode == "pu" else Table()
+    return clean, center_only, ignore, strict_center_only
+
+
 def _zscale_cache_path(
     zscale_root: Path,
     *,
@@ -1695,8 +1907,32 @@ def _preprocess_image_variant_patch(
     zscale_written = 0
     zscale_skipped = 0
     missing: List[str] = []
+    write_variant_labels = (
+        bool(getattr(args, "noncoadd_snr_filter", True))
+        and str(getattr(args, "label_mode", "legacy")) == "pu"
+        and not bool(getattr(args, "skip_band_targets", False))
+    )
+    label_sources_by_band: Dict[str, Tuple[Table, Table, Table, Table]] = {}
+    visibility_counts: Dict[str, Dict[str, int]] = {
+        band: {"normal": 0, "center_only": 0, "ignore": 0} for band in bands
+    }
+    if write_variant_labels:
+        for band in bands:
+            label_sources_by_band[band] = _read_variant_label_sources(
+                coadd_patch_root,
+                band=band,
+                tract=args.tract,
+                patch=patch,
+                args=args,
+            )
 
     for group_dir in groups:
+        group_images: Dict[str, Tuple[np.ndarray, Tuple[int, int]]] = {}
+        if write_variant_labels:
+            for band in bands:
+                src = group_dir / band / f"{variant}.fits"
+                if src.exists():
+                    group_images[band] = _read_exposure_image_plane(src, clean_nonfinite=not args.no_clean_nonfinite)
         group_name = group_dir.name
         for spec in specs:
             tile_name = f"{group_name}_{spec.name}"
@@ -1765,6 +2001,122 @@ def _preprocess_image_variant_patch(
                         zscale_skipped += 1
                     else:
                         zscale_written += 1
+                if write_variant_labels and not args.dry_run:
+                    primary_written = False
+                    for band in bands:
+                        if band not in group_images:
+                            continue
+                        image, image_origin = group_images[band]
+                        clean_full, center_full, ignore_full, strict_center_full = label_sources_by_band[band]
+                        clean_tile_all = crop_catalog_for_tile(
+                            clean_full,
+                            spec,
+                            x_col=args.x_col,
+                            y_col=args.y_col,
+                            margin=0.0,
+                        )
+                        clean_mask_all = crop_catalog_for_tile(
+                            clean_full,
+                            spec,
+                            x_col=args.x_col,
+                            y_col=args.y_col,
+                            margin=args.mask_margin,
+                        )
+                        center_tile = crop_catalog_for_tile(
+                            center_full,
+                            spec,
+                            x_col=args.x_col,
+                            y_col=args.y_col,
+                            margin=0.0,
+                        )
+                        center_mask = crop_catalog_for_tile(
+                            center_full,
+                            spec,
+                            x_col=args.x_col,
+                            y_col=args.y_col,
+                            margin=args.mask_margin,
+                        )
+                        ignore_tile = crop_catalog_for_tile(
+                            ignore_full,
+                            spec,
+                            x_col=args.x_col,
+                            y_col=args.y_col,
+                            margin=0.0,
+                        )
+                        ignore_mask = crop_catalog_for_tile(
+                            ignore_full,
+                            spec,
+                            x_col=args.x_col,
+                            y_col=args.y_col,
+                            margin=args.mask_margin,
+                        )
+                        strict_center_mask = crop_catalog_for_tile(
+                            strict_center_full,
+                            spec,
+                            x_col=args.x_col,
+                            y_col=args.y_col,
+                            margin=args.mask_margin,
+                        )
+
+                        normal_tile, snr_center_tile, snr_ignore_tile, _tile_snr = _classify_clean_by_noncoadd_snr(
+                            clean_tile_all,
+                            image=image,
+                            image_origin=image_origin,
+                            args=args,
+                        )
+                        normal_mask, snr_center_mask, snr_ignore_mask, _mask_snr = _classify_clean_by_noncoadd_snr(
+                            clean_mask_all,
+                            image=image,
+                            image_origin=image_origin,
+                            args=args,
+                        )
+                        combined_center_tile = _vstack_nonempty([center_tile, snr_center_tile])
+                        combined_ignore_tile = _vstack_nonempty([ignore_tile, snr_ignore_tile])
+                        combined_center_mask = _vstack_nonempty([center_mask, snr_center_mask])
+                        combined_ignore_mask = _vstack_nonempty([ignore_mask, snr_ignore_mask])
+
+                        band_target = make_pu_dense_targets(
+                            normal_mask,
+                            combined_center_mask,
+                            combined_ignore_mask,
+                            spec,
+                            x_col=args.x_col,
+                            y_col=args.y_col,
+                            ellipse_sigma=args.ellipse_sigma,
+                            confidence_levels=args.confidence_levels,
+                            core_radius=args.core_radius,
+                            center_only_weight=args.pu_center_only_weight,
+                            lsst_background_mask=_coadd_target_background_mask(coadd_patch_root, band, spec.name),
+                            strict_center_only_sources=strict_center_mask,
+                            strict_center_only_ellipse_sigma=args.pu_strict_bright_center_only_ellipse_sigma,
+                        )
+                        _restore_center_only_shape_targets(
+                            band_target,
+                            combined_center_mask,
+                            spec,
+                            x_col=args.x_col,
+                            y_col=args.y_col,
+                            ellipse_sigma=args.ellipse_sigma,
+                            confidence_levels=args.confidence_levels,
+                            core_radius=args.core_radius,
+                        )
+                        band_target["visibility_center_only_centers"] = _local_centers_from_catalog(snr_center_tile)
+                        band_target["visibility_ignore_centers"] = _local_centers_from_catalog(snr_ignore_tile)
+                        band_target["noncoadd_snr_thresholds"] = np.asarray(
+                            [float(args.noncoadd_snr_ignore_thresh), float(args.noncoadd_snr_center_only_thresh)],
+                            dtype=np.float32,
+                        )
+                        write_targets(band_target, output_root / "band_targets" / band / f"{tile_name}.npz", None)
+                        write_catalog_metadata(normal_tile, output_root / "band_tile_metadata" / band / f"{tile_name}.npz")
+                        visibility_counts[band]["normal"] += int(len(normal_tile))
+                        visibility_counts[band]["center_only"] += int(len(snr_center_tile))
+                        visibility_counts[band]["ignore"] += int(len(snr_ignore_tile))
+
+                        if not primary_written:
+                            write_targets(band_target, output_root / "targets" / f"{tile_name}.npz", None)
+                            write_catalog_metadata(normal_tile, output_root / "tile_metadata" / f"{tile_name}.npz")
+                            primary_written = True
+
                 rows.append(
                     {
                         "name": tile_name,
@@ -1805,6 +2157,10 @@ def _preprocess_image_variant_patch(
             "base_patch_root": str(coadd_patch_root),
             "shared_label_root": str(coadd_patch_root),
             "shared_label_policy": "coadd_preprocessed",
+            "noncoadd_snr_filter": write_variant_labels,
+            "noncoadd_snr_ignore_thresh": float(getattr(args, "noncoadd_snr_ignore_thresh", 2.0)),
+            "noncoadd_snr_center_only_thresh": float(getattr(args, "noncoadd_snr_center_only_thresh", 3.0)),
+            "noncoadd_visibility_counts": visibility_counts if write_variant_labels else None,
             "zscale_root": str(_expand(args.zscale_root)) if args.zscale_root is not None else None,
             "zscale_written": zscale_written,
             "zscale_skipped": zscale_skipped,
@@ -1829,10 +2185,130 @@ def _preprocess_image_variant_patch(
                     shutil.copy2(src, fast_root / filename)
             if (output_root / "effective_count_paths.json").exists():
                 shutil.copy2(output_root / "effective_count_paths.json", fast_root / "effective_count_paths.json")
+            for dirname in ("targets", "tile_metadata", "band_targets", "band_tile_metadata"):
+                src_dir = output_root / dirname
+                dst_dir = fast_root / dirname
+                if src_dir.exists() and src_dir.resolve() != dst_dir.resolve():
+                    shutil.copytree(src_dir, dst_dir, dirs_exist_ok=True)
 
     print(
         f"patch {patch}: prepared {len(cutout_paths)} {variant} tiles from {len(groups)} group(s); "
         f"zscale_written={zscale_written}, zscale_skipped={zscale_skipped}; output={output_root}",
+        flush=True,
+    )
+    return metadata
+
+
+def _sync_existing_variant_patch(
+    args: argparse.Namespace,
+    *,
+    coadd_patch_root: Path,
+    denoised_patch_dir: Optional[Path],
+    variant: str,
+    output_root: Path,
+    bands: Sequence[str],
+    patch: str,
+) -> Dict[str, object]:
+    del coadd_patch_root, denoised_patch_dir
+    if not output_root.exists():
+        raise FileNotFoundError(f"Existing image-variant patch root does not exist: {output_root}")
+
+    manifest_path = output_root / "manifest.json"
+    metadata: Dict[str, object] = {}
+    if manifest_path.exists():
+        try:
+            metadata = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            metadata = {}
+
+    specs = _read_existing_tile_specs(output_root)
+    tile_names = [spec.name for spec in specs]
+    if not tile_names:
+        raise RuntimeError(f"No existing image-variant tile specs found in {output_root / 'tiles.csv'}")
+
+    cutout_paths: Dict[str, Dict[str, str]] = {}
+    missing: List[str] = []
+    for tile_name in tile_names:
+        tile_dir = output_root / "cutouts" / tile_name
+        band_paths: Dict[str, str] = {}
+        for band in bands:
+            try:
+                band_paths[band] = _existing_cutout_fits_path(tile_dir, band)
+            except Exception as exc:
+                missing.append(f"{tile_name}/{band}: {exc}")
+        if len(band_paths) == len(bands):
+            cutout_paths[tile_name] = band_paths
+
+    if missing:
+        examples = "\n".join(missing[:10])
+        raise FileNotFoundError(
+            f"Existing image-variant patch {variant}:{patch} is missing {len(missing)} requested band cutout(s). "
+            f"First examples:\n{examples}"
+        )
+
+    zscale_written = 0
+    zscale_skipped = 0
+    if args.zscale_root is not None and not args.dry_run:
+        zscale_root = _expand(args.zscale_root)
+        for tile_name, band_paths in cutout_paths.items():
+            zscale_path = _zscale_cache_path(
+                zscale_root,
+                tract=args.tract,
+                patch=patch,
+                tile_name=tile_name,
+                bands=bands,
+                fits_hdu=args.zscale_fits_hdu,
+                relative_root=f"{variant}/{args.tract}/{patch}",
+            )
+            existed = zscale_path.exists()
+            write_zscale_cache(
+                [band_paths[band] for band in bands],
+                zscale_path,
+                fits_hdu=args.zscale_fits_hdu,
+                overwrite=args.overwrite_zscale,
+            )
+            if existed and not args.overwrite_zscale:
+                zscale_skipped += 1
+            else:
+                zscale_written += 1
+
+    metadata.update(
+        {
+            "dataset_source": variant,
+            "output_root": str(output_root),
+            "bands": list(bands),
+            "tract": args.tract,
+            "patch": patch,
+            "num_tiles": len(tile_names),
+            "reuse_existing_preprocessed": True,
+            "zscale_root": str(_expand(args.zscale_root)) if args.zscale_root is not None else None,
+            "zscale_written": zscale_written,
+            "zscale_skipped": zscale_skipped,
+            "args": _jsonable_args(args),
+        }
+    )
+
+    if not args.dry_run:
+        (output_root / "cutout_paths.json").write_text(json.dumps(cutout_paths, indent=2), encoding="utf-8")
+        manifest_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        if args.fast_root is not None:
+            fast_root = _variant_patch_output_root(_expand(args.fast_root), variant, args.tract, patch)
+            fast_root.mkdir(parents=True, exist_ok=True)
+            for filename in ("manifest.json", "tiles.csv", "cutout_paths.json"):
+                src = output_root / filename
+                if src.exists():
+                    shutil.copy2(src, fast_root / filename)
+            if (output_root / "effective_count_paths.json").exists():
+                shutil.copy2(output_root / "effective_count_paths.json", fast_root / "effective_count_paths.json")
+            for dirname in ("targets", "tile_metadata", "band_targets", "band_tile_metadata"):
+                src_dir = output_root / dirname
+                dst_dir = fast_root / dirname
+                if src_dir.exists() and src_dir.resolve() != dst_dir.resolve():
+                    shutil.copytree(src_dir, dst_dir, dirs_exist_ok=True)
+
+    print(
+        f"patch {patch}: reused {len(tile_names)} existing {variant} tiles; zscale_written={zscale_written}, "
+        f"zscale_skipped={zscale_skipped}; output={output_root}",
         flush=True,
     )
     return metadata
@@ -1998,32 +2474,30 @@ def preprocess(args: argparse.Namespace) -> None:
     variant_failed_rows: List[Dict[str, str]] = []
     if denoised_fits_root is not None:
         variants = tuple(str(item).strip() for item in args.image_variants if str(item).strip())
-        variant_tasks: List[Tuple[str, str, Path, Path]] = []
+        variant_tasks: List[Tuple[str, str, Optional[Path], Path]] = []
+        skipped_variant_patches: List[str] = []
+        variant_worker_fn = _sync_existing_variant_patch if args.reuse_existing_preprocessed else _preprocess_image_variant_patch
         for patch in patches:
             if patch not in summaries_by_patch:
                 continue
             coadd_patch_root = _patch_output_root(data_root, args.tract, patch)
             denoised_patch_dir = _find_denoised_patch_dir(denoised_fits_root, patch)
-            if denoised_patch_dir is None:
-                variant_failed_rows.append(
-                    {
-                        "patch": patch,
-                        "catalog": str(_catalog_path_for_patch(args, catalog_root, patch, len(patches))),
-                        "output_root": str(coadd_patch_root),
-                        "error_type": "FileNotFoundError",
-                        "error": f"denoised/noisy patch directory not found under {denoised_fits_root}",
-                        "traceback": "",
-                    }
-                )
-                print(f"FAILED patch {patch}: denoised/noisy patch directory not found under {denoised_fits_root}", flush=True)
-                continue
             for variant in variants:
+                variant_output_root = _variant_patch_output_root(data_root, variant, args.tract, patch)
+                if denoised_patch_dir is None and not (args.reuse_existing_preprocessed and variant_output_root.exists()):
+                    skipped_variant_patches.append(f"{variant}:{patch}")
+                    print(
+                        f"WARNING: skipping image variant {variant}:{patch}; "
+                        f"patch directory not found under {denoised_fits_root}",
+                        flush=True,
+                    )
+                    continue
                 variant_tasks.append(
                     (
                         patch,
                         variant,
                         denoised_patch_dir,
-                        _variant_patch_output_root(data_root, variant, args.tract, patch),
+                        variant_output_root,
                     )
                 )
 
@@ -2047,7 +2521,7 @@ def preprocess(args: argparse.Namespace) -> None:
             ):
                 try:
                     variant_summaries.append(
-                        _preprocess_image_variant_patch(
+                        variant_worker_fn(
                             args,
                             coadd_patch_root=_patch_output_root(data_root, args.tract, patch),
                             denoised_patch_dir=denoised_patch_dir,
@@ -2079,7 +2553,7 @@ def preprocess(args: argparse.Namespace) -> None:
             ) as executor:
                 future_to_key = {
                     executor.submit(
-                        _preprocess_image_variant_patch,
+                        variant_worker_fn,
                         args,
                         coadd_patch_root=_patch_output_root(data_root, args.tract, patch),
                         denoised_patch_dir=denoised_patch_dir,
@@ -2114,6 +2588,12 @@ def preprocess(args: argparse.Namespace) -> None:
                         print(f"FAILED patch {key}: {_compact_exception_message(exc, limit=500)}", flush=True)
                     completed += 1
                     print(f"completed image variant {key} ({completed}/{len(variant_tasks)})", flush=True)
+        if skipped_variant_patches:
+            skipped_names = " ".join(skipped_variant_patches)
+            print(
+                f"SKIPPED_IMAGE_VARIANT_PATCHES {skipped_names}",
+                flush=True,
+            )
         summaries.extend(variant_summaries)
         failed_patch_rows.extend(variant_failed_rows)
 
@@ -2948,6 +3428,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--confidence-levels", type=int, default=5)
     parser.add_argument("--core-radius", type=int, default=2)
     parser.add_argument("--pu-center-only-weight", type=float, default=0.25)
+    parser.add_argument(
+        "--noncoadd-snr-filter",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "For noisy/denoised image variants, build variant-local targets by moving clean coadd labels "
+            "with raw-image SNR below the thresholds to ignore/center_only during preprocessing."
+        ),
+    )
+    parser.add_argument("--noncoadd-snr-ignore-thresh", type=float, default=2.0)
+    parser.add_argument("--noncoadd-snr-center-only-thresh", type=float, default=3.0)
+    parser.add_argument("--noncoadd-snr-ap-radius", type=float, default=6.0)
+    parser.add_argument("--noncoadd-snr-annulus-r-in", type=float, default=10.0)
+    parser.add_argument("--noncoadd-snr-annulus-r-out", type=float, default=15.0)
     parser.add_argument("--pu-a-flags", nargs="*", default=list(DEFAULT_PU_A_FLAGS))
     parser.add_argument("--pu-b-flags", nargs="*", default=list(DEFAULT_PU_B_FLAGS))
     parser.add_argument("--pu-a-mode", choices=("any", "all"), default="any")

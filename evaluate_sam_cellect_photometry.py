@@ -50,7 +50,7 @@ DEFAULT_DATA_ROOT = Path("/nvme0/zc/scarlet/preprocessed")
 DEFAULT_OUT_DIR = CELLECT_ROOT / "output/sam_cellect_patch45_group1_photometry_eval"
 DEFAULT_BANDS = ("HSC-G", "HSC-R", "HSC-I", "HSC-Z", "HSC-Y")
 DEFAULT_DATASETS = ("coadd", "denoised")
-DEFAULT_GT_FLUX_SCALE_FOR_RATIOS = 10.0 ** (0.4 * (31.4 - 27.0))
+DEFAULT_GT_FLUX_SCALE_FOR_RATIOS =  1 # 10.0 ** (0.4 * (31.4 - 27.0))
 RATIO_SPECS = (
     ("pred_ap2_over_gt_ap2", "ap_flux", "gt_ap2_flux", "predicted ap2 / scaled GT ap2"),
     ("pred_kron_over_gt_kron", "kron_flux", "gt_kron_flux", "predicted kron / scaled GT kron"),
@@ -81,6 +81,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mag-min", type=float, default=22.0)
     parser.add_argument("--mag-max", type=float, default=30.0)
     parser.add_argument("--bin-size", type=float, default=0.5)
+    parser.add_argument(
+        "--reverse-mag-axis",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Plot magnitude axes right-to-left by default, so fainter larger magnitudes appear on the left.",
+    )
     parser.add_argument("--curve-gt-mag-col", default="gt_ap2mag")
     parser.add_argument("--curve-pred-mag-col", default="ap_abmag")
     parser.add_argument("--ratio-source", choices=("isolated", "matched"), default="isolated")
@@ -127,7 +133,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--photometry-sigma-clip", type=float, default=3.0)
     parser.add_argument("--photometry-method", choices=("center", "exact", "subpixel"), default="exact")
     parser.add_argument("--photometry-annulus-method", choices=("center", "exact", "subpixel"), default="center")
-    parser.add_argument("--photometry-zero-point", type=float, default=31.4)
+    parser.add_argument("--photometry-zero-point", type=float, default=27.0)
     parser.add_argument("--gt-photometry-zero-point", type=float, default=27.0)
     parser.add_argument("--photometry-psf-factor", type=float, default=1.0)
     parser.add_argument("--tp-isolated-max-shape-iou", type=float, default=0.05)
@@ -402,12 +408,231 @@ def _run_inference(args: argparse.Namespace, cfg: dict) -> tuple[list[dict], lis
     return summaries, phot_rows, gt_rows
 
 
+def _requested_checkpoint_map(args: argparse.Namespace) -> dict[str, Path]:
+    return {label: path for path, label in _checkpoint_items(args)}
+
+
+def _photometry_csvs_for_pair(args: argparse.Namespace, label: str, dataset: str) -> list[Path]:
+    pair_dir = args.out_dir / str(label) / str(dataset)
+    if not pair_dir.exists():
+        return []
+    paths = []
+    for path in sorted(pair_dir.glob("*_photometry.csv")):
+        if path.name.endswith("_tp_isolated_gt_photometry.csv"):
+            continue
+        paths.append(path)
+    return paths
+
+
+def _infer_tile_from_photometry_path(path: Path, label: str, dataset: str, args: argparse.Namespace) -> str:
+    stem = path.name.removesuffix("_photometry.csv")
+    patch_token = str(args.patch).replace(",", "_")
+    band_token = str(args.band).replace("-", "_")
+    prefix = f"{label}_{dataset}_{patch_token}_"
+    suffix = f"_{band_token}"
+    if stem.startswith(prefix):
+        stem = stem[len(prefix) :]
+    if stem.endswith(suffix):
+        stem = stem[: -len(suffix)]
+    return stem
+
+
+def _summary_from_photometry_rows(
+    args: argparse.Namespace,
+    *,
+    label: str,
+    checkpoint: Path | None,
+    dataset: str,
+    tile: str,
+    phot_path: Path,
+    rows: Sequence[dict],
+    gt_count: int,
+) -> dict:
+    matched = {
+        str(row.get("gt_index", "")).strip()
+        for row in rows
+        if str(row.get("gt_index", "")).strip() not in {"", "nan", "None"}
+    }
+    kept_masks = sum(1 for row in rows if _is_true(row.get("mask_kept", False)))
+    mask_areas = np.asarray([_float(row.get("mask_area")) for row in rows if _is_true(row.get("mask_kept", False))], dtype=float)
+    mask_ious = np.asarray([_float(row.get("mask_pred_iou")) for row in rows if _is_true(row.get("mask_kept", False))], dtype=float)
+    return {
+        "checkpoint_label": label,
+        "dataset": dataset,
+        "tile": tile,
+        "band": args.band,
+        "detections": len(rows),
+        "mask_prompts": len(rows),
+        "raw_masks": len(rows),
+        "kept_masks": kept_masks,
+        "mask_area_median": float(np.nanmedian(mask_areas)) if mask_areas.size else math.nan,
+        "mask_iou_median": float(np.nanmedian(mask_ious)) if mask_ious.size else math.nan,
+        "clean_gt": int(gt_count),
+        "clean_tp": len(matched),
+        "clean_fn": max(0, int(gt_count) - len(matched)),
+        "photometry_csv": str(phot_path),
+        "photometry_count": len(rows),
+        "checkpoint": str(checkpoint) if checkpoint is not None else "",
+        "checkpoint_epoch": vis._checkpoint_epoch(checkpoint) if checkpoint is not None and checkpoint.exists() else "",
+    }
+
+
+def _rebuild_existing_from_raw_csv(args: argparse.Namespace) -> tuple[list[dict], list[dict], list[dict], set[tuple[str, str]]]:
+    checkpoint_map = _requested_checkpoint_map(args)
+    requested_labels = sorted(checkpoint_map) if checkpoint_map else []
+    requested_datasets = [str(name) for name in args.datasets]
+    summaries: list[dict] = []
+    phot_rows: list[dict] = []
+    gt_rows: list[dict] = []
+    rebuilt_pairs: set[tuple[str, str]] = set()
+    gt_seen: set[tuple[str, str]] = set()
+
+    for label in requested_labels:
+        checkpoint = checkpoint_map.get(label)
+        for dataset in requested_datasets:
+            paths = _photometry_csvs_for_pair(args, label, dataset)
+            if not paths:
+                continue
+            rebuilt_pairs.add((label, dataset))
+            for phot_path in paths:
+                rows = _read_csv(phot_path)
+                if rows:
+                    tile = str(rows[0].get("tile", "")) or _infer_tile_from_photometry_path(phot_path, label, dataset, args)
+                else:
+                    tile = _infer_tile_from_photometry_path(phot_path, label, dataset, args)
+                for row in rows:
+                    row.setdefault("checkpoint_label", label)
+                    row.setdefault("dataset", dataset)
+                    row.setdefault("tile", tile)
+                    row.setdefault("band", args.band)
+                    if checkpoint is not None:
+                        row.setdefault("checkpoint", str(checkpoint))
+                phot_rows.extend(rows)
+
+                gt_key = (dataset, tile)
+                tile_gt_rows: list[dict] = []
+                if gt_key not in gt_seen:
+                    tile_gt_rows = _gt_mag_rows(args, dataset, tile)
+                    gt_rows.extend(tile_gt_rows)
+                    gt_seen.add(gt_key)
+                else:
+                    # Count from existing rows for this tile if GT rows were already collected.
+                    tile_gt_rows = [row for row in gt_rows if str(row.get("dataset", "")) == dataset and str(row.get("tile", "")) == tile]
+
+                summaries.append(
+                    _summary_from_photometry_rows(
+                        args,
+                        label=label,
+                        checkpoint=checkpoint,
+                        dataset=dataset,
+                        tile=tile,
+                        phot_path=phot_path,
+                        rows=rows,
+                        gt_count=len(tile_gt_rows),
+                    )
+                )
+    return summaries, phot_rows, gt_rows, rebuilt_pairs
+
+
+def _merge_rebuilt_rows(
+    existing_summaries: Sequence[dict],
+    existing_phot: Sequence[dict],
+    existing_gt: Sequence[dict],
+    rebuilt_summaries: Sequence[dict],
+    rebuilt_phot: Sequence[dict],
+    rebuilt_gt: Sequence[dict],
+    rebuilt_pairs: set[tuple[str, str]],
+) -> tuple[list[dict], list[dict], list[dict]]:
+    summary_by_key = {
+        (str(row.get("checkpoint_label", "")), str(row.get("dataset", "")), str(row.get("tile", ""))): dict(row)
+        for row in existing_summaries
+        if (str(row.get("checkpoint_label", "")), str(row.get("dataset", ""))) not in rebuilt_pairs
+    }
+    for row in rebuilt_summaries:
+        summary_by_key[(str(row.get("checkpoint_label", "")), str(row.get("dataset", "")), str(row.get("tile", "")))] = dict(row)
+
+    phot_rows = [
+        dict(row)
+        for row in existing_phot
+        if (str(row.get("checkpoint_label", "")), str(row.get("dataset", ""))) not in rebuilt_pairs
+    ]
+    phot_rows.extend(dict(row) for row in rebuilt_phot)
+
+    rebuilt_gt_keys = {(str(row.get("dataset", "")), str(row.get("tile", ""))) for row in rebuilt_gt}
+    gt_rows = [
+        dict(row)
+        for row in existing_gt
+        if (str(row.get("dataset", "")), str(row.get("tile", ""))) not in rebuilt_gt_keys
+    ]
+    gt_rows.extend(dict(row) for row in rebuilt_gt)
+    return list(summary_by_key.values()), phot_rows, gt_rows
+
+
 def _load_existing(args: argparse.Namespace) -> tuple[list[dict], list[dict], list[dict]]:
-    summaries = _read_csv(args.out_dir / "tile_summary.csv")
-    phot_rows = _read_csv(args.out_dir / "per_source_photometry.csv")
-    gt_rows = _read_csv(args.out_dir / "gt_photometry.csv")
+    existing_summaries = _read_csv(args.out_dir / "tile_summary.csv")
+    existing_phot = _read_csv(args.out_dir / "per_source_photometry.csv")
+    existing_gt = _read_csv(args.out_dir / "gt_photometry.csv")
+    if not existing_summaries or not existing_phot or not existing_gt:
+        print("[plot-only] summary CSVs are missing or empty; trying to rebuild from per-tile photometry CSVs", flush=True)
+
+    requested_datasets = {str(name) for name in args.datasets}
+    checkpoint_map = _requested_checkpoint_map(args)
+    requested_labels = set(checkpoint_map)
+    requested_pairs = {(label, dataset) for label in requested_labels for dataset in requested_datasets}
+
+    existing_pairs = {
+        (str(row.get("checkpoint_label", "")), str(row.get("dataset", "")))
+        for row in existing_summaries
+        if str(row.get("dataset", "")) in requested_datasets
+        and (not requested_labels or str(row.get("checkpoint_label", "")) in requested_labels)
+    }
+    need_rebuild = bool(requested_pairs - existing_pairs) or not existing_summaries or not existing_phot or not existing_gt
+    if need_rebuild:
+        rebuilt_summaries, rebuilt_phot, rebuilt_gt, rebuilt_pairs = _rebuild_existing_from_raw_csv(args)
+        if rebuilt_pairs:
+            all_summaries, all_phot, all_gt = _merge_rebuilt_rows(
+                existing_summaries,
+                existing_phot,
+                existing_gt,
+                rebuilt_summaries,
+                rebuilt_phot,
+                rebuilt_gt,
+                rebuilt_pairs,
+            )
+            _write_csv(args.out_dir / "tile_summary.csv", all_summaries)
+            _write_csv(args.out_dir / "per_source_photometry.csv", all_phot)
+            _write_csv(args.out_dir / "gt_photometry.csv", all_gt)
+            print(
+                f"[plot-only] rebuilt summary rows from raw per-tile CSVs for pairs: {sorted(rebuilt_pairs)}",
+                flush=True,
+            )
+            existing_summaries, existing_phot, existing_gt = all_summaries, all_phot, all_gt
+
+    def keep_common(row: dict) -> bool:
+        if str(row.get("dataset", "")) not in requested_datasets:
+            return False
+        if requested_labels and str(row.get("checkpoint_label", "")) not in requested_labels:
+            return False
+        return True
+
+    summaries = [row for row in existing_summaries if keep_common(row)]
+    phot_rows = [row for row in existing_phot if keep_common(row)]
+    gt_dataset_tiles = {(str(row.get("dataset", "")), str(row.get("tile", ""))) for row in summaries}
+    gt_rows = [
+        row for row in existing_gt
+        if (str(row.get("dataset", "")), str(row.get("tile", ""))) in gt_dataset_tiles
+    ]
+
+    available_pairs = sorted({(str(row.get("checkpoint_label", "")), str(row.get("dataset", ""))) for row in existing_summaries})
+    missing_pairs = sorted(requested_pairs - {(str(row.get("checkpoint_label", "")), str(row.get("dataset", ""))) for row in summaries})
+    if missing_pairs:
+        raise ValueError(
+            "plot-only requested checkpoint/dataset pairs are not present in summary CSVs or raw per-tile CSVs: "
+            f"{missing_pairs}. Available pairs in {args.out_dir}: {available_pairs}. "
+            "Run inference without --plot-only for the missing pairs."
+        )
     if not summaries or not phot_rows or not gt_rows:
-        raise FileNotFoundError("plot-only requires tile_summary.csv, per_source_photometry.csv, and gt_photometry.csv")
+        raise FileNotFoundError("plot-only filtering left no rows to plot")
     return summaries, phot_rows, gt_rows
 
 
@@ -492,7 +717,7 @@ def _aggregate_bins(args: argparse.Namespace, phot_rows: Sequence[dict], gt_rows
     return detail, sorted(aggregate, key=lambda r: (str(r["method"]), float(r["mag_left"])))
 
 
-def _plot_curves(path: Path, rows: Sequence[dict], *, title_suffix: str) -> None:
+def _plot_curves(path: Path, rows: Sequence[dict], *, title_suffix: str, reverse_mag_axis: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     methods = sorted({str(row["method"]) for row in rows})
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.5), constrained_layout=True)
@@ -510,6 +735,8 @@ def _plot_curves(path: Path, rows: Sequence[dict], *, title_suffix: str) -> None
         ax.set_xlabel("AB magnitude")
         ax.set_ylabel(title.lower())
         ax.set_ylim(-0.03, 1.03)
+        if reverse_mag_axis:
+            ax.invert_xaxis()
         ax.grid(alpha=0.25)
         ax.spines[["top", "right"]].set_visible(False)
     if methods:
@@ -522,9 +749,9 @@ def _bin_label(lo: float, hi: float) -> str:
     return f"{lo:g}-{hi:g}"
 
 
-def _plot_count_bars(completeness_path: Path, purity_path: Path, rows: Sequence[dict]) -> None:
+def _plot_count_bars(completeness_path: Path, purity_path: Path, rows: Sequence[dict], *, reverse_mag_axis: bool = False) -> None:
     methods = sorted({str(row["method"]) for row in rows})
-    bins = sorted({(_float(row["mag_left"]), _float(row["mag_right"])) for row in rows})
+    bins = sorted({(_float(row["mag_left"]), _float(row["mag_right"])) for row in rows}, reverse=reverse_mag_axis)
     if not methods or not bins:
         return
     by_key = {(str(row["method"]), _float(row["mag_left"]), _float(row["mag_right"])): row for row in rows}
@@ -704,10 +931,30 @@ def main() -> int:
     metric_rows, aggregate_rows = _aggregate_bins(args, phot_rows, gt_rows)
     _write_csv(args.out_dir / "magnitude_bin_metrics.csv", metric_rows)
     _write_csv(args.out_dir / "magnitude_bin_metrics_aggregate.csv", aggregate_rows)
-    _plot_curves(args.out_dir / "magnitude_completeness_purity_curves.png", metric_rows, title_suffix=f"{args.patch} group {args.group}")
-    _plot_curves(args.out_dir / "magnitude_completeness_purity_curves_aggregate.png", aggregate_rows, title_suffix=f"{args.patch} group {args.group} aggregate")
-    _plot_count_bars(args.out_dir / "magnitude_completeness_counts.png", args.out_dir / "magnitude_purity_fp_counts.png", metric_rows)
-    _plot_count_bars(args.out_dir / "magnitude_completeness_counts_aggregate.png", args.out_dir / "magnitude_purity_fp_counts_aggregate.png", aggregate_rows)
+    _plot_curves(
+        args.out_dir / "magnitude_completeness_purity_curves.png",
+        metric_rows,
+        title_suffix=f"{args.patch} group {args.group}",
+        reverse_mag_axis=bool(args.reverse_mag_axis),
+    )
+    _plot_curves(
+        args.out_dir / "magnitude_completeness_purity_curves_aggregate.png",
+        aggregate_rows,
+        title_suffix=f"{args.patch} group {args.group} aggregate",
+        reverse_mag_axis=bool(args.reverse_mag_axis),
+    )
+    _plot_count_bars(
+        args.out_dir / "magnitude_completeness_counts.png",
+        args.out_dir / "magnitude_purity_fp_counts.png",
+        metric_rows,
+        reverse_mag_axis=bool(args.reverse_mag_axis),
+    )
+    _plot_count_bars(
+        args.out_dir / "magnitude_completeness_counts_aggregate.png",
+        args.out_dir / "magnitude_purity_fp_counts_aggregate.png",
+        aggregate_rows,
+        reverse_mag_axis=bool(args.reverse_mag_axis),
+    )
 
     ratio_detail, ratio_stats = _ratio_rows(args, phot_rows)
     _write_csv(args.out_dir / "flux_ratio_details.csv", ratio_detail)
@@ -730,6 +977,7 @@ def main() -> int:
         "ratio_rows": len(ratio_detail),
         "ratio_source": args.ratio_source,
         "gt_flux_scale_for_ratios": float(args.gt_flux_scale_for_ratios),
+        "reverse_mag_axis": bool(args.reverse_mag_axis),
     }
     (args.out_dir / "evaluation_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     print(f"wrote {args.out_dir}", flush=True)

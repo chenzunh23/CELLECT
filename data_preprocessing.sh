@@ -62,6 +62,12 @@ LSST_BACKGROUND_DETECT_CUTOUTS="${LSST_BACKGROUND_DETECT_CUTOUTS:-0}"
 USE_LSST_DETECTION_CALEXP_CUTOUTS="${USE_LSST_DETECTION_CALEXP_CUTOUTS:-0}"
 DENOISED_FITS_ROOT="${DENOISED_FITS_ROOT:-}"
 IMAGE_VARIANTS="${IMAGE_VARIANTS:-denoised noisy}"
+NONCOADD_SNR_FILTER="${NONCOADD_SNR_FILTER:-1}"
+NONCOADD_SNR_IGNORE_THRESH="${NONCOADD_SNR_IGNORE_THRESH:-2.0}"
+NONCOADD_SNR_CENTER_ONLY_THRESH="${NONCOADD_SNR_CENTER_ONLY_THRESH:-3.0}"
+NONCOADD_SNR_AP_RADIUS="${NONCOADD_SNR_AP_RADIUS:-6.0}"
+NONCOADD_SNR_ANNULUS_R_IN="${NONCOADD_SNR_ANNULUS_R_IN:-10.0}"
+NONCOADD_SNR_ANNULUS_R_OUT="${NONCOADD_SNR_ANNULUS_R_OUT:-15.0}"
 
 BAND_LIMIT_MAGS="${BAND_LIMIT_MAGS:-HSC-G=27.4 HSC-R=27.1 HSC-I=26.9 HSC-Z=26.3 HSC-Y=25.3}"
 STRICT_CENTER_ONLY_SATURATION_MAGS="${STRICT_CENTER_ONLY_SATURATION_MAGS:-${STRICT_IGNORE_SATURATION_MAGS:-HSC-G=18.0 HSC-R=18.2 HSC-I=18.6 HSC-Z=17.7 HSC-Y=17.4}}"
@@ -353,7 +359,17 @@ run_preprocess() {
     optional_args+=(
       --denoised-fits-root "${DENOISED_FITS_ROOT}"
       --image-variants "${image_variant_args[@]}"
+      --noncoadd-snr-ignore-thresh "${NONCOADD_SNR_IGNORE_THRESH}"
+      --noncoadd-snr-center-only-thresh "${NONCOADD_SNR_CENTER_ONLY_THRESH}"
+      --noncoadd-snr-ap-radius "${NONCOADD_SNR_AP_RADIUS}"
+      --noncoadd-snr-annulus-r-in "${NONCOADD_SNR_ANNULUS_R_IN}"
+      --noncoadd-snr-annulus-r-out "${NONCOADD_SNR_ANNULUS_R_OUT}"
     )
+    if [[ "${NONCOADD_SNR_FILTER}" == "1" ]]; then
+      optional_args+=(--noncoadd-snr-filter)
+    else
+      optional_args+=(--no-noncoadd-snr-filter)
+    fi
   fi
 
   mkdir -p "${LOG_DIR}"

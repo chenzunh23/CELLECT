@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import importlib.util
 from pathlib import Path
-import sys
-import types
 from typing import Dict, Optional, Sequence, Tuple
 
 import torch
@@ -11,41 +8,9 @@ from torch import Tensor, nn
 
 from .build import SamPerBandImageEncoder, build_per_band_sam_encoder
 from .decoder import SamCellectDecoder
-
-_SAM_ASTRO_ROOT = Path("/home/czh23/SAM-astro")
-if str(_SAM_ASTRO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_SAM_ASTRO_ROOT))
-
-
-def _load_sam_modeling_class(module_name: str, class_name: str) -> type[nn.Module]:
-    """Load SAM modeling submodules without importing torchvision-dependent predictor code."""
-
-    package_name = "segment_anything"
-    modeling_package = f"{package_name}.modeling"
-    package_root = _SAM_ASTRO_ROOT / package_name
-    modeling_root = package_root / "modeling"
-    if package_name not in sys.modules:
-        pkg = types.ModuleType(package_name)
-        pkg.__path__ = [str(package_root)]  # type: ignore[attr-defined]
-        sys.modules[package_name] = pkg
-    if modeling_package not in sys.modules:
-        modeling_pkg = types.ModuleType(modeling_package)
-        modeling_pkg.__path__ = [str(modeling_root)]  # type: ignore[attr-defined]
-        sys.modules[modeling_package] = modeling_pkg
-    full_name = f"{modeling_package}.{module_name}"
-    if full_name not in sys.modules:
-        spec = importlib.util.spec_from_file_location(full_name, modeling_root / f"{module_name}.py")
-        if spec is None or spec.loader is None:
-            raise ImportError(f"Could not load SAM modeling module {full_name}")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[full_name] = module
-        spec.loader.exec_module(module)
-    return getattr(sys.modules[full_name], class_name)
-
-
-PromptEncoder = _load_sam_modeling_class("prompt_encoder", "PromptEncoder")
-MaskDecoder = _load_sam_modeling_class("mask_decoder", "MaskDecoder")
-TwoWayTransformer = _load_sam_modeling_class("transformer", "TwoWayTransformer")
+from .mask_decoder import MaskDecoder
+from .prompt_encoder import PromptEncoder
+from .transformer import TwoWayTransformer
 
 
 class SamCellect2D(nn.Module):

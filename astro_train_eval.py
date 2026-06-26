@@ -719,34 +719,54 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--train-patches",
         nargs="*",
         default=(),
-        help="Restrict --mode train training records to patches or source-qualified patches, e.g. 0,0 9813/0,0 denoised:0,0 noisy:9813/6,1.",
+        help=(
+            "Restrict --mode train training records to patches or source-qualified patches, "
+            "e.g. 0,0 9813/0,0 denoised:0,0 noisy:9813/6,1. "
+            "Append @group_02 to keep one explicit variant group, or @random to choose one "
+            "group per selector using --seed, e.g. denoised:3,4@group_02 or denoised:3,4@random."
+        ),
     )
     parser.add_argument(
         "--train-patches-file",
         default=None,
-        help="Optional text file with one train selector per line. Lines may use 0,0, 9813/0,0, or denoised:0,0; # comments are ignored.",
+        help=(
+            "Optional text file with one train selector per line. Lines may use 0,0, 9813/0,0, "
+            "denoised:0,0, denoised:0,0@group_02, or denoised:0,0@random; # comments are ignored."
+        ),
     )
     parser.add_argument(
         "--val-patches",
         nargs="*",
         default=(),
-        help="Restrict --mode train validation records to patches or source-qualified patches, e.g. 6,1 or denoised:9813/6,1.",
+        help=(
+            "Restrict --mode train validation records to patches or source-qualified patches, "
+            "e.g. 6,1, denoised:9813/6,1, or noisy:6,1@group_03."
+        ),
     )
     parser.add_argument(
         "--val-patches-file",
         default=None,
-        help="Optional text file with one validation selector per line. Lines may use 6,1, 9813/6,1, or noisy:6,1; # comments are ignored.",
+        help=(
+            "Optional text file with one validation selector per line. Lines may use 6,1, 9813/6,1, "
+            "noisy:6,1, noisy:6,1@group_03, or noisy:6,1@random; # comments are ignored."
+        ),
     )
     parser.add_argument(
         "--eval-patches",
         nargs="*",
         default=(),
-        help="Restrict --mode eval to specific patches. Accepts 8,8, 9813/8,8, or source-qualified selectors such as denoised:8,8.",
+        help=(
+            "Restrict --mode eval to specific patches. Accepts 8,8, 9813/8,8, "
+            "denoised:8,8, denoised:8,8@group_01, or denoised:8,8@random."
+        ),
     )
     parser.add_argument(
         "--eval-patches-file",
         default=None,
-        help="Optional text file with one eval selector per line. Lines may use 8,8, 9813/8,8, or denoised:8,8; # comments are ignored.",
+        help=(
+            "Optional text file with one eval selector per line. Lines may use 8,8, 9813/8,8, "
+            "denoised:8,8, denoised:8,8@group_01, or denoised:8,8@random; # comments are ignored."
+        ),
     )
     parser.add_argument("--val-fraction", type=float, default=0.15)
     parser.add_argument(
@@ -770,6 +790,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="nchild0",
         help="Catalog rows used as center/embedding/eval GT. Default is deblend_nChild==0 leaf sources.",
     )
+    parser.add_argument(
+        "--noncoadd-snr-filter",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Debug fallback: for noisy/denoised datasets, classify clean GT online by raw-image ap2 annulus SNR. "
+            "Default is off because data_preprocessing.sh now writes these targets offline."
+        ),
+    )
+    parser.add_argument("--noncoadd-snr-ignore-thresh", type=float, default=2.0, help="Non-coadd GT below this SNR is moved to ignore.")
+    parser.add_argument("--noncoadd-snr-center-only-thresh", type=float, default=3.0, help="Non-coadd GT in [ignore, this) SNR is center-only/low-shape-weight; >= this is normal clean GT.")
+    parser.add_argument("--noncoadd-snr-ap-radius", type=float, default=6.0, help="Aperture radius in pixels for non-coadd GT visibility SNR.")
+    parser.add_argument("--noncoadd-snr-annulus-r-in", type=float, default=10.0, help="Inner annulus radius in pixels for non-coadd GT visibility SNR.")
+    parser.add_argument("--noncoadd-snr-annulus-r-out", type=float, default=15.0, help="Outer annulus radius in pixels for non-coadd GT visibility SNR.")
     parser.add_argument("--confidence-threshold", type=float, default=2.0)
     parser.add_argument(
         "--nms-radius",
@@ -1183,7 +1217,7 @@ def main() -> None:
             )
         if args.mode == "eval" and eval_patch_specs:
             before_count = len(records)
-            records = _filter_records_by_patches(records, eval_patch_specs, root)
+            records = _filter_records_by_patches(records, eval_patch_specs, root, seed=args.seed)
             if args.max_records is not None:
                 records = records[: int(args.max_records)]
             if not records:
@@ -1205,16 +1239,31 @@ def main() -> None:
             else:
                 all_val_source_records = list(all_records)
             if train_patch_specs:
-                train_records = _filter_records_by_patches(all_train_source_records, train_patch_specs, root)
+                train_records = _filter_records_by_patches(
+                    all_train_source_records,
+                    train_patch_specs,
+                    root,
+                    seed=args.seed,
+                )
             elif val_patch_specs:
-                val_records_tmp = _filter_records_by_patches(all_val_source_records, val_patch_specs, root)
+                val_records_tmp = _filter_records_by_patches(
+                    all_val_source_records,
+                    val_patch_specs,
+                    root,
+                    seed=args.seed,
+                )
                 val_names = {rec.name for rec in val_records_tmp}
                 train_records = [rec for rec in all_train_source_records if rec.name not in val_names]
             else:
                 train_records = list(all_train_source_records)
 
             if val_patch_specs:
-                val_records = _filter_records_by_patches(all_val_source_records, val_patch_specs, root)
+                val_records = _filter_records_by_patches(
+                    all_val_source_records,
+                    val_patch_specs,
+                    root,
+                    seed=args.seed,
+                )
             else:
                 train_records, val_records = split_records(
                     train_records,
@@ -1330,6 +1379,12 @@ def main() -> None:
             source_filter=args.source_filter,
             targets_dir=targets_dir,
             image_cache_dir=image_cache_dir,
+            noncoadd_visibility_snr_filter=bool(args.noncoadd_snr_filter),
+            noncoadd_visibility_ignore_snr=float(args.noncoadd_snr_ignore_thresh),
+            noncoadd_visibility_center_only_snr=float(args.noncoadd_snr_center_only_thresh),
+            noncoadd_visibility_ap_radius=float(args.noncoadd_snr_ap_radius),
+            noncoadd_visibility_annulus_r_in=float(args.noncoadd_snr_annulus_r_in),
+            noncoadd_visibility_annulus_r_out=float(args.noncoadd_snr_annulus_r_out),
         )
         pseudo_label_path = out_dir / "pseudo_labels" / "latest.json" if args.enable_pu_self_training else None
         train_ds = AstroCutoutDataset(

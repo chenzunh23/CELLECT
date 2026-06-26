@@ -283,20 +283,23 @@ def discover_cutout_records(
             raise FileNotFoundError(f"Reference catalog directory does not exist: {ref_dir}")
 
         local_band_reference_root = band_reference_root
-        if local_band_reference_root is None and (label_root / "band_reference_catalogs").exists():
-            local_band_reference_root = label_root / "band_reference_catalogs"
-        local_band_rejected_root = label_root / "band_reference_rejected"
-        if not local_band_rejected_root.exists():
-            local_band_rejected_root = None
-        local_band_ignore_root = label_root / "band_reference_ignore"
-        if not local_band_ignore_root.exists():
-            local_band_ignore_root = None
-        local_band_strict_center_only_root = label_root / "band_reference_strict_center_only"
-        if not local_band_strict_center_only_root.exists():
-            local_band_strict_center_only_root = None
-        local_band_strict_ignore_root = label_root / "band_reference_strict_ignore"
-        if not local_band_strict_ignore_root.exists():
-            local_band_strict_ignore_root = None
+        if local_band_reference_root is None:
+            if (patch_root / "band_reference_catalogs").exists():
+                local_band_reference_root = patch_root / "band_reference_catalogs"
+            elif (label_root / "band_reference_catalogs").exists():
+                local_band_reference_root = label_root / "band_reference_catalogs"
+
+        def _prefer_patch_root(dirname: str) -> Optional[Path]:
+            local = patch_root / dirname
+            if local.exists():
+                return local
+            shared = label_root / dirname
+            return shared if shared.exists() else None
+
+        local_band_rejected_root = _prefer_patch_root("band_reference_rejected")
+        local_band_ignore_root = _prefer_patch_root("band_reference_ignore")
+        local_band_strict_center_only_root = _prefer_patch_root("band_reference_strict_center_only")
+        local_band_strict_ignore_root = _prefer_patch_root("band_reference_strict_ignore")
         tract, patch, dataset_source = _relative_root_parts(relative_root)
 
         base_tile_by_tile = _variant_base_tile_map(patch_root) if dataset_source != "coadd" else {}
@@ -354,15 +357,23 @@ def discover_cutout_records(
                 else band_strict_ignore_paths
             )
             band_target_paths = tuple(
-                str(label_root / "band_targets" / band / f"{base_tile_name}.npz")
-                if (label_root / "band_targets" / band / f"{base_tile_name}.npz").exists()
-                else ""
+                str(patch_root / "band_targets" / band / f"{tile_name}.npz")
+                if (patch_root / "band_targets" / band / f"{tile_name}.npz").exists()
+                else (
+                    str(label_root / "band_targets" / band / f"{base_tile_name}.npz")
+                    if (label_root / "band_targets" / band / f"{base_tile_name}.npz").exists()
+                    else ""
+                )
                 for band in band_order
             )
             band_metadata_paths = tuple(
-                str(label_root / "band_tile_metadata" / band / f"{base_tile_name}.npz")
-                if (label_root / "band_tile_metadata" / band / f"{base_tile_name}.npz").exists()
-                else ""
+                str(patch_root / "band_tile_metadata" / band / f"{tile_name}.npz")
+                if (patch_root / "band_tile_metadata" / band / f"{tile_name}.npz").exists()
+                else (
+                    str(label_root / "band_tile_metadata" / band / f"{base_tile_name}.npz")
+                    if (label_root / "band_tile_metadata" / band / f"{base_tile_name}.npz").exists()
+                    else ""
+                )
                 for band in band_order
             )
             band_rejected_id_paths = tuple(
@@ -372,8 +383,16 @@ def discover_cutout_records(
                 for band in band_order
             )
             x0, y0 = _parse_tile_origin(tile_name)
-            target_path = label_root / "targets" / f"{base_tile_name}.npz"
-            metadata_path = label_root / "tile_metadata" / f"{base_tile_name}.npz"
+            target_path = (
+                patch_root / "targets" / f"{tile_name}.npz"
+                if (patch_root / "targets" / f"{tile_name}.npz").exists()
+                else label_root / "targets" / f"{base_tile_name}.npz"
+            )
+            metadata_path = (
+                patch_root / "tile_metadata" / f"{tile_name}.npz"
+                if (patch_root / "tile_metadata" / f"{tile_name}.npz").exists()
+                else label_root / "tile_metadata" / f"{base_tile_name}.npz"
+            )
             ignore_path = label_root / "ignore_catalogs" / f"{base_tile_name}_meas.fits"
             strict_center_only_path = label_root / "strict_center_only_catalogs" / f"{base_tile_name}_meas.fits"
             strict_ignore_path = label_root / "strict_ignore_catalogs" / f"{base_tile_name}_meas.fits"
@@ -823,6 +842,9 @@ def _read_target_npz(path: Path) -> Dict[str, Tensor]:
         for key in ("confidence_weight", "seg_loss_weight"):
             if key in data:
                 targets[key] = torch.from_numpy(np.asarray(data[key], dtype=np.float32))
+        for key in ("visibility_center_only_centers", "visibility_ignore_centers"):
+            if key in data:
+                targets[key] = torch.from_numpy(np.asarray(data[key], dtype=np.float32)).reshape(-1, 2)
     return _target_defaults(targets)
 
 
@@ -930,6 +952,178 @@ def _paint_pseudo_labels(
         )
 
 
+def _subset_catalog(catalog: Dict[str, np.ndarray], keep: np.ndarray) -> Dict[str, np.ndarray]:
+    keep = np.asarray(keep, dtype=bool)
+    out: Dict[str, np.ndarray] = {}
+    for key, value in catalog.items():
+        arr = np.asarray(value)
+        if arr.shape[:1] == keep.shape[:1]:
+            out[key] = arr[keep].copy()
+        else:
+            out[key] = arr.copy()
+    return out
+
+
+def _aperture_annulus_snr(
+    image: np.ndarray,
+    centers: np.ndarray,
+    *,
+    ap_radius: float = 6.0,
+    annulus_r_in: float = 10.0,
+    annulus_r_out: float = 15.0,
+) -> np.ndarray:
+    image = np.asarray(image, dtype=np.float32)
+    centers = np.asarray(centers, dtype=np.float32).reshape(-1, 2)
+    snr = np.full((centers.shape[0],), np.nan, dtype=np.float32)
+    if image.ndim != 2 or centers.size == 0:
+        return snr
+    h, w = image.shape
+    rmax = float(max(ap_radius, annulus_r_out))
+    for idx, (cx, cy) in enumerate(centers):
+        if not (np.isfinite(cx) and np.isfinite(cy)):
+            continue
+        x0 = max(0, int(math.floor(float(cx) - rmax - 1.0)))
+        x1 = min(w, int(math.ceil(float(cx) + rmax + 2.0)))
+        y0 = max(0, int(math.floor(float(cy) - rmax - 1.0)))
+        y1 = min(h, int(math.ceil(float(cy) + rmax + 2.0)))
+        if x0 >= x1 or y0 >= y1:
+            continue
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        rr = np.sqrt((xx.astype(np.float32) - float(cx)) ** 2 + (yy.astype(np.float32) - float(cy)) ** 2)
+        patch = image[y0:y1, x0:x1]
+        finite = np.isfinite(patch)
+        ap_mask = (rr <= float(ap_radius)) & finite
+        ann_mask = (rr >= float(annulus_r_in)) & (rr < float(annulus_r_out)) & finite
+        ap_vals = patch[ap_mask]
+        ann_vals = patch[ann_mask]
+        if ap_vals.size == 0 or ann_vals.size < 2:
+            continue
+        bkg = float(np.median(ann_vals))
+        sigma = float(np.std(ann_vals.astype(np.float64), ddof=1))
+        if not math.isfinite(sigma) or sigma <= 0.0:
+            continue
+        flux = float(np.sum(ap_vals.astype(np.float64))) - bkg * float(ap_vals.size)
+        noise = sigma * math.sqrt(float(ap_vals.size))
+        snr[idx] = float(flux / noise) if noise > 0.0 else np.nan
+    return snr
+
+
+def _merge_visibility_targets(
+    *,
+    image_shape: Tuple[int, int],
+    normal_catalog: Dict[str, np.ndarray],
+    center_only_catalog: Dict[str, np.ndarray],
+    ignore_catalog: Dict[str, np.ndarray],
+    confidence_levels: int,
+    ellipse_sigma: float,
+    core_radius: int,
+    shape_source: str,
+) -> Dict[str, Tensor]:
+    normal = make_targets(
+        image_shape=image_shape,
+        centers=normal_catalog["centers"],
+        moments=normal_catalog["moments"],
+        kron_radius=normal_catalog["kron_radius"],
+        confidence_levels=confidence_levels,
+        ellipse_sigma=ellipse_sigma,
+        core_radius=core_radius,
+        shape_source=shape_source,
+    )
+    targets = _target_defaults(normal)
+    center = _target_defaults(
+        make_targets(
+            image_shape=image_shape,
+            centers=center_only_catalog["centers"],
+            moments=center_only_catalog["moments"],
+            kron_radius=center_only_catalog["kron_radius"],
+            confidence_levels=confidence_levels,
+            ellipse_sigma=ellipse_sigma,
+            core_radius=core_radius,
+            shape_source=shape_source,
+        )
+    )
+    ignored = _target_defaults(
+        make_targets(
+            image_shape=image_shape,
+            centers=ignore_catalog["centers"],
+            moments=ignore_catalog["moments"],
+            kron_radius=ignore_catalog["kron_radius"],
+            confidence_levels=confidence_levels,
+            ellipse_sigma=ellipse_sigma,
+            core_radius=core_radius,
+            shape_source=shape_source,
+        )
+    )
+
+    center_mask = center["clean_mask"] > 0
+    ignore_mask = ignored["clean_mask"] > 0
+    if bool(center_mask.any()):
+        targets["confidence"] = torch.maximum(targets["confidence"], center["confidence"])
+        center_shape_weight = center["shape_weight"] > 0
+        targets["shape"] = torch.where(center_shape_weight.unsqueeze(0), center["shape"], targets["shape"])
+        targets["shape_weight"] = torch.maximum(targets["shape_weight"], center["shape_weight"])
+        targets["center_only_mask"] = ((targets["center_only_mask"] > 0) | center_mask).to(dtype=torch.uint8)
+    if bool(ignore_mask.any()):
+        targets["ignore_mask"] = ((targets["ignore_mask"] > 0) | ignore_mask).to(dtype=torch.uint8)
+
+    source_union = (targets["source_union_mask"] > 0) | center_mask | ignore_mask
+    targets["source_union_mask"] = source_union.to(dtype=torch.uint8)
+    targets["background_mask"] = (~source_union).to(dtype=torch.uint8)
+    return _target_defaults(targets)
+
+
+def _apply_noncoadd_visibility_filter(
+    *,
+    targets: Dict[str, Tensor],
+    catalog: Dict[str, np.ndarray],
+    raw_image: Optional[np.ndarray],
+    image_shape: Tuple[int, int],
+    confidence_levels: int,
+    ellipse_sigma: float,
+    core_radius: int,
+    shape_source: str,
+    ignore_snr: float,
+    center_only_snr: float,
+    ap_radius: float,
+    annulus_r_in: float,
+    annulus_r_out: float,
+) -> Tuple[Dict[str, Tensor], Dict[str, np.ndarray], np.ndarray, np.ndarray, np.ndarray]:
+    centers = np.asarray(catalog.get("centers", np.zeros((0, 2), dtype=np.float32)), dtype=np.float32).reshape(-1, 2)
+    if raw_image is None or centers.size == 0:
+        return targets, catalog, np.zeros((0, 2), dtype=np.float32), np.zeros((0, 2), dtype=np.float32), np.full((centers.shape[0],), np.nan, dtype=np.float32)
+    snr = _aperture_annulus_snr(
+        raw_image,
+        centers,
+        ap_radius=ap_radius,
+        annulus_r_in=annulus_r_in,
+        annulus_r_out=annulus_r_out,
+    )
+    finite_snr = np.isfinite(snr)
+    normal_keep = finite_snr & (snr >= float(center_only_snr))
+    center_keep = finite_snr & (snr >= float(ignore_snr)) & (snr < float(center_only_snr))
+    ignore_keep = (~finite_snr) | (snr < float(ignore_snr))
+    normal_catalog = _subset_catalog(catalog, normal_keep)
+    center_catalog = _subset_catalog(catalog, center_keep)
+    ignore_catalog = _subset_catalog(catalog, ignore_keep)
+    adjusted = _merge_visibility_targets(
+        image_shape=image_shape,
+        normal_catalog=normal_catalog,
+        center_only_catalog=center_catalog,
+        ignore_catalog=ignore_catalog,
+        confidence_levels=confidence_levels,
+        ellipse_sigma=ellipse_sigma,
+        core_radius=core_radius,
+        shape_source=shape_source,
+    )
+    return (
+        adjusted,
+        normal_catalog,
+        center_catalog["centers"].astype(np.float32),
+        ignore_catalog["centers"].astype(np.float32),
+        snr.astype(np.float32),
+    )
+
+
 class AstroCutoutDataset(Dataset):
     def __init__(
         self,
@@ -948,6 +1142,12 @@ class AstroCutoutDataset(Dataset):
         pseudo_seg_weight: float = 0.25,
         pseudo_shape_weight: float = 0.15,
         load_eval_ignore_sources: bool = False,
+        noncoadd_visibility_snr_filter: bool = False,
+        noncoadd_visibility_ignore_snr: float = 2.0,
+        noncoadd_visibility_center_only_snr: float = 3.0,
+        noncoadd_visibility_ap_radius: float = 6.0,
+        noncoadd_visibility_annulus_r_in: float = 10.0,
+        noncoadd_visibility_annulus_r_out: float = 15.0,
         augment: bool = False,
     ) -> None:
         self.records = list(records)
@@ -965,6 +1165,12 @@ class AstroCutoutDataset(Dataset):
         self.pseudo_shape_weight = float(pseudo_shape_weight)
         self.pseudo_labels = load_pseudo_labels(self.pseudo_label_path)
         self.load_eval_ignore_sources = bool(load_eval_ignore_sources)
+        self.noncoadd_visibility_snr_filter = bool(noncoadd_visibility_snr_filter)
+        self.noncoadd_visibility_ignore_snr = float(noncoadd_visibility_ignore_snr)
+        self.noncoadd_visibility_center_only_snr = float(noncoadd_visibility_center_only_snr)
+        self.noncoadd_visibility_ap_radius = float(noncoadd_visibility_ap_radius)
+        self.noncoadd_visibility_annulus_r_in = float(noncoadd_visibility_annulus_r_in)
+        self.noncoadd_visibility_annulus_r_out = float(noncoadd_visibility_annulus_r_out)
         self.augment = bool(augment)
 
     def reload_pseudo_labels(self, pseudo_label_path: Optional[Path] = None) -> None:
@@ -978,9 +1184,40 @@ class AstroCutoutDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Tensor]:
         rec = self.records[idx]
         image = self._load_or_make_image(rec)
+        raw_visibility_images = self._load_raw_images_for_visibility(rec)
         h, w = int(image.shape[-2]), int(image.shape[-1])
         catalog = self._load_catalog(rec.metadata_path, rec.meas_path, rec, image_shape=(h, w))
         targets = self._load_or_make_targets(rec, image_shape=(h, w), catalog=catalog)
+        dynamic_center_only_centers = np.zeros((0, 2), dtype=np.float32)
+        dynamic_ignore_centers = np.zeros((0, 2), dtype=np.float32)
+        if raw_visibility_images is not None and raw_visibility_images.shape[0] > 0:
+            targets, catalog, dynamic_center_only_centers, dynamic_ignore_centers, _primary_snr = _apply_noncoadd_visibility_filter(
+                targets=targets,
+                catalog=catalog,
+                raw_image=raw_visibility_images[0],
+                image_shape=(h, w),
+                confidence_levels=self.confidence_levels,
+                ellipse_sigma=self.ellipse_sigma,
+                core_radius=self.core_radius,
+                shape_source=self.shape_source,
+                ignore_snr=self.noncoadd_visibility_ignore_snr,
+                center_only_snr=self.noncoadd_visibility_center_only_snr,
+                ap_radius=self.noncoadd_visibility_ap_radius,
+                annulus_r_in=self.noncoadd_visibility_annulus_r_in,
+                annulus_r_out=self.noncoadd_visibility_annulus_r_out,
+            )
+        target_center = targets.get("visibility_center_only_centers")
+        if isinstance(target_center, torch.Tensor) and target_center.numel():
+            dynamic_center_only_centers = np.concatenate(
+                [dynamic_center_only_centers.reshape(-1, 2), target_center.detach().cpu().numpy().reshape(-1, 2)],
+                axis=0,
+            )
+        target_ignore = targets.get("visibility_ignore_centers")
+        if isinstance(target_ignore, torch.Tensor) and target_ignore.numel():
+            dynamic_ignore_centers = np.concatenate(
+                [dynamic_ignore_centers.reshape(-1, 2), target_ignore.detach().cpu().numpy().reshape(-1, 2)],
+                axis=0,
+            )
         record_pseudo = _pseudo_record_bands(self.pseudo_labels, rec)
         primary_pseudo: List[dict] = []
         for rows in record_pseudo.values():
@@ -996,6 +1233,8 @@ class AstroCutoutDataset(Dataset):
         )
         band_catalogs: List[Dict[str, np.ndarray]] = []
         band_targets: List[Dict[str, Tensor]] = []
+        band_dynamic_center_only_centers: List[Tensor] = []
+        band_dynamic_ignore_centers: List[Tensor] = []
         band_meas_paths = rec.band_meas_paths if rec.band_meas_paths else tuple(rec.meas_path for _ in range(image.shape[0]))
         for band_idx, meas_path in enumerate(band_meas_paths):
             band_metadata_path = rec.band_metadata_paths[band_idx] if band_idx < len(rec.band_metadata_paths) else ""
@@ -1008,22 +1247,48 @@ class AstroCutoutDataset(Dataset):
             band_catalogs.append(band_catalog)
             band_target_path = rec.band_target_paths[band_idx] if band_idx < len(rec.band_target_paths) else ""
             if band_target_path and Path(band_target_path).exists():
-                band_targets.append(_read_target_npz(Path(band_target_path)))
+                band_target = _read_target_npz(Path(band_target_path))
             else:
-                band_targets.append(
-                    _target_defaults(
-                        make_targets(
-                            image_shape=(h, w),
-                            centers=band_catalog["centers"],
-                            moments=band_catalog["moments"],
-                            kron_radius=band_catalog["kron_radius"],
-                            confidence_levels=self.confidence_levels,
-                            ellipse_sigma=self.ellipse_sigma,
-                            core_radius=self.core_radius,
-                            shape_source=self.shape_source,
-                        )
+                band_target = _target_defaults(
+                    make_targets(
+                        image_shape=(h, w),
+                        centers=band_catalog["centers"],
+                        moments=band_catalog["moments"],
+                        kron_radius=band_catalog["kron_radius"],
+                        confidence_levels=self.confidence_levels,
+                        ellipse_sigma=self.ellipse_sigma,
+                        core_radius=self.core_radius,
+                        shape_source=self.shape_source,
                     )
                 )
+            dyn_center = np.zeros((0, 2), dtype=np.float32)
+            dyn_ignore = np.zeros((0, 2), dtype=np.float32)
+            if raw_visibility_images is not None and band_idx < raw_visibility_images.shape[0]:
+                band_target, band_catalog, dyn_center, dyn_ignore, _band_snr = _apply_noncoadd_visibility_filter(
+                    targets=band_target,
+                    catalog=band_catalog,
+                    raw_image=raw_visibility_images[band_idx],
+                    image_shape=(h, w),
+                    confidence_levels=self.confidence_levels,
+                    ellipse_sigma=self.ellipse_sigma,
+                    core_radius=self.core_radius,
+                    shape_source=self.shape_source,
+                    ignore_snr=self.noncoadd_visibility_ignore_snr,
+                    center_only_snr=self.noncoadd_visibility_center_only_snr,
+                    ap_radius=self.noncoadd_visibility_ap_radius,
+                    annulus_r_in=self.noncoadd_visibility_annulus_r_in,
+                    annulus_r_out=self.noncoadd_visibility_annulus_r_out,
+                )
+                band_catalogs[-1] = band_catalog
+            target_center = band_target.get("visibility_center_only_centers")
+            if isinstance(target_center, torch.Tensor) and target_center.numel():
+                dyn_center = np.concatenate([dyn_center.reshape(-1, 2), target_center.detach().cpu().numpy().reshape(-1, 2)], axis=0)
+            target_ignore = band_target.get("visibility_ignore_centers")
+            if isinstance(target_ignore, torch.Tensor) and target_ignore.numel():
+                dyn_ignore = np.concatenate([dyn_ignore.reshape(-1, 2), target_ignore.detach().cpu().numpy().reshape(-1, 2)], axis=0)
+            band_dynamic_center_only_centers.append(torch.from_numpy(dyn_center.astype(np.float32, copy=False)))
+            band_dynamic_ignore_centers.append(torch.from_numpy(dyn_ignore.astype(np.float32, copy=False)))
+            band_targets.append(band_target)
             band_name = Path(meas_path).parts[-2] if len(Path(meas_path).parts) >= 2 else ""
             pseudo_rows = record_pseudo.get(band_name, [])
             if not pseudo_rows and band_idx < image.shape[0]:
@@ -1086,6 +1351,21 @@ class AstroCutoutDataset(Dataset):
                 torch.empty((0, 2), dtype=torch.float32)
                 for _ in range(len(band_meas_paths) - len(band_strict_center_only_centers))
             )
+        if dynamic_ignore_centers.size:
+            ignore_centers = torch.cat([ignore_centers, torch.from_numpy(dynamic_ignore_centers.astype(np.float32, copy=False))], dim=0)
+        if dynamic_center_only_centers.size:
+            strict_center_only_centers = torch.cat(
+                [strict_center_only_centers, torch.from_numpy(dynamic_center_only_centers.astype(np.float32, copy=False))],
+                dim=0,
+            )
+        for band_idx in range(len(band_meas_paths)):
+            if band_idx < len(band_dynamic_ignore_centers) and band_dynamic_ignore_centers[band_idx].numel():
+                band_ignore_centers[band_idx] = torch.cat([band_ignore_centers[band_idx], band_dynamic_ignore_centers[band_idx]], dim=0)
+            if band_idx < len(band_dynamic_center_only_centers) and band_dynamic_center_only_centers[band_idx].numel():
+                band_strict_center_only_centers[band_idx] = torch.cat(
+                    [band_strict_center_only_centers[band_idx], band_dynamic_center_only_centers[band_idx]],
+                    dim=0,
+                )
         rejected_id_paths = rec.band_rejected_id_paths if any(rec.band_rejected_id_paths) else rec.band_rejected_paths
         if rejected_id_paths:
             band_rejected_ids = [torch.from_numpy(load_catalog_ids(path)) for path in rejected_id_paths]
@@ -1247,6 +1527,16 @@ class AstroCutoutDataset(Dataset):
         if not tensors:
             return None
         return torch.stack(tensors, dim=0).to(dtype=torch.float32)
+
+    def _load_raw_images_for_visibility(self, rec: CutoutRecord) -> Optional[np.ndarray]:
+        if not self.noncoadd_visibility_snr_filter or str(rec.dataset_source).lower() == "coadd":
+            return None
+        if any(Path(path).name == "__zscale_cache_only__.fits" for path in rec.image_paths):
+            return None
+        try:
+            return read_fits_bands(rec.image_paths, hdu=self.fits_hdu).astype(np.float32, copy=False)
+        except Exception:
+            return None
 
     def _load_or_make_image(self, rec: CutoutRecord) -> Tensor:
         cache_path = self._image_cache_path(rec)

@@ -50,37 +50,37 @@ def entries(date: str) -> list[Entry]:
         Entry(
             "amg_masks",
             f"sam_amg_coadd_irg_lower_right_masks_{date}",
-            Path("/home/czh23/SAM-astro/output/test_zangetsu"),
+            Path("zangetsu_demo/output/native_sam_archived/test_zangetsu"),
             "SAM automatic mask generator on coadd lower-right Zangetsu cutout, RGB=I,R,G.",
         ),
         Entry(
             "amg_masks",
             f"sam_amg_denoised_irg_lower_right_masks_{date}",
-            Path("/home/czh23/SAM-astro/output/test_zangetsu_denoised"),
+            Path("zangetsu_demo/output/native_sam_archived/test_zangetsu_denoised"),
             "SAM automatic mask generator on denoised lower-right Zangetsu cutout, RGB=I,R,G.",
         ),
         Entry(
             "amg_masks",
             f"sam_amg_noisy_irg_lower_right_masks_{date}",
-            Path("/home/czh23/SAM-astro/output/test_zangetsu_noisy"),
+            Path("zangetsu_demo/output/native_sam_archived/test_zangetsu_noisy"),
             "SAM automatic mask generator on noisy lower-right Zangetsu cutout, RGB=I,R,G.",
         ),
         Entry(
             "amg_masks",
             f"sam_amg_coadd_gri_reference_masks_{date}",
-            Path("/home/czh23/SAM-astro/output/zangetsu/zangestu_coadd"),
+            Path("zangetsu_demo/output/native_sam_archived/zangetsu/zangestu_coadd"),
             "Older SAM automatic mask generator coadd run, RGB=G,R,I.",
         ),
         Entry(
             "amg_masks",
             f"sam_amg_denoised_gri_reference_masks_{date}",
-            Path("/home/czh23/SAM-astro/output/zangetsu_denoised"),
+            Path("zangetsu_demo/output/native_sam_archived/zangetsu_denoised"),
             "Older SAM automatic mask generator denoised run, RGB=G,R,I.",
         ),
         Entry(
             "amg_masks",
             f"sam_amg_noisy_gri_reference_masks_{date}",
-            Path("/home/czh23/SAM-astro/output/zangetsu_noisy"),
+            Path("zangetsu_demo/output/native_sam_archived/zangetsu_noisy"),
             "Older SAM automatic mask generator noisy run, RGB=G,R,I.",
         ),
         Entry(

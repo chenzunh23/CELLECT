@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
+import re
 from dataclasses import asdict
 from datetime import timedelta
 from pathlib import Path
@@ -143,6 +145,31 @@ def parse_patch_specs(specs: Iterable[str], patch_file: str | None = None) -> se
     return patches
 
 
+def _selector_parts(spec: str) -> tuple[str, str]:
+    text = str(spec).strip().strip("/")
+    if "@" not in text:
+        return text, ""
+    patch_part, group_part = text.rsplit("@", 1)
+    return patch_part.strip().strip("/"), group_part.strip()
+
+
+def _record_group_name(rec: CutoutRecord) -> str:
+    tile_name = str(getattr(rec, "tile_name", "") or "")
+    match = re.match(r"^(group_[^_]+)_", tile_name)
+    return str(match.group(1)) if match else ""
+
+
+def _is_random_group_selector(group_selector: str) -> bool:
+    text = str(group_selector).strip().lower()
+    return text in {"random", "rand", "random-group", "random_group"}
+
+
+def _stable_selector_seed(*parts: object) -> int:
+    payload = "||".join(str(part) for part in parts).encode("utf-8")
+    digest = hashlib.sha256(payload).digest()
+    return int.from_bytes(digest[:8], byteorder="big", signed=False)
+
+
 def record_patch_aliases(rec: CutoutRecord, root: Path) -> set[str]:
     aliases: set[str] = set()
     source = str(getattr(rec, "dataset_source", "coadd") or "coadd")
@@ -169,11 +196,48 @@ def record_patch_aliases(rec: CutoutRecord, root: Path) -> set[str]:
     return aliases
 
 
-def filter_records_by_patches(records: Sequence[CutoutRecord], patches: set[str], root: Path) -> list[CutoutRecord]:
+def filter_records_by_patches(
+    records: Sequence[CutoutRecord],
+    patches: set[str],
+    root: Path,
+    *,
+    seed: int = 0,
+) -> list[CutoutRecord]:
     if not patches:
         return list(records)
-    wanted = {patch.strip("/") for patch in patches if patch.strip("/")}
-    return [rec for rec in records if record_patch_aliases(rec, root) & wanted]
+    wanted = sorted({patch.strip("/") for patch in patches if patch.strip("/")})
+    selected: list[CutoutRecord] = []
+    seen_names: set[str] = set()
+    for spec in wanted:
+        patch_selector, group_selector = _selector_parts(spec)
+        matched = [
+            rec
+            for rec in records
+            if patch_selector and (record_patch_aliases(rec, root) & {patch_selector})
+        ]
+        if not matched:
+            continue
+        group_selector = str(group_selector).strip()
+        if group_selector:
+            if _is_random_group_selector(group_selector):
+                groups = sorted({group for group in (_record_group_name(rec) for rec in matched) if group})
+                if not groups:
+                    matched = []
+                else:
+                    selector_seed = _stable_selector_seed(seed, spec, patch_selector, len(groups))
+                    chosen_group = groups[selector_seed % len(groups)]
+                    matched = [rec for rec in matched if _record_group_name(rec) == chosen_group]
+            else:
+                normalized_group = str(group_selector)
+                if normalized_group.isdigit():
+                    normalized_group = f"group_{int(normalized_group):02d}"
+                matched = [rec for rec in matched if _record_group_name(rec) == normalized_group]
+        for rec in matched:
+            if rec.name in seen_names:
+                continue
+            selected.append(rec)
+            seen_names.add(rec.name)
+    return selected
 
 
 def record_patch_label(rec: CutoutRecord, root: Path) -> str:

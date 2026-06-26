@@ -200,8 +200,8 @@ class SamCellectDecoder(nn.Module):
         confidence = self.confidence_head(out)
         target_size = tuple(output_size) if output_size is not None else tuple(confidence.shape[-2:])
         if tuple(confidence.shape[-2:]) != target_size:
-            confidence = F.interpolate(confidence, size=target_size, mode="nearest")
-            out = F.interpolate(out, size=target_size, mode="nearest")
+            confidence = self._crop_to_output_size(confidence, target_size)
+            out = self._crop_to_output_size(out, target_size)
 
         shape_input = torch.cat([out, confidence], dim=1)
         raw_shape = self.shape_head(self.shape_refine(shape_input))
@@ -223,6 +223,18 @@ class SamCellectDecoder(nn.Module):
             axes = F.softplus(raw_shape[:, :2]) + 1e-3
             return torch.cat([axes, raw_shape[:, 2:]], dim=1)
         return F.softplus(raw_shape) + 1e-3
+
+    @staticmethod
+    def _crop_to_output_size(x: Tensor, output_size: Tuple[int, int]) -> Tensor:
+        """Crop the top-left valid image region after SAM encoder padding."""
+
+        target_h, target_w = int(output_size[0]), int(output_size[1])
+        height, width = int(x.shape[-2]), int(x.shape[-1])
+        if target_h > height or target_w > width:
+            raise ValueError(
+                f"decoder output size {(height, width)} is smaller than requested output size {(target_h, target_w)}"
+            )
+        return x[..., :target_h, :target_w]
 
     @staticmethod
     def _flatten_images(images: Tensor, *, batch: int, bands: int) -> Tensor:

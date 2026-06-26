@@ -452,6 +452,232 @@ def _finalize_link_metrics(total: Dict[str, object]) -> Dict[str, object]:
     }
 
 
+def _init_candidate_stats_bucket() -> Dict[str, object]:
+    return {
+        "maps": 0,
+        "pixels": 0,
+        "foreground_gate_active_maps": 0,
+        "top_channel_argmax_pass": 0,
+        "spatial_localmax_pass": 0,
+        "seed_candidates": 0,
+        "seed_after_foreground_gate": 0,
+        "seed_after_threshold": 0,
+        "final_peaks": 0,
+        "foreground_gate_pass_pixels": 0,
+        "threshold_pass_pixels": 0,
+        "center_score_count": 0,
+        "center_score_sum": 0.0,
+        "center_score_sum_sq": 0.0,
+        "center_score_min": float("inf"),
+        "center_score_max": float("-inf"),
+        "hist_threshold": None,
+        "hist_binning": None,
+        "hist_edges": [],
+        "seed_hist": [],
+        "after_foreground_gate_hist": [],
+        "final_hist": [],
+    }
+
+
+def _candidate_hist_edges(threshold: float) -> Tuple[str, List[float]]:
+    if float(threshold) > 0.0:
+        edges = [-float("inf"), 0.0, 0.5 * float(threshold), float(threshold), 1.5 * float(threshold), 2.0 * float(threshold), 3.0 * float(threshold), 5.0 * float(threshold), float("inf")]
+        deduped: List[float] = []
+        for edge in edges:
+            if deduped and math.isfinite(edge) and math.isfinite(deduped[-1]) and abs(edge - deduped[-1]) < 1e-12:
+                continue
+            deduped.append(float(edge))
+        if len(deduped) < 2:
+            deduped = [-float("inf"), float("inf")]
+        return "threshold_relative", deduped
+    return "absolute_fallback", [-float("inf"), 0.0, 1.0, 2.0, 3.0, 5.0, 8.0, 13.0, float("inf")]
+
+
+def _ensure_candidate_hist_bucket(bucket: Dict[str, object], threshold: float) -> None:
+    if bucket.get("hist_edges"):
+        return
+    mode, edges = _candidate_hist_edges(float(threshold))
+    bucket["hist_threshold"] = float(threshold)
+    bucket["hist_binning"] = mode
+    bucket["hist_edges"] = list(edges)
+    zeros = [0 for _ in range(max(len(edges) - 1, 0))]
+    bucket["seed_hist"] = list(zeros)
+    bucket["after_foreground_gate_hist"] = list(zeros)
+    bucket["final_hist"] = list(zeros)
+
+
+def _add_hist_counts(bucket: Dict[str, object], key: str, values: Tensor) -> None:
+    edges_obj = bucket.get("hist_edges", [])
+    counts_obj = bucket.get(key, [])
+    if not isinstance(edges_obj, list) or len(edges_obj) < 2:
+        return
+    if not isinstance(counts_obj, list):
+        return
+    values_np = values.detach().reshape(-1).float().cpu().numpy()
+    if values_np.size == 0:
+        return
+    finite = np.isfinite(values_np)
+    if not bool(finite.any()):
+        return
+    hist, _ = np.histogram(values_np[finite], bins=np.asarray(edges_obj, dtype=np.float64))
+    if len(counts_obj) != len(hist):
+        return
+    for idx, value in enumerate(hist.tolist()):
+        counts_obj[idx] = int(counts_obj[idx]) + int(value)
+
+
+def _update_candidate_stats_bucket(
+    bucket: Dict[str, object],
+    *,
+    center_score: Tensor,
+    top_channel_argmax: Optional[Tensor],
+    spatial_localmax: Tensor,
+    seed_candidates: Tensor,
+    foreground_gate: Tensor,
+    threshold_pass: Tensor,
+    final_peaks: Tensor,
+    foreground_gate_active: bool,
+    threshold: float,
+) -> None:
+    _ensure_candidate_hist_bucket(bucket, threshold)
+
+    bucket["maps"] = int(bucket.get("maps", 0)) + 1
+    bucket["pixels"] = int(bucket.get("pixels", 0)) + int(center_score.numel())
+    bucket["foreground_gate_active_maps"] = int(bucket.get("foreground_gate_active_maps", 0)) + int(bool(foreground_gate_active))
+    if top_channel_argmax is not None:
+        bucket["top_channel_argmax_pass"] = int(bucket.get("top_channel_argmax_pass", 0)) + int(top_channel_argmax.sum().item())
+    bucket["spatial_localmax_pass"] = int(bucket.get("spatial_localmax_pass", 0)) + int(spatial_localmax.sum().item())
+    bucket["seed_candidates"] = int(bucket.get("seed_candidates", 0)) + int(seed_candidates.sum().item())
+    bucket["seed_after_foreground_gate"] = int(bucket.get("seed_after_foreground_gate", 0)) + int((seed_candidates & foreground_gate).sum().item())
+    bucket["seed_after_threshold"] = int(bucket.get("seed_after_threshold", 0)) + int((seed_candidates & threshold_pass).sum().item())
+    bucket["final_peaks"] = int(bucket.get("final_peaks", 0)) + int(final_peaks.sum().item())
+    bucket["foreground_gate_pass_pixels"] = int(bucket.get("foreground_gate_pass_pixels", 0)) + int(foreground_gate.sum().item())
+    bucket["threshold_pass_pixels"] = int(bucket.get("threshold_pass_pixels", 0)) + int(threshold_pass.sum().item())
+
+    scores = center_score.detach().reshape(-1).float()
+    finite = torch.isfinite(scores)
+    if bool(finite.any()):
+        finite_scores = scores[finite]
+        bucket["center_score_count"] = int(bucket.get("center_score_count", 0)) + int(finite_scores.numel())
+        bucket["center_score_sum"] = float(bucket.get("center_score_sum", 0.0)) + float(finite_scores.sum().item())
+        bucket["center_score_sum_sq"] = float(bucket.get("center_score_sum_sq", 0.0)) + float((finite_scores * finite_scores).sum().item())
+        bucket["center_score_min"] = min(float(bucket.get("center_score_min", float("inf"))), float(finite_scores.min().item()))
+        bucket["center_score_max"] = max(float(bucket.get("center_score_max", -float("inf"))), float(finite_scores.max().item()))
+
+    _add_hist_counts(bucket, "seed_hist", center_score[seed_candidates])
+    _add_hist_counts(bucket, "after_foreground_gate_hist", center_score[seed_candidates & foreground_gate])
+    _add_hist_counts(bucket, "final_hist", center_score[final_peaks])
+
+
+def _merge_candidate_stats_bucket(dst: Dict[str, object], src: Dict[str, object]) -> None:
+    for key in (
+        "maps",
+        "pixels",
+        "foreground_gate_active_maps",
+        "top_channel_argmax_pass",
+        "spatial_localmax_pass",
+        "seed_candidates",
+        "seed_after_foreground_gate",
+        "seed_after_threshold",
+        "final_peaks",
+        "foreground_gate_pass_pixels",
+        "threshold_pass_pixels",
+        "center_score_count",
+    ):
+        dst[key] = int(dst.get(key, 0)) + int(src.get(key, 0))
+    for key in ("center_score_sum", "center_score_sum_sq"):
+        dst[key] = float(dst.get(key, 0.0)) + float(src.get(key, 0.0))
+    dst["center_score_min"] = min(float(dst.get("center_score_min", float("inf"))), float(src.get("center_score_min", float("inf"))))
+    dst["center_score_max"] = max(float(dst.get("center_score_max", -float("inf"))), float(src.get("center_score_max", -float("inf"))))
+
+    src_edges = src.get("hist_edges", [])
+    if src_edges and not dst.get("hist_edges"):
+        dst["hist_threshold"] = src.get("hist_threshold")
+        dst["hist_binning"] = src.get("hist_binning")
+        dst["hist_edges"] = list(src_edges) if isinstance(src_edges, list) else []
+        dst["seed_hist"] = [0 for _ in range(max(len(dst["hist_edges"]) - 1, 0))]  # type: ignore[arg-type]
+        dst["after_foreground_gate_hist"] = [0 for _ in range(max(len(dst["hist_edges"]) - 1, 0))]  # type: ignore[arg-type]
+        dst["final_hist"] = [0 for _ in range(max(len(dst["hist_edges"]) - 1, 0))]  # type: ignore[arg-type]
+    for key in ("seed_hist", "after_foreground_gate_hist", "final_hist"):
+        dst_hist = dst.get(key, [])
+        src_hist = src.get(key, [])
+        if not isinstance(dst_hist, list) or not isinstance(src_hist, list) or len(dst_hist) != len(src_hist):
+            continue
+        for idx, value in enumerate(src_hist):
+            dst_hist[idx] = int(dst_hist[idx]) + int(value)
+
+
+def _format_candidate_hist_range(lo: float, hi: float) -> str:
+    lo_text = "-inf" if not math.isfinite(float(lo)) else f"{float(lo):.3g}"
+    hi_text = "inf" if not math.isfinite(float(hi)) else f"{float(hi):.3g}"
+    return f"({lo_text}, {hi_text}]"
+
+
+def _finalize_candidate_stats_bucket(bucket: Dict[str, object]) -> Dict[str, object]:
+    pixels = int(bucket.get("pixels", 0))
+    maps = int(bucket.get("maps", 0))
+    count = int(bucket.get("center_score_count", 0))
+    score_sum = float(bucket.get("center_score_sum", 0.0))
+    score_sum_sq = float(bucket.get("center_score_sum_sq", 0.0))
+    mean = score_sum / max(count, 1)
+    var = max(score_sum_sq / max(count, 1) - mean * mean, 0.0)
+    edges = bucket.get("hist_edges", [])
+    seed_hist = bucket.get("seed_hist", [])
+    after_fg_hist = bucket.get("after_foreground_gate_hist", [])
+    final_hist = bucket.get("final_hist", [])
+    hist_rows: List[Dict[str, object]] = []
+    if isinstance(edges, list) and isinstance(seed_hist, list) and isinstance(after_fg_hist, list) and isinstance(final_hist, list):
+        for idx in range(max(len(edges) - 1, 0)):
+            hist_rows.append(
+                {
+                    "range": _format_candidate_hist_range(float(edges[idx]), float(edges[idx + 1])),
+                    "seed_candidates": float(seed_hist[idx]) if idx < len(seed_hist) else 0.0,
+                    "after_foreground_gate": float(after_fg_hist[idx]) if idx < len(after_fg_hist) else 0.0,
+                    "final_peaks": float(final_hist[idx]) if idx < len(final_hist) else 0.0,
+                }
+            )
+    seed_candidates = int(bucket.get("seed_candidates", 0))
+    seed_after_foreground_gate = int(bucket.get("seed_after_foreground_gate", 0))
+    seed_after_threshold = int(bucket.get("seed_after_threshold", 0))
+    final_peaks = int(bucket.get("final_peaks", 0))
+    return {
+        "maps": float(maps),
+        "pixels": float(pixels),
+        "foreground_gate_active_maps": float(bucket.get("foreground_gate_active_maps", 0)),
+        "foreground_gate_active_fraction": float(bucket.get("foreground_gate_active_maps", 0)) / max(maps, 1),
+        "counts": {
+            "top_channel_argmax_pass": float(bucket.get("top_channel_argmax_pass", 0)),
+            "spatial_localmax_pass": float(bucket.get("spatial_localmax_pass", 0)),
+            "seed_candidates": float(seed_candidates),
+            "seed_after_foreground_gate": float(seed_after_foreground_gate),
+            "seed_after_threshold": float(seed_after_threshold),
+            "final_peaks": float(final_peaks),
+            "foreground_gate_pass_pixels": float(bucket.get("foreground_gate_pass_pixels", 0)),
+            "threshold_pass_pixels": float(bucket.get("threshold_pass_pixels", 0)),
+        },
+        "retention": {
+            "seed_over_pixels": float(seed_candidates) / max(pixels, 1),
+            "after_foreground_gate_over_seed": float(seed_after_foreground_gate) / max(seed_candidates, 1),
+            "after_threshold_over_seed": float(seed_after_threshold) / max(seed_candidates, 1),
+            "final_over_seed": float(final_peaks) / max(seed_candidates, 1),
+            "final_over_after_foreground_gate": float(final_peaks) / max(seed_after_foreground_gate, 1),
+            "final_over_after_threshold": float(final_peaks) / max(seed_after_threshold, 1),
+        },
+        "center_score_all_pixels": {
+            "count": float(count),
+            "mean": mean,
+            "std": math.sqrt(var),
+            "min": float(bucket.get("center_score_min", float("inf"))) if count > 0 else 0.0,
+            "max": float(bucket.get("center_score_max", -float("inf"))) if count > 0 else 0.0,
+        },
+        "center_score_histogram": {
+            "threshold": bucket.get("hist_threshold"),
+            "binning": bucket.get("hist_binning"),
+            "bins": hist_rows,
+        },
+    }
+
+
 def _init_detection_totals(band_names: Sequence[str]) -> Dict[str, object]:
     return {
         "tp": 0,
@@ -465,6 +691,7 @@ def _init_detection_totals(band_names: Sequence[str]) -> Dict[str, object]:
         "linked_tp": 0,
         "linked_fp": 0,
         "linked_fn": 0,
+        "candidate_stats": _init_candidate_stats_bucket(),
         "per_band_counts": {
             str(name): {
                 "tp": 0,
@@ -475,6 +702,7 @@ def _init_detection_totals(band_names: Sequence[str]) -> Dict[str, object]:
                 "ordinary_ignore_fn": 0,
                 "ordinary_ignore_total": 0,
                 "strict_ignored_pred": 0,
+                "candidate_stats": _init_candidate_stats_bucket(),
             }
             for name in band_names
         },
@@ -515,13 +743,20 @@ def _merge_detection_totals(items: Sequence[Dict[str, object]], band_names: Sequ
             "linked_fn",
         ):
             merged[key] = int(merged.get(key, 0)) + int(item.get(key, 0))
+        merged_candidate = merged.get("candidate_stats")
+        item_candidate = item.get("candidate_stats")
+        if isinstance(merged_candidate, dict) and isinstance(item_candidate, dict):
+            _merge_candidate_stats_bucket(merged_candidate, item_candidate)
         merged_per_band = merged["per_band_counts"]
         item_per_band = item.get("per_band_counts", {})
         assert isinstance(merged_per_band, dict)
         if isinstance(item_per_band, dict):
             for band_name, counts_obj in item_per_band.items():
                 counts = counts_obj if isinstance(counts_obj, dict) else {}
-                bucket = merged_per_band.setdefault(str(band_name), {"tp": 0, "fp": 0, "fn": 0})
+                bucket = merged_per_band.setdefault(
+                    str(band_name),
+                    {"tp": 0, "fp": 0, "fn": 0, "candidate_stats": _init_candidate_stats_bucket()},
+                )
                 assert isinstance(bucket, dict)
                 for count_key in (
                     "tp",
@@ -534,6 +769,10 @@ def _merge_detection_totals(items: Sequence[Dict[str, object]], band_names: Sequ
                     "strict_ignored_pred",
                 ):
                     bucket[count_key] = int(bucket.get(count_key, 0)) + int(counts.get(count_key, 0))
+                bucket_candidate = bucket.get("candidate_stats")
+                counts_candidate = counts.get("candidate_stats")
+                if isinstance(bucket_candidate, dict) and isinstance(counts_candidate, dict):
+                    _merge_candidate_stats_bucket(bucket_candidate, counts_candidate)
         merged_link = merged["link_metrics_total"]
         item_link = item.get("link_metrics_total")
         assert isinstance(merged_link, dict)
@@ -598,9 +837,12 @@ def _finalize_detection_totals(
             "f1": 2.0 * combined_precision * combined_recall / max(combined_precision + combined_recall, 1e-12),
         },
     }
+    candidate_stats = totals.get("candidate_stats")
+    if isinstance(candidate_stats, dict):
+        result["candidate_stats"] = _finalize_candidate_stats_bucket(candidate_stats)
     per_band_counts = totals.get("per_band_counts", {})
     if band_names and isinstance(per_band_counts, dict):
-        per_band: Dict[str, Dict[str, float]] = {}
+        per_band: Dict[str, Dict[str, object]] = {}
         for band_name, counts_obj in per_band_counts.items():
             counts = counts_obj if isinstance(counts_obj, dict) else {"tp": 0, "fp": 0, "fn": 0}
             btp = int(counts["tp"])
@@ -656,6 +898,9 @@ def _finalize_detection_totals(
                     / max(b_combined_precision + b_combined_recall, 1e-12),
                 },
             }
+            band_candidate_stats = counts.get("candidate_stats")
+            if isinstance(band_candidate_stats, dict):
+                per_band[str(band_name)]["candidate_stats"] = _finalize_candidate_stats_bucket(band_candidate_stats)
         result["per_band"] = per_band
     link_metrics_total = totals.get("link_metrics_total")
     if isinstance(link_metrics_total, dict):
