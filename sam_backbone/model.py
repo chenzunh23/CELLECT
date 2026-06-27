@@ -107,26 +107,19 @@ class SamCellect2D(nn.Module):
         point_coords = point_coords.to(device=flat_embeddings.device, dtype=flat_embeddings.dtype)
         if boxes is not None:
             boxes = boxes.to(device=flat_embeddings.device, dtype=flat_embeddings.dtype)
-        order = torch.argsort(prompt_batch_indices)
-        inverse = torch.empty_like(order)
-        inverse[order] = torch.arange(order.numel(), device=order.device)
-        sorted_batch = prompt_batch_indices[order]
-        sorted_points = point_coords[order]
-        sorted_boxes = boxes[order] if boxes is not None else None
-
         mask_chunks: list[Tensor] = []
         iou_chunks: list[Tensor] = []
         dense_pe = self.prompt_encoder.get_dense_pe().to(device=flat_embeddings.device, dtype=flat_embeddings.dtype)
-        total = int(sorted_batch.numel())
+        total = int(prompt_batch_indices.numel())
         for start in range(0, total, int(chunk_size)):
             stop = min(start + int(chunk_size), total)
             pos = slice(start, stop)
-            batch_chunk = sorted_batch[pos]
-            coords = sorted_points[pos].unsqueeze(1)
+            batch_chunk = prompt_batch_indices[pos]
+            coords = point_coords[pos].unsqueeze(1)
             labels = torch.ones((coords.shape[0], 1), device=coords.device, dtype=torch.int64)
             sparse_embeddings, dense_embeddings = self.prompt_encoder(
                 points=(coords, labels),
-                boxes=None if sorted_boxes is None else sorted_boxes[pos],
+                boxes=None if boxes is None else boxes[pos],
                 masks=None,
             )
             image_embedding = flat_embeddings[batch_chunk]
@@ -140,9 +133,7 @@ class SamCellect2D(nn.Module):
             )
             mask_chunks.append(low_res_masks)
             iou_chunks.append(iou_predictions)
-        sorted_masks = torch.cat(mask_chunks, dim=0)
-        sorted_ious = torch.cat(iou_chunks, dim=0)
-        return sorted_masks[inverse], sorted_ious[inverse]
+        return torch.cat(mask_chunks, dim=0), torch.cat(iou_chunks, dim=0)
 
 
 def build_sam_cellect2d(
