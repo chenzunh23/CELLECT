@@ -462,19 +462,81 @@ def _confidence_score_at_centers(outputs: Dict[str, Tensor], centers: Tensor, *,
     return score_map[y, x]
 
 
+ORDINAL_EXPECTATION_THRESHOLD = 2.0
+ORDINAL_EXPECTATION_MERGE_RADIUS = 3.0
+
+
+def _merge_close_centers_by_score(
+    coords: Tensor,
+    scores: Tensor,
+    *,
+    min_distance: float,
+) -> Tuple[Tensor, Tensor]:
+    if coords.numel() == 0 or scores.numel() == 0 or float(min_distance) <= 0.0:
+        return coords, scores
+    if coords.shape[0] != scores.shape[0]:
+        raise ValueError("coords and scores must have matching lengths")
+
+    dist2_thresh = float(min_distance) * float(min_distance)
+    delta = coords[:, None, :2] - coords[None, :, :2]
+    dist2 = (delta * delta).sum(dim=2)
+    adjacency = dist2 < dist2_thresh
+
+    visited = torch.zeros(coords.shape[0], dtype=torch.bool, device=coords.device)
+    keep_indices: List[int] = []
+    for start_idx in range(coords.shape[0]):
+        if bool(visited[start_idx]):
+            continue
+        stack = [int(start_idx)]
+        component: List[int] = []
+        visited[start_idx] = True
+        while stack:
+            current = stack.pop()
+            component.append(current)
+            neighbors = torch.nonzero(adjacency[current] & ~visited, as_tuple=False).flatten()
+            for neighbor_idx in neighbors.tolist():
+                visited[neighbor_idx] = True
+                stack.append(int(neighbor_idx))
+        if len(component) == 1:
+            keep_indices.append(component[0])
+            continue
+        comp_idx = torch.as_tensor(component, device=scores.device, dtype=torch.long)
+        comp_scores = scores[comp_idx]
+        best_local = int(torch.argmax(comp_scores).item())
+        keep_indices.append(int(comp_idx[best_local].item()))
+
+    keep = torch.as_tensor(sorted(keep_indices), device=coords.device, dtype=torch.long)
+    return coords[keep], scores[keep]
+
+
 def _compute_detection_peak_maps(
     outputs: Dict[str, Tensor],
     *,
     threshold: float,
     nms_radius: int,
     confidence_score: str,
+    use_ordinal_expectation: bool = False,
+    debug_ordinal_expectation: bool = False,
 ) -> Tuple[Tensor, Tensor, Dict[str, object]]:
-    if confidence_score == "cellect":
+    detection_score_mode = "ordinal_expectation" if use_ordinal_expectation else str(confidence_score)
+    effective_threshold = float(ORDINAL_EXPECTATION_THRESHOLD if use_ordinal_expectation else threshold)
+    ordinal_expectation_score: Optional[Tensor] = None
+    if bool(use_ordinal_expectation) or bool(debug_ordinal_expectation) or detection_score_mode == "ordinal_expectation":
+        ordinal_expectation_score = _confidence_detection_score(outputs, "ordinal_expectation")
+
+    if detection_score_mode == "cellect":
         smoothed = _cellect_confidence_smooth_2d(outputs["confidence"])
+        argmax_channel = smoothed.argmax(dim=1)
         local_score = smoothed.max(dim=1).values
-        center_score = smoothed[:, -1]
+        center_score = smoothed[:, -1]  # scores of layer 4
         pooled = F.max_pool2d(
             local_score.unsqueeze(1),
+            kernel_size=2 * nms_radius + 1,
+            stride=1,
+            padding=nms_radius,
+        ).squeeze(1)
+        center_pooled = F.max_pool2d(
+            center_score.unsqueeze(1),
             kernel_size=2 * nms_radius + 1,
             stride=1,
             padding=nms_radius,
@@ -485,22 +547,55 @@ def _compute_detection_peak_maps(
             else torch.ones_like(center_score, dtype=torch.bool)
         )
         top_channel_argmax = center_score == local_score
+        center_pooled_candidates = center_pooled == local_score
         spatial_localmax = pooled == local_score
         seed_candidates = pooled == center_score
-        threshold_pass = center_score > threshold
+        threshold_pass = center_score > effective_threshold
         peaks = seed_candidates & foreground_gate & threshold_pass
-        return center_score, peaks, {
+        debug: Dict[str, object] = {
             "center_score": center_score,
+            "argmax_channel": argmax_channel,
             "top_channel_argmax": top_channel_argmax,
+            "center_pooled_candidates": center_pooled_candidates,
             "spatial_localmax": spatial_localmax,
             "seed_candidates": seed_candidates,
             "foreground_gate": foreground_gate,
             "threshold_pass": threshold_pass,
             "final_peaks": peaks,
             "foreground_gate_active": bool("seg_logits" in outputs),
+            "detection_score_mode": detection_score_mode,
+            "effective_threshold": effective_threshold,
+            "ordinal_expectation_threshold": float(ORDINAL_EXPECTATION_THRESHOLD),
+            "use_ordinal_expectation": bool(use_ordinal_expectation),
+            "debug_ordinal_expectation": bool(debug_ordinal_expectation),
         }
+        if ordinal_expectation_score is not None and bool(debug_ordinal_expectation):
+            ordinal_expectation_pooled = F.max_pool2d(
+                ordinal_expectation_score.unsqueeze(1),
+                kernel_size=2 * nms_radius + 1,
+                stride=1,
+                padding=nms_radius,
+            ).squeeze(1)
+            ordinal_expectation_seed_candidates = ordinal_expectation_score == ordinal_expectation_pooled
+            ordinal_expectation_threshold_pass = ordinal_expectation_score > float(ORDINAL_EXPECTATION_THRESHOLD)
+            debug.update(
+                {
+                    "ordinal_expectation_score": ordinal_expectation_score,
+                    "ordinal_expectation_seed_candidates": ordinal_expectation_seed_candidates,
+                    "ordinal_expectation_threshold_pass": ordinal_expectation_threshold_pass,
+                    "ordinal_expectation_final_peaks": (
+                        ordinal_expectation_seed_candidates & foreground_gate & ordinal_expectation_threshold_pass
+                    ),
+                }
+            )
+        return center_score, peaks, debug
 
-    center_score = _confidence_detection_score(outputs, confidence_score)
+    center_score = (
+        ordinal_expectation_score
+        if detection_score_mode == "ordinal_expectation" and ordinal_expectation_score is not None
+        else _confidence_detection_score(outputs, detection_score_mode)
+    )
+    argmax_channel = outputs["confidence"].argmax(dim=1)
     foreground_gate = (
         outputs["seg_logits"].argmax(dim=1) > 0
         if "seg_logits" in outputs
@@ -513,18 +608,45 @@ def _compute_detection_peak_maps(
         padding=nms_radius,
     ).squeeze(1)
     seed_candidates = center_score == pooled
-    threshold_pass = center_score > threshold
+    threshold_pass = center_score > effective_threshold
     peaks = seed_candidates & foreground_gate & threshold_pass
-    return center_score, peaks, {
+    debug = {
         "center_score": center_score,
+        "argmax_channel": argmax_channel,
         "top_channel_argmax": None,
         "spatial_localmax": seed_candidates,
+        "center_pooled_candidates": None,
         "seed_candidates": seed_candidates,
         "foreground_gate": foreground_gate,
         "threshold_pass": threshold_pass,
         "final_peaks": peaks,
         "foreground_gate_active": bool("seg_logits" in outputs),
+        "detection_score_mode": detection_score_mode,
+        "effective_threshold": effective_threshold,
+        "ordinal_expectation_threshold": float(ORDINAL_EXPECTATION_THRESHOLD),
+        "use_ordinal_expectation": bool(use_ordinal_expectation),
+        "debug_ordinal_expectation": bool(debug_ordinal_expectation),
     }
+    if ordinal_expectation_score is not None and bool(debug_ordinal_expectation):
+        ordinal_expectation_pooled = F.max_pool2d(
+            ordinal_expectation_score.unsqueeze(1),
+            kernel_size=2 * nms_radius + 1,
+            stride=1,
+            padding=nms_radius,
+        ).squeeze(1)
+        ordinal_expectation_seed_candidates = ordinal_expectation_score == ordinal_expectation_pooled
+        ordinal_expectation_threshold_pass = ordinal_expectation_score > float(ORDINAL_EXPECTATION_THRESHOLD)
+        debug.update(
+            {
+                "ordinal_expectation_score": ordinal_expectation_score,
+                "ordinal_expectation_seed_candidates": ordinal_expectation_seed_candidates,
+                "ordinal_expectation_threshold_pass": ordinal_expectation_threshold_pass,
+                "ordinal_expectation_final_peaks": (
+                    ordinal_expectation_seed_candidates & foreground_gate & ordinal_expectation_threshold_pass
+                ),
+            }
+        )
+    return center_score, peaks, debug
 
 
 @torch.no_grad()
@@ -618,9 +740,11 @@ def detect_centers_with_en(
     threshold: float,
     nms_radius: int,
     confidence_score: str,
-    match_radius: float,
-    candidate_count: int,
-    en_threshold: float,
+    use_ordinal_expectation: bool = False,
+    debug_ordinal_expectation: bool = False,
+    match_radius: float = 3.0,
+    candidate_count: int = 5,
+    en_threshold: float = 0.6,
     center_refinement: str = "integer",
     center_refinement_radius: int = 1,
 ) -> List[np.ndarray]:
@@ -635,6 +759,8 @@ def detect_centers_with_en(
             threshold=threshold,
             nms_radius=nms_radius,
             confidence_score=confidence_score,
+            use_ordinal_expectation=use_ordinal_expectation,
+            debug_ordinal_expectation=debug_ordinal_expectation,
             center_refinement=center_refinement,
             center_refinement_radius=center_refinement_radius,
         )
@@ -663,6 +789,8 @@ def detect_centers_with_en(
         threshold=threshold,
         nms_radius=nms_radius,
         confidence_score=confidence_score,
+        use_ordinal_expectation=use_ordinal_expectation,
+        debug_ordinal_expectation=debug_ordinal_expectation,
         center_refinement=center_refinement,
         center_refinement_radius=center_refinement_radius,
     )
@@ -690,9 +818,11 @@ def detect_centers_with_ex_link(
     threshold: float,
     nms_radius: int,
     confidence_score: str,
-    match_radius: float,
-    candidate_count: int,
-    ex_threshold: float,
+    use_ordinal_expectation: bool = False,
+    debug_ordinal_expectation: bool = False,
+    match_radius: float = 3.0,
+    candidate_count: int = 5,
+    ex_threshold: float = 0.5,
     center_refinement: str = "integer",
     center_refinement_radius: int = 1,
     use_en_postprocess: bool = False,
@@ -720,6 +850,8 @@ def detect_centers_with_ex_link(
                 threshold=threshold,
                 nms_radius=nms_radius,
                 confidence_score=confidence_score,
+                use_ordinal_expectation=use_ordinal_expectation,
+                debug_ordinal_expectation=debug_ordinal_expectation,
                 center_refinement=center_refinement,
                 center_refinement_radius=center_refinement_radius,
             )
@@ -732,6 +864,8 @@ def detect_centers_with_ex_link(
                     threshold=threshold,
                     nms_radius=nms_radius,
                     confidence_score=confidence_score,
+                    use_ordinal_expectation=use_ordinal_expectation,
+                    debug_ordinal_expectation=debug_ordinal_expectation,
                     center_refinement=center_refinement,
                     center_refinement_radius=center_refinement_radius,
                     match_radius=match_radius,
@@ -746,6 +880,8 @@ def detect_centers_with_ex_link(
                 threshold=threshold,
                 nms_radius=nms_radius,
                 confidence_score=confidence_score,
+                use_ordinal_expectation=use_ordinal_expectation,
+                debug_ordinal_expectation=debug_ordinal_expectation,
                 center_refinement=center_refinement,
                 center_refinement_radius=center_refinement_radius,
             ),
@@ -759,6 +895,8 @@ def detect_centers_with_ex_link(
         threshold=threshold,
         nms_radius=nms_radius,
         confidence_score=confidence_score,
+        use_ordinal_expectation=use_ordinal_expectation,
+        debug_ordinal_expectation=debug_ordinal_expectation,
         center_refinement=center_refinement,
         center_refinement_radius=center_refinement_radius,
     )
@@ -1285,6 +1423,8 @@ def detect_centers(
     threshold: float = 0.0,
     nms_radius: int = 1,
     confidence_score: str = "cellect",
+    use_ordinal_expectation: bool = False,
+    debug_ordinal_expectation: bool = False,
     center_refinement: str = "integer",
     center_refinement_radius: int = 1,
 ) -> List[np.ndarray]:
@@ -1295,9 +1435,12 @@ def detect_centers(
         threshold=threshold,
         nms_radius=nms_radius,
         confidence_score=confidence_score,
+        use_ordinal_expectation=use_ordinal_expectation,
+        debug_ordinal_expectation=debug_ordinal_expectation,
     )
 
     result: List[np.ndarray] = []
+    merge_close = bool(use_ordinal_expectation or str(confidence_score) == "ordinal_expectation")
     for b in range(conf.shape[0]):
         y, x = torch.where(peaks[b])
         coords = _refine_peak_coordinates(
@@ -1307,6 +1450,13 @@ def detect_centers(
             method=center_refinement,
             radius=center_refinement_radius,
         )
+        if bool(merge_close) and coords.numel() > 0:
+            peak_scores = conf[b, y, x]
+            coords, _peak_scores = _merge_close_centers_by_score(
+                coords,
+                peak_scores,
+                min_distance=float(ORDINAL_EXPECTATION_MERGE_RADIUS),
+            )
         result.append(coords.detach().cpu().numpy().astype(np.float32))
     return result
 
@@ -1318,6 +1468,8 @@ def detect_centers_with_scores(
     threshold: float = -float("inf"),
     nms_radius: int = 1,
     confidence_score: str = "cellect",
+    use_ordinal_expectation: bool = False,
+    debug_ordinal_expectation: bool = False,
     center_refinement: str = "integer",
     center_refinement_radius: int = 1,
 ) -> List[Dict[str, np.ndarray]]:
@@ -1328,9 +1480,12 @@ def detect_centers_with_scores(
         threshold=threshold,
         nms_radius=nms_radius,
         confidence_score=confidence_score,
+        use_ordinal_expectation=use_ordinal_expectation,
+        debug_ordinal_expectation=debug_ordinal_expectation,
     )
 
     result: List[Dict[str, np.ndarray]] = []
+    merge_close = bool(use_ordinal_expectation or str(confidence_score) == "ordinal_expectation")
     for b in range(conf.shape[0]):
         y, x = torch.where(peaks[b])
         if x.numel() == 0:
@@ -1343,8 +1498,15 @@ def detect_centers_with_scores(
             method=center_refinement,
             radius=center_refinement_radius,
         )
+        peak_scores = conf[b, y, x]
+        if bool(merge_close):
+            xy_t, peak_scores = _merge_close_centers_by_score(
+                xy_t,
+                peak_scores,
+                min_distance=float(ORDINAL_EXPECTATION_MERGE_RADIUS),
+            )
         xy = xy_t.detach().cpu().numpy().astype(np.float32)
-        score = conf[b, y, x].detach().cpu().numpy().astype(np.float32)
+        score = peak_scores.detach().cpu().numpy().astype(np.float32)
         result.append({"xy": xy, "score": score})
     return result
 
@@ -1541,6 +1703,8 @@ def generate_pu_pseudo_labels(
     axis_ratio_min: float = 0.1,
     nms_radius: int = 1,
     confidence_score: str = "cellect",
+    use_ordinal_expectation: bool = False,
+    debug_ordinal_expectation: bool = False,
     ellipse_sigma: float = 2.0,
     max_pseudo_per_record_band: int = 512,
     show_progress: bool = True,
@@ -1571,6 +1735,8 @@ def generate_pu_pseudo_labels(
                 threshold=-float("inf"),
                 nms_radius=nms_radius,
                 confidence_score=confidence_score,
+                use_ordinal_expectation=use_ordinal_expectation,
+                debug_ordinal_expectation=debug_ordinal_expectation,
             )
             batch_size = int(outputs["seg_logits"].shape[0])
             band_count = int(outputs["seg_logits"].shape[1])
@@ -1632,6 +1798,8 @@ def generate_pu_pseudo_labels(
                 threshold=-float("inf"),
                 nms_radius=nms_radius,
                 confidence_score=confidence_score,
+                use_ordinal_expectation=use_ordinal_expectation,
+                debug_ordinal_expectation=debug_ordinal_expectation,
             )
             shape_cpu = outputs["shape"].detach().cpu()
             for rec_idx, item in enumerate(detection_items):
@@ -1804,6 +1972,8 @@ def _update_detection_totals(
     threshold: float,
     nms_radius: int,
     confidence_score: str,
+    use_ordinal_expectation: bool,
+    debug_ordinal_expectation: bool,
     center_refinement: str,
     center_refinement_radius: int,
     match_radius: float,
@@ -1814,6 +1984,7 @@ def _update_detection_totals(
     ex_link_threshold: float,
     ex_band_pairs: Optional[Sequence[Tuple[int, int]]],
     band_names: Sequence[str],
+    collect_candidate_stats: bool = False,
     ignore_mask_during_detection: bool = True,
 ) -> None:
     per_band_outputs = outputs["confidence"].ndim == 5
@@ -1833,22 +2004,27 @@ def _update_detection_totals(
             merged.append(torch.unique(centers, dim=0))
         return merged
 
-    candidate_debug: Dict[str, object]
+    candidate_debug: Dict[str, object] = {}
 
     if use_en_postprocess and hasattr(base_model, "EN"):
-        candidate_outputs = _flatten_per_band_outputs(outputs) if per_band_outputs else outputs
-        _, _, candidate_debug = _compute_detection_peak_maps(
-            candidate_outputs,
-            threshold=threshold,
-            nms_radius=nms_radius,
-            confidence_score=confidence_score,
-        )
+        if bool(collect_candidate_stats):
+            candidate_outputs = _flatten_per_band_outputs(outputs) if per_band_outputs else outputs
+            _, _, candidate_debug = _compute_detection_peak_maps(
+                candidate_outputs,
+                threshold=threshold,
+                nms_radius=nms_radius,
+                confidence_score=confidence_score,
+                use_ordinal_expectation=use_ordinal_expectation,
+                debug_ordinal_expectation=debug_ordinal_expectation,
+            )
         pred_list = detect_centers_with_en(
             base_model,
             outputs,
             threshold=threshold,
             nms_radius=nms_radius,
             confidence_score=confidence_score,
+            use_ordinal_expectation=use_ordinal_expectation,
+            debug_ordinal_expectation=debug_ordinal_expectation,
             center_refinement=center_refinement,
             center_refinement_radius=center_refinement_radius,
             match_radius=match_radius,
@@ -1885,17 +2061,22 @@ def _update_detection_totals(
         ordinary_ignore_list = _merge_center_lists(ordinary_base, strict_center_list, strict_ignore_list)
     elif per_band_outputs:
         flat_outputs = _flatten_per_band_outputs(outputs)
-        _, _, candidate_debug = _compute_detection_peak_maps(
-            flat_outputs,
-            threshold=threshold,
-            nms_radius=nms_radius,
-            confidence_score=confidence_score,
-        )
+        if bool(collect_candidate_stats):
+            _, _, candidate_debug = _compute_detection_peak_maps(
+                flat_outputs,
+                threshold=threshold,
+                nms_radius=nms_radius,
+                confidence_score=confidence_score,
+                use_ordinal_expectation=use_ordinal_expectation,
+                debug_ordinal_expectation=debug_ordinal_expectation,
+            )
         pred_list = detect_centers(
             flat_outputs,
             threshold=threshold,
             nms_radius=nms_radius,
             confidence_score=confidence_score,
+            use_ordinal_expectation=use_ordinal_expectation,
+            debug_ordinal_expectation=debug_ordinal_expectation,
             center_refinement=center_refinement,
             center_refinement_radius=center_refinement_radius,
         )
@@ -1928,17 +2109,22 @@ def _update_detection_totals(
         )
         ordinary_ignore_list = _merge_center_lists(ordinary_base, strict_center_list, strict_ignore_list)
     else:
-        _, _, candidate_debug = _compute_detection_peak_maps(
-            outputs,
-            threshold=threshold,
-            nms_radius=nms_radius,
-            confidence_score=confidence_score,
-        )
+        if bool(collect_candidate_stats):
+            _, _, candidate_debug = _compute_detection_peak_maps(
+                outputs,
+                threshold=threshold,
+                nms_radius=nms_radius,
+                confidence_score=confidence_score,
+                use_ordinal_expectation=use_ordinal_expectation,
+                debug_ordinal_expectation=debug_ordinal_expectation,
+            )
         pred_list = detect_centers(
             outputs,
             threshold=threshold,
             nms_radius=nms_radius,
             confidence_score=confidence_score,
+            use_ordinal_expectation=use_ordinal_expectation,
+            debug_ordinal_expectation=debug_ordinal_expectation,
             center_refinement=center_refinement,
             center_refinement_radius=center_refinement_radius,
         )
@@ -1957,8 +2143,9 @@ def _update_detection_totals(
 
     per_band_counts = totals["per_band_counts"]
     assert isinstance(per_band_counts, dict)
-    candidate_stats_total = totals.get("candidate_stats")
+    candidate_stats_total = totals.get("candidate_stats") if bool(collect_candidate_stats) else None
     candidate_center_score = candidate_debug.get("center_score")
+    candidate_argmax_channel = candidate_debug.get("argmax_channel")
     candidate_spatial_localmax = candidate_debug.get("spatial_localmax")
     candidate_seed = candidate_debug.get("seed_candidates")
     candidate_foreground_gate = candidate_debug.get("foreground_gate")
@@ -1966,9 +2153,11 @@ def _update_detection_totals(
     candidate_final = candidate_debug.get("final_peaks")
     candidate_top_channel = candidate_debug.get("top_channel_argmax")
     candidate_foreground_gate_active = bool(candidate_debug.get("foreground_gate_active", False))
+    candidate_effective_threshold = float(candidate_debug.get("effective_threshold", threshold))
     if (
         isinstance(candidate_stats_total, dict)
         and isinstance(candidate_center_score, Tensor)
+        and isinstance(candidate_argmax_channel, Tensor)
         and isinstance(candidate_spatial_localmax, Tensor)
         and isinstance(candidate_seed, Tensor)
         and isinstance(candidate_foreground_gate, Tensor)
@@ -1980,6 +2169,7 @@ def _update_detection_totals(
             _update_candidate_stats_bucket(
                 candidate_stats_total,
                 center_score=candidate_center_score[map_idx],
+                argmax_channel=candidate_argmax_channel[map_idx],
                 top_channel_argmax=top_channel_map,
                 spatial_localmax=candidate_spatial_localmax[map_idx],
                 seed_candidates=candidate_seed[map_idx],
@@ -1987,9 +2177,9 @@ def _update_detection_totals(
                 threshold_pass=candidate_threshold_pass[map_idx],
                 final_peaks=candidate_final[map_idx],
                 foreground_gate_active=candidate_foreground_gate_active,
-                threshold=threshold,
+                threshold=candidate_effective_threshold,
             )
-            if band_idx is not None and band_names:
+            if bool(collect_candidate_stats) and band_idx is not None and band_names:
                 band_name = str(band_names[int(band_idx)])
                 band_bucket = per_band_counts.setdefault(
                     band_name,
@@ -2002,7 +2192,7 @@ def _update_detection_totals(
                         "ordinary_ignore_fn": 0,
                         "ordinary_ignore_total": 0,
                         "strict_ignored_pred": 0,
-                        "candidate_stats": _init_candidate_stats_bucket(),
+                        **({"candidate_stats": _init_candidate_stats_bucket()} if bool(collect_candidate_stats) else {}),
                     },
                 )
                 assert isinstance(band_bucket, dict)
@@ -2011,6 +2201,7 @@ def _update_detection_totals(
                     _update_candidate_stats_bucket(
                         band_candidate_stats,
                         center_score=candidate_center_score[map_idx],
+                        argmax_channel=candidate_argmax_channel[map_idx],
                         top_channel_argmax=top_channel_map,
                         spatial_localmax=candidate_spatial_localmax[map_idx],
                         seed_candidates=candidate_seed[map_idx],
@@ -2018,7 +2209,7 @@ def _update_detection_totals(
                         threshold_pass=candidate_threshold_pass[map_idx],
                         final_peaks=candidate_final[map_idx],
                         foreground_gate_active=candidate_foreground_gate_active,
-                        threshold=threshold,
+                        threshold=candidate_effective_threshold,
                     )
     for pred_xy, gt_xy, band_idx, clean_mask, background_mask, ordinary_ignore_xy in zip(
         pred_list, gt_list, band_indices, clean_masks, background_masks, ordinary_ignore_list
@@ -2107,6 +2298,8 @@ def _update_detection_totals(
             threshold=threshold,
             nms_radius=nms_radius,
             confidence_score=confidence_score,
+            use_ordinal_expectation=use_ordinal_expectation,
+            debug_ordinal_expectation=debug_ordinal_expectation,
             center_refinement=center_refinement,
             center_refinement_radius=center_refinement_radius,
             match_radius=match_radius,
@@ -2167,6 +2360,8 @@ def run_epoch(
     threshold: float = 2.0,
     nms_radius: int = 3,
     confidence_score: str = "smooth",
+    use_ordinal_expectation: bool = False,
+    debug_ordinal_expectation: bool = False,
     center_refinement: str = "integer",
     center_refinement_radius: int = 1,
     ellipse_sigma: float = 2.0,
@@ -2304,6 +2499,8 @@ def run_epoch(
                 threshold=threshold,
                 nms_radius=nms_radius,
                 confidence_score=confidence_score,
+                use_ordinal_expectation=use_ordinal_expectation,
+                debug_ordinal_expectation=debug_ordinal_expectation,
                 center_refinement=center_refinement,
                 center_refinement_radius=center_refinement_radius,
                 ellipse_sigma=ellipse_sigma,
@@ -2511,6 +2708,8 @@ def validate_epoch(
     threshold: float,
     nms_radius: int,
     confidence_score: str,
+    use_ordinal_expectation: bool,
+    debug_ordinal_expectation: bool,
     center_refinement: str,
     center_refinement_radius: int,
     use_en_postprocess: bool,
@@ -2518,6 +2717,7 @@ def validate_epoch(
     use_ex_link_postprocess: bool,
     ex_link_threshold: float,
     band_names: Sequence[str],
+    collect_candidate_stats: bool = False,
     ignore_mask_during_detection: bool = True,
     epoch_index: int = 0,
     ellipse_sigma: float = 2.0,
@@ -2552,7 +2752,7 @@ def validate_epoch(
         "mask_pred_prompts": 0.0,
     }
     count = 0
-    det_totals = _init_detection_totals(band_names) if compute_detection else None
+    det_totals = _init_detection_totals(band_names, collect_candidate_stats=collect_candidate_stats) if compute_detection else None
     effective_mask_outer_weight = mask_outer_weight_for_epoch(epoch_index, weights)
     desc = "val+detect" if compute_detection else "val"
     for batch in tqdm(loader, desc=desc, leave=False, disable=not show_progress):
@@ -2571,6 +2771,8 @@ def validate_epoch(
                 threshold=threshold,
                 nms_radius=nms_radius,
                 confidence_score=confidence_score,
+                use_ordinal_expectation=use_ordinal_expectation,
+                debug_ordinal_expectation=debug_ordinal_expectation,
                 center_refinement=center_refinement,
                 center_refinement_radius=center_refinement_radius,
                 ellipse_sigma=ellipse_sigma,
@@ -2629,6 +2831,8 @@ def validate_epoch(
                 threshold=threshold,
                 nms_radius=nms_radius,
                 confidence_score=confidence_score,
+                use_ordinal_expectation=use_ordinal_expectation,
+                debug_ordinal_expectation=debug_ordinal_expectation,
                 center_refinement=center_refinement,
                 center_refinement_radius=center_refinement_radius,
                 match_radius=center_radius_px,
@@ -2639,6 +2843,7 @@ def validate_epoch(
                 ex_link_threshold=ex_link_threshold,
                 ex_band_pairs=ex_band_pairs,
                 band_names=band_names,
+                collect_candidate_stats=collect_candidate_stats,
                 ignore_mask_during_detection=ignore_mask_during_detection,
             )
 
@@ -2703,6 +2908,8 @@ def evaluate_detection(
     threshold: float,
     nms_radius: int,
     confidence_score: str,
+    use_ordinal_expectation: bool = False,
+    debug_ordinal_expectation: bool = False,
     match_radius: float,
     center_refinement: str = "integer",
     center_refinement_radius: int = 1,
@@ -2713,11 +2920,12 @@ def evaluate_detection(
     ex_link_threshold: float = 0.5,
     ex_band_pairs: Optional[Sequence[Tuple[int, int]]] = None,
     band_names: Sequence[str] = (),
+    collect_candidate_stats: bool = False,
     show_progress: bool = True,
 ) -> Dict[str, object]:
     model.eval()
     base_model = unwrap_model(model)
-    totals = _init_detection_totals(band_names)
+    totals = _init_detection_totals(band_names, collect_candidate_stats=collect_candidate_stats)
     for batch in tqdm(loader, desc="detect", leave=False, disable=not show_progress):
         image = batch["image"].to(device=device, dtype=torch.float32, non_blocking=True)
         outputs = model(image)
@@ -2729,6 +2937,8 @@ def evaluate_detection(
             threshold=threshold,
             nms_radius=nms_radius,
             confidence_score=confidence_score,
+            use_ordinal_expectation=use_ordinal_expectation,
+            debug_ordinal_expectation=debug_ordinal_expectation,
             center_refinement=center_refinement,
             center_refinement_radius=center_refinement_radius,
             match_radius=match_radius,
@@ -2739,6 +2949,7 @@ def evaluate_detection(
             ex_link_threshold=ex_link_threshold,
             ex_band_pairs=ex_band_pairs,
             band_names=band_names,
+            collect_candidate_stats=collect_candidate_stats,
         )
     return _finalize_detection_totals(
         totals,

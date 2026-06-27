@@ -642,7 +642,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ellipse-sigma", type=float, default=2.0)
     parser.add_argument("--core-radius", type=int, default=2)
     parser.add_argument("--confidence-threshold", type=float, default=0.0)
-    parser.add_argument("--confidence-score", choices=("cellect", "raw", "ordinal_prob"), default="cellect")
+    parser.add_argument("--confidence-score", choices=("cellect", "raw", "ordinal_prob", "ordinal_expectation"), default="cellect")
     parser.add_argument("--nms-radius", type=int, default=1)
     parser.add_argument("--use-en-postprocess", action="store_true")
     parser.add_argument("--en-postprocess-threshold", type=float, default=0.6)

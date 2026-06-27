@@ -476,6 +476,8 @@ def _init_candidate_stats_bucket() -> Dict[str, object]:
         "seed_hist": [],
         "after_foreground_gate_hist": [],
         "final_hist": [],
+        "spatial_localmax_argmax_num_channels": 0,
+        "spatial_localmax_argmax_hist": [],
     }
 
 
@@ -526,10 +528,24 @@ def _add_hist_counts(bucket: Dict[str, object], key: str, values: Tensor) -> Non
         counts_obj[idx] = int(counts_obj[idx]) + int(value)
 
 
+def _ensure_channel_hist_bucket(bucket: Dict[str, object], num_channels: int) -> None:
+    num_channels = max(int(num_channels), 0)
+    current = int(bucket.get("spatial_localmax_argmax_num_channels", 0))
+    if num_channels <= current:
+        return
+    hist = bucket.get("spatial_localmax_argmax_hist", [])
+    if not isinstance(hist, list):
+        hist = []
+    hist.extend(0 for _ in range(num_channels - len(hist)))
+    bucket["spatial_localmax_argmax_num_channels"] = num_channels
+    bucket["spatial_localmax_argmax_hist"] = hist
+
+
 def _update_candidate_stats_bucket(
     bucket: Dict[str, object],
     *,
     center_score: Tensor,
+    argmax_channel: Optional[Tensor],
     top_channel_argmax: Optional[Tensor],
     spatial_localmax: Tensor,
     seed_candidates: Tensor,
@@ -553,6 +569,15 @@ def _update_candidate_stats_bucket(
     bucket["final_peaks"] = int(bucket.get("final_peaks", 0)) + int(final_peaks.sum().item())
     bucket["foreground_gate_pass_pixels"] = int(bucket.get("foreground_gate_pass_pixels", 0)) + int(foreground_gate.sum().item())
     bucket["threshold_pass_pixels"] = int(bucket.get("threshold_pass_pixels", 0)) + int(threshold_pass.sum().item())
+    if argmax_channel is not None:
+        _ensure_channel_hist_bucket(bucket, int(argmax_channel.max().item()) + 1 if argmax_channel.numel() > 0 else 0)
+        hist_obj = bucket.get("spatial_localmax_argmax_hist", [])
+        if isinstance(hist_obj, list) and argmax_channel.numel() > 0:
+            localmax_channels = argmax_channel[spatial_localmax].detach().reshape(-1).to(dtype=torch.long)
+            if localmax_channels.numel() > 0:
+                bincount = torch.bincount(localmax_channels.cpu(), minlength=len(hist_obj))
+                for idx, value in enumerate(bincount.tolist()):
+                    hist_obj[idx] = int(hist_obj[idx]) + int(value)
 
     scores = center_score.detach().reshape(-1).float()
     finite = torch.isfinite(scores)
@@ -589,6 +614,7 @@ def _merge_candidate_stats_bucket(dst: Dict[str, object], src: Dict[str, object]
         dst[key] = float(dst.get(key, 0.0)) + float(src.get(key, 0.0))
     dst["center_score_min"] = min(float(dst.get("center_score_min", float("inf"))), float(src.get("center_score_min", float("inf"))))
     dst["center_score_max"] = max(float(dst.get("center_score_max", -float("inf"))), float(src.get("center_score_max", -float("inf"))))
+    _ensure_channel_hist_bucket(dst, max(int(dst.get("spatial_localmax_argmax_num_channels", 0)), int(src.get("spatial_localmax_argmax_num_channels", 0))))
 
     src_edges = src.get("hist_edges", [])
     if src_edges and not dst.get("hist_edges"):
@@ -605,6 +631,13 @@ def _merge_candidate_stats_bucket(dst: Dict[str, object], src: Dict[str, object]
             continue
         for idx, value in enumerate(src_hist):
             dst_hist[idx] = int(dst_hist[idx]) + int(value)
+    dst_channel_hist = dst.get("spatial_localmax_argmax_hist", [])
+    src_channel_hist = src.get("spatial_localmax_argmax_hist", [])
+    if isinstance(dst_channel_hist, list) and isinstance(src_channel_hist, list):
+        if len(dst_channel_hist) < len(src_channel_hist):
+            dst_channel_hist.extend(0 for _ in range(len(src_channel_hist) - len(dst_channel_hist)))
+        for idx, value in enumerate(src_channel_hist):
+            dst_channel_hist[idx] = int(dst_channel_hist[idx]) + int(value)
 
 
 def _format_candidate_hist_range(lo: float, hi: float) -> str:
@@ -625,6 +658,7 @@ def _finalize_candidate_stats_bucket(bucket: Dict[str, object]) -> Dict[str, obj
     seed_hist = bucket.get("seed_hist", [])
     after_fg_hist = bucket.get("after_foreground_gate_hist", [])
     final_hist = bucket.get("final_hist", [])
+    spatial_localmax_argmax_hist = bucket.get("spatial_localmax_argmax_hist", [])
     hist_rows: List[Dict[str, object]] = []
     if isinstance(edges, list) and isinstance(seed_hist, list) and isinstance(after_fg_hist, list) and isinstance(final_hist, list):
         for idx in range(max(len(edges) - 1, 0)):
@@ -640,6 +674,17 @@ def _finalize_candidate_stats_bucket(bucket: Dict[str, object]) -> Dict[str, obj
     seed_after_foreground_gate = int(bucket.get("seed_after_foreground_gate", 0))
     seed_after_threshold = int(bucket.get("seed_after_threshold", 0))
     final_peaks = int(bucket.get("final_peaks", 0))
+    channel_hist_rows: List[Dict[str, object]] = []
+    if isinstance(spatial_localmax_argmax_hist, list):
+        spatial_localmax_total = max(int(bucket.get("spatial_localmax_pass", 0)), 1)
+        for idx, value in enumerate(spatial_localmax_argmax_hist):
+            channel_hist_rows.append(
+                {
+                    "channel": float(idx),
+                    "count": float(value),
+                    "fraction": float(value) / float(spatial_localmax_total),
+                }
+            )
     return {
         "maps": float(maps),
         "pixels": float(pixels),
@@ -675,11 +720,16 @@ def _finalize_candidate_stats_bucket(bucket: Dict[str, object]) -> Dict[str, obj
             "binning": bucket.get("hist_binning"),
             "bins": hist_rows,
         },
+        "spatial_localmax_argmax_channel_histogram": channel_hist_rows,
     }
 
 
-def _init_detection_totals(band_names: Sequence[str]) -> Dict[str, object]:
-    return {
+def _init_detection_totals(
+    band_names: Sequence[str],
+    *,
+    collect_candidate_stats: bool = False,
+) -> Dict[str, object]:
+    totals: Dict[str, object] = {
         "tp": 0,
         "fp": 0,
         "clean_region_fp": 0,
@@ -691,21 +741,8 @@ def _init_detection_totals(band_names: Sequence[str]) -> Dict[str, object]:
         "linked_tp": 0,
         "linked_fp": 0,
         "linked_fn": 0,
-        "candidate_stats": _init_candidate_stats_bucket(),
-        "per_band_counts": {
-            str(name): {
-                "tp": 0,
-                "fp": 0,
-                "clean_region_fp": 0,
-                "fn": 0,
-                "ordinary_ignore_tp": 0,
-                "ordinary_ignore_fn": 0,
-                "ordinary_ignore_total": 0,
-                "strict_ignored_pred": 0,
-                "candidate_stats": _init_candidate_stats_bucket(),
-            }
-            for name in band_names
-        },
+        "collect_candidate_stats": bool(collect_candidate_stats),
+        "per_band_counts": {},
         "link_metrics_total": {
             "tp": 0.0,
             "partial": 0.0,
@@ -724,10 +761,30 @@ def _init_detection_totals(band_names: Sequence[str]) -> Dict[str, object]:
             "gt_reference": "band_reference_union_extra_predicted_bands_ignored",
         },
     }
+    per_band_counts: Dict[str, Dict[str, object]] = {}
+    for name in band_names:
+        bucket: Dict[str, object] = {
+            "tp": 0,
+            "fp": 0,
+            "clean_region_fp": 0,
+            "fn": 0,
+            "ordinary_ignore_tp": 0,
+            "ordinary_ignore_fn": 0,
+            "ordinary_ignore_total": 0,
+            "strict_ignored_pred": 0,
+        }
+        if bool(collect_candidate_stats):
+            bucket["candidate_stats"] = _init_candidate_stats_bucket()
+        per_band_counts[str(name)] = bucket
+    totals["per_band_counts"] = per_band_counts
+    if bool(collect_candidate_stats):
+        totals["candidate_stats"] = _init_candidate_stats_bucket()
+    return totals
 
 
 def _merge_detection_totals(items: Sequence[Dict[str, object]], band_names: Sequence[str]) -> Dict[str, object]:
-    merged = _init_detection_totals(band_names)
+    collect_candidate_stats = any(bool(item.get("collect_candidate_stats", False)) for item in items if isinstance(item, dict))
+    merged = _init_detection_totals(band_names, collect_candidate_stats=collect_candidate_stats)
     for item in items:
         for key in (
             "tp",
@@ -745,7 +802,7 @@ def _merge_detection_totals(items: Sequence[Dict[str, object]], band_names: Sequ
             merged[key] = int(merged.get(key, 0)) + int(item.get(key, 0))
         merged_candidate = merged.get("candidate_stats")
         item_candidate = item.get("candidate_stats")
-        if isinstance(merged_candidate, dict) and isinstance(item_candidate, dict):
+        if bool(collect_candidate_stats) and isinstance(merged_candidate, dict) and isinstance(item_candidate, dict):
             _merge_candidate_stats_bucket(merged_candidate, item_candidate)
         merged_per_band = merged["per_band_counts"]
         item_per_band = item.get("per_band_counts", {})
@@ -755,7 +812,17 @@ def _merge_detection_totals(items: Sequence[Dict[str, object]], band_names: Sequ
                 counts = counts_obj if isinstance(counts_obj, dict) else {}
                 bucket = merged_per_band.setdefault(
                     str(band_name),
-                    {"tp": 0, "fp": 0, "fn": 0, "candidate_stats": _init_candidate_stats_bucket()},
+                    {
+                        "tp": 0,
+                        "fp": 0,
+                        "clean_region_fp": 0,
+                        "fn": 0,
+                        "ordinary_ignore_tp": 0,
+                        "ordinary_ignore_fn": 0,
+                        "ordinary_ignore_total": 0,
+                        "strict_ignored_pred": 0,
+                        **({"candidate_stats": _init_candidate_stats_bucket()} if bool(collect_candidate_stats) else {}),
+                    },
                 )
                 assert isinstance(bucket, dict)
                 for count_key in (
@@ -771,7 +838,7 @@ def _merge_detection_totals(items: Sequence[Dict[str, object]], band_names: Sequ
                     bucket[count_key] = int(bucket.get(count_key, 0)) + int(counts.get(count_key, 0))
                 bucket_candidate = bucket.get("candidate_stats")
                 counts_candidate = counts.get("candidate_stats")
-                if isinstance(bucket_candidate, dict) and isinstance(counts_candidate, dict):
+                if bool(collect_candidate_stats) and isinstance(bucket_candidate, dict) and isinstance(counts_candidate, dict):
                     _merge_candidate_stats_bucket(bucket_candidate, counts_candidate)
         merged_link = merged["link_metrics_total"]
         item_link = item.get("link_metrics_total")
@@ -787,6 +854,7 @@ def _finalize_detection_totals(
     band_names: Sequence[str],
     use_ex_link_postprocess: bool,
 ) -> Dict[str, object]:
+    collect_candidate_stats = bool(totals.get("collect_candidate_stats", False))
     tp = int(totals["tp"])
     fp = int(totals["fp"])
     clean_region_fp = int(totals.get("clean_region_fp", fp))
@@ -838,7 +906,7 @@ def _finalize_detection_totals(
         },
     }
     candidate_stats = totals.get("candidate_stats")
-    if isinstance(candidate_stats, dict):
+    if bool(collect_candidate_stats) and isinstance(candidate_stats, dict):
         result["candidate_stats"] = _finalize_candidate_stats_bucket(candidate_stats)
     per_band_counts = totals.get("per_band_counts", {})
     if band_names and isinstance(per_band_counts, dict):
@@ -899,7 +967,7 @@ def _finalize_detection_totals(
                 },
             }
             band_candidate_stats = counts.get("candidate_stats")
-            if isinstance(band_candidate_stats, dict):
+            if bool(collect_candidate_stats) and isinstance(band_candidate_stats, dict):
                 per_band[str(band_name)]["candidate_stats"] = _finalize_candidate_stats_bucket(band_candidate_stats)
         result["per_band"] = per_band
     link_metrics_total = totals.get("link_metrics_total")

@@ -1341,7 +1341,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-size", type=int, default=512)
     parser.add_argument("--threshold", type=float, default=None)
     parser.add_argument("--nms-radius", type=int, default=None)
-    parser.add_argument("--confidence-score", choices=("cellect", "raw", "ordinal_prob"), default=None)
+    parser.add_argument("--confidence-score", choices=("cellect", "raw", "ordinal_prob", "ordinal_expectation"), default=None)
     parser.add_argument("--center-refinement", choices=("integer", "softargmax"), default=None)
     parser.add_argument("--center-refinement-radius", type=int, default=None)
     parser.add_argument("--match-radius", type=float, default=MATCH_RADIUS_PIX)

@@ -171,6 +171,10 @@ def confidence_detection_score(outputs: Dict[str, Tensor], mode: str) -> Tensor:
         prev = logits[:, :-1].max(dim=1).values
         curr = logits[:, -1]
         return torch.softmax(torch.stack([prev, curr], dim=1), dim=1)[:, 1]
+    if mode == "ordinal_expectation":
+        prob = torch.softmax(logits.float(), dim=1)
+        level_values = torch.arange(logits.shape[1], device=prob.device, dtype=prob.dtype).view(1, -1, 1, 1)
+        return (prob * level_values).sum(dim=1).to(dtype=logits.dtype)
     raise ValueError(f"Unknown confidence score mode: {mode}")
 
 
