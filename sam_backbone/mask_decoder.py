@@ -122,10 +122,27 @@ class MaskDecoder(nn.Module):
         output_tokens = output_tokens.unsqueeze(0).expand(sparse_prompt_embeddings.size(0), -1, -1)
         tokens = torch.cat((output_tokens, sparse_prompt_embeddings), dim=1)
 
-        # Expand per-image data in batch direction to be per-mask
-        src = torch.repeat_interleave(image_embeddings, tokens.shape[0], dim=0)
+        # Expand per-image data in batch direction to be per-mask. The original
+        # SAM path passes one image embedding and many prompts, while the
+        # astronomy training path may already provide one image embedding per
+        # prompt to batch mixed images together.
+        if image_embeddings.shape[0] == 1:
+            src = torch.repeat_interleave(image_embeddings, tokens.shape[0], dim=0)
+        elif image_embeddings.shape[0] == tokens.shape[0]:
+            src = image_embeddings
+        else:
+            raise ValueError(
+                f"image_embeddings batch {image_embeddings.shape[0]} must be 1 or match prompt batch {tokens.shape[0]}"
+            )
         src = src + dense_prompt_embeddings
-        pos_src = torch.repeat_interleave(image_pe, tokens.shape[0], dim=0)
+        if image_pe.shape[0] == 1:
+            pos_src = torch.repeat_interleave(image_pe, tokens.shape[0], dim=0)
+        elif image_pe.shape[0] == tokens.shape[0]:
+            pos_src = image_pe
+        else:
+            raise ValueError(
+                f"image_pe batch {image_pe.shape[0]} must be 1 or match prompt batch {tokens.shape[0]}"
+            )
         b, c, h, w = src.shape
 
         # Run the transformer

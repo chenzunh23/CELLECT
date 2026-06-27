@@ -117,27 +117,29 @@ class SamCellect2D(nn.Module):
         mask_chunks: list[Tensor] = []
         iou_chunks: list[Tensor] = []
         dense_pe = self.prompt_encoder.get_dense_pe().to(device=flat_embeddings.device, dtype=flat_embeddings.dtype)
-        for flat_index in torch.unique_consecutive(sorted_batch).tolist():
-            positions = torch.where(sorted_batch == int(flat_index))[0]
-            image_embedding = flat_embeddings[int(flat_index) : int(flat_index) + 1]
-            for start in range(0, int(positions.numel()), int(chunk_size)):
-                pos = positions[start : start + int(chunk_size)]
-                coords = sorted_points[pos].unsqueeze(1)
-                labels = torch.ones((coords.shape[0], 1), device=coords.device, dtype=torch.int64)
-                sparse_embeddings, dense_embeddings = self.prompt_encoder(
-                    points=(coords, labels),
-                    boxes=None if sorted_boxes is None else sorted_boxes[pos],
-                    masks=None,
-                )
-                low_res_masks, iou_predictions = self.mask_decoder(
-                    image_embeddings=image_embedding,
-                    image_pe=dense_pe,
-                    sparse_prompt_embeddings=sparse_embeddings,
-                    dense_prompt_embeddings=dense_embeddings,
-                    multimask_output=multimask_output,
-                )
-                mask_chunks.append(low_res_masks)
-                iou_chunks.append(iou_predictions)
+        total = int(sorted_batch.numel())
+        for start in range(0, total, int(chunk_size)):
+            stop = min(start + int(chunk_size), total)
+            pos = slice(start, stop)
+            batch_chunk = sorted_batch[pos]
+            coords = sorted_points[pos].unsqueeze(1)
+            labels = torch.ones((coords.shape[0], 1), device=coords.device, dtype=torch.int64)
+            sparse_embeddings, dense_embeddings = self.prompt_encoder(
+                points=(coords, labels),
+                boxes=None if sorted_boxes is None else sorted_boxes[pos],
+                masks=None,
+            )
+            image_embedding = flat_embeddings[batch_chunk]
+            image_pe = dense_pe.expand(image_embedding.shape[0], -1, -1, -1)
+            low_res_masks, iou_predictions = self.mask_decoder(
+                image_embeddings=image_embedding,
+                image_pe=image_pe,
+                sparse_prompt_embeddings=sparse_embeddings,
+                dense_prompt_embeddings=dense_embeddings,
+                multimask_output=multimask_output,
+            )
+            mask_chunks.append(low_res_masks)
+            iou_chunks.append(iou_predictions)
         sorted_masks = torch.cat(mask_chunks, dim=0)
         sorted_ious = torch.cat(iou_chunks, dim=0)
         return sorted_masks[inverse], sorted_ious[inverse]
