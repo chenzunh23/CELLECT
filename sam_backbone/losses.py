@@ -275,6 +275,7 @@ def _build_pred_prompt_tensors(
         debug_ordinal_expectation=debug_ordinal_expectation,
         center_refinement=center_refinement,
         center_refinement_radius=center_refinement_radius,
+        merge_close_centers=False,
     )
     flat_shape_pred = flat_outputs["shape"]
     flat_clean = batch["band_clean_mask"].reshape(-1, *batch["band_clean_mask"].shape[2:]).to(device=device, dtype=torch.bool)  # type: ignore[union-attr]

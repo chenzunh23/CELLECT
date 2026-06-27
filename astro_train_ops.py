@@ -462,7 +462,7 @@ def _confidence_score_at_centers(outputs: Dict[str, Tensor], centers: Tensor, *,
     return score_map[y, x]
 
 
-ORDINAL_EXPECTATION_THRESHOLD = 2.0
+ORDINAL_EXPECTATION_THRESHOLD = 2.5
 ORDINAL_EXPECTATION_MERGE_RADIUS = 3.0
 
 
@@ -1427,6 +1427,7 @@ def detect_centers_tensors(
     debug_ordinal_expectation: bool = False,
     center_refinement: str = "integer",
     center_refinement_radius: int = 1,
+    merge_close_centers: Optional[bool] = None,
 ) -> List[Tensor]:
     """Detect center candidates from confidence maps and keep coordinates on-device."""
 
@@ -1440,7 +1441,10 @@ def detect_centers_tensors(
     )
 
     result: List[Tensor] = []
-    merge_close = bool(use_ordinal_expectation or str(confidence_score) == "ordinal_expectation")
+    if merge_close_centers is None:
+        merge_close = bool(use_ordinal_expectation or str(confidence_score) == "ordinal_expectation")
+    else:
+        merge_close = bool(merge_close_centers)
     for b in range(conf.shape[0]):
         y, x = torch.where(peaks[b])
         coords = _refine_peak_coordinates(
@@ -1472,6 +1476,7 @@ def detect_centers(
     debug_ordinal_expectation: bool = False,
     center_refinement: str = "integer",
     center_refinement_radius: int = 1,
+    merge_close_centers: Optional[bool] = None,
 ) -> List[np.ndarray]:
     """Detect center candidates from confidence maps."""
 
@@ -1484,6 +1489,7 @@ def detect_centers(
         debug_ordinal_expectation=debug_ordinal_expectation,
         center_refinement=center_refinement,
         center_refinement_radius=center_refinement_radius,
+        merge_close_centers=merge_close_centers,
     )
     result: List[np.ndarray] = []
     for coords in result_t:
