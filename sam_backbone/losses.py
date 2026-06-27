@@ -261,7 +261,7 @@ def _build_pred_prompt_tensors(
     sample_fraction: float,
     unmatched_weight: float,
     detach_prompt_shapes: bool,
-    detect_centers_fn: Callable[..., List[np.ndarray]],
+    detect_centers_fn: Callable[..., List[Tensor | np.ndarray]],
 ) -> Optional[Dict[str, Tensor]]:
     if outputs["confidence"].ndim != 5:
         return None
@@ -285,8 +285,11 @@ def _build_pred_prompt_tensors(
     target_shapes_all: List[Tensor] = []
     weights_all: List[Tensor] = []
     mask_target_weights_all: List[Tensor] = []
-    for flat_idx, pred_np in enumerate(pred_list):
-        centers = torch.as_tensor(np.asarray(pred_np, dtype=np.float32), device=device).reshape(-1, 2)
+    for flat_idx, pred_item in enumerate(pred_list):
+        if isinstance(pred_item, Tensor):
+            centers = pred_item.to(device=device, dtype=torch.float32).reshape(-1, 2)
+        else:
+            centers = torch.as_tensor(np.asarray(pred_item, dtype=np.float32), device=device).reshape(-1, 2)
         if centers.numel() == 0:
             continue
         keep_count = _prompt_sample_limit(centers.shape[0], int(max_pred_per_sample), float(sample_fraction))

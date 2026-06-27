@@ -1417,7 +1417,7 @@ def _filter_triplet_sources(
 
 
 @torch.no_grad()
-def detect_centers(
+def detect_centers_tensors(
     outputs: Dict[str, Tensor],
     *,
     threshold: float = 0.0,
@@ -1427,8 +1427,8 @@ def detect_centers(
     debug_ordinal_expectation: bool = False,
     center_refinement: str = "integer",
     center_refinement_radius: int = 1,
-) -> List[np.ndarray]:
-    """Detect center candidates from confidence maps."""
+) -> List[Tensor]:
+    """Detect center candidates from confidence maps and keep coordinates on-device."""
 
     conf, peaks, _ = _compute_detection_peak_maps(
         outputs,
@@ -1439,7 +1439,7 @@ def detect_centers(
         debug_ordinal_expectation=debug_ordinal_expectation,
     )
 
-    result: List[np.ndarray] = []
+    result: List[Tensor] = []
     merge_close = bool(use_ordinal_expectation or str(confidence_score) == "ordinal_expectation")
     for b in range(conf.shape[0]):
         y, x = torch.where(peaks[b])
@@ -1457,6 +1457,36 @@ def detect_centers(
                 peak_scores,
                 min_distance=float(ORDINAL_EXPECTATION_MERGE_RADIUS),
             )
+        result.append(coords.to(dtype=torch.float32))
+    return result
+
+
+@torch.no_grad()
+def detect_centers(
+    outputs: Dict[str, Tensor],
+    *,
+    threshold: float = 0.0,
+    nms_radius: int = 1,
+    confidence_score: str = "cellect",
+    use_ordinal_expectation: bool = False,
+    debug_ordinal_expectation: bool = False,
+    center_refinement: str = "integer",
+    center_refinement_radius: int = 1,
+) -> List[np.ndarray]:
+    """Detect center candidates from confidence maps."""
+
+    result_t = detect_centers_tensors(
+        outputs,
+        threshold=threshold,
+        nms_radius=nms_radius,
+        confidence_score=confidence_score,
+        use_ordinal_expectation=use_ordinal_expectation,
+        debug_ordinal_expectation=debug_ordinal_expectation,
+        center_refinement=center_refinement,
+        center_refinement_radius=center_refinement_radius,
+    )
+    result: List[np.ndarray] = []
+    for coords in result_t:
         result.append(coords.detach().cpu().numpy().astype(np.float32))
     return result
 
@@ -2504,7 +2534,7 @@ def run_epoch(
                 center_refinement=center_refinement,
                 center_refinement_radius=center_refinement_radius,
                 ellipse_sigma=ellipse_sigma,
-                detect_centers_fn=detect_centers,
+                detect_centers_fn=detect_centers_tensors,
             )
             _sync_debug(debug_this_batch)
             t_mask_loss = time.perf_counter()
@@ -2776,7 +2806,7 @@ def validate_epoch(
                 center_refinement=center_refinement,
                 center_refinement_radius=center_refinement_radius,
                 ellipse_sigma=ellipse_sigma,
-                detect_centers_fn=detect_centers,
+                detect_centers_fn=detect_centers_tensors,
             )
             total = total + float(effective_mask_outer_weight) * mask_losses["total"]
 
