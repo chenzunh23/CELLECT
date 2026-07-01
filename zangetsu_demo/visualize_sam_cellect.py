@@ -34,8 +34,9 @@ from sam_backbone import build_sam_cellect2d  # noqa: E402
 
 
 TRACT = "9813"
-PATCH = "6,1"
-TILE = "zangetsu_lower_right_x27366_y6453"
+PATCH = "6,1" # "4,5" 
+TILE = "zangetsu_lower_right_x27366_y6453" # "sam_x18204_y20924"
+DEFAULT_VARIANT_GROUP = "group_01"
 DEFAULT_BANDS = ("HSC-G", "HSC-R", "HSC-I", "HSC-Z", "HSC-Y")
 DEFAULT_BAND = "HSC-I"
 DEFAULT_DATA_ROOT = (
@@ -123,12 +124,34 @@ def _make_model(cfg: dict, checkpoint: Path, device: torch.device, bands: Sequen
     return model
 
 
-def _dataset(root: Path, dataset_name: str, bands: Sequence[str], cfg: dict) -> DataLoader:
-    tract_root = root / dataset_name / TRACT
-    records = discover_cutout_records(tract_root, bands=bands)
-    records = [rec for rec in records if rec.patch == PATCH and rec.tile_name == TILE]
+def _tile_for_dataset(dataset_name: str, args: argparse.Namespace) -> str:
+    if args.tile_name:
+        return str(args.tile_name)
+    if str(dataset_name) == "coadd":
+        return TILE
+    if args.variant_group:
+        return f"{args.variant_group}_{TILE}"
+    else:
+        return TILE
+
+
+def _dataset(
+    root: Path,
+    dataset_name: str,
+    bands: Sequence[str],
+    cfg: dict,
+    image_cache_dir: Path | None = None,
+    tile_name: str = TILE,
+) -> DataLoader:
+    records = discover_cutout_records(root, bands=bands)
+    records = [
+        rec
+        for rec in records
+        if str(rec.dataset_source) == str(dataset_name) and rec.patch == PATCH and rec.tile_name == tile_name
+    ]
     if len(records) != 1:
-        raise RuntimeError(f"Expected one record for {dataset_name}/{PATCH}/{TILE}, got {len(records)} under {tract_root}")
+        raise RuntimeError(f"Expected one record for {dataset_name}/{PATCH}/{tile_name}, got {len(records)} under {root}")
+    effective_image_cache_dir = image_cache_dir if str(dataset_name) != "coadd" else None
     ds = AstroCutoutDataset(
         records,
         fits_hdu=int(cfg.get("fits_hdu", 1)),
@@ -137,6 +160,7 @@ def _dataset(root: Path, dataset_name: str, bands: Sequence[str], cfg: dict) -> 
         core_radius=int(cfg.get("core_radius", 2)),
         shape_source=str(cfg.get("shape_source", "kron")),
         source_filter=str(cfg.get("source_filter", "nchild0")),
+        image_cache_dir=effective_image_cache_dir,
         load_eval_ignore_sources=True,
         augment=False,
     )
@@ -288,10 +312,90 @@ def _load_native_sam_centers(native_dir: Path) -> np.ndarray:
     return np.asarray(centers, dtype=np.float32).reshape(-1, 2)
 
 
-def _load_clean_rows(root: Path, dataset_name: str, band: str, tile_name: str) -> tuple[Table, np.ndarray, np.ndarray]:
+def _base_tile_name(tile_name: str) -> str:
+    parts = str(tile_name).split("_", 2)
+    if len(parts) == 3 and parts[0] == "group" and parts[1].isdigit():
+        return parts[2]
+    return str(tile_name)
+
+
+def _visibility_target_candidates(root: Path, dataset_name: str, band: str, tile_name: str) -> list[Path]:
+    base_tile = _base_tile_name(tile_name)
+    return [
+        root / dataset_name / TRACT / PATCH / "band_targets" / band / f"{tile_name}.npz",
+        root / dataset_name / TRACT / PATCH / "band_targets" / band / f"{base_tile}.npz",
+        root / TRACT / PATCH / "band_targets" / band / f"{base_tile}.npz",
+        root / TRACT / PATCH / "band_targets" / band / f"{tile_name}.npz",
+    ]
+
+
+def _visibility_centers(root: Path, dataset_name: str, band: str, tile_name: str) -> tuple[np.ndarray, np.ndarray]:
+    if str(dataset_name).lower() == "coadd":
+        return np.zeros((0, 2), dtype=np.float32), np.zeros((0, 2), dtype=np.float32)
+    for path in _visibility_target_candidates(root, dataset_name, band, tile_name):
+        if not path.exists():
+            continue
+        with np.load(path) as data:
+            center_only = (
+                np.asarray(data["visibility_center_only_centers"], dtype=np.float32).reshape(-1, 2)
+                if "visibility_center_only_centers" in data
+                else np.zeros((0, 2), dtype=np.float32)
+            )
+            ignored = (
+                np.asarray(data["visibility_ignore_centers"], dtype=np.float32).reshape(-1, 2)
+                if "visibility_ignore_centers" in data
+                else np.zeros((0, 2), dtype=np.float32)
+            )
+        return center_only, ignored
+    return np.zeros((0, 2), dtype=np.float32), np.zeros((0, 2), dtype=np.float32)
+
+
+def _within_any_radius(points: np.ndarray, centers: np.ndarray, radius: float) -> np.ndarray:
+    points = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    centers = np.asarray(centers, dtype=np.float32).reshape(-1, 2)
+    matched = np.zeros((points.shape[0],), dtype=bool)
+    if points.size == 0 or centers.size == 0 or float(radius) < 0.0:
+        return matched
+    radius2 = float(radius) * float(radius)
+    for center in centers:
+        matched |= np.sum((points - center[None, :]) ** 2, axis=1) <= radius2
+    return matched
+
+
+def _visibility_keep(cls: str, mode: str) -> bool:
+    cls = str(cls)
+    mode = str(mode)
+    if mode == "raw":
+        return True
+    if mode == "snr_ge2":
+        return cls in {"clean", "center_only"}
+    if mode == "snr_ge3":
+        return cls == "clean"
+    raise ValueError(f"unknown GT visibility filter: {mode!r}")
+
+
+def _load_clean_rows(root: Path, dataset_name: str, band: str, tile_name: str, args: argparse.Namespace) -> tuple[Table, np.ndarray, np.ndarray, dict[str, int]]:
     path = root / dataset_name / TRACT / PATCH / "band_reference_catalogs" / band / f"meas-{band}-{TRACT}-{PATCH}.fits"
     rows, x, y = _local_rows(_table(path), tile_name)
-    return rows, x, y
+    points = np.column_stack([x, y]).astype(np.float32) if len(x) else np.zeros((0, 2), dtype=np.float32)
+    center_only, ignored = _visibility_centers(root, dataset_name, band, tile_name)
+    ignored_match = _within_any_radius(points, ignored, float(args.gt_visibility_match_radius))
+    center_only_match = _within_any_radius(points, center_only, float(args.gt_visibility_match_radius)) & ~ignored_match
+    visibility_class = np.full((len(rows),), "clean", dtype=object)
+    visibility_class[center_only_match] = "center_only"
+    visibility_class[ignored_match] = "ignore"
+    keep = np.asarray(
+        [_visibility_keep(str(cls), str(args.gt_visibility_filter)) for cls in visibility_class],
+        dtype=bool,
+    )
+    stats = {
+        "raw_gt": int(len(rows)),
+        "visibility_clean_gt": int(np.count_nonzero(visibility_class == "clean")),
+        "visibility_center_only_gt": int(np.count_nonzero(visibility_class == "center_only")),
+        "visibility_ignore_gt": int(np.count_nonzero(visibility_class == "ignore")),
+        "filtered_gt": int(np.count_nonzero(keep)),
+    }
+    return rows[keep], x[keep], y[keep], stats
 
 
 def _shape_rows(pred_xy: np.ndarray, shape: np.ndarray, scale: float) -> list[dict[str, float]]:
@@ -858,6 +962,7 @@ def _write_photometry_csv(
     *,
     checkpoint_label: str,
     dataset_name: str,
+    tile_name: str,
     band: str,
     shape_rows: Sequence[dict[str, float]],
     image: np.ndarray,
@@ -955,7 +1060,7 @@ def _write_photometry_csv(
             {
                 "checkpoint_label": checkpoint_label,
                 "dataset": dataset_name,
-                "tile": TILE,
+                "tile": tile_name,
                 "band": band,
                 "pred_index": pred_index,
                 "x": float(row["x"]),
@@ -1021,6 +1126,7 @@ def _write_native_diff_reg(
     path: Path,
     checkpoint_label: str,
     dataset_name: str,
+    tile_name: str,
     band: str,
     shape_rows: Sequence[dict[str, float]],
     native_xy: np.ndarray,
@@ -1033,7 +1139,7 @@ def _write_native_diff_reg(
     missed_native = [idx for idx in range(len(native_xy)) if idx not in native_used]
 
     lines = REG_HEADER + [
-        f"# {checkpoint_label} {dataset_name} {PATCH}/{TILE} {band}: fine-tuned SAM vs native SAM detections",
+        f"# {checkpoint_label} {dataset_name} {PATCH}/{tile_name} {band}: fine-tuned SAM vs native SAM detections",
         f"# magenta ellipses: fine-tuned detections not matched to native SAM within {match_radius:.3f} px",
         f"# red circles: native SAM detections not matched by fine-tuned SAM within {match_radius:.3f} px",
     ]
@@ -1081,7 +1187,8 @@ def _run_one(
     device: torch.device,
     args: argparse.Namespace,
 ) -> dict[str, object]:
-    loader = _dataset(dataset_root, dataset_name, bands, cfg)
+    tile_name = _tile_for_dataset(dataset_name, args)
+    loader = _dataset(dataset_root, dataset_name, bands, cfg, getattr(args, "image_cache_dir", None), tile_name=tile_name)
     band_idx = list(bands).index(band)
     threshold = float(args.threshold if args.threshold is not None else cfg.get("confidence_threshold", 2.0))
     nms_radius = int(args.nms_radius if args.nms_radius is not None else cfg.get("nms_radius", 1))
@@ -1184,12 +1291,12 @@ def _run_one(
     masks_by_pred_index = {int(idx): mask for idx, mask in zip(mask_source_indices, masks)}
     mask_iou_by_pred_index = {int(idx): float(iou) for idx, iou in zip(mask_source_indices, mask_ious)}
 
-    clean_rows, clean_x, clean_y = _load_clean_rows(dataset_root, dataset_name, band, TILE)
+    clean_rows, clean_x, clean_y, gt_visibility_stats = _load_clean_rows(dataset_root, dataset_name, band, tile_name, args)
     clean_xy = np.column_stack([clean_x, clean_y]).astype(np.float32) if len(clean_x) else np.zeros((0, 2), np.float32)
     pred_to_clean, clean_used = _greedy_match(pred_xy, clean_xy, float(args.match_radius))
 
     tile_out = out_dir / checkpoint_label / dataset_name
-    prefix = f"{checkpoint_label}_{dataset_name}_{PATCH.replace(',', '_')}_{TILE}_{band.replace('-', '_')}"
+    prefix = f"{checkpoint_label}_{dataset_name}_{PATCH.replace(',', '_')}_{tile_name}_{band.replace('-', '_')}"
     mask_reg = tile_out / f"{prefix}_instance_masks.reg"
     center_reg = tile_out / f"{prefix}_centers.reg"
     shape_reg = tile_out / f"{prefix}_shape_kron.reg"
@@ -1199,23 +1306,23 @@ def _run_one(
     photometry_csv = tile_out / f"{prefix}_photometry.csv"
     tp_isolated_csv = tile_out / f"{prefix}_tp_isolated_gt_photometry.csv"
 
-    mask_lines = REG_HEADER + [f"# {checkpoint_label} {dataset_name} {PATCH}/{TILE} {band}: SAM instance mask contours"]
+    mask_lines = REG_HEADER + [f"# {checkpoint_label} {dataset_name} {PATCH}/{tile_name} {band}: SAM instance mask contours"]
     for idx, (mask, iou) in enumerate(zip(masks, mask_ious), start=1):
         for contour in _contours(mask, int(args.max_contour_vertices)):
             mask_lines.append(_polygon_line(contour, "green", 1, text=f"id={idx} iou={iou:.3f} area={int(mask.sum())}"))
 
-    center_lines = REG_HEADER + [f"# {checkpoint_label} {dataset_name} {PATCH}/{TILE} {band}: detected centers"]
+    center_lines = REG_HEADER + [f"# {checkpoint_label} {dataset_name} {PATCH}/{tile_name} {band}: detected centers"]
     for idx, row in enumerate(shape_rows, start=1):
         center_lines.append(_circle_line(row["x"], row["y"], float(args.center_radius), color="cyan", width=2, text=f"id={idx}"))
 
-    shape_lines = REG_HEADER + [f"# {checkpoint_label} {dataset_name} {PATCH}/{TILE} {band}: predicted Kron ellipses"]
+    shape_lines = REG_HEADER + [f"# {checkpoint_label} {dataset_name} {PATCH}/{tile_name} {band}: predicted Kron ellipses"]
     for idx, row in enumerate(shape_rows, start=1):
         color = "cyan" if int(row["pred_index"]) in pred_to_clean else "magenta"
         shape_lines.append(
             _ellipse_line(row["x"], row["y"], row["major"], row["minor"], row["theta"], color=color, width=2, text=f"id={idx}")
         )
 
-    fn_lines = REG_HEADER + [f"# {checkpoint_label} {dataset_name} {PATCH}/{TILE} {band}: clean-source false negatives"]
+    fn_lines = REG_HEADER + [f"# {checkpoint_label} {dataset_name} {PATCH}/{tile_name} {band}: clean-source false negatives"]
     for gi in range(len(clean_rows)):
         if gi in clean_used:
             continue
@@ -1237,6 +1344,7 @@ def _run_one(
             photometry_csv,
             checkpoint_label=checkpoint_label,
             dataset_name=dataset_name,
+            tile_name=tile_name,
             band=band,
             shape_rows=shape_rows,
             image=photometry_image_band,
@@ -1262,6 +1370,7 @@ def _run_one(
             path=native_diff_reg,
             checkpoint_label=checkpoint_label,
             dataset_name=dataset_name,
+            tile_name=tile_name,
             band=band,
             shape_rows=shape_rows,
             native_xy=native_xy,
@@ -1273,8 +1382,14 @@ def _run_one(
     return {
         "checkpoint_label": checkpoint_label,
         "dataset": dataset_name,
-        "tile": TILE,
+        "tile": tile_name,
         "band": band,
+        "gt_visibility_filter": str(args.gt_visibility_filter),
+        "gt_visibility_match_radius": float(args.gt_visibility_match_radius),
+        "raw_clean_gt": int(gt_visibility_stats["raw_gt"]),
+        "visibility_clean_gt": int(gt_visibility_stats["visibility_clean_gt"]),
+        "visibility_center_only_gt": int(gt_visibility_stats["visibility_center_only_gt"]),
+        "visibility_ignore_gt": int(gt_visibility_stats["visibility_ignore_gt"]),
         "detections": int(len(pred_xy)),
         "mask_prompts": int(len(shape_rows)),
         "raw_masks": int(raw_mask_count),
@@ -1316,8 +1431,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", "-c", type=Path, action="append", default=None, help="Can be passed multiple times")
     parser.add_argument("--checkpoint-label", "-l", action="append", default=None, help="One label per --checkpoint")
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
+    parser.add_argument(
+        "--image-cache-dir",
+        type=Path,
+        default=None,
+        help="Optional zscale cache root. Defaults to image_cache_dir from run_config.json when available.",
+    )
     parser.add_argument("--out-dir", type=Path, default=CELLECT_ROOT / "zangetsu_demo/output/sam_cellect_visualization")
     parser.add_argument("--datasets", nargs="+", default=["coadd", "denoised"])
+    parser.add_argument(
+        "--tile-name",
+        default=None,
+        help="Force one exact tile name for every dataset. Defaults to sam_x... for coadd and <variant-group>_sam_x... for denoised/noisy.",
+    )
+    parser.add_argument("--variant-group", default=DEFAULT_VARIANT_GROUP, help="Default denoised/noisy group prefix.")
     parser.add_argument(
         "--native-sam-dir",
         type=Path,
@@ -1345,6 +1472,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--center-refinement", choices=("integer", "softargmax"), default=None)
     parser.add_argument("--center-refinement-radius", type=int, default=None)
     parser.add_argument("--match-radius", type=float, default=MATCH_RADIUS_PIX)
+    parser.add_argument(
+        "--gt-visibility-filter",
+        choices=("raw", "snr_ge2", "snr_ge3"),
+        default="snr_ge2",
+        help="Filter GT catalog rows using preprocessed noncoadd SNR visibility labels. Default keeps clean + center-only.",
+    )
+    parser.add_argument(
+        "--gt-visibility-match-radius",
+        type=float,
+        default=1.0,
+        help="Pixel radius for matching visibility center/ignore markers back to GT catalog rows.",
+    )
     parser.add_argument("--center-radius", type=float, default=7.0)
     parser.add_argument("--shape-display-scale", type=float, default=1.0)
     parser.add_argument("--prompt-box-scale", type=float, default=2.0)
@@ -1433,6 +1572,12 @@ def main() -> int:
         args.native_sam_dir = args.native_sam_dir.expanduser().resolve()
     config_path = args.config.expanduser().resolve() if args.config else args.ckpt_dir / "run_config.json"
     cfg = _read_config(config_path)
+    if args.image_cache_dir is None:
+        cache_from_cfg = cfg.get("image_cache_dir") or cfg.get("_top", {}).get("image_cache_dir")
+        if cache_from_cfg:
+            args.image_cache_dir = Path(str(cache_from_cfg)).expanduser().resolve()
+    else:
+        args.image_cache_dir = args.image_cache_dir.expanduser().resolve()
     loss_cfg = cfg.get("_top", {}).get("loss_weights", {})
     if args.multimask is None:
         args.multimask = bool(loss_cfg.get("mask_multimask", not bool(cfg.get("disable_mask_multimask", False))))

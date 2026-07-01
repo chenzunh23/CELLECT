@@ -17,9 +17,11 @@ python evaluate_sam_cellect_photometry.py \
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import json
 import math
+import multiprocessing as mp
 import os
 import sys
 from pathlib import Path
@@ -76,6 +78,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--band", default="HSC-I")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--max-tiles", type=int, default=None, help="Optional debug cap after filtering.")
+    parser.add_argument(
+        "--tile-workers",
+        type=int,
+        default=1,
+        help="Number of tile chunks to process in parallel per checkpoint/dataset. Each worker loads one model copy.",
+    )
+    parser.add_argument(
+        "--tile-worker-devices",
+        nargs="*",
+        default=None,
+        help="Optional devices assigned round-robin to tile workers, e.g. cuda:0 cuda:1. Defaults to --device for every worker.",
+    )
 
     parser.add_argument("--match-radius", type=float, default=vis.MATCH_RADIUS_PIX)
     parser.add_argument("--mag-min", type=float, default=22.0)
@@ -89,6 +103,18 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--curve-gt-mag-col", default="gt_ap2mag")
     parser.add_argument("--curve-pred-mag-col", default="ap_abmag")
+    parser.add_argument(
+        "--gt-visibility-filter",
+        choices=("raw", "snr_ge2", "snr_ge3"),
+        default="snr_ge2",
+        help="GT denominator for completeness. raw keeps the full catalog; snr_ge2 keeps clean+center-only sources; snr_ge3 keeps clean sources only.",
+    )
+    parser.add_argument(
+        "--gt-visibility-match-radius",
+        type=float,
+        default=1.0,
+        help="Pixel radius for matching preprocessed visibility-filter centers back to photometry GT rows.",
+    )
     parser.add_argument("--ratio-source", choices=("isolated", "matched"), default="isolated")
     parser.add_argument("--ratio-min", type=float, default=0.0)
     parser.add_argument("--ratio-max", type=float, default=3.0)
@@ -260,6 +286,61 @@ def _load_clean_rows_compat(root: Path, dataset_name: str, band: str, tile_name:
     raise FileNotFoundError(f"No GT catalog found for {dataset_name}/{vis.PATCH}/{tile_name}/{band}. Searched:\n  {searched}")
 
 
+def _visibility_target_candidates(root: Path, dataset_name: str, band: str, tile_name: str) -> list[Path]:
+    base_tile = _base_tile_name(tile_name)
+    return [
+        root / dataset_name / vis.TRACT / vis.PATCH / "band_targets" / band / f"{tile_name}.npz",
+        root / dataset_name / vis.TRACT / vis.PATCH / "band_targets" / band / f"{base_tile}.npz",
+        root / vis.TRACT / vis.PATCH / "band_targets" / band / f"{base_tile}.npz",
+        root / vis.TRACT / vis.PATCH / "band_targets" / band / f"{tile_name}.npz",
+    ]
+
+
+def _visibility_centers(root: Path, dataset_name: str, band: str, tile_name: str) -> tuple[np.ndarray, np.ndarray]:
+    if str(dataset_name).lower() == "coadd":
+        return np.zeros((0, 2), dtype=np.float32), np.zeros((0, 2), dtype=np.float32)
+    for path in _visibility_target_candidates(root, dataset_name, band, tile_name):
+        if not path.exists():
+            continue
+        with np.load(path) as data:
+            center_only = (
+                np.asarray(data["visibility_center_only_centers"], dtype=np.float32).reshape(-1, 2)
+                if "visibility_center_only_centers" in data
+                else np.zeros((0, 2), dtype=np.float32)
+            )
+            ignored = (
+                np.asarray(data["visibility_ignore_centers"], dtype=np.float32).reshape(-1, 2)
+                if "visibility_ignore_centers" in data
+                else np.zeros((0, 2), dtype=np.float32)
+            )
+        return center_only, ignored
+    return np.zeros((0, 2), dtype=np.float32), np.zeros((0, 2), dtype=np.float32)
+
+
+def _within_any_radius(points: np.ndarray, centers: np.ndarray, radius: float) -> np.ndarray:
+    points = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    centers = np.asarray(centers, dtype=np.float32).reshape(-1, 2)
+    matched = np.zeros((points.shape[0],), dtype=bool)
+    if points.size == 0 or centers.size == 0 or float(radius) < 0.0:
+        return matched
+    radius2 = float(radius) * float(radius)
+    for center in centers:
+        matched |= np.sum((points - center[None, :]) ** 2, axis=1) <= radius2
+    return matched
+
+
+def _visibility_keep(cls: str, mode: str) -> bool:
+    cls = str(cls)
+    mode = str(mode)
+    if mode == "raw":
+        return True
+    if mode == "snr_ge2":
+        return cls in {"clean", "center_only"}
+    if mode == "snr_ge3":
+        return cls == "clean"
+    raise ValueError(f"unknown GT visibility filter: {mode!r}")
+
+
 def _dataset_compat(root: Path, dataset_name: str, bands: Sequence[str], cfg: dict):
     tile_dirs = [
         root / dataset_name / vis.TRACT / vis.PATCH / "cutouts" / vis.TILE,
@@ -337,11 +418,16 @@ def _gt_mag_rows(args: argparse.Namespace, dataset_name: str, tile_name: str) ->
     vis.TRACT = args.tract
     vis.PATCH = args.patch
     vis.TILE = tile_name
-    rows, _x, _y = vis._load_clean_rows(args.data_root, dataset_name, args.band, tile_name)
+    rows, x, y = vis._load_clean_rows(args.data_root, dataset_name, args.band, tile_name)
+    gt_xy = np.column_stack([x, y]).astype(np.float32) if len(x) else np.zeros((0, 2), dtype=np.float32)
+    center_only_xy, ignore_xy = _visibility_centers(args.data_root, dataset_name, args.band, tile_name)
+    ignore_mask = _within_any_radius(gt_xy, ignore_xy, float(args.gt_visibility_match_radius))
+    center_only_mask = _within_any_radius(gt_xy, center_only_xy, float(args.gt_visibility_match_radius)) & ~ignore_mask
     out: list[dict[str, object]] = []
     for idx in range(len(rows)):
         ap_flux, ap_mag = vis._gt_ap2_flux_mag(rows[idx], zero_point=float(args.gt_photometry_zero_point))
         kron_flux, kron_mag = vis._gt_kron_flux_mag(rows[idx], zero_point=float(args.gt_photometry_zero_point))
+        visibility_class = "ignore" if bool(ignore_mask[idx]) else ("center_only" if bool(center_only_mask[idx]) else "clean")
         out.append(
             {
                 "dataset": dataset_name,
@@ -351,15 +437,135 @@ def _gt_mag_rows(args: argparse.Namespace, dataset_name: str, tile_name: str) ->
                 "gt_ap2mag": ap_mag,
                 "gt_kron_flux": kron_flux,
                 "gt_kron_mag": kron_mag,
+                "visibility_class": visibility_class,
+                "visibility_keep_snr_ge2": int(_visibility_keep(visibility_class, "snr_ge2")),
+                "visibility_keep_snr_ge3": int(_visibility_keep(visibility_class, "snr_ge3")),
             }
         )
     return out
 
 
+def _run_tile_local(
+    *,
+    args: argparse.Namespace,
+    cfg: dict,
+    model: torch.nn.Module,
+    checkpoint: Path,
+    label: str,
+    dataset_name: str,
+    tile_name: str,
+    device: torch.device,
+    include_gt_rows: bool,
+) -> tuple[dict, list[dict], list[dict]]:
+    vis.TRACT = args.tract
+    vis.PATCH = args.patch
+    vis.TILE = tile_name
+    print(f"[run] {label} {dataset_name} {args.patch}/{tile_name} {args.band}", flush=True)
+    row = vis._run_one(
+        model=model,
+        cfg=cfg,
+        dataset_root=args.data_root,
+        dataset_name=dataset_name,
+        checkpoint_label=label,
+        out_dir=args.out_dir,
+        bands=args.bands,
+        band=args.band,
+        device=device,
+        args=args,
+    )
+    row["checkpoint"] = str(checkpoint)
+    row["checkpoint_epoch"] = vis._checkpoint_epoch(checkpoint)
+    tile_gt_rows = _gt_mag_rows(args, dataset_name, tile_name)
+    raw_gt_count = len(tile_gt_rows)
+    filtered_gt_count = sum(
+        1
+        for gt_row in tile_gt_rows
+        if _visibility_keep(str(gt_row.get("visibility_class", "clean")), str(args.gt_visibility_filter))
+    )
+    kept_gt_indices = {
+        str(gt_row.get("gt_index", ""))
+        for gt_row in tile_gt_rows
+        if _visibility_keep(str(gt_row.get("visibility_class", "clean")), str(args.gt_visibility_filter))
+    }
+    phot_path = Path(str(row.get("photometry_csv", "")))
+    tile_phot_rows = _read_csv(phot_path)
+    matched_kept = {
+        str(phot.get("gt_index", "")).strip()
+        for phot in tile_phot_rows
+        if str(phot.get("gt_index", "")).strip() in kept_gt_indices
+    }
+    row["raw_gt"] = int(raw_gt_count)
+    row["filtered_gt"] = int(filtered_gt_count)
+    row["gt_visibility_filter"] = str(args.gt_visibility_filter)
+    row["clean_gt"] = int(filtered_gt_count)
+    row["clean_tp"] = int(len(matched_kept))
+    row["clean_fn"] = max(0, int(filtered_gt_count) - int(len(matched_kept)))
+
+    for phot in tile_phot_rows:
+        phot["checkpoint_label"] = label
+        phot["checkpoint"] = str(checkpoint)
+    return row, tile_phot_rows, (tile_gt_rows if include_gt_rows else [])
+
+
+def _tile_chunks(tiles: Sequence[str], workers: int) -> list[list[str]]:
+    worker_count = max(1, min(int(workers), len(tiles)))
+    chunks: list[list[str]] = [[] for _ in range(worker_count)]
+    for idx, tile in enumerate(tiles):
+        chunks[idx % worker_count].append(str(tile))
+    return [chunk for chunk in chunks if chunk]
+
+
+def _worker_device(args: argparse.Namespace, worker_index: int) -> str:
+    devices = getattr(args, "tile_worker_devices", None)
+    if devices:
+        return str(devices[int(worker_index) % len(devices)])
+    return str(args.device)
+
+
+def _run_tile_batch_worker(payload: dict) -> tuple[list[dict], list[dict], list[dict]]:
+    args: argparse.Namespace = payload["args"]
+    cfg: dict = payload["cfg"]
+    checkpoint = Path(payload["checkpoint"]).expanduser().resolve()
+    label = str(payload["label"])
+    dataset_name = str(payload["dataset_name"])
+    tiles = [str(tile) for tile in payload["tiles"]]
+    include_gt_rows = bool(payload["include_gt_rows"])
+    worker_index = int(payload["worker_index"])
+    args.device = _worker_device(args, worker_index)
+    device = torch.device(args.device)
+    _install_visualizer_io_patch()
+    if args.skip_visual_products:
+        _disable_visual_products()
+    model = vis._make_model(cfg, checkpoint, device, args.bands)
+    summaries: list[dict] = []
+    phot_rows: list[dict] = []
+    gt_rows: list[dict] = []
+    try:
+        for tile_name in tiles:
+            row, tile_phot, tile_gt = _run_tile_local(
+                args=args,
+                cfg=cfg,
+                model=model,
+                checkpoint=checkpoint,
+                label=label,
+                dataset_name=dataset_name,
+                tile_name=tile_name,
+                device=device,
+                include_gt_rows=include_gt_rows,
+            )
+            summaries.append(row)
+            phot_rows.extend(tile_phot)
+            gt_rows.extend(tile_gt)
+    finally:
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+    return summaries, phot_rows, gt_rows
+
+
 def _run_inference(args: argparse.Namespace, cfg: dict) -> tuple[list[dict], list[dict], list[dict]]:
     if args.skip_visual_products:
         _disable_visual_products()
-    device = torch.device(args.device)
     ckpt_items = _checkpoint_items(args)
     if not ckpt_items:
         raise FileNotFoundError("No checkpoints found. Pass --checkpoint or provide best.pt/last.pt in --ckpt-dir.")
@@ -367,44 +573,78 @@ def _run_inference(args: argparse.Namespace, cfg: dict) -> tuple[list[dict], lis
     summaries: list[dict] = []
     phot_rows: list[dict] = []
     gt_rows: list[dict] = []
+    tile_workers = max(1, int(getattr(args, "tile_workers", 1)))
     for checkpoint, label in ckpt_items:
         checkpoint = checkpoint.expanduser().resolve()
-        model = vis._make_model(cfg, checkpoint, device, args.bands)
+        if tile_workers > 1 and not getattr(args, "tile_worker_devices", None):
+            print(
+                f"[parallel] --tile-workers={tile_workers} will run all worker model copies on {args.device}; "
+                "use --tile-worker-devices to spread work across multiple GPUs.",
+                flush=True,
+            )
+        if tile_workers <= 1:
+            device = torch.device(args.device)
+            model = vis._make_model(cfg, checkpoint, device, args.bands)
+            try:
+                for dataset_name in args.datasets:
+                    tiles = _discover_tiles(args, dataset_name)
+                    if not tiles:
+                        print(f"[warn] no tiles for {dataset_name} patch={args.patch} group={args.group}", flush=True)
+                        continue
+                    for tile_name in tiles:
+                        row, tile_phot, tile_gt = _run_tile_local(
+                            args=args,
+                            cfg=cfg,
+                            model=model,
+                            checkpoint=checkpoint,
+                            label=label,
+                            dataset_name=dataset_name,
+                            tile_name=tile_name,
+                            device=device,
+                            include_gt_rows=label == ckpt_items[0][1],
+                        )
+                        summaries.append(row)
+                        phot_rows.extend(tile_phot)
+                        gt_rows.extend(tile_gt)
+            finally:
+                del model
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+            continue
+
         for dataset_name in args.datasets:
             tiles = _discover_tiles(args, dataset_name)
             if not tiles:
                 print(f"[warn] no tiles for {dataset_name} patch={args.patch} group={args.group}", flush=True)
                 continue
-            for tile_name in tiles:
-                vis.TRACT = args.tract
-                vis.PATCH = args.patch
-                vis.TILE = tile_name
-                print(f"[run] {label} {dataset_name} {args.patch}/{tile_name} {args.band}", flush=True)
-                row = vis._run_one(
-                    model=model,
-                    cfg=cfg,
-                    dataset_root=args.data_root,
-                    dataset_name=dataset_name,
-                    checkpoint_label=label,
-                    out_dir=args.out_dir,
-                    bands=args.bands,
-                    band=args.band,
-                    device=device,
-                    args=args,
-                )
-                row["checkpoint"] = str(checkpoint)
-                row["checkpoint_epoch"] = vis._checkpoint_epoch(checkpoint)
-                summaries.append(row)
-                phot_path = Path(str(row.get("photometry_csv", "")))
-                for phot in _read_csv(phot_path):
-                    phot["checkpoint_label"] = label
-                    phot["checkpoint"] = str(checkpoint)
-                    phot_rows.append(phot)
-                if label == ckpt_items[0][1]:
-                    gt_rows.extend(_gt_mag_rows(args, dataset_name, tile_name))
-        del model
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+            chunks = _tile_chunks(tiles, tile_workers)
+            print(
+                f"[parallel] {label} {dataset_name}: {len(tiles)} tile(s), {len(chunks)} worker chunk(s)",
+                flush=True,
+            )
+            payloads = [
+                {
+                    "args": args,
+                    "cfg": cfg,
+                    "checkpoint": str(checkpoint),
+                    "label": label,
+                    "dataset_name": dataset_name,
+                    "tiles": chunk,
+                    "include_gt_rows": label == ckpt_items[0][1],
+                    "worker_index": idx,
+                }
+                for idx, chunk in enumerate(chunks)
+            ]
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=len(payloads),
+                mp_context=mp.get_context("spawn"),
+            ) as executor:
+                futures = [executor.submit(_run_tile_batch_worker, payload) for payload in payloads]
+                for future in concurrent.futures.as_completed(futures):
+                    worker_summaries, worker_phot, worker_gt = future.result()
+                    summaries.extend(worker_summaries)
+                    phot_rows.extend(worker_phot)
+                    gt_rows.extend(worker_gt)
     return summaries, phot_rows, gt_rows
 
 
@@ -447,12 +687,15 @@ def _summary_from_photometry_rows(
     phot_path: Path,
     rows: Sequence[dict],
     gt_count: int,
+    kept_gt_indices: set[str] | None = None,
 ) -> dict:
     matched = {
         str(row.get("gt_index", "")).strip()
         for row in rows
         if str(row.get("gt_index", "")).strip() not in {"", "nan", "None"}
     }
+    if kept_gt_indices is not None:
+        matched = {gt_index for gt_index in matched if gt_index in kept_gt_indices}
     kept_masks = sum(1 for row in rows if _is_true(row.get("mask_kept", False)))
     mask_areas = np.asarray([_float(row.get("mask_area")) for row in rows if _is_true(row.get("mask_kept", False))], dtype=float)
     mask_ious = np.asarray([_float(row.get("mask_pred_iou")) for row in rows if _is_true(row.get("mask_kept", False))], dtype=float)
@@ -467,6 +710,7 @@ def _summary_from_photometry_rows(
         "kept_masks": kept_masks,
         "mask_area_median": float(np.nanmedian(mask_areas)) if mask_areas.size else math.nan,
         "mask_iou_median": float(np.nanmedian(mask_ious)) if mask_ious.size else math.nan,
+        "gt_visibility_filter": str(args.gt_visibility_filter),
         "clean_gt": int(gt_count),
         "clean_tp": len(matched),
         "clean_fn": max(0, int(gt_count) - len(matched)),
@@ -475,6 +719,37 @@ def _summary_from_photometry_rows(
         "checkpoint": str(checkpoint) if checkpoint is not None else "",
         "checkpoint_epoch": vis._checkpoint_epoch(checkpoint) if checkpoint is not None and checkpoint.exists() else "",
     }
+
+
+def _ensure_gt_visibility_rows(args: argparse.Namespace, gt_rows: Sequence[dict]) -> list[dict]:
+    rows = [dict(row) for row in gt_rows]
+    if not rows or all("visibility_class" in row for row in rows):
+        return rows
+    rebuilt_by_key: dict[tuple[str, str, str], dict] = {}
+    for dataset, tile in sorted({(str(row.get("dataset", "")), str(row.get("tile", ""))) for row in rows}):
+        if not dataset or not tile:
+            continue
+        try:
+            for fresh in _gt_mag_rows(args, dataset, tile):
+                rebuilt_by_key[(dataset, tile, str(fresh.get("gt_index", "")))] = fresh
+        except Exception as exc:
+            print(f"[warn] could not add GT visibility labels for {dataset}/{tile}: {exc}", flush=True)
+    out: list[dict] = []
+    for row in rows:
+        key = (str(row.get("dataset", "")), str(row.get("tile", "")), str(row.get("gt_index", "")))
+        fresh = rebuilt_by_key.get(key)
+        if fresh is not None:
+            merged = dict(row)
+            for name in ("visibility_class", "visibility_keep_snr_ge2", "visibility_keep_snr_ge3"):
+                merged[name] = fresh.get(name, merged.get(name, ""))
+            out.append(merged)
+        else:
+            merged = dict(row)
+            merged.setdefault("visibility_class", "clean")
+            merged.setdefault("visibility_keep_snr_ge2", 1)
+            merged.setdefault("visibility_keep_snr_ge3", 1)
+            out.append(merged)
+    return out
 
 
 def _rebuild_existing_from_raw_csv(args: argparse.Namespace) -> tuple[list[dict], list[dict], list[dict], set[tuple[str, str]]]:
@@ -528,7 +803,16 @@ def _rebuild_existing_from_raw_csv(args: argparse.Namespace) -> tuple[list[dict]
                         tile=tile,
                         phot_path=phot_path,
                         rows=rows,
-                        gt_count=len(tile_gt_rows),
+                        gt_count=sum(
+                            1
+                            for gt_row in tile_gt_rows
+                            if _visibility_keep(str(gt_row.get("visibility_class", "clean")), str(args.gt_visibility_filter))
+                        ),
+                        kept_gt_indices={
+                            str(gt_row.get("gt_index", ""))
+                            for gt_row in tile_gt_rows
+                            if _visibility_keep(str(gt_row.get("visibility_class", "clean")), str(args.gt_visibility_filter))
+                        },
                     )
                 )
     return summaries, phot_rows, gt_rows, rebuilt_pairs
@@ -622,6 +906,7 @@ def _load_existing(args: argparse.Namespace) -> tuple[list[dict], list[dict], li
         row for row in existing_gt
         if (str(row.get("dataset", "")), str(row.get("tile", ""))) in gt_dataset_tiles
     ]
+    gt_rows = _ensure_gt_visibility_rows(args, gt_rows)
 
     available_pairs = sorted({(str(row.get("checkpoint_label", "")), str(row.get("dataset", ""))) for row in existing_summaries})
     missing_pairs = sorted(requested_pairs - {(str(row.get("checkpoint_label", "")), str(row.get("dataset", ""))) for row in summaries})
@@ -654,6 +939,14 @@ def _aggregate_bins(args: argparse.Namespace, phot_rows: Sequence[dict], gt_rows
         phot_payload = payload["phot"]
         gt_mag = np.asarray([_float(row.get(args.curve_gt_mag_col)) for row in gt_payload], dtype=float)
         gt_keys = [(str(row.get("tile", "")), str(row.get("gt_index", ""))) for row in gt_payload]
+        gt_keep = np.asarray(
+            [
+                _visibility_keep(str(row.get("visibility_class", "clean")), str(args.gt_visibility_filter))
+                for row in gt_payload
+            ],
+            dtype=bool,
+        )
+        kept_gt_keys = {key for key, keep in zip(gt_keys, gt_keep) if bool(keep)}
         matched_keys = {
             (str(row.get("tile", "")), str(row.get("gt_index", "")))
             for row in phot_payload
@@ -662,22 +955,34 @@ def _aggregate_bins(args: argparse.Namespace, phot_rows: Sequence[dict], gt_rows
         gt_matched = np.asarray([key in matched_keys for key in gt_keys], dtype=bool)
 
         pred_mag = np.asarray([_float(row.get(args.curve_pred_mag_col)) for row in phot_payload], dtype=float)
-        pred_matched = np.asarray([str(row.get("gt_index", "")).strip() != "" for row in phot_payload], dtype=bool)
+        pred_matched = np.asarray(
+            [
+                (str(row.get("tile", "")), str(row.get("gt_index", ""))) in kept_gt_keys
+                for row in phot_payload
+            ],
+            dtype=bool,
+        )
 
         for lo, hi, center in bins:
             ref_in = _mag_in(gt_mag, lo, hi)
+            ref_keep_in = ref_in & gt_keep
             pred_in = _mag_in(pred_mag, lo, hi)
-            ref_total = int(ref_in.sum())
-            ref_matched = int(np.count_nonzero(ref_in & gt_matched))
+            raw_ref_total = int(ref_in.sum())
+            raw_ref_matched = int(np.count_nonzero(ref_in & gt_matched))
+            ref_total = int(ref_keep_in.sum())
+            ref_matched = int(np.count_nonzero(ref_keep_in & gt_matched))
             pred_total = int(pred_in.sum())
             pred_tp = int(np.count_nonzero(pred_in & pred_matched))
             row = {
                 "checkpoint_label": label,
                 "dataset": dataset,
                 "method": f"{label}:{dataset}",
+                "gt_visibility_filter": str(args.gt_visibility_filter),
                 "mag_left": lo,
                 "mag_right": hi,
                 "mag_center": center,
+                "raw_reference_total": raw_ref_total,
+                "raw_reference_matched": raw_ref_matched,
                 "reference_total": ref_total,
                 "reference_matched": ref_matched,
                 "completeness": ref_matched / ref_total if ref_total else math.nan,
@@ -693,15 +998,20 @@ def _aggregate_bins(args: argparse.Namespace, phot_rows: Sequence[dict], gt_rows
                     "checkpoint_label": label,
                     "dataset": "all",
                     "method": label,
+                    "gt_visibility_filter": str(args.gt_visibility_filter),
                     "mag_left": lo,
                     "mag_right": hi,
                     "mag_center": center,
+                    "raw_reference_total": 0,
+                    "raw_reference_matched": 0,
                     "reference_total": 0,
                     "reference_matched": 0,
                     "prediction_total": 0,
                     "prediction_matched": 0,
                 },
             )
+            agg["raw_reference_total"] = int(agg["raw_reference_total"]) + raw_ref_total
+            agg["raw_reference_matched"] = int(agg["raw_reference_matched"]) + raw_ref_matched
             agg["reference_total"] = int(agg["reference_total"]) + ref_total
             agg["reference_matched"] = int(agg["reference_matched"]) + ref_matched
             agg["prediction_total"] = int(agg["prediction_total"]) + pred_total
@@ -794,6 +1104,45 @@ def _plot_count_bars(completeness_path: Path, purity_path: Path, rows: Sequence[
     ax.spines[["top", "right"]].set_visible(False)
     ax.legend(frameon=False, fontsize=8)
     fig.savefig(purity_path, dpi=180)
+    plt.close(fig)
+
+
+def _plot_detection_total_bars(path: Path, rows: Sequence[dict], *, reverse_mag_axis: bool = False, aggregate: bool = False) -> None:
+    methods = sorted({str(row["method"]) for row in rows})
+    bins = sorted({(_float(row["mag_left"]), _float(row["mag_right"])) for row in rows}, reverse=reverse_mag_axis)
+    if not methods or not bins:
+        return
+    by_key = {(str(row["method"]), _float(row["mag_left"]), _float(row["mag_right"])): row for row in rows}
+    labels = [_bin_label(lo, hi) for lo, hi in bins]
+    x = np.arange(len(bins), dtype=float)
+    width = min(0.30, 0.78 / max(1, len(methods)))
+    offsets = (np.arange(len(methods)) - (len(methods) - 1) / 2.0) * width
+    figsize = (max(11.0, 0.55 * len(bins)), 5.4)
+
+    raw_gt: list[int] = []
+    filtered_gt: list[int] = []
+    for lo, hi in bins:
+        bin_rows = [row for row in rows if _float(row["mag_left"]) == lo and _float(row["mag_right"]) == hi]
+        raw_gt.append(max((int(row.get("raw_reference_total", row.get("reference_total", 0))) for row in bin_rows), default=0))
+        filtered_gt.append(max((int(row.get("reference_total", 0)) for row in bin_rows), default=0))
+
+    fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
+    ax.bar(x, raw_gt, width=0.88, color="0.88", edgecolor="0.55", linewidth=0.6, label="raw GT")
+    if not aggregate:
+        ax.bar(x, filtered_gt, width=0.58, color="0.62", edgecolor="0.35", linewidth=0.6, label="filtered GT")
+    for offset, method in zip(offsets, methods):
+        totals = [int(by_key.get((method, lo, hi), {}).get("prediction_total", 0)) for lo, hi in bins]
+        ax.bar(x + offset, totals, width=width, alpha=0.82, label=f"{method} detections")
+    ax.set_title("Detections and GT source counts by magnitude")
+    ax.set_xlabel("magnitude bin")
+    ax.set_ylabel("source count")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.grid(axis="y", alpha=0.25)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.legend(frameon=False, fontsize=8)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=180)
     plt.close(fig)
 
 
@@ -949,13 +1298,24 @@ def main() -> int:
         metric_rows,
         reverse_mag_axis=bool(args.reverse_mag_axis),
     )
+    _plot_detection_total_bars(
+        args.out_dir / "magnitude_detection_total_counts.png",
+        metric_rows,
+        reverse_mag_axis=bool(args.reverse_mag_axis),
+    )
     _plot_count_bars(
         args.out_dir / "magnitude_completeness_counts_aggregate.png",
         args.out_dir / "magnitude_purity_fp_counts_aggregate.png",
         aggregate_rows,
         reverse_mag_axis=bool(args.reverse_mag_axis),
     )
-
+    _plot_detection_total_bars(
+        args.out_dir / "magnitude_detection_total_counts_aggregate.png",
+        aggregate_rows,
+        reverse_mag_axis=bool(args.reverse_mag_axis),
+        aggregate=True,
+    )
+    
     ratio_detail, ratio_stats = _ratio_rows(args, phot_rows)
     _write_csv(args.out_dir / "flux_ratio_details.csv", ratio_detail)
     _write_csv(args.out_dir / "flux_ratio_summary.csv", ratio_stats)
@@ -976,6 +1336,10 @@ def main() -> int:
         "metric_rows": len(metric_rows),
         "ratio_rows": len(ratio_detail),
         "ratio_source": args.ratio_source,
+        "gt_visibility_filter": str(args.gt_visibility_filter),
+        "gt_visibility_match_radius": float(args.gt_visibility_match_radius),
+        "tile_workers": int(args.tile_workers),
+        "tile_worker_devices": list(args.tile_worker_devices or []),
         "gt_flux_scale_for_ratios": float(args.gt_flux_scale_for_ratios),
         "reverse_mag_axis": bool(args.reverse_mag_axis),
     }

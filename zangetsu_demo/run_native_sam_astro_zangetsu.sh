@@ -26,9 +26,10 @@ fi
 
 CELLECT_ROOT="${CELLECT_ROOT:-/home/czh23/CELLECT}"
 DATA_ROOT="${DATA_ROOT:-${CELLECT_ROOT}/output/sam_cellect_combination_260611/preprocessing_diagnostics_260611/zangetsu_preprocessed_cutouts_260611}"
-DATASET="${DATASET:-denoised}"
+DATASET="${DATASET:-coadd}"
 TRACT="${TRACT:-9813}"
 PATCH="${PATCH:-6,1}"
+GROUP="${GROUP:-}" # Default to empty string, which is the Zangetsu cutout group for the coadd dataset
 TILE="${TILE:-zangetsu_lower_right_x27366_y6453}"
 BAND="${BAND:-HSC-I}"
 MODEL_TYPE="${MODEL_TYPE:-vit_b}"
@@ -62,6 +63,9 @@ HIGH_PERCENTILE="${HIGH_PERCENTILE:-99.5}"
 CENTER_RADIUS="${CENTER_RADIUS:-7}"
 
 FITS_PATH="${DATA_ROOT}/${DATASET}/${TRACT}/${PATCH}/cutouts/${TILE}/${BAND}"
+if [[ -n "${GROUP}" ]]; then
+  FITS_PATH="${DATA_ROOT}/${DATASET}/${TRACT}/${PATCH}/cutouts/group_${GROUP}_${TILE}/${BAND}"
+fi
 FITS_FILE="$(find "${FITS_PATH}" -maxdepth 1 -type f -name '*.fits' | sort | head -n 1)"
 if [[ -z "${FITS_FILE}" ]]; then
   echo "No FITS file found under ${FITS_PATH}" >&2

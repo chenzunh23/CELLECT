@@ -1720,6 +1720,59 @@ def _coadd_target_background_mask(coadd_patch_root: Path, band: str, tile_name: 
     return None
 
 
+def _variant_lsst_background_root(args: argparse.Namespace) -> Optional[Path]:
+    root = getattr(args, "variant_lsst_background_root", None)
+    return _expand(root) if root is not None else None
+
+
+def _read_cached_variant_background_mask(path: Path) -> Tuple[np.ndarray, Tuple[int, int]]:
+    with np.load(path, allow_pickle=False) as data:
+        if "background_mask" not in data:
+            raise KeyError(f"{path} has no background_mask array")
+        mask = np.asarray(data["background_mask"], dtype=bool)
+        origin = data["origin_xy"] if "origin_xy" in data else np.asarray([0, 0], dtype=np.int32)
+        if mask.ndim != 2:
+            raise ValueError(f"{path} background_mask is not 2D: shape={mask.shape}")
+        return mask, (int(origin[0]), int(origin[1]))
+
+
+def _variant_lsst_background_mask(
+    args: argparse.Namespace,
+    *,
+    variant: str,
+    tract: int,
+    patch: str,
+    group: str,
+    band: str,
+    shape_yx: Tuple[int, int],
+    image_origin: Tuple[int, int],
+) -> Optional[Tuple[np.ndarray, Tuple[int, int]]]:
+    root = _variant_lsst_background_root(args)
+    if root is None:
+        return None
+    candidates = (
+        root / variant / str(tract) / patch / group / band / "background_mask.npz",
+        root / variant / str(tract) / patch / group / band / f"background_mask-{variant}-{band}-{tract}-{patch}-{group}.npz",
+        root / variant / f"patch_{patch.replace(',', '_')}" / group / band / "background_mask.npz",
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return _read_cached_variant_background_mask(candidate)
+    det_candidates = (
+        root / variant / str(tract) / patch / group / band / f"det-{variant}-{band}-{tract}-{patch}-{group}.fits",
+        root / variant / str(tract) / patch / group / band / "det.fits",
+    )
+    for candidate in det_candidates:
+        if candidate.exists():
+            return _read_det_background_mask(candidate, shape_yx, origin_xy=image_origin), image_origin
+    print(
+        f"WARNING: no variant LSST background found for {variant}/{tract}/{patch}/{group}/{band} under {root}; "
+        "falling back to coadd target background if available.",
+        flush=True,
+    )
+    return None
+
+
 def _read_variant_label_sources(
     coadd_patch_root: Path,
     *,
@@ -1892,9 +1945,25 @@ def _preprocess_image_variant_patch(
     patch: str,
 ) -> Dict[str, object]:
     specs = _read_existing_tile_specs(coadd_patch_root)
+    requested_tiles = tuple(str(tile) for tile in getattr(args, "image_variant_tiles", ()) or ())
+    if requested_tiles:
+        tile_names = {tile.split("/", 1)[-1] for tile in requested_tiles}
+        specs = [
+            spec
+            for spec in specs
+            if spec.name in tile_names or any(name.endswith(f"_{spec.name}") for name in tile_names)
+        ]
+        if not specs:
+            raise FileNotFoundError(f"No requested image variant tiles found under {coadd_patch_root}: {sorted(tile_names)}")
     groups = sorted(path for path in denoised_patch_dir.iterdir() if path.is_dir() and path.name.startswith("group_"))
     if not groups:
         groups = sorted(path for path in denoised_patch_dir.iterdir() if path.is_dir())
+    requested_groups = tuple(str(group) for group in getattr(args, "image_variant_groups", ()) or ())
+    if requested_groups:
+        normalized_groups = {
+            group if group.startswith("group_") else f"group_{int(group):02d}" for group in requested_groups
+        }
+        groups = [group for group in groups if group.name in normalized_groups]
     if not groups:
         raise FileNotFoundError(f"No denoised/noisy group directories found in {denoised_patch_dir}")
 
@@ -1934,6 +2003,28 @@ def _preprocess_image_variant_patch(
                 if src.exists():
                     group_images[band] = _read_exposure_image_plane(src, clean_nonfinite=not args.no_clean_nonfinite)
         group_name = group_dir.name
+        group_lsst_background_masks: Dict[str, Tuple[np.ndarray, Tuple[int, int]]] = {}
+        if write_variant_labels and _variant_lsst_background_root(args) is not None:
+            for band, (image, image_origin) in group_images.items():
+                try:
+                    cached = _variant_lsst_background_mask(
+                        args,
+                        variant=variant,
+                        tract=args.tract,
+                        patch=patch,
+                        group=group_name,
+                        band=band,
+                        shape_yx=(int(image.shape[0]), int(image.shape[1])),
+                        image_origin=image_origin,
+                    )
+                    if cached is not None:
+                        group_lsst_background_masks[band] = cached
+                except Exception as exc:
+                    print(
+                        f"WARNING: failed to read variant LSST background for "
+                        f"{variant}/{args.tract}/{patch}/{group_name}/{band}: {exc}",
+                        flush=True,
+                    )
         for spec in specs:
             tile_name = f"{group_name}_{spec.name}"
             band_paths: Dict[str, str] = {}
@@ -2086,7 +2177,15 @@ def _preprocess_image_variant_patch(
                             confidence_levels=args.confidence_levels,
                             core_radius=args.core_radius,
                             center_only_weight=args.pu_center_only_weight,
-                            lsst_background_mask=_coadd_target_background_mask(coadd_patch_root, band, spec.name),
+                            lsst_background_mask=(
+                                _crop_full_mask_for_tile(
+                                    group_lsst_background_masks[band][0],
+                                    spec,
+                                    group_lsst_background_masks[band][1],
+                                )
+                                if band in group_lsst_background_masks
+                                else _coadd_target_background_mask(coadd_patch_root, band, spec.name)
+                            ),
                             strict_center_only_sources=strict_center_mask,
                             strict_center_only_ellipse_sigma=args.pu_strict_bright_center_only_ellipse_sigma,
                         )
@@ -2157,6 +2256,9 @@ def _preprocess_image_variant_patch(
             "base_patch_root": str(coadd_patch_root),
             "shared_label_root": str(coadd_patch_root),
             "shared_label_policy": "coadd_preprocessed",
+            "variant_lsst_background_root": str(_variant_lsst_background_root(args))
+            if _variant_lsst_background_root(args) is not None
+            else None,
             "noncoadd_snr_filter": write_variant_labels,
             "noncoadd_snr_ignore_thresh": float(getattr(args, "noncoadd_snr_ignore_thresh", 2.0)),
             "noncoadd_snr_center_only_thresh": float(getattr(args, "noncoadd_snr_center_only_thresh", 3.0)),
@@ -2476,7 +2578,12 @@ def preprocess(args: argparse.Namespace) -> None:
         variants = tuple(str(item).strip() for item in args.image_variants if str(item).strip())
         variant_tasks: List[Tuple[str, str, Optional[Path], Path]] = []
         skipped_variant_patches: List[str] = []
-        variant_worker_fn = _sync_existing_variant_patch if args.reuse_existing_preprocessed else _preprocess_image_variant_patch
+        rebuild_variants = bool(getattr(args, "rebuild_image_variants", False))
+        variant_worker_fn = (
+            _sync_existing_variant_patch
+            if args.reuse_existing_preprocessed and not rebuild_variants
+            else _preprocess_image_variant_patch
+        )
         for patch in patches:
             if patch not in summaries_by_patch:
                 continue
@@ -3657,6 +3764,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--rebuild-image-variants",
+        action="store_true",
+        help=(
+            "With --reuse-existing-preprocessed, reuse the coadd patch tree but rebuild denoised/noisy image-variant "
+            "cutout metadata and targets. Use this to refresh variant PU targets after changing noncoadd SNR or "
+            "variant LSST background masks."
+        ),
+    )
+    parser.add_argument(
         "--zscale-root",
         type=Path,
         default=None,
@@ -3682,10 +3798,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--variant-lsst-background-root",
+        type=Path,
+        default=None,
+        help=(
+            "Optional cache root containing variant/group LSST detection background masks generated by "
+            "lsst_pipeline/batch_detect_background.py. Layout: "
+            "<root>/<variant>/<tract>/<patch>/<group>/<band>/background_mask.npz. "
+            "When present, denoised/noisy PU targets use these masks before falling back to coadd target backgrounds."
+        ),
+    )
+    parser.add_argument(
         "--image-variants",
         nargs="+",
         default=("denoised", "noisy"),
         help="Image variant FITS basenames to crop from --denoised-fits-root. Default: denoised noisy.",
+    )
+    parser.add_argument(
+        "--image-variant-groups",
+        nargs="+",
+        default=(),
+        help="Optional subset of denoised/noisy group directories to process, e.g. group_01 or 01.",
+    )
+    parser.add_argument(
+        "--image-variant-tiles",
+        nargs="+",
+        default=(),
+        help="Optional subset of base coadd tile names to process for denoised/noisy variants.",
     )
     parser.add_argument(
         "--fast-root",
