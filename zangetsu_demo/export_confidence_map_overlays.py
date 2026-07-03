@@ -26,9 +26,9 @@ from sam_backbone import build_sam_cellect2d  # noqa: E402
 
 
 DEFAULT_DATA_ROOT = CELLECT_ROOT / "zangetsu_demo/data/sam_x18204_y20924"
-DEFAULT_OUT_DIR = CELLECT_ROOT / "zangetsu_demo/output/confidence_map_overlays_0630"
-DEFAULT_CKPT = Path("/nvme0/zc/scarlet/ckpts/sam_link_band_0616/epoch_0016.pt") # /nvme0/zc/scarlet/ckpts/sam_detector_cdn_0628/epoch_0018.pt
-DEFAULT_CONFIG = Path("/nvme0/zc/scarlet/ckpts/sam_link_band_0616/run_config.json")
+DEFAULT_OUT_DIR = CELLECT_ROOT / "zangetsu_demo/output/confidence_map_overlays_0703"
+DEFAULT_CKPT = Path("/nvme0/zc/scarlet/ckpts/sam_new_bkgd_cdn_0702/epoch_0016.pt") # /nvme0/zc/scarlet/ckpts/sam_detector_cdn_0628/epoch_0018.pt
+DEFAULT_CONFIG = Path("/nvme0/zc/scarlet/ckpts/sam_new_bkgd_cdn_0702/run_config.json")
 DEFAULT_BANDS = ("HSC-G", "HSC-R", "HSC-I", "HSC-Z", "HSC-Y")
 TRACT = "9813"
 PATCH = "4,5"

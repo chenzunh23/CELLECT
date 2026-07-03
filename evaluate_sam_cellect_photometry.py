@@ -48,6 +48,21 @@ import zangetsu_demo.visualize_sam_cellect as vis  # noqa: E402
 from astro_train_data import astro_zscale_preprocess, read_fits_bands  # noqa: E402
 
 
+def _safe_tile_for_dataset(dataset_name: str, args: argparse.Namespace) -> str:
+    tile_name = getattr(args, "tile_name", None)
+    if tile_name:
+        return str(tile_name)
+    if str(dataset_name) == "coadd":
+        return vis.TILE
+    variant_group = getattr(args, "variant_group", None)
+    if variant_group:
+        return f"{variant_group}_{vis.TILE}"
+    return vis.TILE
+
+
+vis._tile_for_dataset = _safe_tile_for_dataset
+
+
 DEFAULT_DATA_ROOT = Path("/nvme0/zc/scarlet/preprocessed")
 DEFAULT_OUT_DIR = CELLECT_ROOT / "output/sam_cellect_patch45_group1_photometry_eval"
 DEFAULT_BANDS = ("HSC-G", "HSC-R", "HSC-I", "HSC-Z", "HSC-Y")
@@ -74,6 +89,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--tract", default="9813")
     parser.add_argument("--patch", default="4,5")
     parser.add_argument("--group", default="01", help="Cutout group to run, e.g. 01. Use 'all' to disable group filtering.")
+    parser.add_argument("--tile-name", default=None, help="Compatibility with visualize_sam_cellect; normally set per discovered tile.")
+    parser.add_argument("--variant-group", default=None, help="Compatibility with visualize_sam_cellect; inferred from --group when omitted.")
     parser.add_argument("--bands", nargs="+", default=list(DEFAULT_BANDS))
     parser.add_argument("--band", default="HSC-I")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -268,20 +285,54 @@ def _table(path: Path) -> "vis.Table":
 def _clean_catalog_candidates(root: Path, dataset_name: str, band: str, tile_name: str) -> list[Path]:
     base_tile = _base_tile_name(tile_name)
     return [
-        root / dataset_name / vis.TRACT / vis.PATCH / "band_reference_catalogs" / band / f"meas-{band}-{vis.TRACT}-{vis.PATCH}.fits",
-        root / vis.TRACT / vis.PATCH / "band_reference_catalogs" / band / f"meas-{band}-{vis.TRACT}-{vis.PATCH}.fits",
         root / dataset_name / vis.TRACT / vis.PATCH / "reference_catalogs" / f"{base_tile}_meas.fits",
         root / vis.TRACT / vis.PATCH / "reference_catalogs" / f"{base_tile}_meas.fits",
         root / dataset_name / vis.TRACT / vis.PATCH / "reference_catalogs_csv" / f"{base_tile}_meas.csv",
         root / vis.TRACT / vis.PATCH / "reference_catalogs_csv" / f"{base_tile}_meas.csv",
+        root / dataset_name / vis.TRACT / vis.PATCH / "band_reference_catalogs" / band / f"meas-{band}-{vis.TRACT}-{vis.PATCH}.fits",
+        root / vis.TRACT / vis.PATCH / "band_reference_catalogs" / band / f"meas-{band}-{vis.TRACT}-{vis.PATCH}.fits",
     ]
 
 
-def _load_clean_rows_compat(root: Path, dataset_name: str, band: str, tile_name: str):
+def _load_clean_rows_compat(
+    root: Path,
+    dataset_name: str,
+    band: str,
+    tile_name: str,
+    args: argparse.Namespace | None = None,
+):
     for path in _clean_catalog_candidates(root, dataset_name, band, tile_name):
         if path.exists():
             rows, x, y = vis._local_rows(_table(path), tile_name)
-            return rows, x, y
+            if args is None:
+                stats = {
+                    "raw_gt": int(len(rows)),
+                    "visibility_clean_gt": int(len(rows)),
+                    "visibility_center_only_gt": 0,
+                    "visibility_ignore_gt": 0,
+                    "filtered_gt": int(len(rows)),
+                }
+                return rows, x, y, stats
+            points = np.column_stack([x, y]).astype(np.float32) if len(x) else np.zeros((0, 2), dtype=np.float32)
+            center_only, ignored = _visibility_centers(root, dataset_name, band, tile_name)
+            radius = float(getattr(args, "gt_visibility_match_radius", 1.0))
+            ignored_match = _within_any_radius(points, ignored, radius)
+            center_only_match = _within_any_radius(points, center_only, radius) & ~ignored_match
+            visibility_class = np.full((len(rows),), "clean", dtype=object)
+            visibility_class[center_only_match] = "center_only"
+            visibility_class[ignored_match] = "ignore"
+            mode = str(getattr(args, "gt_visibility_filter", "snr_ge2"))
+            keep = np.asarray([_visibility_keep(str(cls), mode) for cls in visibility_class], dtype=bool)
+            stats = {
+                "raw_gt": int(len(rows)),
+                "visibility_clean_gt": int(np.count_nonzero(visibility_class == "clean")),
+                "visibility_center_only_gt": int(np.count_nonzero(visibility_class == "center_only")),
+                "visibility_ignore_gt": int(np.count_nonzero(visibility_class == "ignore")),
+                "filtered_gt": int(np.count_nonzero(keep)),
+            }
+            # Keep raw row order so photometry gt_index matches gt_photometry.csv.
+            # Visibility filtering is applied later in metric aggregation.
+            return rows, x, y, stats
     searched = "\n  ".join(str(path) for path in _clean_catalog_candidates(root, dataset_name, band, tile_name))
     raise FileNotFoundError(f"No GT catalog found for {dataset_name}/{vis.PATCH}/{tile_name}/{band}. Searched:\n  {searched}")
 
@@ -341,21 +392,36 @@ def _visibility_keep(cls: str, mode: str) -> bool:
     raise ValueError(f"unknown GT visibility filter: {mode!r}")
 
 
-def _dataset_compat(root: Path, dataset_name: str, bands: Sequence[str], cfg: dict):
+def _dataset_compat(
+    root: Path,
+    dataset_name: str,
+    bands: Sequence[str],
+    cfg: dict,
+    image_cache_dir: Path | None = None,
+    tile_name: str | None = None,
+):
+    tile = str(tile_name) if tile_name else str(vis.TILE)
     tile_dirs = [
-        root / dataset_name / vis.TRACT / vis.PATCH / "cutouts" / vis.TILE,
-        root / vis.TRACT / vis.PATCH / "cutouts" / vis.TILE,
+        root / dataset_name / vis.TRACT / vis.PATCH / "cutouts" / tile,
+        root / vis.TRACT / vis.PATCH / "cutouts" / tile,
     ]
     tile_dir = next((path for path in tile_dirs if path.exists()), None)
     if tile_dir is None:
-        return vis._ORIGINAL_DATASET(root, dataset_name, bands, cfg)
+        return vis._ORIGINAL_DATASET(
+            root,
+            dataset_name,
+            bands,
+            cfg,
+            image_cache_dir=image_cache_dir,
+            tile_name=tile,
+        )
     image_paths: list[str] = []
     for band in bands:
         band_dir = tile_dir / band
         matches = sorted(band_dir.glob("*.fits"))
         if not matches:
             searched = ", ".join(str(path / band) for path in tile_dirs)
-            raise FileNotFoundError(f"No FITS image for {dataset_name}/{vis.PATCH}/{vis.TILE}/{band}; searched {searched}")
+            raise FileNotFoundError(f"No FITS image for {dataset_name}/{vis.PATCH}/{tile}/{band}; searched {searched}")
         image_paths.append(str(matches[0]))
     image_np = read_fits_bands(tuple(image_paths), hdu=int(cfg.get("fits_hdu", 1)))
     image = astro_zscale_preprocess(image_np).to(dtype=torch.float32)
@@ -390,6 +456,16 @@ def _resolve_config(args: argparse.Namespace) -> dict:
 
 def _resolve_visual_defaults(args: argparse.Namespace, cfg: dict) -> None:
     loss_cfg = cfg.get("_top", {}).get("loss_weights", {})
+    if not hasattr(args, "tile_name"):
+        args.tile_name = None
+    if not hasattr(args, "variant_group"):
+        group = str(getattr(args, "group", "")).strip()
+        if not group or group.lower() in {"all", "none"}:
+            args.variant_group = ""
+        elif group.startswith("group_"):
+            args.variant_group = group
+        else:
+            args.variant_group = f"group_{int(group):02d}"
     if args.multimask is None:
         args.multimask = bool(loss_cfg.get("mask_multimask", not bool(cfg.get("disable_mask_multimask", False))))
     if args.mask_prompt_center_only is None:
@@ -418,7 +494,7 @@ def _gt_mag_rows(args: argparse.Namespace, dataset_name: str, tile_name: str) ->
     vis.TRACT = args.tract
     vis.PATCH = args.patch
     vis.TILE = tile_name
-    rows, x, y = vis._load_clean_rows(args.data_root, dataset_name, args.band, tile_name)
+    rows, x, y, _stats = vis._load_clean_rows(args.data_root, dataset_name, args.band, tile_name)
     gt_xy = np.column_stack([x, y]).astype(np.float32) if len(x) else np.zeros((0, 2), dtype=np.float32)
     center_only_xy, ignore_xy = _visibility_centers(args.data_root, dataset_name, args.band, tile_name)
     ignore_mask = _within_any_radius(gt_xy, ignore_xy, float(args.gt_visibility_match_radius))
@@ -461,18 +537,23 @@ def _run_tile_local(
     vis.PATCH = args.patch
     vis.TILE = tile_name
     print(f"[run] {label} {dataset_name} {args.patch}/{tile_name} {args.band}", flush=True)
-    row = vis._run_one(
-        model=model,
-        cfg=cfg,
-        dataset_root=args.data_root,
-        dataset_name=dataset_name,
-        checkpoint_label=label,
-        out_dir=args.out_dir,
-        bands=args.bands,
-        band=args.band,
-        device=device,
-        args=args,
-    )
+    previous_tile_name = getattr(args, "tile_name", None)
+    args.tile_name = tile_name
+    try:
+        row = vis._run_one(
+            model=model,
+            cfg=cfg,
+            dataset_root=args.data_root,
+            dataset_name=dataset_name,
+            checkpoint_label=label,
+            out_dir=args.out_dir,
+            bands=args.bands,
+            band=args.band,
+            device=device,
+            args=args,
+        )
+    finally:
+        args.tile_name = previous_tile_name
     row["checkpoint"] = str(checkpoint)
     row["checkpoint_epoch"] = vis._checkpoint_epoch(checkpoint)
     tile_gt_rows = _gt_mag_rows(args, dataset_name, tile_name)
@@ -1263,6 +1344,14 @@ def main() -> int:
     args.data_root = args.data_root.expanduser().resolve()
     args.out_dir = args.out_dir.expanduser().resolve()
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    if os.environ.get("CELLECT_DEBUG_IMPORT"):
+        print(
+            "[debug-import] "
+            f"eval_script={Path(__file__).resolve()} "
+            f"visualizer={Path(getattr(vis, '__file__', '')).resolve()} "
+            f"visualizer_cached={getattr(vis, '__cached__', '')}",
+            flush=True,
+        )
     if args.band not in args.bands:
         raise ValueError(f"--band {args.band!r} is not present in --bands")
     _install_visualizer_io_patch()

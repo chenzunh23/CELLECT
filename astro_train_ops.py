@@ -82,6 +82,13 @@ class LossWeights:
     segmentation_loss_stride: int = 1
     confidence_outer_weight: float = 1.0
     confidence_pos_weight: float = 32.0
+    confidence_loss_mode: str = "ordinal_legacy"
+    confidence_ce_weights: Tuple[float, ...] = (1.0, 4.0, 8.0, 16.0, 32.0)
+    small_shape_loss_weight: float = 0.0
+    small_shape_area_min: float = 20.0
+    small_shape_area_tau: float = 5.0
+    small_shape_ordinal_threshold: float = 2.0
+    small_shape_scope: str = "ignore"
     shape_outer_weight: float = 1.0
     center_position: float = 1.0
     shape_angle_weight: float = 4.0
@@ -145,6 +152,117 @@ def _sam_proposal_modules(model: nn.Module) -> List[nn.Module]:
         if isinstance(module, nn.Module):
             modules.append(module)
     return modules
+
+
+def hard_ce_confidence_loss(
+    logits: Tensor,
+    target: Tensor,
+    *,
+    class_weights: Sequence[float],
+    ignore_index: int = -100,
+    weight: Optional[Tensor] = None,
+) -> Tensor:
+    """Weighted 5-class CE for mutually exclusive confidence levels."""
+
+    if logits.ndim != 4:
+        raise ValueError("logits must be [B,L,H,W]")
+    if target.ndim != 3:
+        raise ValueError("target must be [B,H,W]")
+    levels = int(logits.shape[1])
+    if len(class_weights) != levels:
+        raise ValueError(f"confidence CE weights must have {levels} values, got {len(class_weights)}")
+
+    valid = target != ignore_index
+    if weight is not None:
+        if weight.shape != target.shape:
+            raise ValueError("weight must have the same shape as target")
+        weight = weight.to(device=logits.device, dtype=logits.dtype).clamp_min(0.0)
+        valid = valid & (weight > 0)
+    if not bool(valid.any()):
+        return logits.sum() * 0.0
+
+    safe_target = torch.where(valid, target, torch.zeros_like(target)).long()
+    ce_weights = torch.as_tensor(tuple(float(v) for v in class_weights), device=logits.device, dtype=torch.float32)
+    per_pixel = F.cross_entropy(logits.float(), safe_target, weight=ce_weights, reduction="none").to(dtype=logits.dtype)
+    if weight is not None:
+        return (per_pixel * weight)[valid].sum() / weight[valid].sum().clamp_min(1.0)
+    return per_pixel[valid].mean()
+
+
+def small_shape_ordinal_suppression_loss(
+    outputs: Dict[str, Tensor],
+    batch: Dict[str, object],
+    *,
+    device: torch.device,
+    area_min: float,
+    area_tau: float,
+    ordinal_threshold: float,
+    scope: str = "ignore",
+) -> Tensor:
+    """Suppress high ordinal confidence for tiny predicted shapes in unsupervised regions.
+
+    The predicted area is used only as a detached gate. This prevents early tiny
+    ignore-region seeds from becoming confident without encouraging the model to
+    escape the penalty by inflating their shapes.
+    """
+
+    confidence = outputs["confidence"]
+    shape = outputs["shape"]
+    if confidence.ndim != 4 or shape.ndim != 4:
+        raise ValueError("small_shape_ordinal_suppression_loss expects dense BCHW outputs")
+    if shape.shape[1] < 2:
+        return confidence.sum() * 0.0
+
+    target = batch["confidence"].to(device=device, dtype=torch.long)  # type: ignore[union-attr]
+    scope_key = str(scope).lower()
+    valid: Optional[Tensor]
+    ignore_mask = batch.get("ignore_mask")
+    clean_mask = batch.get("clean_mask")
+    conf_weight = batch.get("confidence_weight")
+    if scope_key == "ignore":
+        valid = (
+            ignore_mask.to(device=device, dtype=torch.bool)  # type: ignore[union-attr]
+            if ignore_mask is not None
+            else None
+        )
+    elif scope_key == "non_clean":
+        valid = (
+            ~clean_mask.to(device=device, dtype=torch.bool)  # type: ignore[union-attr]
+            if clean_mask is not None
+            else None
+        )
+    elif scope_key == "unweighted":
+        valid = (
+            conf_weight.to(device=device, dtype=torch.float32) <= 0  # type: ignore[union-attr]
+            if conf_weight is not None
+            else None
+        )
+    else:
+        raise ValueError(f"small_shape_scope must be ignore, non_clean, or unweighted, got {scope!r}")
+
+    if valid is None:
+        if conf_weight is not None:
+            valid = conf_weight.to(device=device, dtype=torch.float32) <= 0  # type: ignore[union-attr]
+        elif clean_mask is not None:
+            valid = ~clean_mask.to(device=device, dtype=torch.bool)  # type: ignore[union-attr]
+        else:
+            valid = target == -100
+    valid = valid & (target <= 0)
+    if not bool(valid.any()):
+        return confidence.sum() * 0.0
+
+    prob = F.softmax(confidence.float(), dim=1)
+    levels = torch.arange(confidence.shape[1], device=device, dtype=prob.dtype).view(1, -1, 1, 1)
+    ordinal = (prob * levels).sum(dim=1).to(dtype=confidence.dtype)
+
+    major = shape[:, 0].abs().clamp_min(1e-3)
+    minor = shape[:, 1].abs().clamp_min(1e-3)
+    area = math.pi * major * minor
+    tau = max(float(area_tau), 1e-6)
+    small_gate = torch.sigmoid((float(area_min) - area.detach()) / tau).to(dtype=ordinal.dtype)
+    score_excess = F.relu(ordinal - float(ordinal_threshold))
+    loss_map = small_gate * score_excess
+    return loss_map[valid].mean()
 
 
 def _clear_module_grads(module: nn.Module) -> int:
@@ -305,12 +423,26 @@ def dense_losses(
     if float(weights.confidence_outer_weight) <= 0.0:
         conf_loss = outputs["confidence"].sum() * 0.0
     else:
-        conf_loss = ordinal_confidence_loss(
-            outputs["confidence"],
-            conf_target,
-            pos_weight=weights.confidence_pos_weight,
-            weight=conf_weight,
-        )
+        confidence_loss_mode = str(getattr(weights, "confidence_loss_mode", "ordinal_legacy")).lower()
+        if confidence_loss_mode in {"ordinal", "ordinal_legacy", "cellect"}:
+            conf_loss = ordinal_confidence_loss(
+                outputs["confidence"],
+                conf_target,
+                pos_weight=weights.confidence_pos_weight,
+                weight=conf_weight,
+            )
+        elif confidence_loss_mode in {"ce_hard", "hard_ce"}:
+            conf_loss = hard_ce_confidence_loss(
+                outputs["confidence"],
+                conf_target,
+                class_weights=weights.confidence_ce_weights,
+                weight=conf_weight,
+            )
+        else:
+            raise ValueError(
+                "confidence_loss_mode must be one of ordinal_legacy or ce_hard, "
+                f"got {weights.confidence_loss_mode!r}"
+            )
     # torch.cuda.synchronize()
     # conf_time = time.time()
     # print(f'[DEBUG] Confidence loss computed in {conf_time - seg_time:.3f} seconds.')
@@ -354,6 +486,18 @@ def dense_losses(
         center_loss = center_localization_loss(outputs, batch["centers"], radius_px=center_radius_px)
     else:
         center_loss = torch.tensor(0.0, device=device)
+    if float(weights.small_shape_loss_weight) > 0.0:
+        small_shape_loss = small_shape_ordinal_suppression_loss(
+            outputs,
+            batch,
+            device=device,
+            area_min=float(weights.small_shape_area_min),
+            area_tau=float(weights.small_shape_area_tau),
+            ordinal_threshold=float(weights.small_shape_ordinal_threshold),
+            scope=str(weights.small_shape_scope),
+        )
+    else:
+        small_shape_loss = outputs["confidence"].sum() * 0.0
     # torch.cuda.synchronize()
     # center_time = time.time()
     # print(f'[DEBUG] Center localization loss computed in {center_time - shape_time:.3f} seconds.')
@@ -362,8 +506,16 @@ def dense_losses(
         + weights.confidence_outer_weight * conf_loss
         + weights.shape_outer_weight * shape_loss
         + weights.center_position * center_loss
+        + weights.small_shape_loss_weight * small_shape_loss
     )
-    return {"total": total, "seg": seg_loss, "confidence": conf_loss, "shape": shape_loss, "center": center_loss}
+    return {
+        "total": total,
+        "seg": seg_loss,
+        "confidence": conf_loss,
+        "shape": shape_loss,
+        "center": center_loss,
+        "small_shape": small_shape_loss,
+    }
 
 
 def dense_losses_any(
@@ -2423,6 +2575,7 @@ def run_epoch(
         "confidence": 0.0,
         "shape": 0.0,
         "center": 0.0,
+        "small_shape": 0.0,
         "triplet": 0.0,
         "ex_class": 0.0,
         "en_class": 0.0,
@@ -2618,6 +2771,7 @@ def run_epoch(
         sums["confidence"] += float(losses["confidence"].detach()) * batch_size
         sums["shape"] += float(losses["shape"].detach()) * batch_size
         sums["center"] += float(losses["center"].detach()) * batch_size
+        sums["small_shape"] += float(losses["small_shape"].detach()) * batch_size
         sums["triplet"] += float(triplet.detach()) * batch_size
         sums["ex_class"] += float(ex_class.detach()) * batch_size
         sums["en_class"] += float(en_class.detach()) * batch_size
@@ -2654,6 +2808,8 @@ def run_epoch(
                 local_metrics["loss/shape"] = float(losses["shape"].detach())
             if float(weights.center_position) > 0.0:
                 local_metrics["loss/center"] = float(losses["center"].detach())
+            if float(weights.small_shape_loss_weight) > 0.0:
+                local_metrics["loss/small_shape"] = float(losses["small_shape"].detach())
             if triplet_enabled and float(weights.triplet_outer_weight) > 0.0:
                 local_metrics["loss/triplet"] = float(triplet.detach())
             if ex_enabled and float(weights.matcher_outer_weight) > 0.0:
@@ -2769,6 +2925,7 @@ def validate_epoch(
         "confidence": 0.0,
         "shape": 0.0,
         "center": 0.0,
+        "small_shape": 0.0,
         "triplet": 0.0,
         "ex_class": 0.0,
         "en_class": 0.0,
@@ -2890,6 +3047,7 @@ def validate_epoch(
         sums["confidence"] += float(losses["confidence"].detach()) * batch_size
         sums["shape"] += float(losses["shape"].detach()) * batch_size
         sums["center"] += float(losses["center"].detach()) * batch_size
+        sums["small_shape"] += float(losses["small_shape"].detach()) * batch_size
         sums["triplet"] += float(triplet.detach()) * batch_size
         sums["ex_class"] += float(ex_class.detach()) * batch_size
         sums["en_class"] += float(en_class.detach()) * batch_size

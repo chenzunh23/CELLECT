@@ -910,6 +910,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Outer weight for dense confidence loss. Proposal freezing sets this to 0 after the configured epoch.",
     )
     parser.add_argument("--confidence-pos-weight", type=float, default=32.0)
+    parser.add_argument(
+        "--confidence-loss-mode",
+        choices=("ordinal_legacy", "ce_hard"),
+        default="ordinal_legacy",
+        help="Dense confidence loss. ordinal_legacy keeps the CELLECT ordinal loss; ce_hard uses weighted 5-class CE.",
+    )
+    parser.add_argument(
+        "--confidence-ce-weights",
+        type=float,
+        nargs=5,
+        default=(1.0, 4.0, 8.0, 16.0, 32.0),
+        metavar=("W0", "W1", "W2", "W3", "W4"),
+        help="Class weights for --confidence-loss-mode ce_hard, ordered by confidence level 0..4.",
+    )
+    parser.add_argument(
+        "--small-shape-loss-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight for an epoch-0 dense loss that suppresses high ordinal confidence "
+            "for tiny predicted shapes in ignore/non-clean regions. Default disables it."
+        ),
+    )
+    parser.add_argument("--small-shape-area-min", type=float, default=20.0)
+    parser.add_argument("--small-shape-area-tau", type=float, default=5.0)
+    parser.add_argument("--small-shape-ordinal-threshold", type=float, default=2.0)
+    parser.add_argument(
+        "--small-shape-scope",
+        choices=("ignore", "non_clean", "unweighted"),
+        default="ignore",
+        help="Region where the small-shape ordinal suppression loss is applied.",
+    )
     parser.add_argument("--shape-loss-weight", type=float, default=1.0)
     parser.add_argument(
         "--shape-angle-weight",
@@ -1364,6 +1396,13 @@ def main() -> None:
             segmentation_loss_stride=max(1, int(args.seg_loss_stride)),
             confidence_outer_weight=float(args.confidence_loss_weight),
             confidence_pos_weight=float(args.confidence_pos_weight),
+            confidence_loss_mode=str(args.confidence_loss_mode),
+            confidence_ce_weights=tuple(float(v) for v in args.confidence_ce_weights),
+            small_shape_loss_weight=float(args.small_shape_loss_weight),
+            small_shape_area_min=float(args.small_shape_area_min),
+            small_shape_area_tau=float(args.small_shape_area_tau),
+            small_shape_ordinal_threshold=float(args.small_shape_ordinal_threshold),
+            small_shape_scope=str(args.small_shape_scope),
             shape_outer_weight=float(args.shape_loss_weight),
             center_position=float(args.center_loss_weight),
             shape_angle_weight=float(args.shape_angle_weight),
@@ -1859,6 +1898,7 @@ def main() -> None:
                 confidence_outer_weight=0.0,
                 shape_outer_weight=0.0,
                 center_position=0.0,
+                small_shape_loss_weight=0.0,
                 detach_mask_prompt_shapes=True,
             )
 
@@ -1874,6 +1914,8 @@ def main() -> None:
                 filtered["shape"] = float(metrics["shape"])
             if float(active_weights.center_position) > 0.0 and "center" in metrics:
                 filtered["center"] = float(metrics["center"])
+            if float(active_weights.small_shape_loss_weight) > 0.0 and "small_shape" in metrics:
+                filtered["small_shape"] = float(metrics["small_shape"])
             if bool(args.enable_triplet) and float(active_weights.triplet_outer_weight) > 0.0 and "triplet" in metrics:
                 filtered["triplet"] = float(metrics["triplet"])
             if bool(ex_enabled) and float(active_weights.matcher_outer_weight) > 0.0 and "ex_class" in metrics:
@@ -2050,6 +2092,7 @@ def main() -> None:
                         "confidence": float(epoch_weights.confidence_outer_weight),
                         "shape": float(epoch_weights.shape_outer_weight),
                         "center": float(epoch_weights.center_position),
+                        "small_shape": float(epoch_weights.small_shape_loss_weight),
                     },
                 }
                 if sam_iteration_scheduler is not None:
@@ -2092,6 +2135,7 @@ def main() -> None:
                         "proposal/confidence_loss_weight": float(epoch_weights.confidence_outer_weight),
                         "proposal/shape_loss_weight": float(epoch_weights.shape_outer_weight),
                         "proposal/center_loss_weight": float(epoch_weights.center_position),
+                        "proposal/small_shape_loss_weight": float(epoch_weights.small_shape_loss_weight),
                     }
                     epoch_payload["prompt/gt_ratio"] = 1.0 - float(epoch_payload["prompt/predicted_ratio"])
                     epoch_payload.update(
