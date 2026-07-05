@@ -16,7 +16,6 @@ legacy/
 batch-heavyfp-kron-refit/test/
 batch-heavyfp-kron-refit/refit/
 zangetsu_demo/preprocessed
-zangetsu_demo/eval*
 zangetsu_demo/data
 **.reg
 vis/
