@@ -418,8 +418,9 @@ def classify_sources(table: Table, args: argparse.Namespace) -> dict[str, object
     base = finite_center & source_mask
     eligible = base & valid_kron
 
+    dropped_area = eligible & np.isfinite(kron_area) & (kron_area > float(args.a_area_max))
     removed_a = eligible & (
-        (np.isfinite(kron_area) & (kron_area > float(args.a_area_max)))
+        dropped_area
         | (
             np.isfinite(kron_area)
             & (kron_area > float(args.a_faint_area_max))
@@ -573,11 +574,12 @@ def classify_sources(table: Table, args: argparse.Namespace) -> dict[str, object
     center_only = np.zeros(len(table), dtype=bool)
     if not bool(getattr(args, "keep_all_ab_clean", True)):
         center_only = ab_class & ambiguous
-    ignore = b_class | a_failed | invalid_kron_drop
+    ignore = b_class | (a_failed & ~dropped_area) | invalid_kron_drop
 
     class_name = np.full(len(table), "outside_base", dtype=object)
     class_name[b_class] = "b_ignore"
     class_name[a_failed] = "a_failed"
+    class_name[dropped_area] = "dropped_area"
     class_name[invalid_kron_drop] = "b_ignore"
     class_name[center_only] = "center_only"
     class_name[clean] = "clean"
@@ -595,8 +597,9 @@ def classify_sources(table: Table, args: argparse.Namespace) -> dict[str, object
         "mag": mag,
         "base": base,
         "eligible": eligible,
-        "dropped_large_ellipse": a_failed,
+        "dropped_large_ellipse": dropped_area,
         "dropped_by_a": a_failed,
+        "dropped_area": dropped_area,
         "dropped_invalid_kron": invalid_kron_drop,
         "a_class": ab_class,
         "a_failed": a_failed,

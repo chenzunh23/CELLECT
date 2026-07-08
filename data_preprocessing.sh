@@ -24,7 +24,7 @@ CONDA_ENV="${CONDA_ENV:-cellect}"
 RUN_REFIT="${RUN_REFIT:-1}"
 RUN_PREPROCESS="${RUN_PREPROCESS:-1}"
 REUSE_EXISTING_PREPROCESSED="${REUSE_EXISTING_PREPROCESSED:-0}"
-REBUILD_IMAGE_VARIANTS="${REBUILD_IMAGE_VARIANTS:-0}"
+REBUILD_IMAGE_VARIANTS="${REBUILD_IMAGE_VARIANTS:-auto}"
 SKIP_EXISTING_REFIT="${SKIP_EXISTING_REFIT:-1}"
 REFIT_CSV_ONLY="${REFIT_CSV_ONLY:-1}"
 COPY_REFIT_INPUTS_TO_TMP="${COPY_REFIT_INPUTS_TO_TMP:-0}"
@@ -57,6 +57,7 @@ WRITE_TARGET_FITS="${WRITE_TARGET_FITS:-0}"
 LSST_BACKGROUND_POLICY="${LSST_BACKGROUND_POLICY:-run-if-missing}"
 LSST_BACKGROUND_CACHE_ROOT="${LSST_BACKGROUND_CACHE_ROOT:-}"
 VARIANT_LSST_BACKGROUND_ROOT="${VARIANT_LSST_BACKGROUND_ROOT:-}"
+IMAGE_VARIANT_BACKGROUND_SOURCE="${IMAGE_VARIANT_BACKGROUND_SOURCE:-coadd-target}"
 LSST_DETECT_PYTHON="${LSST_DETECT_PYTHON:-}"
 OVERWRITE_LSST_BACKGROUND="${OVERWRITE_LSST_BACKGROUND:-0}"
 WRITE_LSST_BACKGROUND_PRODUCTS="${WRITE_LSST_BACKGROUND_PRODUCTS:-0}"
@@ -71,7 +72,19 @@ NONCOADD_SNR_CENTER_ONLY_THRESH="${NONCOADD_SNR_CENTER_ONLY_THRESH:-3.0}"
 NONCOADD_SNR_AP_RADIUS="${NONCOADD_SNR_AP_RADIUS:-6.0}"
 NONCOADD_SNR_ANNULUS_R_IN="${NONCOADD_SNR_ANNULUS_R_IN:-10.0}"
 NONCOADD_SNR_ANNULUS_R_OUT="${NONCOADD_SNR_ANNULUS_R_OUT:-15.0}"
-NONCOADD_SNR_ANNULUS_EXCLUDE_RADIUS="${NONCOADD_SNR_ANNULUS_EXCLUDE_RADIUS:-6.0}"
+NONCOADD_SNR_SOURCE_MASK_ELLIPSE_SIGMA="${NONCOADD_SNR_SOURCE_MASK_ELLIPSE_SIGMA:-1.0}"
+NONCOADD_SNR_MIN_ANNULUS_PIXELS="${NONCOADD_SNR_MIN_ANNULUS_PIXELS:-50}"
+NONCOADD_SNR_MASK_PLANES="${NONCOADD_SNR_MASK_PLANES:-BRIGHT_OBJECT SAT BAD NO_DATA EDGE UNMASKEDNAN}"
+NONCOADD_SNR_USE_SOURCE_MASK="${NONCOADD_SNR_USE_SOURCE_MASK:-1}"
+NONCOADD_SNR_USE_QUALITY_MASK="${NONCOADD_SNR_USE_QUALITY_MASK:-1}"
+
+if [[ "${REBUILD_IMAGE_VARIANTS}" == "auto" ]]; then
+  if [[ -n "${DENOISED_FITS_ROOT}" && "${REUSE_EXISTING_PREPROCESSED}" == "1" ]]; then
+    REBUILD_IMAGE_VARIANTS=1
+  else
+    REBUILD_IMAGE_VARIANTS=0
+  fi
+fi
 
 BAND_LIMIT_MAGS="${BAND_LIMIT_MAGS:-HSC-G=27.4 HSC-R=27.1 HSC-I=26.9 HSC-Z=26.3 HSC-Y=25.3}"
 STRICT_CENTER_ONLY_SATURATION_MAGS="${STRICT_CENTER_ONLY_SATURATION_MAGS:-${STRICT_IGNORE_SATURATION_MAGS:-HSC-G=18.0 HSC-R=18.2 HSC-I=18.6 HSC-Z=17.7 HSC-Y=17.4}}"
@@ -343,6 +356,7 @@ run_preprocess() {
   if [[ -n "${VARIANT_LSST_BACKGROUND_ROOT}" ]]; then
     optional_args+=(--variant-lsst-background-root "${VARIANT_LSST_BACKGROUND_ROOT}")
   fi
+  optional_args+=(--image-variant-background-source "${IMAGE_VARIANT_BACKGROUND_SOURCE}")
   if [[ -n "${LSST_DETECT_PYTHON}" ]]; then
     optional_args+=(--lsst-detect-python "${LSST_DETECT_PYTHON}")
   fi
@@ -387,12 +401,26 @@ run_preprocess() {
       --noncoadd-snr-ap-radius "${NONCOADD_SNR_AP_RADIUS}"
       --noncoadd-snr-annulus-r-in "${NONCOADD_SNR_ANNULUS_R_IN}"
       --noncoadd-snr-annulus-r-out "${NONCOADD_SNR_ANNULUS_R_OUT}"
-      --noncoadd-snr-annulus-exclude-radius "${NONCOADD_SNR_ANNULUS_EXCLUDE_RADIUS}"
+      --noncoadd-snr-source-mask-ellipse-sigma "${NONCOADD_SNR_SOURCE_MASK_ELLIPSE_SIGMA}"
+      --noncoadd-snr-min-annulus-pixels "${NONCOADD_SNR_MIN_ANNULUS_PIXELS}"
     )
+    split_words "${NONCOADD_SNR_MASK_PLANES}"
+    local noncoadd_snr_mask_plane_args=("${SPLIT_WORDS_OUT[@]}")
+    optional_args+=(--noncoadd-snr-mask-planes "${noncoadd_snr_mask_plane_args[@]}")
     if [[ "${NONCOADD_SNR_FILTER}" == "1" ]]; then
       optional_args+=(--noncoadd-snr-filter)
     else
       optional_args+=(--no-noncoadd-snr-filter)
+    fi
+    if [[ "${NONCOADD_SNR_USE_SOURCE_MASK}" == "1" ]]; then
+      optional_args+=(--noncoadd-snr-use-source-mask)
+    else
+      optional_args+=(--no-noncoadd-snr-use-source-mask)
+    fi
+    if [[ "${NONCOADD_SNR_USE_QUALITY_MASK}" == "1" ]]; then
+      optional_args+=(--noncoadd-snr-use-quality-mask)
+    else
+      optional_args+=(--no-noncoadd-snr-use-quality-mask)
     fi
     if [[ -n "${IMAGE_VARIANT_GROUPS}" ]]; then
       split_words "${IMAGE_VARIANT_GROUPS}"

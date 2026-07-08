@@ -138,6 +138,41 @@ def _compile_sam_runtime_model(model: nn.Module, args: argparse.Namespace, *, is
     return compile_fn(model, **kwargs)
 
 
+def _init_wandb_or_disable(
+    args: argparse.Namespace,
+    *,
+    out_dir: Path,
+    metadata: dict[str, object],
+    is_main: bool,
+):
+    if not is_main or str(args.wandb_mode) == "disabled":
+        return None
+    try:
+        run = wandb.init(
+            project=str(args.wandb_project),
+            entity=str(args.wandb_entity) if args.wandb_entity else None,
+            name=str(args.wandb_run_name) if args.wandb_run_name else out_dir.name,
+            dir=str(out_dir),
+            config=metadata,
+            mode=str(args.wandb_mode),
+        )
+    except Exception as exc:
+        print(
+            "WARNING: wandb initialization failed; continuing with wandb disabled. "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        return None
+    wandb.define_metric("iteration")
+    wandb.define_metric("epoch")
+    wandb.define_metric("train/iteration/*", step_metric="iteration")
+    wandb.define_metric("lr/iteration/*", step_metric="iteration")
+    wandb.define_metric("lr/epoch/*", step_metric="epoch")
+    wandb.define_metric("val/epoch/*", step_metric="epoch")
+    wandb.define_metric("train/epoch/*", step_metric="epoch")
+    return run
+
+
 @torch.no_grad()
 def _write_eval_sources_csv(
     model: nn.Module,
@@ -595,7 +630,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--wandb-mode",
         choices=("online", "offline", "disabled"),
         default="online",
-        help="Weights & Biases logging mode. Use disabled to turn off wandb entirely.",
+        help="Weights & Biases logging mode. Default is disabled to avoid blocking non-interactive DDP runs.",
     )
     parser.add_argument(
         "--wandb-log-interval",
@@ -1879,22 +1914,7 @@ def main() -> None:
         }
         if is_main:
             (out_dir / "run_config.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-            if str(args.wandb_mode) != "disabled":
-                run = wandb.init(
-                    project=str(args.wandb_project),
-                    entity=str(args.wandb_entity) if args.wandb_entity else None,
-                    name=str(args.wandb_run_name) if args.wandb_run_name else out_dir.name,
-                    dir=str(out_dir),
-                    config=metadata,
-                    mode=str(args.wandb_mode),
-                )
-                wandb.define_metric("iteration")
-                wandb.define_metric("epoch")
-                wandb.define_metric("train/iteration/*", step_metric="iteration")
-                wandb.define_metric("lr/iteration/*", step_metric="iteration")
-                wandb.define_metric("lr/epoch/*", step_metric="epoch")
-                wandb.define_metric("val/epoch/*", step_metric="epoch")
-                wandb.define_metric("train/epoch/*", step_metric="epoch")
+            run = _init_wandb_or_disable(args, out_dir=out_dir, metadata=metadata, is_main=is_main)
         _sync_distributed()
 
         best_val = float("inf")

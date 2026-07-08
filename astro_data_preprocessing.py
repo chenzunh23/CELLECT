@@ -178,6 +178,54 @@ def _plane_hdu_indices(hdul: fits.HDUList) -> Dict[str, int]:
     return indices
 
 
+def _mask_plane_bit_mapping(header: fits.Header) -> Dict[str, int]:
+    mapping: Dict[str, int] = {}
+    for key, value in header.items():
+        text_key = str(key).upper()
+        if not text_key.startswith("MP_"):
+            continue
+        name = text_key[3:]
+        try:
+            mapping[name] = int(value)
+        except Exception:
+            continue
+    return mapping
+
+
+def _quality_mask_from_lsst_fits(path: Path, mask_planes: Sequence[str]) -> Optional[np.ndarray]:
+    if not path.exists() or not mask_planes:
+        return None
+    try:
+        with fits.open(path, memmap=False) as hdul:
+            plane_indices = _plane_hdu_indices(hdul)
+            mask_idx = plane_indices.get("MASK")
+            if mask_idx is None:
+                return None
+            mask_hdu = hdul[mask_idx]
+            mask_data = np.asarray(mask_hdu.data)
+            if mask_data.ndim != 2:
+                return None
+            bit_mapping = _mask_plane_bit_mapping(mask_hdu.header)
+            selected = np.zeros(mask_data.shape, dtype=bool)
+            mask_values = mask_data.astype(np.int64, copy=False)
+            for plane in mask_planes:
+                plane_name = str(plane).strip().upper()
+                if not plane_name:
+                    continue
+                bit = bit_mapping.get(plane_name)
+                if bit is None:
+                    continue
+                selected |= (mask_values & (1 << int(bit))) != 0
+            return selected
+    except Exception as exc:
+        print(f"WARNING: failed to read quality mask from {path}: {exc}", flush=True)
+        return None
+
+
+def _coadd_cutout_path_for_quality_mask(coadd_patch_root: Path, *, band: str, tract: int, patch: str, tile_name: str) -> Path:
+    return coadd_patch_root / "cutouts" / tile_name / band / f"calexp-{band}-{tract}-{patch}.fits"
+
+
 def _cropped_header(header: fits.Header, *, local_x0: int, local_y0: int) -> fits.Header:
     out = header.copy()
     if "LTV1" in out:
@@ -489,6 +537,29 @@ def _crop_full_mask_for_tile(mask: Optional[np.ndarray], spec: TileSpec, parent_
     dst_y0 = src_y0 - y0
     out[dst_y0 : dst_y0 + (src_y1 - src_y0), dst_x0 : dst_x0 + (src_x1 - src_x0)] = mask[src_y0:src_y1, src_x0:src_x1]
     return out
+
+
+def _crop_image_for_tile(
+    image: np.ndarray,
+    spec: TileSpec,
+    parent_origin: Tuple[int, int],
+) -> Tuple[np.ndarray, Tuple[int, int]]:
+    x0 = int(spec.x0 - parent_origin[0])
+    y0 = int(spec.y0 - parent_origin[1])
+    x1 = x0 + int(spec.size)
+    y1 = y0 + int(spec.size)
+    out = np.zeros((spec.size, spec.size), dtype=np.asarray(image).dtype)
+    src_x0 = max(0, x0)
+    src_y0 = max(0, y0)
+    src_x1 = min(image.shape[1], x1)
+    src_y1 = min(image.shape[0], y1)
+    if src_x1 > src_x0 and src_y1 > src_y0:
+        dst_x0 = src_x0 - x0
+        dst_y0 = src_y0 - y0
+        out[dst_y0 : dst_y0 + (src_y1 - src_y0), dst_x0 : dst_x0 + (src_x1 - src_x0)] = image[
+            src_y0:src_y1, src_x0:src_x1
+        ]
+    return out, (int(spec.x0), int(spec.y0))
 
 
 def _existing_cutout_fits_path(tile_dir: Path, band: str) -> str:
@@ -1140,7 +1211,7 @@ def _remeasure_ap2_kron_outliers(
     """
 
     n = len(shaped)
-    empty_class = np.asarray([""] * n, dtype=object)
+    empty_class = np.asarray([""] * n, dtype="U32")
     if n == 0 or not bool(getattr(args, "pu_remeasure_ap2_kron_outliers", False)):
         return empty_class, {}, {"selected": 0}
     if band is None or patch is None:
@@ -1170,7 +1241,7 @@ def _remeasure_ap2_kron_outliers(
     leaf = nchild == 0
     old_ignore = np.asarray(result.get("ignore", result.get("b_class", np.zeros(n, dtype=bool))), dtype=bool)
     selected = np.flatnonzero(leaf & finite_center & np.isfinite(old_diff) & (old_diff > threshold) & old_ignore)
-    class_override = np.asarray([""] * n, dtype=object)
+    class_override = np.asarray([""] * n, dtype="U32")
     stats: Dict[str, int] = {"selected": int(selected.size)}
 
     diagnostics: Dict[str, np.ndarray] = {
@@ -1183,8 +1254,8 @@ def _remeasure_ap2_kron_outliers(
         "pu_remeasure_aperture_area": np.full(n, np.nan, dtype=np.float32),
         "pu_remeasure_footprint_fill_fraction": np.full(n, np.nan, dtype=np.float32),
         "pu_remeasure_axis_ratio": np.full(n, np.nan, dtype=np.float32),
-        "pu_remeasure_surface": np.asarray([""] * n, dtype=object),
-        "pu_remeasure_reason": np.asarray([""] * n, dtype=object),
+        "pu_remeasure_surface": np.asarray([""] * n, dtype="U32"),
+        "pu_remeasure_reason": np.asarray([""] * n, dtype="U512"),
     }
     if selected.size == 0:
         return class_override, diagnostics, stats
@@ -1317,7 +1388,7 @@ def _remeasure_ap2_kron_outliers(
         diagnostics["pu_remeasure_reason"][selected] = f"remeasure_archive_error:{exc}"
         return class_override, diagnostics, stats
 
-    ignore_area_max = float(getattr(args, "pu_remeasure_ignore_area_max", 10000.0))
+    drop_area_max = float(getattr(args, "pu_remeasure_ignore_area_max", 10000.0))
     faint_mag_min = float(getattr(args, "pu_remeasure_faint_mag_min", 28.0))
     faint_area_max = float(getattr(args, "pu_remeasure_faint_area_max", 900.0))
     axis_ratio_max = float(getattr(args, "pu_remeasure_axis_ratio_max", 5.0))
@@ -1335,8 +1406,8 @@ def _remeasure_ap2_kron_outliers(
         ap2_value = float(record["ap2_mag"])
         if np.isfinite(diff) and diff <= center_abs_max and np.isfinite(fill_fraction) and fill_fraction < small_fill_threshold:
             reasons.append("small_footprint_large_aperture")
-        if np.isfinite(area) and area > ignore_area_max:
-            reasons.append(f"used_aperture_area_gt_{ignore_area_max:g}")
+        if np.isfinite(area) and area > drop_area_max:
+            reasons.append(f"used_aperture_area_gt_{drop_area_max:g}")
         if np.isfinite(ap2_value) and ap2_value > faint_mag_min and np.isfinite(area) and area > faint_area_max:
             reasons.append(f"ap2_mag_gt_{faint_mag_min:g}_and_area_gt_{faint_area_max:g}")
         if np.isfinite(axis_ratio) and axis_ratio > axis_ratio_max:
@@ -1392,7 +1463,10 @@ def _remeasure_ap2_kron_outliers(
     for row, record in row_records.items():
         reasons = list(record["reasons"])
         diff = float(record["new_diff"])
-        if reasons:
+        drop_reasons = [reason for reason in reasons if reason.startswith("used_aperture_area_gt_")]
+        if drop_reasons:
+            label = "drop"
+        elif reasons:
             label = "ignore"
         elif np.isfinite(diff) and diff < keep_abs_max:
             label = "clean"
@@ -1475,10 +1549,22 @@ def _classify_pu_catalog(
     result["clean"] = clean_mask
     result["center_only"] = center_only_mask
     result["ignore"] = ignore_mask
+    result["dropped_remeasure"] = np.asarray(remeasure_class, dtype=str) == "drop"
     clean = shaped[clean_mask]
     center_only = shaped[center_only_mask]
     ignore = shaped[ignore_mask]
     return clean, center_only, ignore, shaped, result
+
+
+def _pu_dropped_sources(pu_all: Table, pu_result: Optional[Dict[str, object]]) -> Table:
+    if pu_result is None or len(pu_all) == 0:
+        return Table()
+    mask = np.zeros(len(pu_all), dtype=bool)
+    for key in ("dropped_area", "dropped_remeasure"):
+        value = pu_result.get(key)
+        if value is not None:
+            mask |= np.asarray(value, dtype=bool)
+    return pu_all[mask]
 
 
 def edge_aligned_starts(length: int, tile_size: int, stride: int) -> List[int]:
@@ -2143,18 +2229,39 @@ def _aperture_annulus_snr(
     ap_radius: float = 6.0,
     annulus_r_in: float = 10.0,
     annulus_r_out: float = 15.0,
-    exclude_centers: Optional[np.ndarray] = None,
-    annulus_exclude_radius: float = 0.0,
-) -> np.ndarray:
+    annulus_exclude_mask: Optional[np.ndarray] = None,
+    annulus_hard_exclude_mask: Optional[np.ndarray] = None,
+    annulus_self_ellipse_params: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
+    annulus_self_ellipse_sigma: float = 1.0,
+    min_annulus_pixels: int = 2,
+) -> Tuple[np.ndarray, np.ndarray]:
     image = np.asarray(image, dtype=np.float32)
     centers = np.asarray(centers, dtype=np.float32).reshape(-1, 2)
     snr = np.full((centers.shape[0],), np.nan, dtype=np.float32)
+    annulus_counts = np.zeros((centers.shape[0],), dtype=np.int32)
     if image.ndim != 2 or centers.size == 0:
-        return snr
-    exclude_xy = np.asarray(exclude_centers, dtype=np.float32).reshape(-1, 2) if exclude_centers is not None else centers
-    exclude_radius = float(annulus_exclude_radius)
+        return snr, annulus_counts
+    exclude = None
+    if annulus_exclude_mask is not None:
+        exclude = np.asarray(annulus_exclude_mask, dtype=bool)
+        if exclude.shape != image.shape:
+            raise ValueError(f"annulus_exclude_mask shape {exclude.shape} != image shape {image.shape}")
+    hard_exclude = None
+    if annulus_hard_exclude_mask is not None:
+        hard_exclude = np.asarray(annulus_hard_exclude_mask, dtype=bool)
+        if hard_exclude.shape != image.shape:
+            raise ValueError(f"annulus_hard_exclude_mask shape {hard_exclude.shape} != image shape {image.shape}")
+    self_major = self_minor = self_theta = None
+    if annulus_self_ellipse_params is not None:
+        self_major, self_minor, self_theta = annulus_self_ellipse_params
+        self_major = np.asarray(self_major, dtype=np.float32)
+        self_minor = np.asarray(self_minor, dtype=np.float32)
+        self_theta = np.asarray(self_theta, dtype=np.float32)
+        if not (len(self_major) == len(self_minor) == len(self_theta) == centers.shape[0]):
+            raise ValueError("annulus_self_ellipse_params must have one entry per center")
     h, w = image.shape
     rmax = float(max(ap_radius, annulus_r_out))
+    min_ann = max(2, int(min_annulus_pixels))
     for idx, (cx, cy) in enumerate(centers):
         if not (np.isfinite(cx) and np.isfinite(cy)):
             continue
@@ -2170,20 +2277,32 @@ def _aperture_annulus_snr(
         finite = np.isfinite(patch)
         ap_mask = (rr <= float(ap_radius)) & finite
         ann_mask = (rr >= float(annulus_r_in)) & (rr < float(annulus_r_out)) & finite
-        if exclude_radius > 0.0 and exclude_xy.size:
-            nearby = (
-                (exclude_xy[:, 0] >= x0 - exclude_radius)
-                & (exclude_xy[:, 0] < x1 + exclude_radius)
-                & (exclude_xy[:, 1] >= y0 - exclude_radius)
-                & (exclude_xy[:, 1] < y1 + exclude_radius)
-            )
-            for ex, ey in exclude_xy[nearby]:
-                if not (np.isfinite(ex) and np.isfinite(ey)):
-                    continue
-                ann_mask &= ((xx.astype(np.float32) - float(ex)) ** 2 + (yy.astype(np.float32) - float(ey)) ** 2) > exclude_radius**2
+        if hard_exclude is not None:
+            ann_mask &= ~hard_exclude[y0:y1, x0:x1]
+        if exclude is not None:
+            exclude_patch = exclude[y0:y1, x0:x1]
+            if self_major is not None:
+                if np.isfinite(self_major[idx]) and np.isfinite(self_minor[idx]) and np.isfinite(self_theta[idx]):
+                    a = float(max(self_major[idx] * float(annulus_self_ellipse_sigma), 1.5))
+                    b = float(max(self_minor[idx] * float(annulus_self_ellipse_sigma), 1.5))
+                    theta = float(self_theta[idx])
+                else:
+                    a = b = float(max(2.0 * float(annulus_self_ellipse_sigma), 1.5))
+                    theta = 0.0
+                dx = xx.astype(np.float32) - float(cx)
+                dy = yy.astype(np.float32) - float(cy)
+                cos_t = math.cos(theta)
+                sin_t = math.sin(theta)
+                xr = cos_t * dx + sin_t * dy
+                yr = -sin_t * dx + cos_t * dy
+                self_ellipse = (xr / a) ** 2 + (yr / b) ** 2 <= 1.0
+                ann_mask &= ~(exclude_patch & ~self_ellipse)
+            else:
+                ann_mask &= ~exclude_patch
         ap_vals = patch[ap_mask]
         ann_vals = patch[ann_mask]
-        if ap_vals.size == 0 or ann_vals.size < 2:
+        annulus_counts[idx] = int(ann_vals.size)
+        if ap_vals.size == 0 or ann_vals.size < min_ann:
             continue
         bkg = float(np.median(ann_vals))
         sigma = float(np.std(ann_vals.astype(np.float64), ddof=1))
@@ -2193,7 +2312,20 @@ def _aperture_annulus_snr(
         noise = sigma * math.sqrt(float(ap_vals.size))
         if noise > 0.0:
             snr[idx] = float(flux / noise)
-    return snr
+    return snr, annulus_counts
+
+
+def _source_annulus_exclusion_mask(
+    sources: Table,
+    spec: TileSpec,
+    *,
+    x_col: str,
+    y_col: str,
+    ellipse_sigma: float,
+) -> np.ndarray:
+    mask = np.zeros((spec.size, spec.size), dtype=np.uint8)
+    _paint_ellipse_mask(mask, sources, spec, x_col=x_col, y_col=y_col, ellipse_sigma=ellipse_sigma)
+    return mask > 0
 
 
 def _centers_for_image_snr(
@@ -2218,30 +2350,48 @@ def _classify_clean_by_noncoadd_snr(
     image: np.ndarray,
     image_origin: Tuple[int, int],
     args: argparse.Namespace,
+    annulus_exclude_mask: Optional[np.ndarray] = None,
+    annulus_hard_exclude_mask: Optional[np.ndarray] = None,
 ) -> Tuple[Table, Table, Table, np.ndarray]:
     if len(clean_sources) == 0:
         empty = clean_sources.copy(copy_data=True)
         return empty, empty.copy(copy_data=True), empty.copy(copy_data=True), np.zeros((0,), dtype=np.float32)
     centers = _centers_for_image_snr(clean_sources, image_origin=image_origin, x_col=args.x_col, y_col=args.y_col)
-    snr = _aperture_annulus_snr(
+    self_params = None
+    if all(name in clean_sources.colnames for name in ("ellipse_major_sigma", "ellipse_minor_sigma", "ellipse_theta")):
+        self_params = (
+            np.asarray(clean_sources["ellipse_major_sigma"], dtype=np.float32),
+            np.asarray(clean_sources["ellipse_minor_sigma"], dtype=np.float32),
+            np.asarray(clean_sources["ellipse_theta"], dtype=np.float32),
+        )
+    snr, annulus_counts = _aperture_annulus_snr(
         image,
         centers,
         ap_radius=float(args.noncoadd_snr_ap_radius),
         annulus_r_in=float(args.noncoadd_snr_annulus_r_in),
         annulus_r_out=float(args.noncoadd_snr_annulus_r_out),
-        exclude_centers=centers,
-        annulus_exclude_radius=float(getattr(args, "noncoadd_snr_annulus_exclude_radius", 0.0)),
+        annulus_exclude_mask=annulus_exclude_mask,
+        annulus_hard_exclude_mask=annulus_hard_exclude_mask,
+        annulus_self_ellipse_params=self_params,
+        annulus_self_ellipse_sigma=float(getattr(args, "noncoadd_snr_source_mask_ellipse_sigma", 1.0)),
+        min_annulus_pixels=int(getattr(args, "noncoadd_snr_min_annulus_pixels", 2)),
     )
     finite_snr = np.isfinite(snr)
+    insufficient_annulus = annulus_counts < int(getattr(args, "noncoadd_snr_min_annulus_pixels", 2))
     normal_keep = finite_snr & (snr >= float(args.noncoadd_snr_center_only_thresh))
-    center_keep = finite_snr & (snr >= float(args.noncoadd_snr_ignore_thresh)) & (snr < float(args.noncoadd_snr_center_only_thresh))
-    ignore_keep = (~finite_snr) | (snr < float(args.noncoadd_snr_ignore_thresh))
+    center_keep = insufficient_annulus | (
+        finite_snr
+        & (snr >= float(args.noncoadd_snr_ignore_thresh))
+        & (snr < float(args.noncoadd_snr_center_only_thresh))
+    )
+    ignore_keep = (~insufficient_annulus) & ((~finite_snr) | (snr < float(args.noncoadd_snr_ignore_thresh)))
 
     annotated = clean_sources.copy(copy_data=True)
     visibility_class = np.full(len(annotated), "normal", dtype="U16")
     visibility_class[center_keep] = "center_only"
     visibility_class[ignore_keep] = "ignore"
     annotated["noncoadd_visibility_snr"] = snr.astype(np.float32)
+    annotated["noncoadd_visibility_annulus_pixels"] = annulus_counts.astype(np.int32)
     annotated["noncoadd_visibility_class"] = visibility_class
     return (
         annotated[normal_keep],
@@ -2368,6 +2518,30 @@ def _variant_lsst_background_mask(
     return None
 
 
+def _image_variant_background_mask_for_tile(
+    args: argparse.Namespace,
+    *,
+    coadd_patch_root: Path,
+    band: str,
+    spec: TileSpec,
+    group_lsst_background_masks: Dict[str, Tuple[np.ndarray, Tuple[int, int]]],
+) -> Optional[np.ndarray]:
+    source = str(getattr(args, "image_variant_background_source", "auto")).strip().lower()
+    if source not in {"auto", "coadd-target", "variant-lsst", "none"}:
+        raise ValueError(f"Unknown image_variant_background_source: {source}")
+    if source == "none":
+        return None
+    if source == "variant-lsst":
+        if band not in group_lsst_background_masks:
+            return None
+        return _crop_full_mask_for_tile(group_lsst_background_masks[band][0], spec, group_lsst_background_masks[band][1])
+    if source == "coadd-target":
+        return _coadd_target_background_mask(coadd_patch_root, band, spec.name)
+    if band in group_lsst_background_masks:
+        return _crop_full_mask_for_tile(group_lsst_background_masks[band][0], spec, group_lsst_background_masks[band][1])
+    return _coadd_target_background_mask(coadd_patch_root, band, spec.name)
+
+
 def _read_variant_label_sources(
     coadd_patch_root: Path,
     *,
@@ -2449,6 +2623,7 @@ def mirror_fast_outputs(source_root: Path, fast_root: Path) -> None:
         "strict_ignore_catalogs",
         "band_reference_catalogs",
         "band_reference_rejected",
+        "band_reference_dropped",
         "band_reference_center_only",
         "band_reference_ignore",
         "band_reference_strict_center_only",
@@ -2744,17 +2919,53 @@ def _preprocess_image_variant_patch(
                             margin=args.mask_margin,
                         )
 
+                        image_tile, image_tile_origin = _crop_image_for_tile(image, spec, image_origin)
+                        snr_exclusion_sources = _vstack_nonempty([clean_mask_all, center_mask, strict_center_mask])
+                        snr_annulus_exclude_mask = None
+                        if bool(getattr(args, "noncoadd_snr_use_source_mask", True)):
+                            snr_annulus_exclude_mask = _source_annulus_exclusion_mask(
+                                snr_exclusion_sources,
+                                spec,
+                                x_col=args.x_col,
+                                y_col=args.y_col,
+                                ellipse_sigma=float(getattr(args, "noncoadd_snr_source_mask_ellipse_sigma", 1.0)),
+                            )
+                        quality_mask = None
+                        if bool(getattr(args, "noncoadd_snr_use_quality_mask", True)):
+                            quality_mask_path = _coadd_cutout_path_for_quality_mask(
+                                coadd_patch_root,
+                                band=band,
+                                tract=args.tract,
+                                patch=patch,
+                                tile_name=spec.name,
+                            )
+                            quality_mask = _quality_mask_from_lsst_fits(
+                                quality_mask_path,
+                                tuple(str(plane) for plane in getattr(args, "noncoadd_snr_mask_planes", ()) or ()),
+                            )
+                        if quality_mask is not None and quality_mask.shape != image_tile.shape:
+                            print(
+                                f"WARNING: quality mask shape {quality_mask.shape} != tile shape "
+                                f"{image_tile.shape} for {quality_mask_path}; ignoring quality mask",
+                                flush=True,
+                            )
+                            quality_mask = None
+
                         normal_tile, snr_center_tile, snr_ignore_tile, _tile_snr = _classify_clean_by_noncoadd_snr(
                             clean_tile_all,
-                            image=image,
-                            image_origin=image_origin,
+                            image=image_tile,
+                            image_origin=image_tile_origin,
                             args=args,
+                            annulus_exclude_mask=snr_annulus_exclude_mask,
+                            annulus_hard_exclude_mask=quality_mask,
                         )
                         normal_mask, snr_center_mask, snr_ignore_mask, _mask_snr = _classify_clean_by_noncoadd_snr(
                             clean_mask_all,
-                            image=image,
-                            image_origin=image_origin,
+                            image=image_tile,
+                            image_origin=image_tile_origin,
                             args=args,
+                            annulus_exclude_mask=snr_annulus_exclude_mask,
+                            annulus_hard_exclude_mask=quality_mask,
                         )
                         combined_center_tile = _vstack_nonempty([center_tile, snr_center_tile])
                         combined_ignore_tile = _vstack_nonempty([ignore_tile, snr_ignore_tile])
@@ -2772,14 +2983,12 @@ def _preprocess_image_variant_patch(
                             confidence_levels=args.confidence_levels,
                             core_radius=args.core_radius,
                             center_only_weight=args.pu_center_only_weight,
-                            lsst_background_mask=(
-                                _crop_full_mask_for_tile(
-                                    group_lsst_background_masks[band][0],
-                                    spec,
-                                    group_lsst_background_masks[band][1],
-                                )
-                                if band in group_lsst_background_masks
-                                else _coadd_target_background_mask(coadd_patch_root, band, spec.name)
+                            lsst_background_mask=_image_variant_background_mask_for_tile(
+                                args,
+                                coadd_patch_root=coadd_patch_root,
+                                band=band,
+                                spec=spec,
+                                group_lsst_background_masks=group_lsst_background_masks,
                             ),
                             strict_center_only_sources=strict_center_mask,
                             strict_center_only_ellipse_sigma=args.pu_strict_bright_center_only_ellipse_sigma,
@@ -2854,9 +3063,13 @@ def _preprocess_image_variant_patch(
             "variant_lsst_background_root": str(_variant_lsst_background_root(args))
             if _variant_lsst_background_root(args) is not None
             else None,
+            "image_variant_background_source": str(getattr(args, "image_variant_background_source", "auto")),
             "noncoadd_snr_filter": write_variant_labels,
             "noncoadd_snr_ignore_thresh": float(getattr(args, "noncoadd_snr_ignore_thresh", 2.0)),
             "noncoadd_snr_center_only_thresh": float(getattr(args, "noncoadd_snr_center_only_thresh", 3.0)),
+            "noncoadd_snr_use_source_mask": bool(getattr(args, "noncoadd_snr_use_source_mask", True)),
+            "noncoadd_snr_use_quality_mask": bool(getattr(args, "noncoadd_snr_use_quality_mask", True)),
+            "noncoadd_snr_algorithm": "aperture_annulus_v2_source_quality_mask_options",
             "noncoadd_visibility_counts": visibility_counts if write_variant_labels else None,
             "zscale_root": str(_expand(args.zscale_root)) if args.zscale_root is not None else None,
             "zscale_written": zscale_written,
@@ -3384,6 +3597,7 @@ def _preprocess_patch(
             band=args.catalog_band,
             patch=patch,
         )
+        dropped_sources = _pu_dropped_sources(pu_all, pu_result)
         filtered, center_only, strict_center_only_sources = _move_bright_clean_to_center_only(
             filtered,
             center_only,
@@ -3393,6 +3607,7 @@ def _preprocess_patch(
         rejected_parts = [part for part in (center_only, ignore_sources) if len(part)]
         rejected = vstack(rejected_parts) if len(rejected_parts) >= 2 else (rejected_parts[0] if rejected_parts else Table())
     else:
+        dropped_sources = Table()
         filtered, rejected = _filter_catalog(table, args)
         if args.target_shape_source != args.shape_source:
             filtered = add_ellipse_columns(filtered, shape_source=args.target_shape_source)
@@ -3411,6 +3626,7 @@ def _preprocess_patch(
             write_table_pair(center_only, sources_dir / "sources_pu_center_only.fits", None)
             write_table_pair(ignore_sources, sources_dir / "sources_pu_ignore.fits", None)
             write_table_pair(strict_center_only_sources, sources_dir / "sources_pu_strict_center_only.fits", None)
+            write_table_pair(dropped_sources, sources_dir / "sources_pu_dropped.fits", None)
             write_table_pair(pu_all, sources_dir / "sources_pu_all.fits", None)
 
     band_catalog_warnings: List[Dict[str, str]] = []
@@ -3428,6 +3644,7 @@ def _preprocess_patch(
                         band=band,
                         patch=patch,
                     )
+                    band_dropped = _pu_dropped_sources(band_pu_all, _band_pu_result)
                     band_strict_center_only = Table()
                     band_filtered, band_center_only, band_strict_center_only = _move_bright_clean_to_center_only(
                         band_filtered,
@@ -3442,6 +3659,7 @@ def _preprocess_patch(
                         else (band_rejected_parts[0] if band_rejected_parts else Table())
                     )
                 else:
+                    band_dropped = Table()
                     band_filtered, band_rejected = _filter_catalog(band_table, args)
                     if args.target_shape_source != args.shape_source:
                         band_filtered = add_ellipse_columns(band_filtered, shape_source=args.target_shape_source)
@@ -3479,6 +3697,7 @@ def _preprocess_patch(
                 band_ignore = ignore_sources
                 band_strict_center_only = strict_center_only_sources
                 band_pu_all = pu_all if args.label_mode == "pu" else Table()
+                band_dropped = dropped_sources
             band_target_sources[band] = (band_filtered, band_center_only, band_ignore, band_strict_center_only)
             band_ref_dir = output_root / "band_reference_catalogs" / band
             write_table_pair(
@@ -3493,6 +3712,11 @@ def _preprocess_patch(
             )
             write_ids_metadata(band_rejected, output_root / "band_rejected_ids" / f"{band}.npz")
             if args.label_mode == "pu":
+                write_table_pair(
+                    band_dropped,
+                    output_root / "band_reference_dropped" / band / f"meas-{band}-{args.tract}-{patch}.fits",
+                    None,
+                )
                 write_table_pair(
                     band_center_only,
                     output_root / "band_reference_center_only" / band / f"meas-{band}-{args.tract}-{patch}.fits",
@@ -4148,7 +4372,46 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--noncoadd-snr-annulus-exclude-radius",
         type=float,
         default=6.0,
-        help="Exclude pixels within this radius of any clean source center from non-coadd SNR annuli. Use <=0 to disable.",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--noncoadd-snr-source-mask-ellipse-sigma",
+        type=float,
+        default=1.0,
+        help=(
+            "Ellipse scale for source masks excluded from noncoadd SNR annuli. "
+            "The target source's own ellipse is kept in the annulus so nearby source masks do not erase all pixels."
+        ),
+    )
+    parser.add_argument(
+        "--noncoadd-snr-use-source-mask",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Exclude known source ellipses from the noncoadd SNR background annulus. "
+            "Disable this to reproduce the older Zangetsu demo SNR split more closely."
+        ),
+    )
+    parser.add_argument(
+        "--noncoadd-snr-use-quality-mask",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Exclude selected coadd MASK planes from the noncoadd SNR background annulus. "
+            "Disable this together with --no-noncoadd-snr-use-source-mask for legacy diagnostics."
+        ),
+    )
+    parser.add_argument(
+        "--noncoadd-snr-min-annulus-pixels",
+        type=int,
+        default=50,
+        help="Minimum unmasked annulus pixels required for noncoadd SNR. Fewer pixels marks the source center_only.",
+    )
+    parser.add_argument(
+        "--noncoadd-snr-mask-planes",
+        nargs="*",
+        default=["BRIGHT_OBJECT", "SAT", "BAD", "NO_DATA", "EDGE", "UNMASKEDNAN"],
+        help="Coadd MASK planes excluded from noncoadd SNR annuli. Pass an empty value to disable pixel-quality masking.",
     )
     parser.add_argument("--pu-a-flags", nargs="*", default=list(DEFAULT_PU_A_FLAGS))
     parser.add_argument("--pu-b-flags", nargs="*", default=list(DEFAULT_PU_B_FLAGS))
@@ -4430,6 +4693,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "lsst_pipeline/batch_detect_background.py. Layout: "
             "<root>/<variant>/<tract>/<patch>/<group>/<band>/background_mask.npz. "
             "When present, denoised/noisy PU targets use these masks before falling back to coadd target backgrounds."
+        ),
+    )
+    parser.add_argument(
+        "--image-variant-background-source",
+        choices=("auto", "coadd-target", "variant-lsst", "none"),
+        default="auto",
+        help=(
+            "Background mask source for denoised/noisy PU targets. "
+            "'coadd-target' reuses the coadd target background mask, which is normally the LSST-detected "
+            "background after clean/center/ignore exclusion; 'variant-lsst' uses --variant-lsst-background-root; "
+            "'auto' prefers variant-lsst when available and otherwise uses coadd-target."
         ),
     )
     parser.add_argument(
