@@ -98,6 +98,46 @@ def _filter_records_by_dataset_sources(records, values: Sequence[str]):
     ]
 
 
+def _runtime_unwrap_model(model: nn.Module) -> nn.Module:
+    """Unwrap DDP helper layers while preserving torch.compile runtime wrappers."""
+
+    current = model
+    while True:
+        if hasattr(current, "module"):
+            current = current.module  # type: ignore[assignment]
+            continue
+        if hasattr(current, "_ddp_wrapped_model"):
+            current = current._ddp_wrapped_model  # type: ignore[attr-defined,assignment]
+            continue
+        return current
+
+
+def _compile_sam_runtime_model(model: nn.Module, args: argparse.Namespace, *, is_main: bool) -> nn.Module:
+    if not bool(getattr(args, "sam_compile", False)):
+        return model
+    if str(getattr(args, "model_variant", "")) != "sam_per_band":
+        if is_main:
+            print("WARNING: --sam-compile is only used with --model-variant sam_per_band; ignoring.")
+        return model
+    compile_fn = getattr(torch, "compile", None)
+    if compile_fn is None:
+        raise RuntimeError("--sam-compile requires a PyTorch build with torch.compile")
+    kwargs: dict[str, object] = {
+        "backend": str(getattr(args, "sam_compile_backend", "inductor")),
+        "fullgraph": bool(getattr(args, "sam_compile_fullgraph", False)),
+    }
+    mode = str(getattr(args, "sam_compile_mode", "default"))
+    if mode and mode != "default":
+        kwargs["mode"] = mode
+    if is_main:
+        print(
+            "Compiling SAM runtime model with torch.compile "
+            f"(backend={kwargs['backend']}, mode={mode}, fullgraph={kwargs['fullgraph']}). "
+            "Checkpoints will still store the uncompiled state_dict."
+        )
+    return compile_fn(model, **kwargs)
+
+
 @torch.no_grad()
 def _write_eval_sources_csv(
     model: nn.Module,
@@ -661,6 +701,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "mask-loss warmup uses a dynamic parameter graph."
         ),
     )
+    parser.add_argument(
+        "--sam-compile",
+        action="store_true",
+        help=(
+            "Compile --model-variant sam_per_band with torch.compile after checkpoint loading. "
+            "Saved checkpoints still use the original uncompiled module state_dict."
+        ),
+    )
+    parser.add_argument("--sam-compile-backend", default="inductor", help="torch.compile backend for --sam-compile.")
+    parser.add_argument(
+        "--sam-compile-mode",
+        choices=("default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"),
+        default="default",
+        help="torch.compile mode for --sam-compile.",
+    )
+    parser.add_argument(
+        "--sam-compile-fullgraph",
+        action="store_true",
+        help="Pass fullgraph=True to torch.compile for --sam-compile. Default allows graph breaks.",
+    )
     parser.add_argument("--base-channels", type=int, default=32)
     parser.add_argument("--embedding-dim", type=int, default=64)
     parser.add_argument(
@@ -814,6 +874,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--noncoadd-snr-ap-radius", type=float, default=6.0, help="Aperture radius in pixels for non-coadd GT visibility SNR.")
     parser.add_argument("--noncoadd-snr-annulus-r-in", type=float, default=10.0, help="Inner annulus radius in pixels for non-coadd GT visibility SNR.")
     parser.add_argument("--noncoadd-snr-annulus-r-out", type=float, default=15.0, help="Outer annulus radius in pixels for non-coadd GT visibility SNR.")
+    parser.add_argument(
+        "--noncoadd-snr-annulus-exclude-radius",
+        type=float,
+        default=6.0,
+        help="Exclude pixels within this radius of any clean source center from online non-coadd SNR annuli. Use <=0 to disable.",
+    )
     parser.add_argument("--confidence-threshold", type=float, default=2.0)
     parser.add_argument(
         "--nms-radius",
@@ -1452,6 +1518,7 @@ def main() -> None:
             noncoadd_visibility_ap_radius=float(args.noncoadd_snr_ap_radius),
             noncoadd_visibility_annulus_r_in=float(args.noncoadd_snr_annulus_r_in),
             noncoadd_visibility_annulus_r_out=float(args.noncoadd_snr_annulus_r_out),
+            noncoadd_visibility_annulus_exclude_radius=float(args.noncoadd_snr_annulus_exclude_radius),
         )
         pseudo_label_path = out_dir / "pseudo_labels" / "latest.json" if args.enable_pu_self_training else None
         train_ds = AstroCutoutDataset(
@@ -1599,6 +1666,8 @@ def main() -> None:
                     model.EX.load_state_dict(ckpt["EX"])
                 if isinstance(ckpt, dict) and ckpt.get("EN") is not None:
                     model.EN.load_state_dict(ckpt["EN"])
+
+        model = _compile_sam_runtime_model(model, args, is_main=is_main)
 
         if is_main and distributed:
             print(
@@ -1765,6 +1834,10 @@ def main() -> None:
             "sam_checkpoint": str(_expand_path(args.sam_checkpoint)) if model_variant == "sam_per_band" and args.sam_checkpoint else None,
             "sam_cen_enabled": bool(model_variant == "sam_per_band" and not args.disable_sam_cen),
             "sam_astro_preprocess_in_model": bool(False) if model_variant == "sam_per_band" else None,
+            "sam_compile": bool(model_variant == "sam_per_band" and args.sam_compile),
+            "sam_compile_backend": str(args.sam_compile_backend) if model_variant == "sam_per_band" and args.sam_compile else None,
+            "sam_compile_mode": str(args.sam_compile_mode) if model_variant == "sam_per_band" and args.sam_compile else None,
+            "sam_compile_fullgraph": bool(args.sam_compile_fullgraph) if model_variant == "sam_per_band" and args.sam_compile else None,
             "sam_lr_schedule": (
                 {
                     "type": "iteration_warmup_step",
@@ -2021,7 +2094,7 @@ def main() -> None:
             )
             global_step += len(train_loader)
 
-            eval_model = unwrap_model(model)
+            eval_model = _runtime_unwrap_model(model)
             run_detect = int(args.detect_every) > 0 and ((epoch + 1) % int(args.detect_every) == 0)
             val_metrics, det_metrics = validate_epoch(
                 eval_model,

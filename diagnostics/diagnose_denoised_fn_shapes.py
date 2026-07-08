@@ -171,6 +171,38 @@ def _select_random_records(
     return selected
 
 
+def _select_explicit_records(records: Sequence[CutoutRecord], *, tiles: Sequence[str], group: str) -> list[CutoutRecord]:
+    selected: list[CutoutRecord] = []
+    seen: set[tuple[str, str]] = set()
+    denoised = [rec for rec in records if rec.dataset_source == "denoised" and (not group or rec.tile_name.startswith(f"{group}_"))]
+    for value in tiles:
+        text = str(value).strip()
+        if not text:
+            continue
+        if "/" in text:
+            patch, tile = text.split("/", 1)
+            patch = patch.strip()
+            tile = tile.strip()
+        else:
+            patch = ""
+            tile = text
+        matches = [
+            rec
+            for rec in denoised
+            if (not patch or rec.patch == patch)
+            and (rec.tile_name == tile or rec.tile_name.startswith(tile) or _base_tile_name(rec.tile_name) == tile)
+        ]
+        if len(matches) != 1:
+            names = ", ".join(f"{rec.patch}/{rec.tile_name}" for rec in matches[:10])
+            raise RuntimeError(f"Expected exactly one denoised record for {text!r}, got {len(matches)}: {names}")
+        rec = matches[0]
+        key = (rec.patch, rec.tile_name)
+        if key not in seen:
+            selected.append(rec)
+            seen.add(key)
+    return selected
+
+
 def _dataset_for_record(rec: CutoutRecord, cfg: dict, image_cache_dir: Path | None) -> DataLoader:
     ds = AstroCutoutDataset(
         [rec],
@@ -611,6 +643,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--group", default="group_01")
     parser.add_argument("--sam-tile", default=DEFAULT_SAM_TILE)
     parser.add_argument("--extra-tiles", type=int, default=4)
+    parser.add_argument("--tiles", nargs="*", default=())
     parser.add_argument("--random-tiles-total", type=int, default=0)
     parser.add_argument("--random-seed", type=int, default=704)
     parser.add_argument("--exclude-tiles", nargs="*", default=())
@@ -646,7 +679,9 @@ def main() -> int:
     device = torch.device(args.device)
     print(f"[load] records from {args.data_root}", flush=True)
     records = discover_cutout_records(args.data_root, bands=bands)
-    if int(args.random_tiles_total) > 0:
+    if tuple(args.tiles):
+        selected = _select_explicit_records(records, tiles=tuple(str(item) for item in args.tiles), group=str(args.group))
+    elif int(args.random_tiles_total) > 0:
         selected = _select_random_records(
             records,
             patches=[str(patch) for patch in args.patches],

@@ -71,6 +71,7 @@ NONCOADD_SNR_CENTER_ONLY_THRESH="${NONCOADD_SNR_CENTER_ONLY_THRESH:-3.0}"
 NONCOADD_SNR_AP_RADIUS="${NONCOADD_SNR_AP_RADIUS:-6.0}"
 NONCOADD_SNR_ANNULUS_R_IN="${NONCOADD_SNR_ANNULUS_R_IN:-10.0}"
 NONCOADD_SNR_ANNULUS_R_OUT="${NONCOADD_SNR_ANNULUS_R_OUT:-15.0}"
+NONCOADD_SNR_ANNULUS_EXCLUDE_RADIUS="${NONCOADD_SNR_ANNULUS_EXCLUDE_RADIUS:-6.0}"
 
 BAND_LIMIT_MAGS="${BAND_LIMIT_MAGS:-HSC-G=27.4 HSC-R=27.1 HSC-I=26.9 HSC-Z=26.3 HSC-Y=25.3}"
 STRICT_CENTER_ONLY_SATURATION_MAGS="${STRICT_CENTER_ONLY_SATURATION_MAGS:-${STRICT_IGNORE_SATURATION_MAGS:-HSC-G=18.0 HSC-R=18.2 HSC-I=18.6 HSC-Z=17.7 HSC-Y=17.4}}"
@@ -78,6 +79,14 @@ ENABLE_STRICT_BRIGHT_CENTER_ONLY="${ENABLE_STRICT_BRIGHT_CENTER_ONLY:-0}"
 PU_AP2_KRON_ABS_MAX="${PU_AP2_KRON_ABS_MAX:-1.0}"
 PU_AP2_FLUX_COLUMN="${PU_AP2_FLUX_COLUMN:-base_CircularApertureFlux_6_0_instFlux}"
 PU_AP2_KRON_FLUX_COLUMN="${PU_AP2_KRON_FLUX_COLUMN:-ext_photometryKron_KronFlux_instFlux}"
+PU_REMEASURE_AP2_KRON_OUTLIERS="${PU_REMEASURE_AP2_KRON_OUTLIERS:-1}"
+PU_REMEASURE_CENTER_ONLY_ABS_MAX="${PU_REMEASURE_CENTER_ONLY_ABS_MAX:-1.5}"
+PU_REMEASURE_SMALL_FOOTPRINT_FILL_THRESHOLD="${PU_REMEASURE_SMALL_FOOTPRINT_FILL_THRESHOLD:-0.2}"
+PU_REMEASURE_IGNORE_AREA_MAX="${PU_REMEASURE_IGNORE_AREA_MAX:-10000}"
+PU_REMEASURE_FAINT_MAG_MIN="${PU_REMEASURE_FAINT_MAG_MIN:-28}"
+PU_REMEASURE_FAINT_AREA_MAX="${PU_REMEASURE_FAINT_AREA_MAX:-900}"
+PU_REMEASURE_AXIS_RATIO_MAX="${PU_REMEASURE_AXIS_RATIO_MAX:-5}"
+PU_REMEASURE_CONTAINMENT_THRESHOLD="${PU_REMEASURE_CONTAINMENT_THRESHOLD:-0.80}"
 
 WRITE_CLEAN_REGIONS="${WRITE_CLEAN_REGIONS:-0}"
 CLEAN_REGION_OUT_DIR="${CLEAN_REGION_OUT_DIR:-output/preprocessed_clean_regions}"
@@ -362,6 +371,11 @@ run_preprocess() {
       --pu-band-limit-mags "${band_limit_args[@]}"
     )
   fi
+  if [[ "${PU_REMEASURE_AP2_KRON_OUTLIERS}" == "1" ]]; then
+    optional_args+=(--pu-remeasure-ap2-kron-outliers)
+  else
+    optional_args+=(--no-pu-remeasure-ap2-kron-outliers)
+  fi
   if [[ -n "${DENOISED_FITS_ROOT}" ]]; then
     split_words "${IMAGE_VARIANTS}"
     local image_variant_args=("${SPLIT_WORDS_OUT[@]}")
@@ -373,6 +387,7 @@ run_preprocess() {
       --noncoadd-snr-ap-radius "${NONCOADD_SNR_AP_RADIUS}"
       --noncoadd-snr-annulus-r-in "${NONCOADD_SNR_ANNULUS_R_IN}"
       --noncoadd-snr-annulus-r-out "${NONCOADD_SNR_ANNULUS_R_OUT}"
+      --noncoadd-snr-annulus-exclude-radius "${NONCOADD_SNR_ANNULUS_EXCLUDE_RADIUS}"
     )
     if [[ "${NONCOADD_SNR_FILTER}" == "1" ]]; then
       optional_args+=(--noncoadd-snr-filter)
@@ -406,6 +421,14 @@ run_preprocess() {
     --pu-ap2-kron-abs-max "${PU_AP2_KRON_ABS_MAX}" \
     --pu-ap2-flux-column "${PU_AP2_FLUX_COLUMN}" \
     --pu-ap2-kron-flux-column "${PU_AP2_KRON_FLUX_COLUMN}" \
+    --pu-remeasure-clean-abs-max "${PU_AP2_KRON_ABS_MAX}" \
+    --pu-remeasure-center-only-abs-max "${PU_REMEASURE_CENTER_ONLY_ABS_MAX}" \
+    --pu-remeasure-small-footprint-fill-threshold "${PU_REMEASURE_SMALL_FOOTPRINT_FILL_THRESHOLD}" \
+    --pu-remeasure-ignore-area-max "${PU_REMEASURE_IGNORE_AREA_MAX}" \
+    --pu-remeasure-faint-mag-min "${PU_REMEASURE_FAINT_MAG_MIN}" \
+    --pu-remeasure-faint-area-max "${PU_REMEASURE_FAINT_AREA_MAX}" \
+    --pu-remeasure-axis-ratio-max "${PU_REMEASURE_AXIS_RATIO_MAX}" \
+    --pu-remeasure-containment-threshold "${PU_REMEASURE_CONTAINMENT_THRESHOLD}" \
     --pu-b-close-center-arcsec "${PU_B_CLOSE_CENTER_ARCSEC}" \
     --pu-b-axis-ratio-max "${PU_B_AXIS_RATIO_MAX}" \
     --pu-containment-threshold "${PU_CONTAINMENT_THRESHOLD}" \

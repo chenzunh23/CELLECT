@@ -30,8 +30,9 @@ class _DDPModelWrapper(nn.Module):
     def forward(self, image: torch.Tensor) -> dict[str, torch.Tensor]:
         outputs = self._ddp_wrapped_model(image)
         dummy = image.new_zeros(())
+        base_model = unwrap_model(self._ddp_wrapped_model)
         for name in ("EX", "EN", "prompt_encoder", "mask_decoder"):
-            module = getattr(self._ddp_wrapped_model, name, None)
+            module = getattr(base_model, name, None)
             if module is None:
                 continue
             for param in module.parameters():
