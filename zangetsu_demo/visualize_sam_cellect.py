@@ -34,8 +34,8 @@ from sam_backbone import build_sam_cellect2d  # noqa: E402
 
 
 TRACT = "9813"
-PATCH = "4,5" # "6,1"
-TILE = "sam_x18204_y20924" #  "zangetsu_lower_right_x27366_y6453"
+PATCH =  "4,5" # "6,1"
+TILE = "sam_x18204_y20924" # "zangetsu_lower_right_x27366_y6453"
 DEFAULT_VARIANT_GROUP = "group_01"
 DEFAULT_BANDS = ("HSC-G", "HSC-R", "HSC-I", "HSC-Z", "HSC-Y")
 DEFAULT_BAND = "HSC-I"
@@ -145,14 +145,32 @@ def _dataset(
     image_cache_dir: Path | None = None,
     tile_name: str = TILE,
 ) -> DataLoader:
-    records = discover_cutout_records(root, bands=bands)
-    records = [
+    all_records = discover_cutout_records(root, bands=bands)
+    patch_records = [
         rec
-        for rec in records
-        if str(rec.dataset_source) == str(dataset_name) and rec.patch == PATCH and rec.tile_name == tile_name
+        for rec in all_records
+        if str(rec.dataset_source) == str(dataset_name) and rec.patch == PATCH
     ]
+    candidate_tiles = [tile_name]
+    # Some Zangetsu demo roots store denoised/noisy cutouts without a group_XX
+    # prefix, while full preprocessed variant roots include it. Prefer the exact
+    # requested tile but gracefully fall back to the unprefixed demo tile.
+    if str(dataset_name) != "coadd" and str(tile_name).startswith("group_"):
+        parts = str(tile_name).split("_", 2)
+        if len(parts) == 3:
+            candidate_tiles.append(parts[2])
+    records = []
+    for candidate in candidate_tiles:
+        records = [rec for rec in patch_records if rec.tile_name == candidate]
+        if records:
+            tile_name = candidate
+            break
     if len(records) != 1:
-        raise RuntimeError(f"Expected one record for {dataset_name}/{PATCH}/{tile_name}, got {len(records)} under {root}")
+        available = sorted({str(rec.tile_name) for rec in patch_records})
+        raise RuntimeError(
+            f"Expected one record for {dataset_name}/{PATCH}/{tile_name}, got {len(records)} under {root}; "
+            f"tried tiles={candidate_tiles}; available tiles={available}"
+        )
     effective_image_cache_dir = image_cache_dir if str(dataset_name) != "coadd" else None
     ds = AstroCutoutDataset(
         records,

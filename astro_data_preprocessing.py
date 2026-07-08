@@ -178,6 +178,53 @@ def _plane_hdu_indices(hdul: fits.HDUList) -> Dict[str, int]:
     return indices
 
 
+def _mask_plane_bit_mapping(header: fits.Header) -> Dict[str, int]:
+    mapping: Dict[str, int] = {}
+    for key, value in header.items():
+        text_key = str(key).upper()
+        if not text_key.startswith("MP_"):
+            continue
+        name = text_key[3:]
+        try:
+            mapping[name] = int(value)
+        except Exception:
+            continue
+    return mapping
+
+
+def _quality_mask_from_lsst_fits(path: Path, mask_planes: Sequence[str]) -> Optional[np.ndarray]:
+    if not path.exists() or not mask_planes:
+        return None
+    try:
+        with fits.open(path, memmap=False) as hdul:
+            plane_indices = _plane_hdu_indices(hdul)
+            mask_idx = plane_indices.get("MASK")
+            if mask_idx is None:
+                return None
+            mask_hdu = hdul[mask_idx]
+            mask_data = np.asarray(mask_hdu.data)
+            if mask_data.ndim != 2:
+                return None
+            bit_mapping = _mask_plane_bit_mapping(mask_hdu.header)
+            selected = np.zeros(mask_data.shape, dtype=bool)
+            for plane in mask_planes:
+                plane_name = str(plane).strip().upper()
+                if not plane_name:
+                    continue
+                bit = bit_mapping.get(plane_name)
+                if bit is None:
+                    continue
+                selected |= (mask_data.astype(np.int64, copy=False) & (1 << int(bit))) != 0
+            return selected
+    except Exception as exc:
+        print(f"WARNING: failed to read quality mask from {path}: {exc}", flush=True)
+        return None
+
+
+def _coadd_cutout_path_for_quality_mask(coadd_patch_root: Path, *, band: str, tract: int, patch: str, tile_name: str) -> Path:
+    return coadd_patch_root / "cutouts" / tile_name / band / f"calexp-{band}-{tract}-{patch}.fits"
+
+
 def _cropped_header(header: fits.Header, *, local_x0: int, local_y0: int) -> fits.Header:
     out = header.copy()
     if "LTV1" in out:
@@ -1565,14 +1612,39 @@ def _aperture_annulus_snr(
     ap_radius: float = 6.0,
     annulus_r_in: float = 10.0,
     annulus_r_out: float = 15.0,
-) -> np.ndarray:
+    annulus_exclude_mask: Optional[np.ndarray] = None,
+    annulus_hard_exclude_mask: Optional[np.ndarray] = None,
+    annulus_self_ellipse_params: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
+    annulus_self_ellipse_sigma: float = 1.0,
+    min_annulus_pixels: int = 2,
+) -> Tuple[np.ndarray, np.ndarray]:
     image = np.asarray(image, dtype=np.float32)
     centers = np.asarray(centers, dtype=np.float32).reshape(-1, 2)
     snr = np.full((centers.shape[0],), np.nan, dtype=np.float32)
+    annulus_counts = np.zeros((centers.shape[0],), dtype=np.int32)
     if image.ndim != 2 or centers.size == 0:
-        return snr
+        return snr, annulus_counts
     h, w = image.shape
+    exclude = None
+    if annulus_exclude_mask is not None:
+        exclude = np.asarray(annulus_exclude_mask, dtype=bool)
+        if exclude.shape != image.shape:
+            raise ValueError(f"annulus_exclude_mask shape {exclude.shape} != image shape {image.shape}")
+    hard_exclude = None
+    if annulus_hard_exclude_mask is not None:
+        hard_exclude = np.asarray(annulus_hard_exclude_mask, dtype=bool)
+        if hard_exclude.shape != image.shape:
+            raise ValueError(f"annulus_hard_exclude_mask shape {hard_exclude.shape} != image shape {image.shape}")
+    self_major = self_minor = self_theta = None
+    if annulus_self_ellipse_params is not None:
+        self_major, self_minor, self_theta = annulus_self_ellipse_params
+        self_major = np.asarray(self_major, dtype=np.float32)
+        self_minor = np.asarray(self_minor, dtype=np.float32)
+        self_theta = np.asarray(self_theta, dtype=np.float32)
+        if not (len(self_major) == len(self_minor) == len(self_theta) == centers.shape[0]):
+            raise ValueError("annulus_self_ellipse_params must have one entry per center")
     rmax = float(max(ap_radius, annulus_r_out))
+    min_ann = max(2, int(min_annulus_pixels))
     for idx, (cx, cy) in enumerate(centers):
         if not (np.isfinite(cx) and np.isfinite(cy)):
             continue
@@ -1588,9 +1660,32 @@ def _aperture_annulus_snr(
         finite = np.isfinite(patch)
         ap_mask = (rr <= float(ap_radius)) & finite
         ann_mask = (rr >= float(annulus_r_in)) & (rr < float(annulus_r_out)) & finite
+        if hard_exclude is not None:
+            ann_mask &= ~hard_exclude[y0:y1, x0:x1]
+        if exclude is not None:
+            exclude_patch = exclude[y0:y1, x0:x1]
+            if self_major is not None:
+                if np.isfinite(self_major[idx]) and np.isfinite(self_minor[idx]) and np.isfinite(self_theta[idx]):
+                    a = float(max(self_major[idx] * float(annulus_self_ellipse_sigma), 1.5))
+                    b = float(max(self_minor[idx] * float(annulus_self_ellipse_sigma), 1.5))
+                    theta = float(self_theta[idx])
+                else:
+                    a = b = float(max(2.0 * float(annulus_self_ellipse_sigma), 1.5))
+                    theta = 0.0
+                dx = xx.astype(np.float32) - float(cx)
+                dy = yy.astype(np.float32) - float(cy)
+                cos_t = math.cos(theta)
+                sin_t = math.sin(theta)
+                xr = cos_t * dx + sin_t * dy
+                yr = -sin_t * dx + cos_t * dy
+                self_ellipse = (xr / a) ** 2 + (yr / b) ** 2 <= 1.0
+                ann_mask &= ~(exclude_patch & ~self_ellipse)
+            else:
+                ann_mask &= ~exclude_patch
         ap_vals = patch[ap_mask]
         ann_vals = patch[ann_mask]
-        if ap_vals.size == 0 or ann_vals.size < 2:
+        annulus_counts[idx] = int(ann_vals.size)
+        if ap_vals.size == 0 or ann_vals.size < min_ann:
             continue
         bkg = float(np.median(ann_vals))
         sigma = float(np.std(ann_vals.astype(np.float64), ddof=1))
@@ -1600,7 +1695,20 @@ def _aperture_annulus_snr(
         noise = sigma * math.sqrt(float(ap_vals.size))
         if noise > 0.0:
             snr[idx] = float(flux / noise)
-    return snr
+    return snr, annulus_counts
+
+
+def _source_annulus_exclusion_mask(
+    sources: Table,
+    spec: TileSpec,
+    *,
+    x_col: str,
+    y_col: str,
+    ellipse_sigma: float,
+) -> np.ndarray:
+    mask = np.zeros((spec.size, spec.size), dtype=np.uint8)
+    _paint_ellipse_mask(mask, sources, spec, x_col=x_col, y_col=y_col, ellipse_sigma=ellipse_sigma)
+    return mask > 0
 
 
 def _centers_for_image_snr(
@@ -1625,28 +1733,48 @@ def _classify_clean_by_noncoadd_snr(
     image: np.ndarray,
     image_origin: Tuple[int, int],
     args: argparse.Namespace,
+    annulus_exclude_mask: Optional[np.ndarray] = None,
+    annulus_hard_exclude_mask: Optional[np.ndarray] = None,
 ) -> Tuple[Table, Table, Table, np.ndarray]:
     if len(clean_sources) == 0:
         empty = clean_sources.copy(copy_data=True)
         return empty, empty.copy(copy_data=True), empty.copy(copy_data=True), np.zeros((0,), dtype=np.float32)
     centers = _centers_for_image_snr(clean_sources, image_origin=image_origin, x_col=args.x_col, y_col=args.y_col)
-    snr = _aperture_annulus_snr(
+    self_params = None
+    if all(name in clean_sources.colnames for name in ("ellipse_major_sigma", "ellipse_minor_sigma", "ellipse_theta")):
+        self_params = (
+            np.asarray(clean_sources["ellipse_major_sigma"], dtype=np.float32),
+            np.asarray(clean_sources["ellipse_minor_sigma"], dtype=np.float32),
+            np.asarray(clean_sources["ellipse_theta"], dtype=np.float32),
+        )
+    snr, annulus_counts = _aperture_annulus_snr(
         image,
         centers,
         ap_radius=float(args.noncoadd_snr_ap_radius),
         annulus_r_in=float(args.noncoadd_snr_annulus_r_in),
         annulus_r_out=float(args.noncoadd_snr_annulus_r_out),
+        annulus_exclude_mask=annulus_exclude_mask,
+        annulus_hard_exclude_mask=annulus_hard_exclude_mask,
+        annulus_self_ellipse_params=self_params,
+        annulus_self_ellipse_sigma=float(args.noncoadd_snr_source_mask_ellipse_sigma),
+        min_annulus_pixels=int(args.noncoadd_snr_min_annulus_pixels),
     )
     finite_snr = np.isfinite(snr)
+    insufficient_annulus = annulus_counts < int(args.noncoadd_snr_min_annulus_pixels)
     normal_keep = finite_snr & (snr >= float(args.noncoadd_snr_center_only_thresh))
-    center_keep = finite_snr & (snr >= float(args.noncoadd_snr_ignore_thresh)) & (snr < float(args.noncoadd_snr_center_only_thresh))
-    ignore_keep = (~finite_snr) | (snr < float(args.noncoadd_snr_ignore_thresh))
+    center_keep = insufficient_annulus | (
+        finite_snr
+        & (snr >= float(args.noncoadd_snr_ignore_thresh))
+        & (snr < float(args.noncoadd_snr_center_only_thresh))
+    )
+    ignore_keep = (~insufficient_annulus) & ((~finite_snr) | (snr < float(args.noncoadd_snr_ignore_thresh)))
 
     annotated = clean_sources.copy(copy_data=True)
     visibility_class = np.full(len(annotated), "normal", dtype="U16")
     visibility_class[center_keep] = "center_only"
     visibility_class[ignore_keep] = "ignore"
     annotated["noncoadd_visibility_snr"] = snr.astype(np.float32)
+    annotated["noncoadd_visibility_annulus_pixels"] = annulus_counts.astype(np.int32)
     annotated["noncoadd_visibility_class"] = visibility_class
     return (
         annotated[normal_keep],
@@ -2149,17 +2277,49 @@ def _preprocess_image_variant_patch(
                             margin=args.mask_margin,
                         )
 
+                        snr_exclusion_sources = _vstack_nonempty([clean_mask_all, center_mask, strict_center_mask])
+                        snr_annulus_exclude_mask = _source_annulus_exclusion_mask(
+                            snr_exclusion_sources,
+                            spec,
+                            x_col=args.x_col,
+                            y_col=args.y_col,
+                            ellipse_sigma=float(args.noncoadd_snr_source_mask_ellipse_sigma),
+                        )
+                        quality_mask_path = _coadd_cutout_path_for_quality_mask(
+                            coadd_patch_root,
+                            band=band,
+                            tract=args.tract,
+                            patch=patch,
+                            tile_name=spec.name,
+                        )
+                        quality_mask = _quality_mask_from_lsst_fits(
+                            quality_mask_path,
+                            tuple(str(plane) for plane in getattr(args, "noncoadd_snr_mask_planes", ()) or ()),
+                        )
+                        if quality_mask is not None:
+                            if quality_mask.shape != snr_annulus_exclude_mask.shape:
+                                print(
+                                    f"WARNING: quality mask shape {quality_mask.shape} != tile shape "
+                                    f"{snr_annulus_exclude_mask.shape} for {quality_mask_path}; ignoring quality mask",
+                                    flush=True,
+                                )
+                                quality_mask = None
+
                         normal_tile, snr_center_tile, snr_ignore_tile, _tile_snr = _classify_clean_by_noncoadd_snr(
                             clean_tile_all,
                             image=image,
                             image_origin=image_origin,
                             args=args,
+                            annulus_exclude_mask=snr_annulus_exclude_mask,
+                            annulus_hard_exclude_mask=quality_mask,
                         )
                         normal_mask, snr_center_mask, snr_ignore_mask, _mask_snr = _classify_clean_by_noncoadd_snr(
                             clean_mask_all,
                             image=image,
                             image_origin=image_origin,
                             args=args,
+                            annulus_exclude_mask=snr_annulus_exclude_mask,
+                            annulus_hard_exclude_mask=quality_mask,
                         )
                         combined_center_tile = _vstack_nonempty([center_tile, snr_center_tile])
                         combined_ignore_tile = _vstack_nonempty([ignore_tile, snr_ignore_tile])
@@ -3549,6 +3709,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--noncoadd-snr-ap-radius", type=float, default=6.0)
     parser.add_argument("--noncoadd-snr-annulus-r-in", type=float, default=10.0)
     parser.add_argument("--noncoadd-snr-annulus-r-out", type=float, default=15.0)
+    parser.add_argument(
+        "--noncoadd-snr-source-mask-ellipse-sigma",
+        type=float,
+        default=1.0,
+        help=(
+            "Ellipse scale for source masks excluded from noncoadd SNR annuli. "
+            "This is intentionally smaller than the training target ellipse to avoid masking the target source's own annulus."
+        ),
+    )
+    parser.add_argument(
+        "--noncoadd-snr-min-annulus-pixels",
+        type=int,
+        default=50,
+        help="Minimum unmasked annulus pixels required for noncoadd SNR. Fewer pixels marks the source center_only.",
+    )
+    parser.add_argument(
+        "--noncoadd-snr-mask-planes",
+        nargs="*",
+        default=["BRIGHT_OBJECT", "SAT", "BAD", "NO_DATA", "EDGE", "UNMASKEDNAN"],
+        help=(
+            "Coadd MASK planes excluded from noncoadd SNR annuli. Use an empty value to disable pixel-quality masking."
+        ),
+    )
     parser.add_argument("--pu-a-flags", nargs="*", default=list(DEFAULT_PU_A_FLAGS))
     parser.add_argument("--pu-b-flags", nargs="*", default=list(DEFAULT_PU_B_FLAGS))
     parser.add_argument("--pu-a-mode", choices=("any", "all"), default="any")
