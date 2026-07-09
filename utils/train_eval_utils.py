@@ -532,7 +532,7 @@ def checkpoint_payload(
 ) -> dict[str, object]:
     base_model = unwrap_model(model)
     return {
-        "model": base_model.state_dict(),
+        "model": normalized_state_dict(base_model),
         "EX": base_model.EX.state_dict() if hasattr(base_model, "EX") else None,
         "EN": base_model.EN.state_dict() if hasattr(base_model, "EN") else None,
         "model_variant": model_variant,
@@ -545,5 +545,12 @@ def checkpoint_payload(
     }
 
 
+def normalized_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
+    return {
+        str(key).replace("._orig_mod.", "."): value
+        for key, value in unwrap_model(model).state_dict().items()
+    }
+
+
 def state_dict_cpu_copy(model: nn.Module) -> dict[str, torch.Tensor]:
-    return {key: value.detach().cpu().clone() for key, value in unwrap_model(model).state_dict().items()}
+    return {key: value.detach().cpu().clone() for key, value in normalized_state_dict(model).items()}

@@ -2568,6 +2568,8 @@ def run_epoch(
     show_progress: bool = True,
     freeze_sam_proposal: bool = False,
     freeze_sam_encoder: bool = False,
+    mask_loss_interval: int = 1,
+    mask_loss_interval_scale: bool = True,
 ) -> Dict[str, float]:
     training = optimizer is not None
     model.train(training)
@@ -2596,6 +2598,8 @@ def run_epoch(
         "mask_prompts": 0.0,
         "mask_gt_prompts": 0.0,
         "mask_pred_prompts": 0.0,
+        "mask_active": 0.0,
+        "mask_weight_scale": 0.0,
     }
     count = 0
     rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
@@ -2647,8 +2651,31 @@ def run_epoch(
     data_wait_start = time.perf_counter()
     prompt_ratio = prompt_pred_ratio(epoch_index, weights)
     effective_mask_outer_weight = mask_outer_weight_for_epoch(epoch_index, weights)
+    mask_interval = max(1, int(mask_loss_interval))
+
+    def _zero_mask_loss_dict(anchor: Tensor) -> Dict[str, Tensor]:
+        zero = anchor.sum() * 0.0
+        keys = (
+            "total",
+            "dice",
+            "bce",
+            "centroid",
+            "outside",
+            "area",
+            "max_area",
+            "pred_iou",
+            "stability",
+            "prompts",
+            "gt_total",
+            "pred_total",
+            "gt_prompts",
+            "pred_prompts",
+        )
+        return {key: zero for key in keys}
+
     progress = tqdm(loader, desc="train" if training else "eval", leave=False, disable=not show_progress)
     for batch_idx, batch in enumerate(progress):
+        current_step = int(global_step_start) + int(batch_idx) + 1
         debug_this_batch = debug_enabled and debug_start <= int(batch_idx) <= debug_end
         debug_print = debug_this_batch and (bool(debug_batch_all_ranks) or rank == 0)
         t_after_data = time.perf_counter()
@@ -2660,6 +2687,20 @@ def run_epoch(
                 f"data_wait={t_after_data - data_wait_start:.4f}s {_batch_debug_summary(batch)}",
                 flush=True,
             )
+
+        def _mask_loss_timing(label: str, start: float, stats: Dict[str, float]) -> float:
+            _sync_debug(debug_this_batch)
+            now = time.perf_counter()
+            stat_text = ""
+            if stats:
+                stat_text = " " + " ".join(f"{key}={float(value):.4g}" for key, value in sorted(stats.items()))
+            print(
+                f"[debug-mask-loss][rank={rank}] epoch={epoch_index} batch={batch_idx} "
+                f"{label}={now - start:.4f}s{stat_text}{_mem_debug()}",
+                flush=True,
+            )
+            return now
+
         if optimizer is not None and show_progress:
             head_group = next(
                 (group for group in optimizer.param_groups if str(group.get("name", "")) == "head"),
@@ -2681,27 +2722,39 @@ def run_epoch(
             t_dense_loss = time.perf_counter()
             _phase_debug(debug_print, "dense_loss", t_dense_loss - t_forward)
             total = losses["total"]
-            mask_losses = sam_prompt_mask_losses(
-                base_model,
-                outputs,
-                batch,
-                weights=weights,
-                device=device,
-                epoch_index=epoch_index,
-                threshold=threshold,
-                nms_radius=nms_radius,
-                confidence_score=confidence_score,
-                use_ordinal_expectation=use_ordinal_expectation,
-                debug_ordinal_expectation=debug_ordinal_expectation,
-                center_refinement=center_refinement,
-                center_refinement_radius=center_refinement_radius,
-                ellipse_sigma=ellipse_sigma,
-                detect_centers_fn=detect_centers_tensors,
+            mask_active = (
+                (not training)
+                or mask_interval <= 1
+                or ((current_step - 1) % mask_interval == 0)
             )
+            if training and float(effective_mask_outer_weight) <= 0.0:
+                mask_active = False
+            mask_weight_scale = float(mask_interval) if training and mask_active and mask_interval > 1 and bool(mask_loss_interval_scale) else 1.0
+            if mask_active:
+                mask_losses = sam_prompt_mask_losses(
+                    base_model,
+                    outputs,
+                    batch,
+                    weights=weights,
+                    device=device,
+                    epoch_index=epoch_index,
+                    threshold=threshold,
+                    nms_radius=nms_radius,
+                    confidence_score=confidence_score,
+                    use_ordinal_expectation=use_ordinal_expectation,
+                    debug_ordinal_expectation=debug_ordinal_expectation,
+                    center_refinement=center_refinement,
+                    center_refinement_radius=center_refinement_radius,
+                    ellipse_sigma=ellipse_sigma,
+                    detect_centers_fn=detect_centers_tensors,
+                    debug_timing=_mask_loss_timing if debug_print else None,
+                )
+            else:
+                mask_losses = _zero_mask_loss_dict(outputs["confidence"])
             _sync_debug(debug_this_batch)
             t_mask_loss = time.perf_counter()
             _phase_debug(debug_print, "mask_loss", t_mask_loss - t_dense_loss)
-            total = total + float(effective_mask_outer_weight) * mask_losses["total"]
+            total = total + float(effective_mask_outer_weight) * float(mask_weight_scale) * mask_losses["total"]
             if training and "embedding" in outputs:
                 # Keep the embedding branch visible to DDP when triplet/EX/EN losses are disabled.
                 total = total + outputs["embedding"].sum() * 0.0
@@ -2792,7 +2845,8 @@ def run_epoch(
         sums["mask_prompts"] += float(mask_losses["prompts"].detach()) * batch_size
         sums["mask_gt_prompts"] += float(mask_losses["gt_prompts"].detach()) * batch_size
         sums["mask_pred_prompts"] += float(mask_losses["pred_prompts"].detach()) * batch_size
-        current_step = int(global_step_start) + int(batch_idx) + 1
+        sums["mask_active"] += float(mask_active) * batch_size
+        sums["mask_weight_scale"] += float(mask_weight_scale) * batch_size
         should_log_iteration = (
             training
             and iteration_log_fn is not None
@@ -2831,6 +2885,8 @@ def run_epoch(
                 local_metrics["loss/mask_prompts"] = float(mask_losses["prompts"].detach())
                 local_metrics["loss/mask_gt_prompts"] = float(mask_losses["gt_prompts"].detach())
                 local_metrics["loss/mask_pred_prompts"] = float(mask_losses["pred_prompts"].detach())
+                local_metrics["loss/mask_active"] = float(mask_active)
+                local_metrics["loss/mask_weight_scale"] = float(mask_weight_scale)
             if distributed and dist.is_available() and dist.is_initialized():
                 metric_keys = list(local_metrics.keys())
                 packed = torch.tensor(
@@ -2868,7 +2924,8 @@ def run_epoch(
                 f"extra_loss={t_extra_loss - t_mask_loss:.4f}s backward={t_backward - t_extra_loss:.4f}s "
                 f"step={t_step - t_backward:.4f}s post={t_done - t_step:.4f}s total_iter={t_done - t_after_data:.4f}s "
                 f"loss={float(total.detach()):.6g} mask={float(mask_losses['total'].detach()):.6g} "
-                f"mask_prompts={float(mask_losses['prompts'].detach()):.1f}{_mem_debug()}",
+                f"mask_prompts={float(mask_losses['prompts'].detach()):.1f} "
+                f"mask_active={float(mask_active):.0f} mask_scale={float(mask_weight_scale):.3g}{_mem_debug()}",
                 flush=True,
             )
         data_wait_start = time.perf_counter()

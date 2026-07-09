@@ -84,10 +84,14 @@ class PromptEncoder(nn.Module):
             points = torch.cat([points, padding_point], dim=1)
             labels = torch.cat([labels, padding_label], dim=1)
         point_embedding = self.pe_layer.forward_with_coords(points, self.input_image_size)
-        point_embedding[labels == -1] = 0.0
-        point_embedding[labels == -1] += self.not_a_point_embed.weight
-        point_embedding[labels == 0] += self.point_embeddings[0].weight
-        point_embedding[labels == 1] += self.point_embeddings[1].weight
+        label_mask = labels.unsqueeze(-1)
+        not_a_point = self.not_a_point_embed.weight.view(1, 1, -1).to(dtype=point_embedding.dtype)
+        point0 = self.point_embeddings[0].weight.view(1, 1, -1).to(dtype=point_embedding.dtype)
+        point1 = self.point_embeddings[1].weight.view(1, 1, -1).to(dtype=point_embedding.dtype)
+        zeros = torch.zeros_like(point_embedding)
+        point_embedding = torch.where(label_mask == -1, not_a_point.expand_as(point_embedding), point_embedding)
+        point_embedding = point_embedding + torch.where(label_mask == 0, point0.expand_as(point_embedding), zeros)
+        point_embedding = point_embedding + torch.where(label_mask == 1, point1.expand_as(point_embedding), zeros)
         return point_embedding
 
     def _embed_boxes(self, boxes: torch.Tensor) -> torch.Tensor:

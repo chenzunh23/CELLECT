@@ -145,6 +145,39 @@ def _compile_sam_runtime_model(model: nn.Module, args: argparse.Namespace, *, is
     return compile_fn(model, **kwargs)
 
 
+def _compile_sam_mask_decoder_modules(model: nn.Module, args: argparse.Namespace, *, is_main: bool) -> nn.Module:
+    if not bool(getattr(args, "sam_compile_mask_decoder", False)):
+        return model
+    if str(getattr(args, "model_variant", "")) != "sam_per_band":
+        if is_main:
+            print("WARNING: --sam-compile-mask-decoder is only used with --model-variant sam_per_band; ignoring.")
+        return model
+    compile_fn = getattr(torch, "compile", None)
+    if compile_fn is None:
+        raise RuntimeError("--sam-compile-mask-decoder requires a PyTorch build with torch.compile")
+    kwargs: dict[str, object] = {
+        "backend": str(getattr(args, "sam_compile_backend", "inductor")),
+        "fullgraph": bool(getattr(args, "sam_compile_fullgraph", False)),
+    }
+    mode = str(getattr(args, "sam_compile_mode", "default"))
+    if mode and mode != "default":
+        kwargs["mode"] = mode
+    base_model = _runtime_unwrap_model(model)
+    compiled: list[str] = []
+    for name in ("prompt_encoder", "mask_decoder"):
+        module = getattr(base_model, name, None)
+        if isinstance(module, nn.Module):
+            setattr(base_model, name, compile_fn(module, **kwargs))
+            compiled.append(name)
+    if is_main:
+        print(
+            "Compiling SAM mask-loss decoder modules with torch.compile "
+            f"(modules={compiled}, backend={kwargs['backend']}, mode={mode}, fullgraph={kwargs['fullgraph']}).",
+            flush=True,
+        )
+    return model
+
+
 def _init_wandb_or_disable(
     args: argparse.Namespace,
     *,
@@ -706,6 +739,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print --debug-batch-start timing from every DDP rank instead of rank 0 only.",
     )
+    parser.add_argument(
+        "--mask-loss-interval",
+        type=int,
+        default=1,
+        help=(
+            "Compute SAM mask loss every N training iterations. Skipped iterations avoid forward_sam_masks. "
+            "The mask loss is multiplied by N on active iterations unless --no-mask-loss-interval-scale is set."
+        ),
+    )
+    parser.add_argument(
+        "--mask-loss-interval-scale",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Scale active intermittent mask-loss steps by --mask-loss-interval to preserve expected mask gradient size.",
+    )
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument(
@@ -791,6 +839,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--sam-compile-fullgraph",
         action="store_true",
         help="Pass fullgraph=True to torch.compile for --sam-compile. Default allows graph breaks.",
+    )
+    parser.add_argument(
+        "--sam-compile-mask-decoder",
+        action="store_true",
+        help=(
+            "Also compile SAM prompt_encoder and mask_decoder modules used by forward_sam_masks in mask loss. "
+            "Uses the same backend/mode/fullgraph settings as --sam-compile."
+        ),
     )
     parser.add_argument("--base-channels", type=int, default=32)
     parser.add_argument("--embedding-dim", type=int, default=64)
@@ -1693,7 +1749,7 @@ def main() -> None:
                         f"incomplete train batch(es) on rank {rank}; batch-size changes can trigger "
                         "extra torch.compile recompilation pauses."
                     )
-                    if bool(args.sam_compile) and not bool(args.zarr_drop_last):
+                    if (bool(args.sam_compile) or bool(args.sam_compile_mask_decoder)) and not bool(args.zarr_drop_last):
                         message += " Add --zarr-drop-last for compile-heavy runs."
                     print(message, flush=True)
             num_val_local = int(val_iter_ds.local_sample_count())
@@ -1746,7 +1802,7 @@ def main() -> None:
                         f"incomplete train batch(es) on rank {rank}; batch-size changes can trigger "
                         "extra torch.compile recompilation pauses."
                     )
-                    if bool(args.sam_compile) and not bool(args.zarr_drop_last):
+                    if (bool(args.sam_compile) or bool(args.sam_compile_mask_decoder)) and not bool(args.zarr_drop_last):
                         message += " Add --zarr-drop-last for compile-heavy runs."
                     print(message, flush=True)
             num_val_local = sum(len(batch) for batch in val_batch_sampler)
@@ -1871,6 +1927,7 @@ def main() -> None:
                 if isinstance(ckpt, dict) and ckpt.get("EN") is not None:
                     model.EN.load_state_dict(ckpt["EN"])
 
+        model = _compile_sam_mask_decoder_modules(model, args, is_main=is_main)
         model = _compile_sam_runtime_model(model, args, is_main=is_main)
 
         if is_main and distributed:
@@ -2042,6 +2099,9 @@ def main() -> None:
             "sam_compile_backend": str(args.sam_compile_backend) if model_variant == "sam_per_band" and args.sam_compile else None,
             "sam_compile_mode": str(args.sam_compile_mode) if model_variant == "sam_per_band" and args.sam_compile else None,
             "sam_compile_fullgraph": bool(args.sam_compile_fullgraph) if model_variant == "sam_per_band" and args.sam_compile else None,
+            "sam_compile_mask_decoder": bool(model_variant == "sam_per_band" and args.sam_compile_mask_decoder),
+            "mask_loss_interval": int(args.mask_loss_interval),
+            "mask_loss_interval_scale": bool(args.mask_loss_interval_scale),
             "sam_lr_schedule": (
                 {
                     "type": "iteration_warmup_step",
@@ -2280,6 +2340,8 @@ def main() -> None:
                 show_progress=is_main,
                 freeze_sam_proposal=proposal_frozen,
                 freeze_sam_encoder=encoder_frozen,
+                mask_loss_interval=max(1, int(args.mask_loss_interval)),
+                mask_loss_interval_scale=bool(args.mask_loss_interval_scale),
             )
             global_step += len(train_loader)
 
