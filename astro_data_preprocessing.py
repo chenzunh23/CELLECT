@@ -38,8 +38,30 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from astropy.io import fits
+from astropy.io.fits.verify import VerifyWarning
 from astropy.table import Table, vstack
 from astropy.units import UnitsWarning
+
+warnings.filterwarnings(
+    "ignore",
+    message=".*'second' did not parse as fits unit.*",
+    category=UnitsWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=".*Unit 'second' not supported by the FITS standard.*",
+    category=UnitsWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*Keyword name .* is greater than 8 characters or contains characters not allowed by the FITS standard.*",
+    category=VerifyWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    category=VerifyWarning,
+    module=r"astropy\.io\.fits\..*",
+)
 
 try:
     from tqdm import tqdm as _tqdm
@@ -207,6 +229,7 @@ def _quality_mask_from_lsst_fits(path: Path, mask_planes: Sequence[str]) -> Opti
                 return None
             bit_mapping = _mask_plane_bit_mapping(mask_hdu.header)
             selected = np.zeros(mask_data.shape, dtype=bool)
+            mask_values = mask_data.astype(np.int64, copy=False)
             for plane in mask_planes:
                 plane_name = str(plane).strip().upper()
                 if not plane_name:
@@ -214,7 +237,7 @@ def _quality_mask_from_lsst_fits(path: Path, mask_planes: Sequence[str]) -> Opti
                 bit = bit_mapping.get(plane_name)
                 if bit is None:
                     continue
-                selected |= (mask_data.astype(np.int64, copy=False) & (1 << int(bit))) != 0
+                selected |= (mask_values & (1 << int(bit))) != 0
             return selected
     except Exception as exc:
         print(f"WARNING: failed to read quality mask from {path}: {exc}", flush=True)
@@ -538,6 +561,29 @@ def _crop_full_mask_for_tile(mask: Optional[np.ndarray], spec: TileSpec, parent_
     return out
 
 
+def _crop_image_for_tile(
+    image: np.ndarray,
+    spec: TileSpec,
+    parent_origin: Tuple[int, int],
+) -> Tuple[np.ndarray, Tuple[int, int]]:
+    x0 = int(spec.x0 - parent_origin[0])
+    y0 = int(spec.y0 - parent_origin[1])
+    x1 = x0 + int(spec.size)
+    y1 = y0 + int(spec.size)
+    out = np.zeros((spec.size, spec.size), dtype=np.asarray(image).dtype)
+    src_x0 = max(0, x0)
+    src_y0 = max(0, y0)
+    src_x1 = min(image.shape[1], x1)
+    src_y1 = min(image.shape[0], y1)
+    if src_x1 > src_x0 and src_y1 > src_y0:
+        dst_x0 = src_x0 - x0
+        dst_y0 = src_y0 - y0
+        out[dst_y0 : dst_y0 + (src_y1 - src_y0), dst_x0 : dst_x0 + (src_x1 - src_x0)] = image[
+            src_y0:src_y1, src_x0:src_x1
+        ]
+    return out, (int(spec.x0), int(spec.y0))
+
+
 def _existing_cutout_fits_path(tile_dir: Path, band: str) -> str:
     band_dir = tile_dir / band
     if not band_dir.exists():
@@ -655,6 +701,62 @@ _DEFAULT_PU_STRICT_CENTER_ONLY_SATURATION_MAGS = {
     "HSC-Z": 17.7,
     "HSC-Y": 17.4,
 }
+
+
+@dataclass(frozen=True)
+class _ArchiveLookup:
+    row0: np.ndarray
+    nrows: np.ndarray
+    found: np.ndarray
+
+
+@dataclass(frozen=True)
+class _ArchiveIndex:
+    ids: np.ndarray
+    archive_numbers: np.ndarray
+    names: np.ndarray
+    row0: np.ndarray
+    nrows: np.ndarray
+
+    @classmethod
+    def from_archive(cls, archive: fits.FITS_rec) -> "_ArchiveIndex":
+        return cls(
+            ids=np.asarray(archive["id"], dtype=np.int64),
+            archive_numbers=np.asarray(archive["cat.archive"], dtype=np.int64),
+            names=np.asarray([_decode_fits_string(value) for value in archive["name"]], dtype=object),
+            row0=np.asarray(archive["row0"], dtype=np.int64),
+            nrows=np.asarray(archive["nrows"], dtype=np.int64),
+        )
+
+    def lookup(self, target_ids: np.ndarray, *, archive_number: int, name: Optional[str]) -> _ArchiveLookup:
+        target = np.asarray(target_ids, dtype=np.int64)
+        mask = self.archive_numbers == int(archive_number)
+        if name is not None:
+            mask &= self.names == str(name)
+        group_rows = np.flatnonzero(mask)
+        group_ids = self.ids[group_rows]
+        order = np.argsort(group_ids, kind="mergesort")
+        sorted_ids = group_ids[order]
+        sorted_rows = group_rows[order]
+        found = np.zeros(target.shape, dtype=bool)
+        row0 = np.full(target.shape, -1, dtype=np.int64)
+        nrows = np.zeros(target.shape, dtype=np.int64)
+        if sorted_ids.size:
+            pos = np.searchsorted(sorted_ids, target)
+            in_range = pos < sorted_ids.size
+            matched = np.zeros(target.shape, dtype=bool)
+            matched[in_range] = sorted_ids[pos[in_range]] == target[in_range]
+            found = matched
+            archive_rows = sorted_rows[pos[found]]
+            row0[found] = self.row0[archive_rows]
+            nrows[found] = self.nrows[archive_rows]
+        return _ArchiveLookup(row0=row0, nrows=nrows, found=found)
+
+
+def _decode_fits_string(value: object) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="ignore").strip()
+    return str(value).strip()
 
 
 def _normalize_band_name(name: str) -> str:
@@ -820,6 +922,185 @@ def _magnitude_from_catalog(table: Table, *, mag_column: str, zeropoint: float) 
     return mag
 
 
+def _magnitude_from_flux(flux: np.ndarray | float, *, zeropoint: float) -> np.ndarray | float:
+    arr = np.asarray(flux, dtype=np.float64)
+    out = np.full(arr.shape, np.nan, dtype=np.float64)
+    valid = np.isfinite(arr) & (arr > 0.0)
+    out[valid] = float(zeropoint) - 2.5 * np.log10(arr[valid])
+    if np.isscalar(flux):
+        return float(out)
+    return out
+
+
+def _table_float_column(table: Table, column: str, default: float = np.nan) -> np.ndarray:
+    if column not in table.colnames:
+        return np.full(len(table), default, dtype=np.float64)
+    return np.asarray(table[column], dtype=np.float64)
+
+
+def _table_bool_column(table: Table, column: str) -> np.ndarray:
+    if column not in table.colnames:
+        return np.zeros(len(table), dtype=bool)
+    return np.asarray(table[column], dtype=bool)
+
+
+def _ellipse_aperture_sum(
+    x: np.ndarray,
+    y: np.ndarray,
+    values: np.ndarray,
+    *,
+    cx: float,
+    cy: float,
+    major: float,
+    minor: float,
+    theta: float,
+) -> Tuple[float, int, int]:
+    if not (np.isfinite(cx) and np.isfinite(cy) and np.isfinite(major) and np.isfinite(minor)):
+        return np.nan, 0, 0
+    if major <= 0.0 or minor <= 0.0:
+        return np.nan, 0, 0
+    dx = np.asarray(x, dtype=np.float64) - float(cx)
+    dy = np.asarray(y, dtype=np.float64) - float(cy)
+    c = math.cos(float(theta))
+    s = math.sin(float(theta))
+    du = dx * c + dy * s
+    dv = -dx * s + dy * c
+    inside = (du / float(major)) ** 2 + (dv / float(minor)) ** 2 <= 1.0
+    if not np.any(inside):
+        return 0.0, 0, int(np.asarray(values).size)
+    selected = np.asarray(values, dtype=np.float64)[inside]
+    finite = np.isfinite(selected)
+    return float(np.sum(np.where(finite, selected, 0.0))), int(np.count_nonzero(inside)), int(np.asarray(values).size)
+
+
+def _spanset_pixels(spans_table: fits.FITS_rec, span0: int, nspan: int) -> Tuple[np.ndarray, np.ndarray]:
+    if span0 < 0 or nspan <= 0:
+        return np.zeros((0,), dtype=np.int64), np.zeros((0,), dtype=np.int64)
+    spans = spans_table[span0 : span0 + nspan]
+    widths = np.asarray(spans["x1"], dtype=np.int64) - np.asarray(spans["x0"], dtype=np.int64) + 1
+    total_pixels = int(np.sum(widths))
+    if total_pixels <= 0:
+        return np.zeros((0,), dtype=np.int64), np.zeros((0,), dtype=np.int64)
+    span_index = np.repeat(np.arange(nspan, dtype=np.int64), widths)
+    starts = np.repeat(np.cumsum(widths) - widths, widths)
+    x = np.asarray(spans["x0"], dtype=np.int64)[span_index] + (np.arange(total_pixels) - starts)
+    y = np.asarray(spans["y"], dtype=np.int64)[span_index]
+    return x, y
+
+
+def _measure_heavy_ellipse(
+    *,
+    spans_table: fits.FITS_rec,
+    heavy_table: fits.FITS_rec,
+    span0: int,
+    nspan: int,
+    heavy_row: int,
+    cx: float,
+    cy: float,
+    major: float,
+    minor: float,
+    theta: float,
+) -> Tuple[float, int, int]:
+    x, y = _spanset_pixels(spans_table, span0, nspan)
+    if x.size == 0 or heavy_row < 0:
+        return np.nan, 0, int(x.size)
+    values = np.asarray(heavy_table["image"][heavy_row], dtype=np.float64)
+    if values.size != x.size:
+        return np.nan, 0, int(x.size)
+    return _ellipse_aperture_sum(x, y, values, cx=cx, cy=cy, major=major, minor=minor, theta=theta)
+
+
+def _measure_direct_ellipse(
+    *,
+    image: np.ndarray,
+    image_origin: Tuple[int, int],
+    cx: float,
+    cy: float,
+    major: float,
+    minor: float,
+    theta: float,
+) -> Tuple[float, int, int]:
+    if not (np.isfinite(cx) and np.isfinite(cy) and np.isfinite(major) and np.isfinite(minor)):
+        return np.nan, 0, 0
+    if major <= 0.0 or minor <= 0.0:
+        return np.nan, 0, 0
+    local_cx = float(cx) - float(image_origin[0])
+    local_cy = float(cy) - float(image_origin[1])
+    r = int(math.ceil(max(float(major), float(minor)) + 2.0))
+    x0 = max(0, int(math.floor(local_cx)) - r)
+    x1 = min(image.shape[1] - 1, int(math.floor(local_cx)) + r)
+    y0 = max(0, int(math.floor(local_cy)) - r)
+    y1 = min(image.shape[0] - 1, int(math.floor(local_cy)) + r)
+    if x1 < x0 or y1 < y0:
+        return np.nan, 0, 0
+    yy, xx = np.mgrid[y0 : y1 + 1, x0 : x1 + 1]
+    global_x = xx.astype(np.float64) + float(image_origin[0])
+    global_y = yy.astype(np.float64) + float(image_origin[1])
+    return _ellipse_aperture_sum(
+        global_x.ravel(),
+        global_y.ravel(),
+        np.asarray(image[y0 : y1 + 1, x0 : x1 + 1], dtype=np.float64).ravel(),
+        cx=cx,
+        cy=cy,
+        major=major,
+        minor=minor,
+        theta=theta,
+    )
+
+
+def _footprint_ellipse_counts(
+    *,
+    spans_table: fits.FITS_rec,
+    span0: int,
+    nspan: int,
+    cx: float,
+    cy: float,
+    major: float,
+    minor: float,
+    theta: float,
+) -> Tuple[int, int]:
+    x, y = _spanset_pixels(spans_table, span0, nspan)
+    if x.size == 0:
+        return 0, 0
+    _, aperture_pixels, total_pixels = _ellipse_aperture_sum(
+        x,
+        y,
+        np.ones(x.size, dtype=np.float64),
+        cx=cx,
+        cy=cy,
+        major=major,
+        minor=minor,
+        theta=theta,
+    )
+    return int(aperture_pixels), int(total_pixels)
+
+
+def _unit_disk_points(n: int = 15) -> np.ndarray:
+    grid = np.linspace(-1.0, 1.0, int(n), dtype=np.float64)
+    uu, vv = np.meshgrid(grid, grid)
+    pts = np.column_stack([uu.ravel(), vv.ravel()])
+    return pts[np.sum(pts * pts, axis=1) <= 1.0]
+
+
+def _ellipse_contains_fraction(small: Dict[str, float], big: Dict[str, float], unit_points: np.ndarray) -> float:
+    if min(small["a"], small["b"], big["a"], big["b"]) <= 0.0:
+        return 0.0
+    cs = math.cos(small["theta"])
+    ss = math.sin(small["theta"])
+    u = unit_points[:, 0] * small["a"]
+    v = unit_points[:, 1] * small["b"]
+    px = small["x"] + u * cs - v * ss
+    py = small["y"] + u * ss + v * cs
+    cb = math.cos(big["theta"])
+    sb = math.sin(big["theta"])
+    dx = px - big["x"]
+    dy = py - big["y"]
+    du = dx * cb + dy * sb
+    dv = -dx * sb + dy * cb
+    inside = (du / big["a"]) ** 2 + (dv / big["b"]) ** 2 <= 1.0
+    return float(np.mean(inside))
+
+
 def _strict_bright_center_only_catalog(
     table: Table,
     args: argparse.Namespace,
@@ -913,6 +1194,316 @@ def _move_bright_clean_to_center_only(
     return remaining_clean, merged_center, bright_center
 
 
+def _source_geometry_from_shaped(shaped: Table, row: int) -> Optional[Dict[str, float]]:
+    required = ("ellipse_major_sigma", "ellipse_minor_sigma", "ellipse_theta")
+    if any(column not in shaped.colnames for column in required):
+        return None
+    x = _table_float_column(shaped, "base_SdssCentroid_x")
+    y = _table_float_column(shaped, "base_SdssCentroid_y")
+    major = _table_float_column(shaped, "ellipse_major_sigma")
+    minor = _table_float_column(shaped, "ellipse_minor_sigma")
+    theta = _table_float_column(shaped, "ellipse_theta", default=0.0)
+    cx = float(x[row])
+    cy = float(y[row])
+    a = float(major[row])
+    b = float(minor[row])
+    t = float(theta[row])
+    if not (np.isfinite(cx) and np.isfinite(cy) and np.isfinite(a) and np.isfinite(b)):
+        return None
+    if a <= 0.0 or b <= 0.0:
+        return None
+    sid = int(shaped["id"][row]) if "id" in shaped.colnames else int(row)
+    return {"source_id": sid, "x": cx, "y": cy, "a": a, "b": b, "theta": t, "area": math.pi * a * b, "rmax": max(a, b)}
+
+
+def _remeasure_ap2_kron_outliers(
+    shaped: Table,
+    result: Dict[str, object],
+    args: argparse.Namespace,
+    *,
+    band: Optional[str],
+    patch: Optional[str],
+) -> Tuple[np.ndarray, Dict[str, np.ndarray], Dict[str, int]]:
+    """Remeasure old ap2-Kron outliers with refit apertures and update PU classes.
+
+    This ports the diagnostic logic from diagnostics/debug_refit_kron_photometry_4_5.py
+    into preprocessing.  It only acts on leaf sources whose catalog ap2-vs-Kron
+    difference failed the original B filter, then promotes reliable remeasured
+    candidates out of ordinary ignore into clean or center_only.
+    """
+
+    n = len(shaped)
+    empty_class = np.asarray([""] * n, dtype="U32")
+    if n == 0 or not bool(getattr(args, "pu_remeasure_ap2_kron_outliers", False)):
+        return empty_class, {}, {"selected": 0}
+    if band is None or patch is None:
+        return empty_class, {}, {"selected": 0, "skipped_missing_band_patch": 1}
+    if "id" not in shaped.colnames:
+        return empty_class, {}, {"selected": 0, "skipped_missing_id": 1}
+
+    ap2_flux = _table_float_column(shaped, getattr(args, "pu_ap2_flux_column", "base_CircularApertureFlux_6_0_instFlux"))
+    kron_flux = _table_float_column(
+        shaped,
+        getattr(args, "pu_ap2_kron_flux_column", "ext_photometryKron_KronFlux_instFlux"),
+    )
+    zeropoint = float(getattr(args, "pu_input_zeropoint", 27.0))
+    ap2_mag = np.asarray(_magnitude_from_flux(ap2_flux, zeropoint=zeropoint), dtype=np.float64)
+    kron_mag = np.asarray(_magnitude_from_flux(kron_flux, zeropoint=zeropoint), dtype=np.float64)
+    old_diff = np.abs(ap2_mag - kron_mag)
+    threshold = float(getattr(args, "pu_remeasure_ap2_kron_threshold", np.nan))
+    if not np.isfinite(threshold):
+        threshold = float(getattr(args, "pu_ap2_kron_abs_max", 1.0))
+    if threshold < 0.0:
+        return empty_class, {}, {"selected": 0, "skipped_disabled_threshold": 1}
+
+    nchild = _table_float_column(shaped, "deblend_nChild", default=1.0)
+    x = _table_float_column(shaped, args.x_col)
+    y = _table_float_column(shaped, args.y_col)
+    finite_center = np.isfinite(x) & np.isfinite(y)
+    leaf = nchild == 0
+    old_ignore = np.asarray(result.get("ignore", result.get("b_class", np.zeros(n, dtype=bool))), dtype=bool)
+    selected = np.flatnonzero(leaf & finite_center & np.isfinite(old_diff) & (old_diff > threshold) & old_ignore)
+    class_override = np.asarray([""] * n, dtype="U32")
+    stats: Dict[str, int] = {"selected": int(selected.size)}
+
+    diagnostics: Dict[str, np.ndarray] = {
+        "pu_remeasure_ap2_mag": np.full(n, np.nan, dtype=np.float32),
+        "pu_remeasure_catalog_kron_mag": np.full(n, np.nan, dtype=np.float32),
+        "pu_remeasure_old_absdiff": np.full(n, np.nan, dtype=np.float32),
+        "pu_remeasure_kron_flux": np.full(n, np.nan, dtype=np.float32),
+        "pu_remeasure_kron_mag": np.full(n, np.nan, dtype=np.float32),
+        "pu_remeasure_absdiff": np.full(n, np.nan, dtype=np.float32),
+        "pu_remeasure_aperture_area": np.full(n, np.nan, dtype=np.float32),
+        "pu_remeasure_footprint_fill_fraction": np.full(n, np.nan, dtype=np.float32),
+        "pu_remeasure_axis_ratio": np.full(n, np.nan, dtype=np.float32),
+        "pu_remeasure_surface": np.asarray([""] * n, dtype="U32"),
+        "pu_remeasure_reason": np.asarray([""] * n, dtype="U512"),
+    }
+    if selected.size == 0:
+        return class_override, diagnostics, stats
+
+    try:
+        image_path = _band_fits_path(_expand(args.coadd_root), band, int(args.tract), patch)
+        archive_catalog_root = _expand(getattr(args, "band_catalog_root", None) or getattr(args, "catalog_root"))
+        archive_path = _band_catalog_path(archive_catalog_root, band, int(args.tract), patch)
+        image, image_origin = _read_exposure_image_plane(image_path, clean_nonfinite=not args.no_clean_nonfinite)
+    except Exception as exc:
+        stats["skipped_missing_inputs"] = int(selected.size)
+        stats["error"] = 1
+        diagnostics["pu_remeasure_reason"][selected] = f"remeasure_input_error:{exc}"
+        return class_override, diagnostics, stats
+
+    try:
+        with fits.open(archive_path, memmap=True, ignore_missing_end=True) as archive_hdul:
+            if len(archive_hdul) <= 4:
+                raise RuntimeError("archive catalog lacks footprint archive HDUs")
+            archive_main = archive_hdul[int(args.catalog_hdu)].data
+            archive = archive_hdul[2].data
+            footprint_refs = archive_hdul[3].data
+            spans_table = archive_hdul[4].data
+            heavy_table = archive_hdul[6].data if len(archive_hdul) > 6 else None
+
+            archive_ids = np.asarray(archive_main["id"], dtype=np.int64)
+            archive_order = np.argsort(archive_ids, kind="mergesort")
+            selected_ids = np.asarray(shaped["id"][selected], dtype=np.int64)
+            id_pos = np.searchsorted(archive_ids[archive_order], selected_ids)
+            in_range = id_pos < archive_order.size
+            archive_rows = np.full(selected.shape, -1, dtype=np.int64)
+            matched_ids = np.zeros(selected.shape, dtype=bool)
+            matched_ids[in_range] = archive_ids[archive_order[id_pos[in_range]]] == selected_ids[in_range]
+            archive_rows[matched_ids] = archive_order[id_pos[matched_ids]]
+
+            archive_index = _ArchiveIndex.from_archive(archive)
+            footprint_ids = np.full(selected.shape, -1, dtype=np.int64)
+            footprint_ids[matched_ids] = np.asarray(archive_main["footprint"][archive_rows[matched_ids]], dtype=np.int64)
+            footprint_lookup = archive_index.lookup(footprint_ids, archive_number=1, name=None)
+            spanset_ids = np.full(selected.shape, -1, dtype=np.int64)
+            valid_fp = footprint_lookup.found & (footprint_lookup.row0 >= 0) & (footprint_lookup.row0 < len(footprint_refs))
+            spanset_ids[valid_fp] = np.asarray(footprint_refs["id"], dtype=np.int64)[footprint_lookup.row0[valid_fp]]
+            spanset_lookup = archive_index.lookup(spanset_ids, archive_number=2, name="SpanSet")
+            if heavy_table is not None:
+                heavy_lookup = archive_index.lookup(footprint_ids, archive_number=4, name="HeavyFootprintF")
+            else:
+                heavy_lookup = _ArchiveLookup(
+                    row0=np.full(selected.shape, -1, dtype=np.int64),
+                    nrows=np.zeros(selected.shape, dtype=np.int64),
+                    found=np.zeros(selected.shape, dtype=bool),
+                )
+
+            refit_matched = _table_bool_column(shaped, "pu_refit_kron_radius_matched")
+            row_records: Dict[int, Dict[str, object]] = {}
+            for local_index, row in enumerate(selected):
+                geom = _source_geometry_from_shaped(shaped, int(row))
+                if geom is None:
+                    class_override[row] = "ignore"
+                    diagnostics["pu_remeasure_reason"][row] = "invalid_refit_ellipse"
+                    continue
+                major = float(geom["a"])
+                minor = float(geom["b"])
+                theta = float(geom["theta"])
+                has_heavy = bool(heavy_lookup.found[local_index] and heavy_lookup.row0[local_index] >= 0)
+                use_heavy = bool(refit_matched[row] and has_heavy and heavy_table is not None)
+                if use_heavy:
+                    flux, ap_pixels, _source_pixels = _measure_heavy_ellipse(
+                        spans_table=spans_table,
+                        heavy_table=heavy_table,
+                        span0=int(spanset_lookup.row0[local_index]),
+                        nspan=int(spanset_lookup.nrows[local_index]),
+                        heavy_row=int(heavy_lookup.row0[local_index]),
+                        cx=float(geom["x"]),
+                        cy=float(geom["y"]),
+                        major=major,
+                        minor=minor,
+                        theta=theta,
+                    )
+                    surface = "heavy_footprint"
+                else:
+                    flux, ap_pixels, _source_pixels = _measure_direct_ellipse(
+                        image=image,
+                        image_origin=image_origin,
+                        cx=float(geom["x"]),
+                        cy=float(geom["y"]),
+                        major=major,
+                        minor=minor,
+                        theta=theta,
+                    )
+                    surface = "direct_image_fallback"
+                new_mag = float(_magnitude_from_flux(flux, zeropoint=zeropoint))
+                new_diff = abs(float(ap2_mag[row]) - new_mag) if np.isfinite(new_mag) else np.nan
+                aperture_area = math.pi * major * minor
+                axis_ratio = max(major, minor) / min(major, minor) if min(major, minor) > 0.0 else np.inf
+                fp_ap_pixels, _fp_total = _footprint_ellipse_counts(
+                    spans_table=spans_table,
+                    span0=int(spanset_lookup.row0[local_index]),
+                    nspan=int(spanset_lookup.nrows[local_index]),
+                    cx=float(geom["x"]),
+                    cy=float(geom["y"]),
+                    major=major,
+                    minor=minor,
+                    theta=theta,
+                )
+                fill_fraction = float(fp_ap_pixels) / float(aperture_area) if aperture_area > 0.0 else np.nan
+
+                diagnostics["pu_remeasure_ap2_mag"][row] = float(ap2_mag[row])
+                diagnostics["pu_remeasure_catalog_kron_mag"][row] = float(kron_mag[row])
+                diagnostics["pu_remeasure_old_absdiff"][row] = float(old_diff[row])
+                diagnostics["pu_remeasure_kron_flux"][row] = float(flux) if np.isfinite(flux) else np.nan
+                diagnostics["pu_remeasure_kron_mag"][row] = new_mag if np.isfinite(new_mag) else np.nan
+                diagnostics["pu_remeasure_absdiff"][row] = new_diff if np.isfinite(new_diff) else np.nan
+                diagnostics["pu_remeasure_aperture_area"][row] = float(aperture_area)
+                diagnostics["pu_remeasure_footprint_fill_fraction"][row] = fill_fraction if np.isfinite(fill_fraction) else np.nan
+                diagnostics["pu_remeasure_axis_ratio"][row] = axis_ratio if np.isfinite(axis_ratio) else np.nan
+                diagnostics["pu_remeasure_surface"][row] = surface
+
+                row_records[int(row)] = {
+                    "geom": geom,
+                    "new_diff": new_diff,
+                    "ap2_mag": float(ap2_mag[row]),
+                    "area": aperture_area,
+                    "axis_ratio": axis_ratio,
+                    "fill_fraction": fill_fraction,
+                    "reasons": [],
+                }
+                stats[surface] = stats.get(surface, 0) + 1
+    except Exception as exc:
+        stats["error"] = 1
+        diagnostics["pu_remeasure_reason"][selected] = f"remeasure_archive_error:{exc}"
+        return class_override, diagnostics, stats
+
+    drop_area_max = float(getattr(args, "pu_remeasure_ignore_area_max", 10000.0))
+    faint_mag_min = float(getattr(args, "pu_remeasure_faint_mag_min", 28.0))
+    faint_area_max = float(getattr(args, "pu_remeasure_faint_area_max", 900.0))
+    axis_ratio_max = float(getattr(args, "pu_remeasure_axis_ratio_max", 5.0))
+    small_fill_threshold = float(getattr(args, "pu_remeasure_small_footprint_fill_threshold", 0.2))
+    keep_abs_max = float(getattr(args, "pu_remeasure_clean_abs_max", 1.0))
+    center_abs_max = float(getattr(args, "pu_remeasure_center_only_abs_max", 1.5))
+    containment_threshold = float(getattr(args, "pu_remeasure_containment_threshold", 0.80))
+
+    for row, record in row_records.items():
+        reasons: List[str] = []
+        diff = float(record["new_diff"])
+        area = float(record["area"])
+        axis_ratio = float(record["axis_ratio"])
+        fill_fraction = float(record["fill_fraction"])
+        ap2_value = float(record["ap2_mag"])
+        if np.isfinite(diff) and diff <= center_abs_max and np.isfinite(fill_fraction) and fill_fraction < small_fill_threshold:
+            reasons.append("small_footprint_large_aperture")
+        if np.isfinite(area) and area > drop_area_max:
+            reasons.append(f"used_aperture_area_gt_{drop_area_max:g}")
+        if np.isfinite(ap2_value) and ap2_value > faint_mag_min and np.isfinite(area) and area > faint_area_max:
+            reasons.append(f"ap2_mag_gt_{faint_mag_min:g}_and_area_gt_{faint_area_max:g}")
+        if np.isfinite(axis_ratio) and axis_ratio > axis_ratio_max:
+            reasons.append(f"axis_ratio_gt_{axis_ratio_max:g}")
+        if not np.isfinite(diff):
+            reasons.append("invalid_new_diff")
+        elif diff > center_abs_max:
+            reasons.append(f"new_absdiff_gt_{center_abs_max:g}")
+        record["reasons"] = reasons
+
+    unit_points = _unit_disk_points()
+    clean_mask = np.asarray(result["clean"], dtype=bool)
+    small_pool: List[Dict[str, float]] = []
+    seen: set[int] = set()
+    for row in np.flatnonzero(clean_mask):
+        geom = _source_geometry_from_shaped(shaped, int(row))
+        if geom is not None:
+            small_pool.append(geom)
+            seen.add(int(geom["source_id"]))
+    for row, record in row_records.items():
+        if record["reasons"]:
+            continue
+        geom = record["geom"]
+        sid = int(geom["source_id"])
+        if sid not in seen:
+            small_pool.append(geom)
+            seen.add(sid)
+
+    for row, record in row_records.items():
+        if record["reasons"]:
+            continue
+        big = record["geom"]
+        possible = []
+        for small in small_pool:
+            if int(small["source_id"]) == int(big["source_id"]):
+                continue
+            if small["area"] >= big["area"]:
+                continue
+            dx = float(small["x"]) - float(big["x"])
+            dy = float(small["y"]) - float(big["y"])
+            if dx * dx + dy * dy > (float(small["rmax"]) + float(big["rmax"])) ** 2:
+                continue
+            possible.append(small)
+        possible.sort(key=lambda item: float(item["area"]))
+        for small in possible:
+            frac = _ellipse_contains_fraction(small, big, unit_points)
+            if frac >= containment_threshold:
+                record["reasons"].append(
+                    f"contains_smaller_kron_ge_{containment_threshold:.2f}:small_id={int(small['source_id'])},frac={frac:.3f}"
+                )
+                break
+
+    for row, record in row_records.items():
+        reasons = list(record["reasons"])
+        diff = float(record["new_diff"])
+        drop_reasons = [reason for reason in reasons if reason.startswith("used_aperture_area_gt_")]
+        if drop_reasons:
+            label = "drop"
+        elif reasons:
+            label = "ignore"
+        elif np.isfinite(diff) and diff < keep_abs_max:
+            label = "clean"
+        elif np.isfinite(diff) and diff <= center_abs_max:
+            label = "center_only"
+        else:
+            label = "ignore"
+            reasons.append("new_diff_outside_keep_bins")
+        class_override[row] = label
+        reason = ";".join(reasons) if reasons else f"remeasured_ap2_kron_{label}"
+        diagnostics["pu_remeasure_reason"][row] = reason
+        stats[label] = stats.get(label, 0) + 1
+    return class_override, diagnostics, stats
+
+
 def _exclude_catalog_rows_by_id(table: Table, excluded: Table) -> Table:
     if len(table) == 0 or len(excluded) == 0:
         return table
@@ -944,10 +1535,58 @@ def _classify_pu_catalog(
     shaped["pu_reason"] = reasons.astype(str)
     shaped["pu_kron_area"] = area
     shaped["pu_mag"] = mag
-    clean = shaped[np.asarray(result["clean"], dtype=bool)]
-    center_only = shaped[np.asarray(result["center_only"], dtype=bool)]
-    ignore = shaped[np.asarray(result.get("ignore", result["b_class"]), dtype=bool)]
+    clean_mask = np.asarray(result["clean"], dtype=bool).copy()
+    center_only_mask = np.asarray(result["center_only"], dtype=bool).copy()
+    ignore_mask = np.asarray(result.get("ignore", result["b_class"]), dtype=bool).copy()
+    remeasure_class, remeasure_diagnostics, remeasure_stats = _remeasure_ap2_kron_outliers(
+        shaped,
+        result,
+        args,
+        band=band,
+        patch=patch,
+    )
+    if remeasure_diagnostics:
+        for key, value in remeasure_diagnostics.items():
+            shaped[key] = value
+    override_mask = np.asarray([bool(str(value)) for value in remeasure_class], dtype=bool)
+    if np.any(override_mask):
+        remeasure_class_str = np.asarray(remeasure_class, dtype=str)
+        clean_mask[override_mask] = remeasure_class_str[override_mask] == "clean"
+        center_only_mask[override_mask] = remeasure_class_str[override_mask] == "center_only"
+        ignore_mask[override_mask] = remeasure_class_str[override_mask] == "ignore"
+        class_name = np.asarray(shaped["pu_class"], dtype=object)
+        class_name[override_mask] = remeasure_class_str[override_mask]
+        shaped["pu_class"] = class_name.astype(str)
+        if "pu_remeasure_reason" in shaped.colnames:
+            old_reasons = np.asarray(shaped["pu_reason"], dtype=object)
+            new_reasons = np.asarray(shaped["pu_remeasure_reason"], dtype=object)
+            merged_reasons = old_reasons.copy()
+            for idx in np.flatnonzero(override_mask):
+                old = str(old_reasons[idx])
+                new = str(new_reasons[idx])
+                if new:
+                    merged_reasons[idx] = f"{old};{new}" if old and old != "--" else new
+            shaped["pu_reason"] = merged_reasons.astype(str)
+    result["remeasure_ap2_kron"] = remeasure_stats
+    result["clean"] = clean_mask
+    result["center_only"] = center_only_mask
+    result["ignore"] = ignore_mask
+    result["dropped_remeasure"] = np.asarray(remeasure_class, dtype=str) == "drop"
+    clean = shaped[clean_mask]
+    center_only = shaped[center_only_mask]
+    ignore = shaped[ignore_mask]
     return clean, center_only, ignore, shaped, result
+
+
+def _pu_dropped_sources(pu_all: Table, pu_result: Optional[Dict[str, object]]) -> Table:
+    if pu_result is None or len(pu_all) == 0:
+        return Table()
+    mask = np.zeros(len(pu_all), dtype=bool)
+    for key in ("dropped_area", "dropped_remeasure"):
+        value = pu_result.get(key)
+        if value is not None:
+            mask |= np.asarray(value, dtype=bool)
+    return pu_all[mask]
 
 
 def edge_aligned_starts(length: int, tile_size: int, stride: int) -> List[int]:
@@ -1624,6 +2263,24 @@ def _aperture_annulus_snr(
     annulus_counts = np.zeros((centers.shape[0],), dtype=np.int32)
     if image.ndim != 2 or centers.size == 0:
         return snr, annulus_counts
+    exclude = None
+    if annulus_exclude_mask is not None:
+        exclude = np.asarray(annulus_exclude_mask, dtype=bool)
+        if exclude.shape != image.shape:
+            raise ValueError(f"annulus_exclude_mask shape {exclude.shape} != image shape {image.shape}")
+    hard_exclude = None
+    if annulus_hard_exclude_mask is not None:
+        hard_exclude = np.asarray(annulus_hard_exclude_mask, dtype=bool)
+        if hard_exclude.shape != image.shape:
+            raise ValueError(f"annulus_hard_exclude_mask shape {hard_exclude.shape} != image shape {image.shape}")
+    self_major = self_minor = self_theta = None
+    if annulus_self_ellipse_params is not None:
+        self_major, self_minor, self_theta = annulus_self_ellipse_params
+        self_major = np.asarray(self_major, dtype=np.float32)
+        self_minor = np.asarray(self_minor, dtype=np.float32)
+        self_theta = np.asarray(self_theta, dtype=np.float32)
+        if not (len(self_major) == len(self_minor) == len(self_theta) == centers.shape[0]):
+            raise ValueError("annulus_self_ellipse_params must have one entry per center")
     h, w = image.shape
     exclude = None
     if annulus_exclude_mask is not None:
@@ -1756,11 +2413,11 @@ def _classify_clean_by_noncoadd_snr(
         annulus_exclude_mask=annulus_exclude_mask,
         annulus_hard_exclude_mask=annulus_hard_exclude_mask,
         annulus_self_ellipse_params=self_params,
-        annulus_self_ellipse_sigma=float(args.noncoadd_snr_source_mask_ellipse_sigma),
-        min_annulus_pixels=int(args.noncoadd_snr_min_annulus_pixels),
+        annulus_self_ellipse_sigma=float(getattr(args, "noncoadd_snr_source_mask_ellipse_sigma", 1.0)),
+        min_annulus_pixels=int(getattr(args, "noncoadd_snr_min_annulus_pixels", 2)),
     )
     finite_snr = np.isfinite(snr)
-    insufficient_annulus = annulus_counts < int(args.noncoadd_snr_min_annulus_pixels)
+    insufficient_annulus = annulus_counts < int(getattr(args, "noncoadd_snr_min_annulus_pixels", 2))
     normal_keep = finite_snr & (snr >= float(args.noncoadd_snr_center_only_thresh))
     center_keep = insufficient_annulus | (
         finite_snr
@@ -1901,6 +2558,30 @@ def _variant_lsst_background_mask(
     return None
 
 
+def _image_variant_background_mask_for_tile(
+    args: argparse.Namespace,
+    *,
+    coadd_patch_root: Path,
+    band: str,
+    spec: TileSpec,
+    group_lsst_background_masks: Dict[str, Tuple[np.ndarray, Tuple[int, int]]],
+) -> Optional[np.ndarray]:
+    source = str(getattr(args, "image_variant_background_source", "auto")).strip().lower()
+    if source not in {"auto", "coadd-target", "variant-lsst", "none"}:
+        raise ValueError(f"Unknown image_variant_background_source: {source}")
+    if source == "none":
+        return None
+    if source == "variant-lsst":
+        if band not in group_lsst_background_masks:
+            return None
+        return _crop_full_mask_for_tile(group_lsst_background_masks[band][0], spec, group_lsst_background_masks[band][1])
+    if source == "coadd-target":
+        return _coadd_target_background_mask(coadd_patch_root, band, spec.name)
+    if band in group_lsst_background_masks:
+        return _crop_full_mask_for_tile(group_lsst_background_masks[band][0], spec, group_lsst_background_masks[band][1])
+    return _coadd_target_background_mask(coadd_patch_root, band, spec.name)
+
+
 def _read_variant_label_sources(
     coadd_patch_root: Path,
     *,
@@ -1982,6 +2663,7 @@ def mirror_fast_outputs(source_root: Path, fast_root: Path) -> None:
         "strict_ignore_catalogs",
         "band_reference_catalogs",
         "band_reference_rejected",
+        "band_reference_dropped",
         "band_reference_center_only",
         "band_reference_ignore",
         "band_reference_strict_center_only",
@@ -2277,46 +2959,50 @@ def _preprocess_image_variant_patch(
                             margin=args.mask_margin,
                         )
 
+                        image_tile, image_tile_origin = _crop_image_for_tile(image, spec, image_origin)
                         snr_exclusion_sources = _vstack_nonempty([clean_mask_all, center_mask, strict_center_mask])
-                        snr_annulus_exclude_mask = _source_annulus_exclusion_mask(
-                            snr_exclusion_sources,
-                            spec,
-                            x_col=args.x_col,
-                            y_col=args.y_col,
-                            ellipse_sigma=float(args.noncoadd_snr_source_mask_ellipse_sigma),
-                        )
-                        quality_mask_path = _coadd_cutout_path_for_quality_mask(
-                            coadd_patch_root,
-                            band=band,
-                            tract=args.tract,
-                            patch=patch,
-                            tile_name=spec.name,
-                        )
-                        quality_mask = _quality_mask_from_lsst_fits(
-                            quality_mask_path,
-                            tuple(str(plane) for plane in getattr(args, "noncoadd_snr_mask_planes", ()) or ()),
-                        )
-                        if quality_mask is not None:
-                            if quality_mask.shape != snr_annulus_exclude_mask.shape:
-                                print(
-                                    f"WARNING: quality mask shape {quality_mask.shape} != tile shape "
-                                    f"{snr_annulus_exclude_mask.shape} for {quality_mask_path}; ignoring quality mask",
-                                    flush=True,
-                                )
-                                quality_mask = None
+                        snr_annulus_exclude_mask = None
+                        if bool(getattr(args, "noncoadd_snr_use_source_mask", True)):
+                            snr_annulus_exclude_mask = _source_annulus_exclusion_mask(
+                                snr_exclusion_sources,
+                                spec,
+                                x_col=args.x_col,
+                                y_col=args.y_col,
+                                ellipse_sigma=float(getattr(args, "noncoadd_snr_source_mask_ellipse_sigma", 1.0)),
+                            )
+                        quality_mask = None
+                        if bool(getattr(args, "noncoadd_snr_use_quality_mask", True)):
+                            quality_mask_path = _coadd_cutout_path_for_quality_mask(
+                                coadd_patch_root,
+                                band=band,
+                                tract=args.tract,
+                                patch=patch,
+                                tile_name=spec.name,
+                            )
+                            quality_mask = _quality_mask_from_lsst_fits(
+                                quality_mask_path,
+                                tuple(str(plane) for plane in getattr(args, "noncoadd_snr_mask_planes", ()) or ()),
+                            )
+                        if quality_mask is not None and quality_mask.shape != image_tile.shape:
+                            print(
+                                f"WARNING: quality mask shape {quality_mask.shape} != tile shape "
+                                f"{image_tile.shape} for {quality_mask_path}; ignoring quality mask",
+                                flush=True,
+                            )
+                            quality_mask = None
 
                         normal_tile, snr_center_tile, snr_ignore_tile, _tile_snr = _classify_clean_by_noncoadd_snr(
                             clean_tile_all,
-                            image=image,
-                            image_origin=image_origin,
+                            image=image_tile,
+                            image_origin=image_tile_origin,
                             args=args,
                             annulus_exclude_mask=snr_annulus_exclude_mask,
                             annulus_hard_exclude_mask=quality_mask,
                         )
                         normal_mask, snr_center_mask, snr_ignore_mask, _mask_snr = _classify_clean_by_noncoadd_snr(
                             clean_mask_all,
-                            image=image,
-                            image_origin=image_origin,
+                            image=image_tile,
+                            image_origin=image_tile_origin,
                             args=args,
                             annulus_exclude_mask=snr_annulus_exclude_mask,
                             annulus_hard_exclude_mask=quality_mask,
@@ -2337,14 +3023,12 @@ def _preprocess_image_variant_patch(
                             confidence_levels=args.confidence_levels,
                             core_radius=args.core_radius,
                             center_only_weight=args.pu_center_only_weight,
-                            lsst_background_mask=(
-                                _crop_full_mask_for_tile(
-                                    group_lsst_background_masks[band][0],
-                                    spec,
-                                    group_lsst_background_masks[band][1],
-                                )
-                                if band in group_lsst_background_masks
-                                else _coadd_target_background_mask(coadd_patch_root, band, spec.name)
+                            lsst_background_mask=_image_variant_background_mask_for_tile(
+                                args,
+                                coadd_patch_root=coadd_patch_root,
+                                band=band,
+                                spec=spec,
+                                group_lsst_background_masks=group_lsst_background_masks,
                             ),
                             strict_center_only_sources=strict_center_mask,
                             strict_center_only_ellipse_sigma=args.pu_strict_bright_center_only_ellipse_sigma,
@@ -2419,9 +3103,13 @@ def _preprocess_image_variant_patch(
             "variant_lsst_background_root": str(_variant_lsst_background_root(args))
             if _variant_lsst_background_root(args) is not None
             else None,
+            "image_variant_background_source": str(getattr(args, "image_variant_background_source", "auto")),
             "noncoadd_snr_filter": write_variant_labels,
             "noncoadd_snr_ignore_thresh": float(getattr(args, "noncoadd_snr_ignore_thresh", 2.0)),
             "noncoadd_snr_center_only_thresh": float(getattr(args, "noncoadd_snr_center_only_thresh", 3.0)),
+            "noncoadd_snr_use_source_mask": bool(getattr(args, "noncoadd_snr_use_source_mask", True)),
+            "noncoadd_snr_use_quality_mask": bool(getattr(args, "noncoadd_snr_use_quality_mask", True)),
+            "noncoadd_snr_algorithm": "aperture_annulus_v2_source_quality_mask_options",
             "noncoadd_visibility_counts": visibility_counts if write_variant_labels else None,
             "zscale_root": str(_expand(args.zscale_root)) if args.zscale_root is not None else None,
             "zscale_written": zscale_written,
@@ -2949,6 +3637,7 @@ def _preprocess_patch(
             band=args.catalog_band,
             patch=patch,
         )
+        dropped_sources = _pu_dropped_sources(pu_all, pu_result)
         filtered, center_only, strict_center_only_sources = _move_bright_clean_to_center_only(
             filtered,
             center_only,
@@ -2958,6 +3647,7 @@ def _preprocess_patch(
         rejected_parts = [part for part in (center_only, ignore_sources) if len(part)]
         rejected = vstack(rejected_parts) if len(rejected_parts) >= 2 else (rejected_parts[0] if rejected_parts else Table())
     else:
+        dropped_sources = Table()
         filtered, rejected = _filter_catalog(table, args)
         if args.target_shape_source != args.shape_source:
             filtered = add_ellipse_columns(filtered, shape_source=args.target_shape_source)
@@ -2976,6 +3666,7 @@ def _preprocess_patch(
             write_table_pair(center_only, sources_dir / "sources_pu_center_only.fits", None)
             write_table_pair(ignore_sources, sources_dir / "sources_pu_ignore.fits", None)
             write_table_pair(strict_center_only_sources, sources_dir / "sources_pu_strict_center_only.fits", None)
+            write_table_pair(dropped_sources, sources_dir / "sources_pu_dropped.fits", None)
             write_table_pair(pu_all, sources_dir / "sources_pu_all.fits", None)
 
     band_catalog_warnings: List[Dict[str, str]] = []
@@ -2993,6 +3684,7 @@ def _preprocess_patch(
                         band=band,
                         patch=patch,
                     )
+                    band_dropped = _pu_dropped_sources(band_pu_all, _band_pu_result)
                     band_strict_center_only = Table()
                     band_filtered, band_center_only, band_strict_center_only = _move_bright_clean_to_center_only(
                         band_filtered,
@@ -3007,6 +3699,7 @@ def _preprocess_patch(
                         else (band_rejected_parts[0] if band_rejected_parts else Table())
                     )
                 else:
+                    band_dropped = Table()
                     band_filtered, band_rejected = _filter_catalog(band_table, args)
                     if args.target_shape_source != args.shape_source:
                         band_filtered = add_ellipse_columns(band_filtered, shape_source=args.target_shape_source)
@@ -3044,6 +3737,7 @@ def _preprocess_patch(
                 band_ignore = ignore_sources
                 band_strict_center_only = strict_center_only_sources
                 band_pu_all = pu_all if args.label_mode == "pu" else Table()
+                band_dropped = dropped_sources
             band_target_sources[band] = (band_filtered, band_center_only, band_ignore, band_strict_center_only)
             band_ref_dir = output_root / "band_reference_catalogs" / band
             write_table_pair(
@@ -3058,6 +3752,11 @@ def _preprocess_patch(
             )
             write_ids_metadata(band_rejected, output_root / "band_rejected_ids" / f"{band}.npz")
             if args.label_mode == "pu":
+                write_table_pair(
+                    band_dropped,
+                    output_root / "band_reference_dropped" / band / f"meas-{band}-{args.tract}-{patch}.fits",
+                    None,
+                )
                 write_table_pair(
                     band_center_only,
                     output_root / "band_reference_center_only" / band / f"meas-{band}-{args.tract}-{patch}.fits",
@@ -3710,12 +4409,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--noncoadd-snr-annulus-r-in", type=float, default=10.0)
     parser.add_argument("--noncoadd-snr-annulus-r-out", type=float, default=15.0)
     parser.add_argument(
+        "--noncoadd-snr-annulus-exclude-radius",
+        type=float,
+        default=6.0,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--noncoadd-snr-source-mask-ellipse-sigma",
         type=float,
         default=1.0,
         help=(
             "Ellipse scale for source masks excluded from noncoadd SNR annuli. "
-            "This is intentionally smaller than the training target ellipse to avoid masking the target source's own annulus."
+            "The target source's own ellipse is kept in the annulus so nearby source masks do not erase all pixels."
+        ),
+    )
+    parser.add_argument(
+        "--noncoadd-snr-use-source-mask",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Exclude known source ellipses from the noncoadd SNR background annulus. "
+            "Disable this to reproduce the older Zangetsu demo SNR split more closely."
+        ),
+    )
+    parser.add_argument(
+        "--noncoadd-snr-use-quality-mask",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Exclude selected coadd MASK planes from the noncoadd SNR background annulus. "
+            "Disable this together with --no-noncoadd-snr-use-source-mask for legacy diagnostics."
         ),
     )
     parser.add_argument(
@@ -3728,9 +4451,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--noncoadd-snr-mask-planes",
         nargs="*",
         default=["BRIGHT_OBJECT", "SAT", "BAD", "NO_DATA", "EDGE", "UNMASKEDNAN"],
-        help=(
-            "Coadd MASK planes excluded from noncoadd SNR annuli. Use an empty value to disable pixel-quality masking."
-        ),
+        help="Coadd MASK planes excluded from noncoadd SNR annuli. Pass an empty value to disable pixel-quality masking.",
     )
     parser.add_argument("--pu-a-flags", nargs="*", default=list(DEFAULT_PU_A_FLAGS))
     parser.add_argument("--pu-b-flags", nargs="*", default=list(DEFAULT_PU_B_FLAGS))
@@ -3776,6 +4497,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--pu-ap2-flux-column", default="base_CircularApertureFlux_6_0_instFlux")
     parser.add_argument("--pu-ap2-kron-flux-column", default="ext_photometryKron_KronFlux_instFlux")
+    parser.add_argument(
+        "--pu-remeasure-ap2-kron-outliers",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "For sources rejected by the catalog ap2-vs-Kron B filter, remeasure Kron flux with "
+            "heavy footprints plus refit Kron apertures and promote reliable candidates to clean/center_only."
+        ),
+    )
+    parser.add_argument(
+        "--pu-remeasure-ap2-kron-threshold",
+        type=float,
+        default=np.nan,
+        help="Old abs(ap2_mag-kron_mag) threshold selecting rows for remeasurement. Default: --pu-ap2-kron-abs-max.",
+    )
+    parser.add_argument("--pu-remeasure-clean-abs-max", type=float, default=1.0)
+    parser.add_argument("--pu-remeasure-center-only-abs-max", type=float, default=1.5)
+    parser.add_argument("--pu-remeasure-small-footprint-fill-threshold", type=float, default=0.2)
+    parser.add_argument("--pu-remeasure-ignore-area-max", type=float, default=10000.0)
+    parser.add_argument("--pu-remeasure-faint-mag-min", type=float, default=28.0)
+    parser.add_argument("--pu-remeasure-faint-area-max", type=float, default=900.0)
+    parser.add_argument("--pu-remeasure-axis-ratio-max", type=float, default=5.0)
+    parser.add_argument("--pu-remeasure-containment-threshold", type=float, default=0.80)
     parser.add_argument(
         "--pu-use-band-limit-b-filter",
         action="store_true",
@@ -3989,6 +4733,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "lsst_pipeline/batch_detect_background.py. Layout: "
             "<root>/<variant>/<tract>/<patch>/<group>/<band>/background_mask.npz. "
             "When present, denoised/noisy PU targets use these masks before falling back to coadd target backgrounds."
+        ),
+    )
+    parser.add_argument(
+        "--image-variant-background-source",
+        choices=("auto", "coadd-target", "variant-lsst", "none"),
+        default="auto",
+        help=(
+            "Background mask source for denoised/noisy PU targets. "
+            "'coadd-target' reuses the coadd target background mask, which is normally the LSST-detected "
+            "background after clean/center/ignore exclusion; 'variant-lsst' uses --variant-lsst-background-root; "
+            "'auto' prefers variant-lsst when available and otherwise uses coadd-target."
         ),
     )
     parser.add_argument(

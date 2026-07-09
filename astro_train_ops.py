@@ -60,7 +60,7 @@ def _autocast_context(device: torch.device, amp_dtype: Optional[torch.dtype]):
 
 
 def unwrap_model(model: nn.Module) -> nn.Module:
-    """Return the original model under DDP or the local DDP helper wrapper."""
+    """Return the original model under DDP, local DDP helper, or torch.compile."""
 
     current = model
     while True:
@@ -69,6 +69,9 @@ def unwrap_model(model: nn.Module) -> nn.Module:
             continue
         if hasattr(current, "_ddp_wrapped_model"):
             current = current._ddp_wrapped_model  # type: ignore[attr-defined,assignment]
+            continue
+        if hasattr(current, "_orig_mod"):
+            current = current._orig_mod  # type: ignore[attr-defined,assignment]
             continue
         return current
 

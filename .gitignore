@@ -19,3 +19,4 @@ zangetsu_demo/preprocessed
 zangetsu_demo/data
 **.reg
 vis/
+debug.sh

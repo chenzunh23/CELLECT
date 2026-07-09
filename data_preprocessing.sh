@@ -24,7 +24,7 @@ CONDA_ENV="${CONDA_ENV:-cellect}"
 RUN_REFIT="${RUN_REFIT:-1}"
 RUN_PREPROCESS="${RUN_PREPROCESS:-1}"
 REUSE_EXISTING_PREPROCESSED="${REUSE_EXISTING_PREPROCESSED:-0}"
-REBUILD_IMAGE_VARIANTS="${REBUILD_IMAGE_VARIANTS:-0}"
+REBUILD_IMAGE_VARIANTS="${REBUILD_IMAGE_VARIANTS:-auto}"
 SKIP_EXISTING_REFIT="${SKIP_EXISTING_REFIT:-1}"
 REFIT_CSV_ONLY="${REFIT_CSV_ONLY:-1}"
 COPY_REFIT_INPUTS_TO_TMP="${COPY_REFIT_INPUTS_TO_TMP:-0}"
@@ -54,9 +54,11 @@ OVERWRITE_ZSCALE="${OVERWRITE_ZSCALE:-1}"
 OVERWRITE_CUTOUTS="${OVERWRITE_CUTOUTS:-0}"
 SKIP_CUTOUTS="${SKIP_CUTOUTS:-0}"
 WRITE_TARGET_FITS="${WRITE_TARGET_FITS:-0}"
+QUIET_ASTROPY_WARNINGS="${QUIET_ASTROPY_WARNINGS:-1}"
 LSST_BACKGROUND_POLICY="${LSST_BACKGROUND_POLICY:-run-if-missing}"
 LSST_BACKGROUND_CACHE_ROOT="${LSST_BACKGROUND_CACHE_ROOT:-}"
 VARIANT_LSST_BACKGROUND_ROOT="${VARIANT_LSST_BACKGROUND_ROOT:-}"
+IMAGE_VARIANT_BACKGROUND_SOURCE="${IMAGE_VARIANT_BACKGROUND_SOURCE:-coadd-target}"
 LSST_DETECT_PYTHON="${LSST_DETECT_PYTHON:-}"
 OVERWRITE_LSST_BACKGROUND="${OVERWRITE_LSST_BACKGROUND:-0}"
 WRITE_LSST_BACKGROUND_PRODUCTS="${WRITE_LSST_BACKGROUND_PRODUCTS:-0}"
@@ -72,8 +74,18 @@ NONCOADD_SNR_AP_RADIUS="${NONCOADD_SNR_AP_RADIUS:-6.0}"
 NONCOADD_SNR_ANNULUS_R_IN="${NONCOADD_SNR_ANNULUS_R_IN:-10.0}"
 NONCOADD_SNR_ANNULUS_R_OUT="${NONCOADD_SNR_ANNULUS_R_OUT:-15.0}"
 NONCOADD_SNR_SOURCE_MASK_ELLIPSE_SIGMA="${NONCOADD_SNR_SOURCE_MASK_ELLIPSE_SIGMA:-1.0}"
-NONCOADD_SNR_MIN_ANNULUS_PIXELS="${NONCOADD_SNR_MIN_ANNULUS_PIXELS:-20}"
+NONCOADD_SNR_MIN_ANNULUS_PIXELS="${NONCOADD_SNR_MIN_ANNULUS_PIXELS:-50}"
 NONCOADD_SNR_MASK_PLANES="${NONCOADD_SNR_MASK_PLANES:-BRIGHT_OBJECT SAT BAD NO_DATA EDGE UNMASKEDNAN}"
+NONCOADD_SNR_USE_SOURCE_MASK="${NONCOADD_SNR_USE_SOURCE_MASK:-1}"
+NONCOADD_SNR_USE_QUALITY_MASK="${NONCOADD_SNR_USE_QUALITY_MASK:-1}"
+
+if [[ "${REBUILD_IMAGE_VARIANTS}" == "auto" ]]; then
+  if [[ -n "${DENOISED_FITS_ROOT}" && "${REUSE_EXISTING_PREPROCESSED}" == "1" ]]; then
+    REBUILD_IMAGE_VARIANTS=1
+  else
+    REBUILD_IMAGE_VARIANTS=0
+  fi
+fi
 
 BAND_LIMIT_MAGS="${BAND_LIMIT_MAGS:-HSC-G=27.4 HSC-R=27.1 HSC-I=26.9 HSC-Z=26.3 HSC-Y=25.3}"
 STRICT_CENTER_ONLY_SATURATION_MAGS="${STRICT_CENTER_ONLY_SATURATION_MAGS:-${STRICT_IGNORE_SATURATION_MAGS:-HSC-G=18.0 HSC-R=18.2 HSC-I=18.6 HSC-Z=17.7 HSC-Y=17.4}}"
@@ -81,6 +93,14 @@ ENABLE_STRICT_BRIGHT_CENTER_ONLY="${ENABLE_STRICT_BRIGHT_CENTER_ONLY:-0}"
 PU_AP2_KRON_ABS_MAX="${PU_AP2_KRON_ABS_MAX:-1.0}"
 PU_AP2_FLUX_COLUMN="${PU_AP2_FLUX_COLUMN:-base_CircularApertureFlux_6_0_instFlux}"
 PU_AP2_KRON_FLUX_COLUMN="${PU_AP2_KRON_FLUX_COLUMN:-ext_photometryKron_KronFlux_instFlux}"
+PU_REMEASURE_AP2_KRON_OUTLIERS="${PU_REMEASURE_AP2_KRON_OUTLIERS:-1}"
+PU_REMEASURE_CENTER_ONLY_ABS_MAX="${PU_REMEASURE_CENTER_ONLY_ABS_MAX:-1.5}"
+PU_REMEASURE_SMALL_FOOTPRINT_FILL_THRESHOLD="${PU_REMEASURE_SMALL_FOOTPRINT_FILL_THRESHOLD:-0.2}"
+PU_REMEASURE_IGNORE_AREA_MAX="${PU_REMEASURE_IGNORE_AREA_MAX:-10000}"
+PU_REMEASURE_FAINT_MAG_MIN="${PU_REMEASURE_FAINT_MAG_MIN:-28}"
+PU_REMEASURE_FAINT_AREA_MAX="${PU_REMEASURE_FAINT_AREA_MAX:-900}"
+PU_REMEASURE_AXIS_RATIO_MAX="${PU_REMEASURE_AXIS_RATIO_MAX:-5}"
+PU_REMEASURE_CONTAINMENT_THRESHOLD="${PU_REMEASURE_CONTAINMENT_THRESHOLD:-0.80}"
 
 WRITE_CLEAN_REGIONS="${WRITE_CLEAN_REGIONS:-0}"
 CLEAN_REGION_OUT_DIR="${CLEAN_REGION_OUT_DIR:-output/preprocessed_clean_regions}"
@@ -105,10 +125,14 @@ LOG_DIR="${LOG_DIR:-output/data_preprocessing_logs}"
 mkdir -p "${LOG_DIR}"
 
 run_python() {
+  local env_args=()
+  if [[ "${QUIET_ASTROPY_WARNINGS}" == "1" ]]; then
+    env_args+=("PYTHONWARNINGS=ignore::astropy.units.UnitsWarning,ignore::astropy.io.fits.verify.VerifyWarning${PYTHONWARNINGS:+,${PYTHONWARNINGS}}")
+  fi
   if [[ "${CONDA_DEFAULT_ENV:-}" == "${CONDA_ENV}" ]]; then
-    python "$@"
+    env "${env_args[@]}" python "$@"
   else
-    conda run -n "${CONDA_ENV}" python "$@"
+    env "${env_args[@]}" conda run -n "${CONDA_ENV}" python "$@"
   fi
 }
 
@@ -337,6 +361,7 @@ run_preprocess() {
   if [[ -n "${VARIANT_LSST_BACKGROUND_ROOT}" ]]; then
     optional_args+=(--variant-lsst-background-root "${VARIANT_LSST_BACKGROUND_ROOT}")
   fi
+  optional_args+=(--image-variant-background-source "${IMAGE_VARIANT_BACKGROUND_SOURCE}")
   if [[ -n "${LSST_DETECT_PYTHON}" ]]; then
     optional_args+=(--lsst-detect-python "${LSST_DETECT_PYTHON}")
   fi
@@ -365,6 +390,11 @@ run_preprocess() {
       --pu-band-limit-mags "${band_limit_args[@]}"
     )
   fi
+  if [[ "${PU_REMEASURE_AP2_KRON_OUTLIERS}" == "1" ]]; then
+    optional_args+=(--pu-remeasure-ap2-kron-outliers)
+  else
+    optional_args+=(--no-pu-remeasure-ap2-kron-outliers)
+  fi
   if [[ -n "${DENOISED_FITS_ROOT}" ]]; then
     split_words "${IMAGE_VARIANTS}"
     local image_variant_args=("${SPLIT_WORDS_OUT[@]}")
@@ -386,6 +416,16 @@ run_preprocess() {
       optional_args+=(--noncoadd-snr-filter)
     else
       optional_args+=(--no-noncoadd-snr-filter)
+    fi
+    if [[ "${NONCOADD_SNR_USE_SOURCE_MASK}" == "1" ]]; then
+      optional_args+=(--noncoadd-snr-use-source-mask)
+    else
+      optional_args+=(--no-noncoadd-snr-use-source-mask)
+    fi
+    if [[ "${NONCOADD_SNR_USE_QUALITY_MASK}" == "1" ]]; then
+      optional_args+=(--noncoadd-snr-use-quality-mask)
+    else
+      optional_args+=(--no-noncoadd-snr-use-quality-mask)
     fi
     if [[ -n "${IMAGE_VARIANT_GROUPS}" ]]; then
       split_words "${IMAGE_VARIANT_GROUPS}"
@@ -414,6 +454,14 @@ run_preprocess() {
     --pu-ap2-kron-abs-max "${PU_AP2_KRON_ABS_MAX}" \
     --pu-ap2-flux-column "${PU_AP2_FLUX_COLUMN}" \
     --pu-ap2-kron-flux-column "${PU_AP2_KRON_FLUX_COLUMN}" \
+    --pu-remeasure-clean-abs-max "${PU_AP2_KRON_ABS_MAX}" \
+    --pu-remeasure-center-only-abs-max "${PU_REMEASURE_CENTER_ONLY_ABS_MAX}" \
+    --pu-remeasure-small-footprint-fill-threshold "${PU_REMEASURE_SMALL_FOOTPRINT_FILL_THRESHOLD}" \
+    --pu-remeasure-ignore-area-max "${PU_REMEASURE_IGNORE_AREA_MAX}" \
+    --pu-remeasure-faint-mag-min "${PU_REMEASURE_FAINT_MAG_MIN}" \
+    --pu-remeasure-faint-area-max "${PU_REMEASURE_FAINT_AREA_MAX}" \
+    --pu-remeasure-axis-ratio-max "${PU_REMEASURE_AXIS_RATIO_MAX}" \
+    --pu-remeasure-containment-threshold "${PU_REMEASURE_CONTAINMENT_THRESHOLD}" \
     --pu-b-close-center-arcsec "${PU_B_CLOSE_CENTER_ARCSEC}" \
     --pu-b-axis-ratio-max "${PU_B_AXIS_RATIO_MAX}" \
     --pu-containment-threshold "${PU_CONTAINMENT_THRESHOLD}" \

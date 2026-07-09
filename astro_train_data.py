@@ -971,12 +971,16 @@ def _aperture_annulus_snr(
     ap_radius: float = 6.0,
     annulus_r_in: float = 10.0,
     annulus_r_out: float = 15.0,
+    exclude_centers: Optional[np.ndarray] = None,
+    annulus_exclude_radius: float = 0.0,
 ) -> np.ndarray:
     image = np.asarray(image, dtype=np.float32)
     centers = np.asarray(centers, dtype=np.float32).reshape(-1, 2)
     snr = np.full((centers.shape[0],), np.nan, dtype=np.float32)
     if image.ndim != 2 or centers.size == 0:
         return snr
+    exclude_xy = np.asarray(exclude_centers, dtype=np.float32).reshape(-1, 2) if exclude_centers is not None else centers
+    exclude_radius = float(annulus_exclude_radius)
     h, w = image.shape
     rmax = float(max(ap_radius, annulus_r_out))
     for idx, (cx, cy) in enumerate(centers):
@@ -994,6 +998,17 @@ def _aperture_annulus_snr(
         finite = np.isfinite(patch)
         ap_mask = (rr <= float(ap_radius)) & finite
         ann_mask = (rr >= float(annulus_r_in)) & (rr < float(annulus_r_out)) & finite
+        if exclude_radius > 0.0 and exclude_xy.size:
+            nearby = (
+                (exclude_xy[:, 0] >= x0 - exclude_radius)
+                & (exclude_xy[:, 0] < x1 + exclude_radius)
+                & (exclude_xy[:, 1] >= y0 - exclude_radius)
+                & (exclude_xy[:, 1] < y1 + exclude_radius)
+            )
+            for ex, ey in exclude_xy[nearby]:
+                if not (np.isfinite(ex) and np.isfinite(ey)):
+                    continue
+                ann_mask &= ((xx.astype(np.float32) - float(ex)) ** 2 + (yy.astype(np.float32) - float(ey)) ** 2) > exclude_radius**2
         ap_vals = patch[ap_mask]
         ann_vals = patch[ann_mask]
         if ap_vals.size == 0 or ann_vals.size < 2:
@@ -1087,6 +1102,7 @@ def _apply_noncoadd_visibility_filter(
     ap_radius: float,
     annulus_r_in: float,
     annulus_r_out: float,
+    annulus_exclude_radius: float,
 ) -> Tuple[Dict[str, Tensor], Dict[str, np.ndarray], np.ndarray, np.ndarray, np.ndarray]:
     centers = np.asarray(catalog.get("centers", np.zeros((0, 2), dtype=np.float32)), dtype=np.float32).reshape(-1, 2)
     if raw_image is None or centers.size == 0:
@@ -1097,6 +1113,8 @@ def _apply_noncoadd_visibility_filter(
         ap_radius=ap_radius,
         annulus_r_in=annulus_r_in,
         annulus_r_out=annulus_r_out,
+        exclude_centers=centers,
+        annulus_exclude_radius=annulus_exclude_radius,
     )
     finite_snr = np.isfinite(snr)
     normal_keep = finite_snr & (snr >= float(center_only_snr))
@@ -1148,6 +1166,7 @@ class AstroCutoutDataset(Dataset):
         noncoadd_visibility_ap_radius: float = 6.0,
         noncoadd_visibility_annulus_r_in: float = 10.0,
         noncoadd_visibility_annulus_r_out: float = 15.0,
+        noncoadd_visibility_annulus_exclude_radius: float = 6.0,
         augment: bool = False,
     ) -> None:
         self.records = list(records)
@@ -1171,6 +1190,7 @@ class AstroCutoutDataset(Dataset):
         self.noncoadd_visibility_ap_radius = float(noncoadd_visibility_ap_radius)
         self.noncoadd_visibility_annulus_r_in = float(noncoadd_visibility_annulus_r_in)
         self.noncoadd_visibility_annulus_r_out = float(noncoadd_visibility_annulus_r_out)
+        self.noncoadd_visibility_annulus_exclude_radius = float(noncoadd_visibility_annulus_exclude_radius)
         self.augment = bool(augment)
 
     def reload_pseudo_labels(self, pseudo_label_path: Optional[Path] = None) -> None:
@@ -1205,6 +1225,7 @@ class AstroCutoutDataset(Dataset):
                 ap_radius=self.noncoadd_visibility_ap_radius,
                 annulus_r_in=self.noncoadd_visibility_annulus_r_in,
                 annulus_r_out=self.noncoadd_visibility_annulus_r_out,
+                annulus_exclude_radius=self.noncoadd_visibility_annulus_exclude_radius,
             )
         target_center = targets.get("visibility_center_only_centers")
         if isinstance(target_center, torch.Tensor) and target_center.numel():
@@ -1278,6 +1299,7 @@ class AstroCutoutDataset(Dataset):
                     ap_radius=self.noncoadd_visibility_ap_radius,
                     annulus_r_in=self.noncoadd_visibility_annulus_r_in,
                     annulus_r_out=self.noncoadd_visibility_annulus_r_out,
+                    annulus_exclude_radius=self.noncoadd_visibility_annulus_exclude_radius,
                 )
                 band_catalogs[-1] = band_catalog
             target_center = band_target.get("visibility_center_only_centers")
