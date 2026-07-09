@@ -535,15 +535,15 @@ def _sam_mask_loss_for_prompts(
         max_area_loss = F.relu(area_full - max_area_px) / max(max_area_px, 1.0)
     else:
         max_area_loss = torch.zeros_like(area_loss)
-    if debug_timer is not None:
-        debug_timer(f"{debug_prefix}.max_area")
+    t_phase = _mark_mask_timing(debug_timing, f"{timing_prefix}.max_area", t_phase, enabled=float(weight_max_area))
+
     if weight_pred_iou:
         pred_iou_thresh = float(getattr(weights, "mask_pred_iou_thresh", 0.8))
         pred_iou_loss = F.relu(pred_iou_thresh - iou_predictions) / max(pred_iou_thresh, 1e-6)
     else:
         pred_iou_loss = logits.new_zeros((n, int(logits.shape[1])))
-    if debug_timer is not None:
-        debug_timer(f"{debug_prefix}.pred_iou")
+    t_phase = _mark_mask_timing(debug_timing, f"{timing_prefix}.pred_iou", t_phase, enabled=float(weight_pred_iou))
+
     if weight_stability:
         assert soft_stability is not None
         stability_thresh = float(getattr(weights, "mask_stability_score_thresh", 0.95))
@@ -678,6 +678,12 @@ def sam_prompt_mask_losses(
             pieces.append((1.0 - pred_ratio, gt_loss))
     if pred_ratio > 0.0:
         t_phase = time.perf_counter()
+        pred_internal_start = t_phase
+
+        def _pred_debug_timer(label: str) -> None:
+            nonlocal pred_internal_start
+            pred_internal_start = _mark_mask_timing(debug_timing, label, pred_internal_start)
+
         pred_prompts = _build_pred_prompt_tensors(
             outputs,
             batch,
@@ -694,7 +700,7 @@ def sam_prompt_mask_losses(
             unmatched_weight=float(getattr(weights, "mask_unmatched_prompt")),
             detach_prompt_shapes=bool(getattr(weights, "detach_mask_prompt_shapes", False)),
             detect_centers_fn=detect_centers_fn,
-            debug_timer=debug_timer,
+            debug_timer=_pred_debug_timer if debug_timing is not None else None,
         )
         t_phase = _mark_mask_timing(
             debug_timing,
@@ -725,8 +731,6 @@ def sam_prompt_mask_losses(
             result[key] = sum(loss[key] for _scale, loss in pieces)
         else:
             result[key] = sum(float(scale) * loss[key] for scale, loss in pieces)
-    if debug_timer is not None:
-        debug_timer("mask.combine")
     zero = result["total"].new_zeros(())
     result["gt_total"] = gt_loss["total"] if gt_loss is not None else zero
     result["pred_total"] = pred_loss["total"] if pred_loss is not None else zero
