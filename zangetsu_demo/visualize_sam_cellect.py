@@ -34,8 +34,8 @@ from sam_backbone import build_sam_cellect2d  # noqa: E402
 
 
 TRACT = "9813"
-PATCH = "4,5" # "6,1"
-TILE = "sam_x18204_y20924" #  "zangetsu_lower_right_x27366_y6453"
+PATCH =  "4,5" # "6,1"
+TILE = "sam_x18204_y20924" # "zangetsu_lower_right_x27366_y6453"
 DEFAULT_VARIANT_GROUP = "group_01"
 DEFAULT_BANDS = ("HSC-G", "HSC-R", "HSC-I", "HSC-Z", "HSC-Y")
 DEFAULT_BAND = "HSC-I"

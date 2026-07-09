@@ -369,6 +369,7 @@ def dense_losses(
     weights: LossWeights,
     device: torch.device,
     center_radius_px: float,
+    debug_timer: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Tensor]:
     # Debug
     # torch.cuda.synchronize()
@@ -387,6 +388,8 @@ def dense_losses(
             if clean_mask is not None
             else None
         )
+    if debug_timer is not None:
+        debug_timer("dense.prepare_targets")
 
     if float(weights.segmentation_outer_weight) <= 0.0 or "seg_logits" not in outputs:
         seg_loss = outputs["confidence"].sum() * 0.0
@@ -420,6 +423,8 @@ def dense_losses(
                 seg_loss = per_pixel_seg.sum() * 0.0
         else:
             seg_loss = per_pixel_seg.mean()
+    if debug_timer is not None:
+        debug_timer("dense.seg")
     # torch.cuda.synchronize()
     # seg_time = time.time()
     # print(f'[DEBUG] Segmentation loss computed in {seg_time - start_time:.3f} seconds.')
@@ -446,6 +451,8 @@ def dense_losses(
                 "confidence_loss_mode must be one of ordinal_legacy or ce_hard, "
                 f"got {weights.confidence_loss_mode!r}"
             )
+    if debug_timer is not None:
+        debug_timer("dense.confidence")
     # torch.cuda.synchronize()
     # conf_time = time.time()
     # print(f'[DEBUG] Confidence loss computed in {conf_time - seg_time:.3f} seconds.')
@@ -482,6 +489,8 @@ def dense_losses(
             shape_loss = (per_pixel_shape * shape_weight).sum() / shape_weight.sum().clamp_min(1.0)
         else:
             shape_loss = per_pixel_shape.mean() * 0.0
+    if debug_timer is not None:
+        debug_timer("dense.shape")
     # torch.cuda.synchronize()
     # shape_time = time.time()
     # print(f'[DEBUG] Shape loss computed in {shape_time - conf_time:.3f} seconds.')
@@ -489,6 +498,8 @@ def dense_losses(
         center_loss = center_localization_loss(outputs, batch["centers"], radius_px=center_radius_px)
     else:
         center_loss = torch.tensor(0.0, device=device)
+    if debug_timer is not None:
+        debug_timer("dense.center")
     if float(weights.small_shape_loss_weight) > 0.0:
         small_shape_loss = small_shape_ordinal_suppression_loss(
             outputs,
@@ -501,6 +512,8 @@ def dense_losses(
         )
     else:
         small_shape_loss = outputs["confidence"].sum() * 0.0
+    if debug_timer is not None:
+        debug_timer("dense.small_shape")
     # torch.cuda.synchronize()
     # center_time = time.time()
     # print(f'[DEBUG] Center localization loss computed in {center_time - shape_time:.3f} seconds.')
@@ -511,6 +524,8 @@ def dense_losses(
         + weights.center_position * center_loss
         + weights.small_shape_loss_weight * small_shape_loss
     )
+    if debug_timer is not None:
+        debug_timer("dense.total_combine")
     return {
         "total": total,
         "seg": seg_loss,
@@ -528,12 +543,20 @@ def dense_losses_any(
     weights: LossWeights,
     device: torch.device,
     center_radius_px: float,
+    debug_timer: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Tensor]:
     """Dense loss for both fused BCHW outputs and per-band B,C,CHW outputs."""
 
     per_band = outputs["confidence"].ndim == 5
     if not per_band:
-        return dense_losses(outputs, batch, weights=weights, device=device, center_radius_px=center_radius_px)
+        return dense_losses(
+            outputs,
+            batch,
+            weights=weights,
+            device=device,
+            center_radius_px=center_radius_px,
+            debug_timer=debug_timer,
+        )
 
     flat_outputs = _flatten_per_band_outputs(outputs)
     flat_batch = {
@@ -556,7 +579,14 @@ def dense_losses_any(
         flat_batch["seg_loss_weight"] = batch["band_seg_loss_weight"].reshape(
             -1, *batch["band_seg_loss_weight"].shape[2:]
         )  # type: ignore[union-attr]
-    return dense_losses(flat_outputs, flat_batch, weights=weights, device=device, center_radius_px=center_radius_px)
+    return dense_losses(
+        flat_outputs,
+        flat_batch,
+        weights=weights,
+        device=device,
+        center_radius_px=center_radius_px,
+        debug_timer=debug_timer,
+    )
 
 
 def center_localization_loss(outputs: Dict[str, Tensor], centers_list: Sequence[Tensor], *, radius_px: float) -> Tensor:
@@ -617,7 +647,7 @@ def _confidence_score_at_centers(outputs: Dict[str, Tensor], centers: Tensor, *,
     return score_map[y, x]
 
 
-ORDINAL_EXPECTATION_THRESHOLD = 2.5
+ORDINAL_EXPECTATION_THRESHOLD = 3.0
 ORDINAL_EXPECTATION_MERGE_RADIUS = 3.0
 
 
@@ -1707,7 +1737,7 @@ def build_cellect_style_segmentation(
     outputs: Dict[str, Tensor],
     centers_list: Sequence[np.ndarray | Tensor],
     *,
-    ellipse_sigma: float = 3.0,
+    ellipse_sigma: float = 1.0,
     min_axis: float = 1.5,
 ) -> List[Dict[str, np.ndarray]]:
     """Build CELLECT-style dense ``seg`` and per-center ``seg_mask`` outputs.
@@ -1896,7 +1926,7 @@ def generate_pu_pseudo_labels(
     confidence_score: str = "cellect",
     use_ordinal_expectation: bool = False,
     debug_ordinal_expectation: bool = False,
-    ellipse_sigma: float = 2.0,
+    ellipse_sigma: float = 1.0,
     max_pseudo_per_record_band: int = 512,
     show_progress: bool = True,
 ) -> Dict[str, object]:
@@ -2555,7 +2585,7 @@ def run_epoch(
     debug_ordinal_expectation: bool = False,
     center_refinement: str = "integer",
     center_refinement_radius: int = 1,
-    ellipse_sigma: float = 2.0,
+    ellipse_sigma: float = 1.0,
     amp_dtype: Optional[torch.dtype] = None,
     scheduler_step: Optional[Callable[[], None]] = None,
     global_step_start: int = 0,
@@ -2626,6 +2656,19 @@ def run_epoch(
                 f"{label}={float(seconds):.4f}s{_mem_debug()}",
                 flush=True,
             )
+
+    def _make_debug_timer(active: bool) -> Optional[Callable[[str], None]]:
+        if not active:
+            return None
+        last_time = [time.perf_counter()]
+
+        def _timer(label: str) -> None:
+            _sync_debug(True)
+            now = time.perf_counter()
+            _phase_debug(True, label, now - last_time[0])
+            last_time[0] = now
+
+        return _timer
 
     def _batch_debug_summary(batch_obj: Dict[str, object]) -> str:
         names = batch_obj.get("name", [])
@@ -2717,7 +2760,14 @@ def run_epoch(
             _sync_debug(debug_this_batch)
             t_forward = time.perf_counter()
             _phase_debug(debug_print, "forward", t_forward - t_transfer)
-            losses = dense_losses_any(outputs, batch, weights=weights, device=device, center_radius_px=center_radius_px)
+            losses = dense_losses_any(
+                outputs,
+                batch,
+                weights=weights,
+                device=device,
+                center_radius_px=center_radius_px,
+                debug_timer=_make_debug_timer(debug_print),
+            )
             _sync_debug(debug_this_batch)
             t_dense_loss = time.perf_counter()
             _phase_debug(debug_print, "dense_loss", t_dense_loss - t_forward)
@@ -2759,6 +2809,7 @@ def run_epoch(
                 # Keep the embedding branch visible to DDP when triplet/EX/EN losses are disabled.
                 total = total + outputs["embedding"].sum() * 0.0
 
+            extra_debug_timer = _make_debug_timer(debug_print)
             triplet = total.new_tensor(0.0)
             if triplet_enabled:
                 triplet = embedding_triplet_loss(
@@ -2769,6 +2820,8 @@ def run_epoch(
                     negative_scope=triplet_negative_scope,
                 )
                 total = total + weights.triplet_outer_weight * triplet
+            if extra_debug_timer is not None:
+                extra_debug_timer("extra.triplet")
 
             ex_class = total.new_tensor(0.0)
             if ex_enabled and hasattr(base_model, "EX") and image.shape[1] > 1:
@@ -2783,6 +2836,8 @@ def run_epoch(
                     max_anchors_per_band=matcher_max_anchors_per_band,
                 )
                 total = total + weights.matcher_outer_weight * ex_class
+            if extra_debug_timer is not None:
+                extra_debug_timer("extra.ex_class")
 
             en_class = total.new_tensor(0.0)
             if en_enabled and hasattr(base_model, "EN"):
@@ -2796,6 +2851,8 @@ def run_epoch(
                     max_anchors_per_band=matcher_max_anchors_per_band,
                 )
                 total = total + weights.matcher_outer_weight * en_class
+            if extra_debug_timer is not None:
+                extra_debug_timer("extra.en_class")
 
         _sync_debug(debug_this_batch)
         t_extra_loss = time.perf_counter()
@@ -2972,7 +3029,7 @@ def validate_epoch(
     collect_candidate_stats: bool = False,
     ignore_mask_during_detection: bool = True,
     epoch_index: int = 0,
-    ellipse_sigma: float = 2.0,
+    ellipse_sigma: float = 1.0,
     amp_dtype: Optional[torch.dtype] = None,
     distributed: bool = False,
     show_progress: bool = True,

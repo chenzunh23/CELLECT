@@ -2282,6 +2282,24 @@ def _aperture_annulus_snr(
         if not (len(self_major) == len(self_minor) == len(self_theta) == centers.shape[0]):
             raise ValueError("annulus_self_ellipse_params must have one entry per center")
     h, w = image.shape
+    exclude = None
+    if annulus_exclude_mask is not None:
+        exclude = np.asarray(annulus_exclude_mask, dtype=bool)
+        if exclude.shape != image.shape:
+            raise ValueError(f"annulus_exclude_mask shape {exclude.shape} != image shape {image.shape}")
+    hard_exclude = None
+    if annulus_hard_exclude_mask is not None:
+        hard_exclude = np.asarray(annulus_hard_exclude_mask, dtype=bool)
+        if hard_exclude.shape != image.shape:
+            raise ValueError(f"annulus_hard_exclude_mask shape {hard_exclude.shape} != image shape {image.shape}")
+    self_major = self_minor = self_theta = None
+    if annulus_self_ellipse_params is not None:
+        self_major, self_minor, self_theta = annulus_self_ellipse_params
+        self_major = np.asarray(self_major, dtype=np.float32)
+        self_minor = np.asarray(self_minor, dtype=np.float32)
+        self_theta = np.asarray(self_theta, dtype=np.float32)
+        if not (len(self_major) == len(self_minor) == len(self_theta) == centers.shape[0]):
+            raise ValueError("annulus_self_ellipse_params must have one entry per center")
     rmax = float(max(ap_radius, annulus_r_out))
     min_ann = max(2, int(min_annulus_pixels))
     for idx, (cx, cy) in enumerate(centers):
