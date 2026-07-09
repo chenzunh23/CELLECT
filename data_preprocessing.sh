@@ -54,6 +54,7 @@ OVERWRITE_ZSCALE="${OVERWRITE_ZSCALE:-1}"
 OVERWRITE_CUTOUTS="${OVERWRITE_CUTOUTS:-0}"
 SKIP_CUTOUTS="${SKIP_CUTOUTS:-0}"
 WRITE_TARGET_FITS="${WRITE_TARGET_FITS:-0}"
+QUIET_ASTROPY_WARNINGS="${QUIET_ASTROPY_WARNINGS:-1}"
 LSST_BACKGROUND_POLICY="${LSST_BACKGROUND_POLICY:-run-if-missing}"
 LSST_BACKGROUND_CACHE_ROOT="${LSST_BACKGROUND_CACHE_ROOT:-}"
 VARIANT_LSST_BACKGROUND_ROOT="${VARIANT_LSST_BACKGROUND_ROOT:-}"
@@ -124,10 +125,14 @@ LOG_DIR="${LOG_DIR:-output/data_preprocessing_logs}"
 mkdir -p "${LOG_DIR}"
 
 run_python() {
+  local env_args=()
+  if [[ "${QUIET_ASTROPY_WARNINGS}" == "1" ]]; then
+    env_args+=("PYTHONWARNINGS=ignore::astropy.units.UnitsWarning,ignore::astropy.io.fits.verify.VerifyWarning${PYTHONWARNINGS:+,${PYTHONWARNINGS}}")
+  fi
   if [[ "${CONDA_DEFAULT_ENV:-}" == "${CONDA_ENV}" ]]; then
-    python "$@"
+    env "${env_args[@]}" python "$@"
   else
-    conda run -n "${CONDA_ENV}" python "$@"
+    env "${env_args[@]}" conda run -n "${CONDA_ENV}" python "$@"
   fi
 }
 

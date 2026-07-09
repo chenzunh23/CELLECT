@@ -39,6 +39,13 @@ from astro_train_data import (
     make_targets,
     split_records,
 )
+from astro_train_zarr_data import (
+    ZarrChunkBatchIterableDataset,
+    ZarrChunkLocalBatchSampler,
+    ZarrCutoutDataset,
+    discover_zarr_records,
+    zarr_passthrough_batch,
+)
 from astro_train_ops import (
     HardTripletLoss,
     LossWeights,
@@ -602,9 +609,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train/evaluate AstroCELLECT2D on LSST/HSC FITS cutouts.")
     parser.add_argument("--mode", choices=("train", "eval"), default="train")
     parser.add_argument(
+        "--data-format",
+        choices=("legacy", "zarr"),
+        default="legacy",
+        help="Use legacy FITS/NPZ preprocessing or direct patch Zarr stores.",
+    )
+    parser.add_argument(
+        "--zarr-chunk-local-batches",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="In Zarr mode, batch samples from the same Zarr chunk and shuffle at chunk level.",
+    )
+    parser.add_argument(
+        "--zarr-worker-owned-chunks",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="In Zarr mode, shard chunks by DDP rank and DataLoader worker; each worker drains one chunk into batches.",
+    )
+    parser.add_argument(
+        "--zarr-shuffle-within-chunk",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="In Zarr chunk-local batching, shuffle sample order inside each chunk.",
+    )
+    parser.add_argument(
+        "--zarr-drop-last",
+        action="store_true",
+        help="Drop incomplete chunk-local batches in Zarr mode.",
+    )
+    parser.add_argument(
         "--root",
         default="~/segment-anything/lsst_pipeline/output/cutout_magnitude_experiment_grid",
-        help="Root containing cutouts/ and reference_catalogs/, or <tract>/<patch>/cutouts and reference_catalogs.",
+        help="Legacy root containing cutouts/reference_catalogs, or direct Zarr root when --data-format zarr.",
     )
     parser.add_argument("--reference-dir", default=None)
     parser.add_argument("--cutout-dir", default=None)
@@ -1359,14 +1395,20 @@ def main() -> None:
         train_patch_specs = _parse_patch_specs(args.train_patches, args.train_patches_file)
         val_patch_specs = _parse_patch_specs(args.val_patches, args.val_patches_file)
         explicit_train_val_patches = args.mode == "train" and (bool(train_patch_specs) or bool(val_patch_specs))
-        records = discover_cutout_records(
-            root,
-            reference_dir=reference_dir,
-            cutout_dir=cutout_dir,
-            band_reference_root=band_reference_root,
-            bands=args.bands,
-            max_records=None if ((args.mode == "eval" and eval_patch_specs) or explicit_train_val_patches) else args.max_records,
-        )
+        discover_max_records = None if ((args.mode == "eval" and eval_patch_specs) or explicit_train_val_patches) else args.max_records
+        if args.data_format == "zarr":
+            if reference_dir is not None or cutout_dir is not None or band_reference_root is not None:
+                raise ValueError("--reference-dir/--cutout-dir/--band-reference-root are legacy-only options")
+            records = discover_zarr_records(root, bands=args.bands, max_records=discover_max_records)
+        else:
+            records = discover_cutout_records(
+                root,
+                reference_dir=reference_dir,
+                cutout_dir=cutout_dir,
+                band_reference_root=band_reference_root,
+                bands=args.bands,
+                max_records=discover_max_records,
+            )
         dataset_sources = args.eval_dataset_sources if args.mode == "eval" and args.eval_dataset_sources else args.dataset_sources
         if args.mode == "train" and (args.train_dataset_sources or args.val_dataset_sources):
             dataset_sources = ("all",)
@@ -1556,7 +1598,10 @@ def main() -> None:
             noncoadd_visibility_annulus_exclude_radius=float(args.noncoadd_snr_annulus_exclude_radius),
         )
         pseudo_label_path = out_dir / "pseudo_labels" / "latest.json" if args.enable_pu_self_training else None
-        train_ds = AstroCutoutDataset(
+        dataset_cls = ZarrCutoutDataset if args.data_format == "zarr" else AstroCutoutDataset
+        if args.data_format == "zarr" and args.enable_pu_self_training:
+            raise ValueError("--enable-pu-self-training is not yet supported with --data-format zarr")
+        train_ds = dataset_cls(
             train_records,
             augment=True,
             pseudo_label_path=pseudo_label_path,
@@ -1565,7 +1610,7 @@ def main() -> None:
             pseudo_shape_weight=args.pu_pseudo_shape_weight,
             **common_ds,
         )
-        val_ds = AstroCutoutDataset(
+        val_ds = dataset_cls(
             val_records,
             augment=False,
             load_eval_ignore_sources=args.mode == "eval" or int(args.detect_every) > 0,
@@ -1573,7 +1618,7 @@ def main() -> None:
         )
         pseudo_detect_loader = None
         if args.enable_pu_self_training and is_main and args.mode == "train":
-            pseudo_detect_ds = AstroCutoutDataset(train_records, augment=False, **common_ds)
+            pseudo_detect_ds = dataset_cls(train_records, augment=False, **common_ds)
             pseudo_kwargs = {
                 "batch_size": args.batch_size,
                 "shuffle": False,
@@ -1585,18 +1630,142 @@ def main() -> None:
                 pseudo_kwargs["persistent_workers"] = bool(args.persistent_workers)
                 pseudo_kwargs["prefetch_factor"] = max(1, int(args.prefetch_factor))
             pseudo_detect_loader = DataLoader(pseudo_detect_ds, **pseudo_kwargs)
-        train_sampler = (
-            DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True, seed=args.seed)
-            if distributed and args.mode == "train"
-            else None
-        )
-        val_loader_ds = (
-            Subset(val_ds, list(range(rank, len(val_ds), world_size)))
-            if distributed and args.mode == "train"
-            else val_ds
-        )
-        train_loader = DataLoader(train_ds, **_loader_kwargs(args, shuffle=train_sampler is None, sampler=train_sampler))
-        val_loader = DataLoader(val_loader_ds, **_loader_kwargs(args, shuffle=False))
+        train_epoch_setter = None
+        use_zarr_worker_chunks = args.data_format == "zarr" and bool(args.zarr_worker_owned_chunks)
+        use_zarr_chunk_batches = args.data_format == "zarr" and bool(args.zarr_chunk_local_batches)
+        if use_zarr_worker_chunks:
+            train_iter_ds = (
+                ZarrChunkBatchIterableDataset(
+                    train_records,
+                    batch_size=args.batch_size,
+                    shuffle=args.mode == "train",
+                    seed=args.seed,
+                    num_replicas=world_size if distributed and args.mode == "train" else 1,
+                    rank=rank if distributed and args.mode == "train" else 0,
+                    drop_last=bool(args.zarr_drop_last),
+                    shuffle_within_chunk=bool(args.zarr_shuffle_within_chunk),
+                    equalize_replicas=bool(distributed and args.mode == "train"),
+                    augment=True,
+                    pseudo_label_path=pseudo_label_path,
+                    pseudo_confidence_weight=args.pu_pseudo_conf_weight,
+                    pseudo_seg_weight=args.pu_pseudo_seg_weight,
+                    pseudo_shape_weight=args.pu_pseudo_shape_weight,
+                    **common_ds,
+                )
+                if args.mode == "train"
+                else None
+            )
+            val_iter_ds = ZarrChunkBatchIterableDataset(
+                val_records,
+                batch_size=args.batch_size,
+                shuffle=False,
+                seed=args.seed,
+                num_replicas=world_size if distributed and args.mode == "train" else 1,
+                rank=rank if distributed and args.mode == "train" else 0,
+                drop_last=False,
+                shuffle_within_chunk=False,
+                augment=False,
+                load_eval_ignore_sources=args.mode == "eval" or int(args.detect_every) > 0,
+                **common_ds,
+            )
+
+            def _zarr_iter_loader_kwargs():
+                kwargs: dict[str, object] = {
+                    "batch_size": None,
+                    "num_workers": args.num_workers,
+                    "collate_fn": zarr_passthrough_batch,
+                    "pin_memory": bool(args.pin_memory),
+                }
+                if int(args.num_workers) > 0:
+                    kwargs["persistent_workers"] = bool(args.persistent_workers)
+                    kwargs["prefetch_factor"] = max(1, int(args.prefetch_factor))
+                return kwargs
+
+            train_sampler = None
+            train_loader = DataLoader(train_iter_ds, **_zarr_iter_loader_kwargs()) if train_iter_ds is not None else None
+            val_loader = DataLoader(val_iter_ds, **_zarr_iter_loader_kwargs())
+            train_epoch_setter = train_iter_ds
+            if train_iter_ds is not None and is_main:
+                incomplete_train_batches = int(train_iter_ds.incomplete_batch_count())
+                if incomplete_train_batches > 0:
+                    message = (
+                        f"WARNING: worker-owned Zarr chunk iterator will emit {incomplete_train_batches} "
+                        f"incomplete train batch(es) on rank {rank}; batch-size changes can trigger "
+                        "extra torch.compile recompilation pauses."
+                    )
+                    if bool(args.sam_compile) and not bool(args.zarr_drop_last):
+                        message += " Add --zarr-drop-last for compile-heavy runs."
+                    print(message, flush=True)
+            num_val_local = int(val_iter_ds.local_sample_count())
+        elif use_zarr_chunk_batches:
+            train_sampler = (
+                ZarrChunkLocalBatchSampler(
+                    train_records,
+                    batch_size=args.batch_size,
+                    shuffle=args.mode == "train",
+                    seed=args.seed,
+                    num_replicas=world_size if distributed and args.mode == "train" else 1,
+                    rank=rank if distributed and args.mode == "train" else 0,
+                    drop_last=bool(args.zarr_drop_last),
+                    shuffle_within_chunk=bool(args.zarr_shuffle_within_chunk),
+                    equalize_replicas=bool(distributed and args.mode == "train"),
+                )
+                if args.mode == "train"
+                else None
+            )
+            val_batch_sampler = ZarrChunkLocalBatchSampler(
+                val_records,
+                batch_size=args.batch_size,
+                shuffle=False,
+                seed=args.seed,
+                num_replicas=world_size if distributed and args.mode == "train" else 1,
+                rank=rank if distributed and args.mode == "train" else 0,
+                drop_last=False,
+                shuffle_within_chunk=False,
+            )
+
+            def _zarr_loader_kwargs(batch_sampler):
+                kwargs: dict[str, object] = {
+                    "batch_sampler": batch_sampler,
+                    "num_workers": args.num_workers,
+                    "collate_fn": collate_cutouts,
+                    "pin_memory": bool(args.pin_memory),
+                }
+                if int(args.num_workers) > 0:
+                    kwargs["persistent_workers"] = bool(args.persistent_workers)
+                    kwargs["prefetch_factor"] = max(1, int(args.prefetch_factor))
+                return kwargs
+
+            train_loader = DataLoader(train_ds, **_zarr_loader_kwargs(train_sampler)) if train_sampler is not None else None
+            val_loader = DataLoader(val_ds, **_zarr_loader_kwargs(val_batch_sampler))
+            if train_sampler is not None and is_main:
+                incomplete_train_batches = sum(1 for batch in train_sampler if len(batch) < int(args.batch_size))
+                if incomplete_train_batches > 0:
+                    message = (
+                        f"WARNING: Zarr chunk-local sampler will emit {incomplete_train_batches} "
+                        f"incomplete train batch(es) on rank {rank}; batch-size changes can trigger "
+                        "extra torch.compile recompilation pauses."
+                    )
+                    if bool(args.sam_compile) and not bool(args.zarr_drop_last):
+                        message += " Add --zarr-drop-last for compile-heavy runs."
+                    print(message, flush=True)
+            num_val_local = sum(len(batch) for batch in val_batch_sampler)
+            train_epoch_setter = train_sampler
+        else:
+            train_sampler = (
+                DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True, seed=args.seed)
+                if distributed and args.mode == "train"
+                else None
+            )
+            val_loader_ds = (
+                Subset(val_ds, list(range(rank, len(val_ds), world_size)))
+                if distributed and args.mode == "train"
+                else val_ds
+            )
+            train_loader = DataLoader(train_ds, **_loader_kwargs(args, shuffle=train_sampler is None, sampler=train_sampler))
+            val_loader = DataLoader(val_loader_ds, **_loader_kwargs(args, shuffle=False))
+            num_val_local = len(val_loader_ds)
+            train_epoch_setter = train_sampler
 
         if args.model_variant == "auto":
             model_variant = "fused_encoder" if len(args.bands) > 1 or args.enable_en_loss else "fused"
@@ -1849,7 +2018,7 @@ def main() -> None:
             "num_records": len(records),
             "num_train": len(train_records),
             "num_val": len(val_records),
-            "num_val_local": len(val_loader_ds),
+            "num_val_local": num_val_local,
             "fixed_val_names": list(args.fixed_val_names),
             "val_record_names": [rec.name for rec in val_records],
             "train_patch_specs": sorted(train_patch_specs),
@@ -2072,8 +2241,8 @@ def main() -> None:
                     f"SAM encoder frozen from epoch {epoch}: encoder gradients are cleared before optimizer.step().",
                     flush=True,
                 )
-            if train_sampler is not None:
-                train_sampler.set_epoch(epoch)
+            if train_epoch_setter is not None:
+                train_epoch_setter.set_epoch(epoch)
             train_metrics = run_epoch(
                 model,
                 train_loader,

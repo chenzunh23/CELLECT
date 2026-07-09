@@ -38,8 +38,30 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from astropy.io import fits
+from astropy.io.fits.verify import VerifyWarning
 from astropy.table import Table, vstack
 from astropy.units import UnitsWarning
+
+warnings.filterwarnings(
+    "ignore",
+    message=".*'second' did not parse as fits unit.*",
+    category=UnitsWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=".*Unit 'second' not supported by the FITS standard.*",
+    category=UnitsWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*Keyword name .* is greater than 8 characters or contains characters not allowed by the FITS standard.*",
+    category=VerifyWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    category=VerifyWarning,
+    module=r"astropy\.io\.fits\..*",
+)
 
 try:
     from tqdm import tqdm as _tqdm
