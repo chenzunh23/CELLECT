@@ -310,6 +310,9 @@ Key training concepts:
 --dataset-sources              Select coadd/denoised/noisy trees.
 --confidence-loss-mode         ordinal_legacy or ce_hard.
 --confidence-ce-weights        Class weights for ce_hard level 0..4.
+--shape-loss-mode              source_center (per-source core) or dense_pixel.
+--shape-center-size            Odd source-core size, normally 3 or 5.
+--shape-geometry-loss          legacy_area_ratio or matrix-free log_spd.
 --small-shape-loss-weight      Epoch-0 loss suppressing high ordinal confidence
                                for tiny shapes in ignore/non-clean regions.
 --use-ordinal-expectation      Use ordinal expectation for center detection.
@@ -545,4 +548,3 @@ DETECTION_ONLY_WORKFLOW.md
 SCARLET_CATALOG_FLAGS.md
 batch-heavyfp-kron-refit/README.md
 ```
-

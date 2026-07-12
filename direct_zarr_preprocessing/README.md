@@ -49,10 +49,27 @@ The Zarr store contains:
   - `4`: background
   - `5`: strict bright center only
 - `/source_centers`, `/source_ids`, `/source_offsets`
+- `/shape_source_centers`, `/shape_source_values`, `/shape_source_classes`,
+  `/shape_source_ids`, `/shape_source_offsets`
 - `/tile_x0`, `/tile_y0`, `/tile_name`, `/group`, `/dataset_source`
 
 `source_centers/source_ids` currently store clean source centers. Center-only,
 ignore, and background regions are represented in `/band_pu_class_mask`.
+Non-strict center-only ellipses are also stored in `/band_shape`. The
+`shape_source_*` arrays preserve exact per-source `(major, minor, theta)` values
+for clean (`class=1`) and non-strict center-only (`class=2`) sources whose
+centers lie inside the tile. By default, shape loss averages a 3x3 prediction
+core per source and then averages sources; use `--shape-center-size 5` for a
+5x5 core or `--shape-loss-mode dense_pixel` to reproduce the old
+ellipse-pixel-weighted loss. `--center-only-shape-factor` remains the relative
+source weight for class 2. Add `--shape-geometry-loss log_spd` to replace the
+legacy area/axis-ratio/angular objective with a matrix-free FP32 Log-Euclidean
+SPD loss. Strict bright center-only regions remain excluded.
+
+Catalog classification is normalized by the same shared PU runtime
+configuration used by `astro_data_preprocessing.py`. The direct CLI keeps its
+short option names, including the default `B_MAG_MIN=15` and `B_MAG_MAX=35`,
+but no longer maintains a separate classification namespace.
 
 ## Background Masks
 
@@ -71,17 +88,18 @@ Set `IMAGE_VARIANT_BACKGROUND_SOURCE=coadd-target` to force old behavior,
 `variant-lsst` to require only variant masks, or `none` to disable variant
 background labels.
 
+For denoised/noisy SNR classification, source ellipses and the coadd MASK
+planes `BRIGHT_OBJECT SAT BAD NO_DATA EDGE UNMASKEDNAN` are excluded from the
+background annulus by default. The target source's own ellipse is excluded as
+well; insufficient clean annulus pixels classify the source as center-only.
+The runner exposes `NONCOADD_SNR_USE_SOURCE_MASK`,
+`NONCOADD_SNR_USE_QUALITY_MASK`, `NONCOADD_SNR_EXCLUDE_SELF_SOURCE`, and
+`NONCOADD_SNR_MASK_PLANES` for controlled ablations.
+
 ## Full patch command
 
 ```bash
-COADD_ROOT=/nvme0/zc/scarlet \
-CATALOG_ROOT=/nvme0/zc/scarlet \
-BAND_CATALOG_ROOT=/nvme0/zc/scarlet \
-DENOISED_FITS_ROOT=/nvme0/zc/scarlet/denoised_fits \
-REFIT_ROOT=/nvme0/zc/scarlet/refit \
-VARIANT_LSST_BACKGROUND_ROOT=/nvme0/zc/scarlet/lsst_background_masks \
-IMAGE_VARIANT_BACKGROUND_SOURCE=auto \
-OUTPUT_ROOT=/nvme0/zc/scarlet/direct_zarr \
+DATA_ROOT=/nvme0/zc/scarlet \
 TRACT=9813 \
 PATCHES=all \
 BANDS="HSC-G HSC-R HSC-I HSC-Z HSC-Y" \
@@ -90,7 +108,8 @@ B_MAG_MIN=15 \
 B_MAG_MAX=35 \
 PATCH_WORKERS=4 \
 TILE_WORKERS=2 \
-CHUNK_TILES=2 \
+CHUNK_TILES=8 \
+WORKER_THREADS=1 \
 OVERWRITE=0 \
 bash direct_zarr_preprocessing/run_direct_zarr.sh
 ```

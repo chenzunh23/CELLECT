@@ -46,6 +46,9 @@ class PatchZarrReader:
         self._chunk_cache: Dict[str, np.ndarray] = {}
         self._full_cache: Dict[str, np.ndarray] = {}
 
+    def has_array(self, name: str) -> bool:
+        return (self.root / name / ".zarray").is_file()
+
     def meta(self, name: str) -> _ArrayMeta:
         cached = self._meta.get(name)
         if cached is not None:
@@ -369,8 +372,18 @@ def discover_zarr_records(
     records: list[CutoutRecord] = []
     wanted_bands = tuple(str(band) for band in bands)
     for store in stores:
-        reader = PatchZarrReader(store)
+        manifest_path = store.parent / f"{store.name}_manifest.json"
+        try:
+            reader = PatchZarrReader(store)
+        except (FileNotFoundError, json.JSONDecodeError) as exc:
+            if not manifest_path.exists():
+                print(f"[zarr] skip incomplete store without manifest: {store} ({exc})", flush=True)
+                continue
+            raise
         attrs = reader.attrs
+        if attrs.get("format") == "cellect_direct_patch_zarr" and not manifest_path.exists():
+            print(f"[zarr] skip incomplete direct store without manifest: {store}", flush=True)
+            continue
         store_bands = tuple(str(b) for b in attrs.get("bands", []))
         if wanted_bands and store_bands and tuple(wanted_bands) != store_bands:
             continue
@@ -484,6 +497,51 @@ class ZarrCutoutDataset(Dataset):
         centers = band_centers[0] if band_centers else torch.empty((0, 2), dtype=torch.float32)
         ids = band_ids[0] if band_ids else torch.empty((0,), dtype=torch.long)
 
+        band_shape_source_centers = []
+        band_shape_source_values = []
+        band_shape_source_classes = []
+        band_shape_source_ids = []
+        if reader.has_array("shape_source_offsets"):
+            shape_offsets = reader.read_full_small("shape_source_offsets").astype(np.int64, copy=False)
+            shape_centers_flat = reader.read_full_small("shape_source_centers").astype(np.float32, copy=False)
+            shape_values_flat = reader.read_full_small("shape_source_values").astype(np.float32, copy=False)
+            shape_classes_flat = reader.read_full_small("shape_source_classes").astype(np.uint8, copy=False)
+            shape_ids_flat = reader.read_full_small("shape_source_ids").astype(np.int64, copy=False)
+            for b in range(int(image.shape[0])):
+                s0, s1 = int(shape_offsets[sample_idx, b]), int(shape_offsets[sample_idx, b + 1])
+                band_shape_source_centers.append(torch.from_numpy(shape_centers_flat[s0:s1]))
+                band_shape_source_values.append(torch.from_numpy(shape_values_flat[s0:s1]))
+                band_shape_source_classes.append(torch.from_numpy(shape_classes_flat[s0:s1]))
+                band_shape_source_ids.append(torch.from_numpy(shape_ids_flat[s0:s1]))
+        else:
+            # Backward compatibility for stores created before source-level
+            # shape metadata was added. Only clean centers are recoverable.
+            h, w = int(image.shape[-2]), int(image.shape[-1])
+            for b, source_centers in enumerate(band_centers):
+                rounded = source_centers.round().to(dtype=torch.long)
+                valid = (
+                    torch.isfinite(source_centers).all(dim=1)
+                    & (source_centers[:, 0] >= 0.0)
+                    & (source_centers[:, 0] < float(w))
+                    & (source_centers[:, 1] >= 0.0)
+                    & (source_centers[:, 1] < float(h))
+                )
+                source_centers = source_centers[valid]
+                rounded = rounded[valid]
+                if rounded.numel():
+                    rounded[:, 0].clamp_(0, w - 1)
+                    rounded[:, 1].clamp_(0, h - 1)
+                source_ids = band_ids[b][valid]
+                values = (
+                    band_shape[b, :, rounded[:, 1], rounded[:, 0]].transpose(0, 1).contiguous()
+                    if rounded.numel()
+                    else torch.empty((0, 3), dtype=torch.float32)
+                )
+                band_shape_source_centers.append(source_centers)
+                band_shape_source_values.append(values)
+                band_shape_source_classes.append(torch.ones((len(source_centers),), dtype=torch.uint8))
+                band_shape_source_ids.append(source_ids)
+
         if self.augment and random.random() < 0.5:
             width = int(image.shape[-1])
             image = torch.flip(image, dims=(-1,))
@@ -501,8 +559,18 @@ class ZarrCutoutDataset(Dataset):
                 if c.numel():
                     c[:, 0] = float(width - 1) - c[:, 0]
             centers = band_centers[0] if band_centers else centers
+            band_shape_source_centers = [c.clone() for c in band_shape_source_centers]
+            band_shape_source_values = [v.clone() for v in band_shape_source_values]
+            for source_centers, source_values in zip(band_shape_source_centers, band_shape_source_values):
+                if source_centers.numel():
+                    source_centers[:, 0] = float(width - 1) - source_centers[:, 0]
+                    source_values[:, 2] = -source_values[:, 2]
 
         primary = band_targets[0]
+        shape_source_centers = band_shape_source_centers[0]
+        shape_source_values = band_shape_source_values[0]
+        shape_source_classes = band_shape_source_classes[0]
+        shape_source_ids = band_shape_source_ids[0]
         empty_centers = [torch.empty((0, 2), dtype=torch.float32) for _ in band_targets]
         empty_ids = [torch.empty((0,), dtype=torch.long) for _ in band_targets]
         return {
@@ -548,6 +616,14 @@ class ZarrCutoutDataset(Dataset):
             "band_strict_center_only_centers": list(empty_centers),
             "band_strict_ignore_centers": list(empty_centers),
             "band_rejected_ids": list(empty_ids),
+            "shape_source_centers": shape_source_centers,
+            "shape_source_values": shape_source_values,
+            "shape_source_classes": shape_source_classes,
+            "shape_source_ids": shape_source_ids,
+            "band_shape_source_centers": band_shape_source_centers,
+            "band_shape_source_values": band_shape_source_values,
+            "band_shape_source_classes": band_shape_source_classes,
+            "band_shape_source_ids": band_shape_source_ids,
             "name": rec.name,
             "tile_name": rec.tile_name,
             "tract": rec.tract,

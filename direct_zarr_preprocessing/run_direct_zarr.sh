@@ -12,12 +12,13 @@ if [[ ! -x "${PYTHON}" ]]; then
   PYTHON="conda run -n ${CONDA_ENV} python"
 fi
 
-COADD_ROOT="${COADD_ROOT:-/nvme0/zc/scarlet}"
-CATALOG_ROOT="${CATALOG_ROOT:-/nvme0/zc/scarlet}"
+DATA_ROOT="${DATA_ROOT:-/nvme0/zc/scarlet}"
+COADD_ROOT="${COADD_ROOT:-${DATA_ROOT}}"
+CATALOG_ROOT="${CATALOG_ROOT:-${DATA_ROOT}}"
 BAND_CATALOG_ROOT="${BAND_CATALOG_ROOT:-${CATALOG_ROOT}}"
-DENOISED_FITS_ROOT="${DENOISED_FITS_ROOT-/nvme0/zc/scarlet/denoised_fits}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-/nvme0/zc/scarlet/direct_zarr}"
-REFIT_ROOT="${REFIT_ROOT:-/nvme0/zc/scarlet/refit}"
+DENOISED_FITS_ROOT="${DENOISED_FITS_ROOT-${DATA_ROOT}/denoised_fits}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${DATA_ROOT}/direct_zarr}"
+REFIT_ROOT="${REFIT_ROOT:-${DATA_ROOT}/refit}"
 VARIANT_LSST_BACKGROUND_ROOT="${VARIANT_LSST_BACKGROUND_ROOT:-${COADD_ROOT}/lsst_background_masks}"
 IMAGE_VARIANT_BACKGROUND_SOURCE="${IMAGE_VARIANT_BACKGROUND_SOURCE:-auto}"
 
@@ -30,9 +31,14 @@ IMAGE_VARIANT_GROUPS="${IMAGE_VARIANT_GROUPS:-}"
 PATCH_WORKERS="${PATCH_WORKERS:-1}"
 TILE_WORKERS="${TILE_WORKERS:-2}"
 CHUNK_TILES="${CHUNK_TILES:-8}"
+WORKER_THREADS="${WORKER_THREADS:-1}"
 OVERWRITE="${OVERWRITE:-0}"
 INCLUDE_COADD="${INCLUDE_COADD:-1}"
 NONCOADD_SNR_FILTER="${NONCOADD_SNR_FILTER:-1}"
+NONCOADD_SNR_USE_SOURCE_MASK="${NONCOADD_SNR_USE_SOURCE_MASK:-1}"
+NONCOADD_SNR_USE_QUALITY_MASK="${NONCOADD_SNR_USE_QUALITY_MASK:-1}"
+NONCOADD_SNR_EXCLUDE_SELF_SOURCE="${NONCOADD_SNR_EXCLUDE_SELF_SOURCE:-1}"
+NONCOADD_SNR_MASK_PLANES="${NONCOADD_SNR_MASK_PLANES:-BRIGHT_OBJECT SAT BAD NO_DATA EDGE UNMASKEDNAN}"
 
 B_MAG_MIN="${B_MAG_MIN:-15}"
 B_MAG_MAX="${B_MAG_MAX:-35}"
@@ -53,6 +59,7 @@ args=(
   --b-mag-max "${B_MAG_MAX}"
   --tile-workers "${TILE_WORKERS}"
   --patch-workers "${PATCH_WORKERS}"
+  --worker-threads "${WORKER_THREADS}"
   --chunk-tiles "${CHUNK_TILES}"
   --image-variant-background-source "${IMAGE_VARIANT_BACKGROUND_SOURCE}"
 )
@@ -77,6 +84,20 @@ if [[ "${INCLUDE_COADD}" == "0" ]]; then
 fi
 if [[ "${NONCOADD_SNR_FILTER}" == "0" ]]; then
   args+=(--no-noncoadd-snr-filter)
+fi
+if [[ "${NONCOADD_SNR_USE_SOURCE_MASK}" == "0" ]]; then
+  args+=(--no-noncoadd-snr-use-source-mask)
+fi
+if [[ "${NONCOADD_SNR_USE_QUALITY_MASK}" == "0" ]]; then
+  args+=(--no-noncoadd-snr-use-quality-mask)
+fi
+if [[ "${NONCOADD_SNR_EXCLUDE_SELF_SOURCE}" == "0" ]]; then
+  args+=(--no-noncoadd-snr-exclude-self-source)
+fi
+if [[ -n "${NONCOADD_SNR_MASK_PLANES}" ]]; then
+  # shellcheck disable=SC2206
+  mask_plane_args=(${NONCOADD_SNR_MASK_PLANES})
+  args+=(--noncoadd-snr-mask-planes "${mask_plane_args[@]}")
 fi
 if [[ -n "${COMPARE_ORIGIN:-}" ]]; then
   args+=(--compare-origin ${COMPARE_ORIGIN})

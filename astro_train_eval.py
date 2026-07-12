@@ -1137,10 +1137,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--shape-loss-weight", type=float, default=1.0)
     parser.add_argument(
+        "--shape-loss-mode",
+        choices=("source_center", "dense_pixel"),
+        default="source_center",
+        help=(
+            "source_center averages a configurable center neighborhood per source, then averages sources; "
+            "dense_pixel reproduces the legacy ellipse-pixel-weighted loss."
+        ),
+    )
+    parser.add_argument(
+        "--shape-center-size",
+        type=int,
+        default=3,
+        help="Positive odd side length of the per-source shape supervision core, normally 3 or 5.",
+    )
+    parser.add_argument(
+        "--shape-geometry-loss",
+        choices=("legacy_area_ratio", "log_spd"),
+        default="legacy_area_ratio",
+        help=(
+            "Per-location ellipse geometry loss. log_spd uses a matrix-free FP32 Log-Euclidean distance "
+            "between ellipse covariance matrices; legacy_area_ratio preserves the previous loss."
+        ),
+    )
+    parser.add_argument(
         "--shape-angle-weight",
         type=float,
         default=4.0,
-        help="Weight for angular shape loss 1-cos(delta theta) relative to the two axis-length MSE channels.",
+        help=(
+            "Weight for the legacy angular loss 1-cos(2*delta theta). "
+            "Ignored by --shape-geometry-loss log_spd."
+        ),
     )
     parser.add_argument(
         "--freeze-proposal-after-epochs",
@@ -1412,6 +1439,8 @@ def main() -> None:
         raise ValueError("--segmentation-class-weights requires at least background and foreground weights")
     if int(args.seg_classes) < 2:
         raise ValueError("--seg-classes must be >= 2")
+    if int(args.shape_center_size) <= 0 or int(args.shape_center_size) % 2 != 1:
+        raise ValueError("--shape-center-size must be a positive odd integer, normally 3 or 5")
     distributed, rank, world_size, local_rank, device, backend = _setup_distributed(args)
     is_main = _is_main(rank)
     run = None
@@ -1603,6 +1632,9 @@ def main() -> None:
             small_shape_ordinal_threshold=float(args.small_shape_ordinal_threshold),
             small_shape_scope=str(args.small_shape_scope),
             shape_outer_weight=float(args.shape_loss_weight),
+            shape_loss_mode=str(args.shape_loss_mode),
+            shape_center_size=int(args.shape_center_size),
+            shape_geometry_loss=str(args.shape_geometry_loss),
             center_position=float(args.center_loss_weight),
             shape_angle_weight=float(args.shape_angle_weight),
             triplet_outer_weight=float(args.triplet_outer_weight),

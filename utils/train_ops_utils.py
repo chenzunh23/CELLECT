@@ -22,11 +22,76 @@ def binary_segmentation_logits(seg_logits: Tensor) -> Tensor:
     raise ValueError("binary segmentation requires at least two logits")
 
 
-def shape_regression_loss_map(pred: Tensor, target: Tensor, *, angle_weight: float = 4.0) -> Tensor:
-    """Per-pixel shape loss with periodic angular error for channel 2."""
+def log_spd_shape_loss_map(pred: Tensor, target: Tensor, *, min_axis: float = 1e-3) -> Tensor:
+    """Squared Log-Euclidean distance between 2D ellipse covariance matrices.
+
+    For ``Sigma = R(theta) diag(a^2, b^2) R(theta)^T``, ``log(Sigma)``
+    has a closed form. Computing its three unique components avoids allocating
+    2x2 matrices or calling a batched eigendecomposition.
+    """
 
     if pred.shape != target.shape:
         raise ValueError("pred and target shape tensors must have identical shapes")
+    if pred.ndim < 3 or pred.shape[1] < 3:
+        raise ValueError("log-SPD shape loss requires major, minor, and theta channels")
+
+    # Keep logs and trigonometry in FP32 under bf16 autocast. The cast remains
+    # differentiable with respect to the original prediction tensor.
+    pred_f = pred.float()
+    target_f = target.float()
+    pred_a = pred_f[:, 0].clamp_min(float(min_axis))
+    pred_b = pred_f[:, 1].clamp_min(float(min_axis))
+    target_a = target_f[:, 0].clamp_min(float(min_axis))
+    target_b = target_f[:, 1].clamp_min(float(min_axis))
+
+    # Eigenvalues of log(Sigma) are 2*log(a), 2*log(b). In the image basis:
+    #   log(Sigma) = [[m+d*cos(2t), d*sin(2t)],
+    #                 [d*sin(2t), m-d*cos(2t)]]
+    # where m=log(a)+log(b), d=log(a)-log(b).
+    pred_log_a = torch.log(pred_a)
+    pred_log_b = torch.log(pred_b)
+    target_log_a = torch.log(target_a)
+    target_log_b = torch.log(target_b)
+    pred_m = pred_log_a + pred_log_b
+    pred_d = pred_log_a - pred_log_b
+    target_m = target_log_a + target_log_b
+    target_d = target_log_a - target_log_b
+
+    pred_twice_theta = 2.0 * pred_f[:, 2]
+    target_twice_theta = 2.0 * target_f[:, 2]
+    pred_cos = torch.cos(pred_twice_theta)
+    pred_sin = torch.sin(pred_twice_theta)
+    target_cos = torch.cos(target_twice_theta)
+    target_sin = torch.sin(target_twice_theta)
+    pred_xx = pred_m + pred_d * pred_cos
+    pred_yy = pred_m - pred_d * pred_cos
+    pred_xy = pred_d * pred_sin
+    target_xx = target_m + target_d * target_cos
+    target_yy = target_m - target_d * target_cos
+    target_xy = target_d * target_sin
+
+    delta_xx = pred_xx - target_xx
+    delta_yy = pred_yy - target_yy
+    delta_xy = pred_xy - target_xy
+    return delta_xx.square() + delta_yy.square() + 2.0 * delta_xy.square()
+
+
+def shape_regression_loss_map(
+    pred: Tensor,
+    target: Tensor,
+    *,
+    angle_weight: float = 4.0,
+    geometry_loss: str = "legacy_area_ratio",
+) -> Tensor:
+    """Per-location shape loss using legacy channels or Log-Euclidean SPD geometry."""
+
+    if pred.shape != target.shape:
+        raise ValueError("pred and target shape tensors must have identical shapes")
+    mode = str(geometry_loss).lower()
+    if mode in {"log_spd", "log_euclidean", "log_euclidean_spd"}:
+        return log_spd_shape_loss_map(pred, target)
+    if mode not in {"legacy", "legacy_area_ratio", "area_ratio"}:
+        raise ValueError(f"Unknown shape geometry loss {geometry_loss!r}")
     if pred.ndim < 3 or pred.shape[1] < 3:
         return F.mse_loss(pred, target, reduction="none").mean(dim=1)
     pred_a = pred[:, 0].clamp_min(1e-3)

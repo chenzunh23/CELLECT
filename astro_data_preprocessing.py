@@ -34,6 +34,7 @@ import traceback
 import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -86,6 +87,108 @@ DEFAULT_PARENT_ORIGIN = (15900, 19900)
 DEFAULT_COMPARE_ORIGIN = (18204, 20924)
 DEFAULT_CATALOG_BAND = "HSC-I"
 _THREADPOOL_LIMITER = None
+
+
+def build_pu_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
+    """Normalize legacy and direct-Zarr preprocessing options.
+
+    The direct Zarr CLI intentionally keeps shorter option names, while the
+    legacy preprocessor uses ``pu_*`` names.  All catalog classification and
+    non-coadd SNR code consumes the canonical names produced here so the two
+    output formats cannot silently drift through separate defaults.
+    """
+
+    if bool(getattr(args, "_shared_pu_runtime_config", False)):
+        return args  # type: ignore[return-value]
+
+    values = dict(vars(args))
+    aliases = {
+        "shape_source": ("target_shape_source", "kron"),
+        "target_shape_source": ("target_shape_source", "kron"),
+        "max_area_3sigma": (None, 400.0),
+        "relaxed_area_3sigma": (None, 900.0),
+        "area_filter_policy": (None, "max_area"),
+        "drop_children": (None, False),
+        "label_mode": (None, "pu"),
+        "ellipse_sigma": ("ellipse_sigma", 1.0),
+        "min_ellipse_axis": (None, 1.5),
+        "pixel_scale_arcsec": ("pixel_scale_arcsec", 0.168),
+        "no_clean_nonfinite": (None, False),
+        "pu_a_flags": (None, ()),
+        "pu_b_flags": ("b_flags", ("base_SdssShape_flag", "base_SdssCentroid_flag")),
+        "pu_a_mode": (None, "any"),
+        "pu_b_mode": (None, "any"),
+        "pu_strict_flags": (None, ()),
+        "pu_mag_column": ("mag_column", "ext_photometryKron_KronFlux_instFlux"),
+        "pu_input_zeropoint": ("zeropoint", 27.0),
+        "pu_require_kron_refit_match": ("require_kron_refit_match", True),
+        "pu_kron_refit_csv": ("kron_refit_csv", None),
+        "pu_kron_refit_radius_column": ("kron_refit_radius_column", "proxy_nan0_flux_aperture_radius"),
+        "pu_kron_refit_good_column": ("kron_refit_good_column", "proxy_nan0_good"),
+        "pu_a_area_max": ("a_area_max", 10000.0),
+        "pu_a_faint_area_max": ("a_faint_area_max", 900.0),
+        "pu_a_faint_mag_min": ("a_faint_mag_min", 28.0),
+        "pu_b_mag_min": ("b_mag_min", 15.0),
+        "pu_b_mag_max": ("b_mag_max", 35.0),
+        "pu_use_band_limit_b_filter": ("use_band_limit_b_filter", False),
+        "pu_band_limit_mags": ("band_limit_mags", None),
+        "pu_band_limit_b_min_offset": (None, -5.0),
+        "pu_band_limit_b_max_offset": (None, 0.0),
+        "pu_ap2_kron_abs_max": ("ap2_kron_abs_max", 1.0),
+        "pu_ap2_flux_column": ("ap2_flux_column", "base_CircularApertureFlux_6_0_instFlux"),
+        "pu_ap2_kron_flux_column": ("ap2_kron_flux_column", "ext_photometryKron_KronFlux_instFlux"),
+        "pu_b_close_center_arcsec": ("close_center_arcsec", 0.5),
+        "pu_overlap_iou_threshold": (None, 0.33),
+        "pu_b_ellipse_area_max": (None, None),
+        "pu_b_footprint_area_max": (None, None),
+        "pu_b_axis_ratio_max": ("axis_ratio_max", 5.0),
+        "pu_b_kron_radius_lt_sdss_major_ratio": (None, 0.5),
+        "pu_drop_ellipse_area_min": ("drop_ellipse_area_min", 40000.0),
+        "pu_ambiguous_area_max": (None, None),
+        "pu_neighbor_radius": (None, 0.0),
+        "pu_center_distance_factor": (None, 0.0),
+        "pu_containment_threshold": ("containment_threshold", 0.80),
+        "pu_mutual_overlap_threshold": (None, 0.0),
+        "pu_overlap_sample_grid": (None, 16),
+        "pu_ambiguous_mark": (None, "center_only"),
+        "pu_keep_all_ab_clean": (None, True),
+        "pu_enable_strict_bright_center_only": ("enable_strict_bright_center_only", True),
+        "pu_strict_bright_center_only_mag_threshold": ("strict_bright_center_only_mag_threshold", None),
+        "pu_strict_ignore_mag_threshold": (None, None),
+        "pu_strict_bright_center_only_saturation_mags": ("strict_bright_center_only_saturation_mags", None),
+        "pu_strict_ignore_saturation_mags": (None, None),
+        "pu_strict_bright_center_only_radius_column": (
+            "strict_bright_center_only_radius_column",
+            "proxy_nan0_flux_aperture_radius",
+        ),
+        "pu_strict_bright_center_only_ellipse_sigma": ("strict_bright_center_only_ellipse_sigma", 1.0),
+        "pu_remeasure_ap2_kron_outliers": ("remeasure_ap2_kron_outliers", True),
+        "pu_remeasure_ap2_kron_threshold": (None, np.nan),
+        "pu_remeasure_clean_abs_max": ("ap2_kron_abs_max", 1.0),
+        "pu_remeasure_center_only_abs_max": ("remeasure_center_only_abs_max", 1.5),
+        "pu_remeasure_small_footprint_fill_threshold": ("remeasure_small_footprint_fill_threshold", 0.2),
+        "pu_remeasure_ignore_area_max": ("remeasure_ignore_area_max", 10000.0),
+        "pu_remeasure_faint_mag_min": ("remeasure_faint_mag_min", 28.0),
+        "pu_remeasure_faint_area_max": ("remeasure_faint_area_max", 900.0),
+        "pu_remeasure_axis_ratio_max": ("remeasure_axis_ratio_max", 5.0),
+        "pu_remeasure_containment_threshold": ("remeasure_containment_threshold", 0.80),
+        "noncoadd_snr_use_source_mask": ("noncoadd_snr_use_source_mask", True),
+        "noncoadd_snr_use_quality_mask": ("noncoadd_snr_use_quality_mask", True),
+        "noncoadd_snr_mask_planes": (
+            "noncoadd_snr_mask_planes",
+            ("BRIGHT_OBJECT", "SAT", "BAD", "NO_DATA", "EDGE", "UNMASKEDNAN"),
+        ),
+        "noncoadd_snr_exclude_self_source": ("noncoadd_snr_exclude_self_source", True),
+    }
+    for canonical, (alias, default) in aliases.items():
+        if canonical in values:
+            continue
+        if alias is not None and alias in values:
+            values[canonical] = values[alias]
+        else:
+            values[canonical] = default
+    values["_shared_pu_runtime_config"] = True
+    return SimpleNamespace(**values)
 
 
 @dataclass(frozen=True)
@@ -1154,6 +1257,7 @@ def _move_bright_clean_to_center_only(
     *,
     band: Optional[str] = None,
 ) -> Tuple[Table, Table, Table]:
+    args = build_pu_runtime_config(args)
     if not bool(getattr(args, "pu_enable_strict_bright_center_only", False)) or len(clean) == 0:
         return clean, center_only, clean[:0].copy(copy_data=True)
     threshold = _strict_center_only_mag_threshold(args, band=band)
@@ -1524,6 +1628,7 @@ def _classify_pu_catalog(
     band: Optional[str] = None,
     patch: Optional[str] = None,
 ) -> Tuple[Table, Table, Table, Table, Dict[str, object]]:
+    args = build_pu_runtime_config(args)
     table = _attach_pu_kron_refit(table, args, band=band, patch=patch)
     shaped = add_ellipse_columns(table, shape_source=args.target_shape_source)
     result = classify_pu_sources(table, _pu_args(args, band=band))
@@ -2150,6 +2255,60 @@ def make_pu_dense_targets(
             "center_only_weight_value": np.asarray(float(center_only_weight), dtype=np.float32),
         }
     )
+    source_centers = []
+    source_values = []
+    source_classes = []
+    source_ids = []
+    for source_table, class_id in ((clean_sources, 1), (center_only_sources, 2)):
+        if len(source_table) == 0:
+            continue
+        source_x, source_y = _require_position_columns(source_table, x_col, y_col)
+        centers_xy = np.stack(
+            [source_x - float(spec.x0), source_y - float(spec.y0)],
+            axis=1,
+        ).astype(np.float32, copy=False)
+        values = np.stack(
+            [
+                np.asarray(source_table["ellipse_major_sigma"], dtype=np.float32),
+                np.asarray(source_table["ellipse_minor_sigma"], dtype=np.float32),
+                np.asarray(source_table["ellipse_theta"], dtype=np.float32),
+            ],
+            axis=1,
+        )
+        valid = (
+            np.isfinite(centers_xy).all(axis=1)
+            & np.isfinite(values).all(axis=1)
+            & (centers_xy[:, 0] >= 0.0)
+            & (centers_xy[:, 0] < float(w))
+            & (centers_xy[:, 1] >= 0.0)
+            & (centers_xy[:, 1] < float(h))
+            & (values[:, 0] > 0.0)
+            & (values[:, 1] > 0.0)
+        )
+        source_centers.append(centers_xy[valid])
+        source_values.append(values[valid])
+        source_classes.append(np.full(int(valid.sum()), class_id, dtype=np.uint8))
+        ids = (
+            np.asarray(source_table["id"], dtype=np.int64)
+            if "id" in source_table.colnames
+            else np.full(len(source_table), -1, dtype=np.int64)
+        )
+        source_ids.append(ids[valid])
+    targets["shape_source_centers"] = (
+        np.concatenate(source_centers, axis=0) if source_centers else np.zeros((0, 2), dtype=np.float32)
+    )
+    targets["shape_source_values"] = (
+        np.concatenate(source_values, axis=0) if source_values else np.zeros((0, 3), dtype=np.float32)
+    )
+    targets["shape_source_classes"] = (
+        np.concatenate(source_classes, axis=0) if source_classes else np.zeros((0,), dtype=np.uint8)
+    )
+    targets["shape_source_ids"] = (
+        np.concatenate(source_ids, axis=0) if source_ids else np.zeros((0,), dtype=np.int64)
+    )
+    targets["shape_center_only_centers"] = targets["shape_source_centers"][
+        targets["shape_source_classes"] == 2
+    ]
     return targets
 
 
@@ -2255,6 +2414,7 @@ def _aperture_annulus_snr(
     annulus_hard_exclude_mask: Optional[np.ndarray] = None,
     annulus_self_ellipse_params: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
     annulus_self_ellipse_sigma: float = 1.0,
+    exclude_self_source: bool = True,
     min_annulus_pixels: int = 2,
 ) -> Tuple[np.ndarray, np.ndarray]:
     image = np.asarray(image, dtype=np.float32)
@@ -2321,7 +2481,7 @@ def _aperture_annulus_snr(
             ann_mask &= ~hard_exclude[y0:y1, x0:x1]
         if exclude is not None:
             exclude_patch = exclude[y0:y1, x0:x1]
-            if self_major is not None:
+            if self_major is not None and not bool(exclude_self_source):
                 if np.isfinite(self_major[idx]) and np.isfinite(self_minor[idx]) and np.isfinite(self_theta[idx]):
                     a = float(max(self_major[idx] * float(annulus_self_ellipse_sigma), 1.5))
                     b = float(max(self_minor[idx] * float(annulus_self_ellipse_sigma), 1.5))
@@ -2414,6 +2574,7 @@ def _classify_clean_by_noncoadd_snr(
         annulus_hard_exclude_mask=annulus_hard_exclude_mask,
         annulus_self_ellipse_params=self_params,
         annulus_self_ellipse_sigma=float(getattr(args, "noncoadd_snr_source_mask_ellipse_sigma", 1.0)),
+        exclude_self_source=bool(getattr(args, "noncoadd_snr_exclude_self_source", True)),
         min_annulus_pixels=int(getattr(args, "noncoadd_snr_min_annulus_pixels", 2)),
     )
     finite_snr = np.isfinite(snr)
@@ -2484,6 +2645,8 @@ def _restore_center_only_shape_targets(
         core_radius=core_radius,
     )
     mask = center_targets["shape_weight"] > 0
+    if "center_only_mask" in targets:
+        mask &= np.asarray(targets["center_only_mask"], dtype=bool)
     if not np.any(mask):
         return
     targets["shape"][:, mask] = center_targets["shape"][:, mask]
@@ -3109,7 +3272,10 @@ def _preprocess_image_variant_patch(
             "noncoadd_snr_center_only_thresh": float(getattr(args, "noncoadd_snr_center_only_thresh", 3.0)),
             "noncoadd_snr_use_source_mask": bool(getattr(args, "noncoadd_snr_use_source_mask", True)),
             "noncoadd_snr_use_quality_mask": bool(getattr(args, "noncoadd_snr_use_quality_mask", True)),
-            "noncoadd_snr_algorithm": "aperture_annulus_v2_source_quality_mask_options",
+            "noncoadd_snr_exclude_self_source": bool(
+                getattr(args, "noncoadd_snr_exclude_self_source", True)
+            ),
+            "noncoadd_snr_algorithm": "aperture_annulus_v3_clean_source_quality_masks",
             "noncoadd_visibility_counts": visibility_counts if write_variant_labels else None,
             "zscale_root": str(_expand(args.zscale_root)) if args.zscale_root is not None else None,
             "zscale_written": zscale_written,
@@ -3590,6 +3756,8 @@ def _preprocess_patch(
     bands: Tuple[str, ...],
     patch: str,
 ) -> Dict[str, object]:
+
+    args = build_pu_runtime_config(args)
 
     first_band = bands[0]
     first_path = _band_fits_path(coadd_root, first_band, args.tract, patch)
@@ -4420,7 +4588,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=1.0,
         help=(
             "Ellipse scale for source masks excluded from noncoadd SNR annuli. "
-            "The target source's own ellipse is kept in the annulus so nearby source masks do not erase all pixels."
+            "By default the target source itself is also excluded; use "
+            "--no-noncoadd-snr-exclude-self-source only for legacy reproduction."
         ),
     )
     parser.add_argument(
@@ -4439,6 +4608,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Exclude selected coadd MASK planes from the noncoadd SNR background annulus. "
             "Disable this together with --no-noncoadd-snr-use-source-mask for legacy diagnostics."
+        ),
+    )
+    parser.add_argument(
+        "--noncoadd-snr-exclude-self-source",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Exclude the target source's own ellipse from its SNR background annulus. "
+            "Disable only to reproduce the older annulus behavior."
         ),
     )
     parser.add_argument(

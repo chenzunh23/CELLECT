@@ -30,6 +30,7 @@ if str(CELLECT_ROOT) not in sys.path:
 
 from astro_train_data import AstroCutoutDataset, collate_cutouts, discover_cutout_records  # noqa: E402
 from astro_train_ops import detect_centers, unwrap_model  # noqa: E402
+from astro_train_zarr_data import ZarrCutoutDataset, discover_zarr_records  # noqa: E402
 from sam_backbone import build_sam_cellect2d  # noqa: E402
 
 
@@ -144,18 +145,22 @@ def _dataset(
     cfg: dict,
     image_cache_dir: Path | None = None,
     tile_name: str = TILE,
+    data_format: str = "cutout",
 ) -> DataLoader:
-    all_records = discover_cutout_records(root, bands=bands)
+    if str(data_format) == "zarr":
+        all_records = discover_zarr_records(root, bands=bands)
+    else:
+        all_records = discover_cutout_records(root, bands=bands)
     patch_records = [
         rec
         for rec in all_records
         if str(rec.dataset_source) == str(dataset_name) and rec.patch == PATCH
     ]
     candidate_tiles = [tile_name]
-    # Some Zangetsu demo roots store denoised/noisy cutouts without a group_XX
-    # prefix, while full preprocessed variant roots include it. Prefer the exact
-    # requested tile but gracefully fall back to the unprefixed demo tile.
-    if str(dataset_name) != "coadd" and str(tile_name).startswith("group_"):
+    # Variant Zarr/cutout tiles carry a group_XX prefix, while coadd and some
+    # demo roots use the same tile without that prefix. Prefer the exact
+    # requested tile but gracefully fall back to the unprefixed tile.
+    if str(tile_name).startswith("group_"):
         parts = str(tile_name).split("_", 2)
         if len(parts) == 3:
             candidate_tiles.append(parts[2])
@@ -171,6 +176,9 @@ def _dataset(
             f"Expected one record for {dataset_name}/{PATCH}/{tile_name}, got {len(records)} under {root}; "
             f"tried tiles={candidate_tiles}; available tiles={available}"
         )
+    if str(data_format) == "zarr":
+        ds = ZarrCutoutDataset(records, augment=False)
+        return DataLoader(ds, batch_size=1, shuffle=False, num_workers=0, collate_fn=collate_cutouts)
     effective_image_cache_dir = image_cache_dir if str(dataset_name) != "coadd" else None
     ds = AstroCutoutDataset(
         records,
@@ -416,6 +424,61 @@ def _load_clean_rows(root: Path, dataset_name: str, band: str, tile_name: str, a
         "filtered_gt": int(np.count_nonzero(keep)),
     }
     return rows[keep], x[keep], y[keep], stats
+
+
+def _zarr_clean_rows_from_batch(batch: dict, band_idx: int) -> tuple[Table, np.ndarray, np.ndarray, dict[str, int]]:
+    centers = np.zeros((0, 2), dtype=np.float32)
+    try:
+        band_centers = batch.get("band_centers", [])
+        if band_centers and len(band_centers[0]) > int(band_idx):
+            raw = band_centers[0][int(band_idx)]
+            if torch.is_tensor(raw):
+                centers = raw.detach().cpu().numpy().astype(np.float32, copy=False).reshape(-1, 2)
+            else:
+                centers = np.asarray(raw, dtype=np.float32).reshape(-1, 2)
+    except Exception:
+        centers = np.zeros((0, 2), dtype=np.float32)
+    rows = Table()
+    rows["centroid_local_x"] = centers[:, 0] if len(centers) else np.asarray([], dtype=np.float32)
+    rows["centroid_local_y"] = centers[:, 1] if len(centers) else np.asarray([], dtype=np.float32)
+    stats = {
+        "raw_gt": int(len(rows)),
+        "visibility_clean_gt": int(len(rows)),
+        "visibility_center_only_gt": 0,
+        "visibility_ignore_gt": 0,
+        "filtered_gt": int(len(rows)),
+    }
+    return rows, centers[:, 0].copy(), centers[:, 1].copy(), stats
+
+
+def _load_clean_rows_for_run(
+    root: Path,
+    dataset_name: str,
+    band: str,
+    tile_name: str,
+    args: argparse.Namespace,
+    *,
+    batch: dict,
+    band_idx: int,
+) -> tuple[Table, np.ndarray, np.ndarray, dict[str, int]]:
+    reference_root = getattr(args, "reference_root", None)
+    roots = []
+    if reference_root is not None:
+        roots.append(Path(reference_root))
+    roots.append(root)
+    seen: set[Path] = set()
+    for candidate_root in roots:
+        candidate_root = candidate_root.expanduser().resolve()
+        if candidate_root in seen:
+            continue
+        seen.add(candidate_root)
+        path = candidate_root / dataset_name / TRACT / PATCH / "band_reference_catalogs" / band / f"meas-{band}-{TRACT}-{PATCH}.fits"
+        if path.exists():
+            return _load_clean_rows(candidate_root, dataset_name, band, tile_name, args)
+    if str(getattr(args, "data_format", "cutout")) == "zarr":
+        return _zarr_clean_rows_from_batch(batch, band_idx)
+    tried = ", ".join(str(root / dataset_name / TRACT / PATCH / "band_reference_catalogs" / band / f"meas-{band}-{TRACT}-{PATCH}.fits") for root in seen)
+    raise FileNotFoundError(f"Missing reference catalog for {dataset_name}/{PATCH}/{tile_name}/{band}; tried {tried}")
 
 
 def _shape_rows(pred_xy: np.ndarray, shape: np.ndarray, scale: float) -> list[dict[str, float]]:
@@ -1141,6 +1204,253 @@ def _write_photometry_csv(
     return resolved_mode, len(rows), isolated_count
 
 
+def _batch_band_bool_mask(batch: dict, key: str, band_idx: int, image_shape: tuple[int, int]) -> np.ndarray:
+    value = batch.get(key)
+    if value is None:
+        return np.zeros(image_shape, dtype=bool)
+    try:
+        if torch.is_tensor(value):
+            arr = value[0, int(band_idx)].detach().cpu().numpy()
+        else:
+            arr = np.asarray(value)[0, int(band_idx)]
+        arr = np.asarray(arr, dtype=bool)
+        if arr.shape == image_shape:
+            return arr
+    except Exception:
+        pass
+    return np.zeros(image_shape, dtype=bool)
+
+
+def _should_write_snr(args: argparse.Namespace, checkpoint_label: str) -> bool:
+    label = getattr(args, "snr_epoch_label", None)
+    if label is None:
+        return False
+    text = str(label).strip()
+    if not text:
+        return False
+    if text.lower() in {"all", "*"}:
+        return True
+    wanted = {part.strip() for part in text.replace(",", " ").split() if part.strip()}
+    return str(checkpoint_label) in wanted
+
+
+def _write_snr_diagnostics(
+    *,
+    path_prefix: Path,
+    checkpoint_label: str,
+    dataset_name: str,
+    tile_name: str,
+    band: str,
+    image: np.ndarray,
+    image_source: str,
+    shape_rows: Sequence[dict[str, float]],
+    pred_to_clean: dict[int, int],
+    batch: dict,
+    band_idx: int,
+    args: argparse.Namespace,
+) -> dict[str, object]:
+    try:
+        from diagnostics.measure_background_snr_and_export_reg import (
+            _aperture_sum,
+            _disk,
+            _local_annulus_stats,
+            _sample_background_aperture_sums,
+            _sigmaex_background,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "SNR diagnostics require /home/czh23/CELLECT/diagnostics/measure_background_snr_and_export_reg.py "
+            "and its dependencies, including sigmaex."
+        ) from exc
+
+    image = np.asarray(image, dtype=np.float32)
+    if image.ndim != 2:
+        raise ValueError(f"SNR image must be 2D, got {image.shape}")
+    image_shape = tuple(int(v) for v in image.shape)
+    if str(args.snr_background_source) == "pu":
+        background = _batch_band_bool_mask(batch, "band_background_mask", band_idx, image_shape)
+        if not bool(background.any()):
+            background = None
+    elif str(args.snr_background_source) == "none":
+        background = None
+    else:
+        raise ValueError(f"unknown --snr-background-source={args.snr_background_source!r}")
+
+    clean = _batch_band_bool_mask(batch, "band_clean_mask", band_idx, image_shape)
+    center = _batch_band_bool_mask(batch, "band_center_only_mask", band_idx, image_shape)
+    strict_center = _batch_band_bool_mask(batch, "band_strict_center_only_mask", band_idx, image_shape)
+    source_exclude = clean | center | strict_center
+    if not bool(source_exclude.any()):
+        source_exclude = None
+    local_require_background = bool(getattr(args, "snr_local_require_background", False))
+    local_non_background_exclude = None
+    if local_require_background:
+        if background is None:
+            local_non_background_exclude = np.ones(image_shape, dtype=bool)
+        else:
+            local_non_background_exclude = ~background.astype(bool, copy=False)
+
+    if background is None:
+        bg_pixels = image[np.isfinite(image)]
+        sigmaex_mode = str(args.snr_no_background_mask_sigmaex_mode)
+        background_mode = "no_background_mask_all_finite_pixels"
+    else:
+        bg_pixels = image[background & np.isfinite(image)]
+        sigmaex_mode = str(args.snr_sigmaex_mode)
+        background_mode = "pu_background_mask"
+
+    pixel_bg = _sigmaex_background(
+        bg_pixels,
+        sigma=float(args.snr_sigmaex_sigma),
+        mode=sigmaex_mode,
+        nbins=int(args.snr_sigmaex_nbins),
+        sample=int(args.snr_sigmaex_sample),
+    )
+    bg_sums, bg_ap_meta = _sample_background_aperture_sums(
+        image,
+        background,
+        radius=int(args.snr_ap_radius),
+        n_sample=int(args.snr_num_background_apertures),
+        seed=int(args.snr_seed),
+    )
+    aperture_bg = _sigmaex_background(
+        bg_sums,
+        sigma=float(args.snr_sigmaex_sigma),
+        mode=sigmaex_mode,
+        nbins=int(args.snr_sigmaex_nbins),
+        sample=int(args.snr_sigmaex_sample),
+    )
+    global_bg = float(pixel_bg["sigmaex_clip_median"])
+    global_sigma = float(aperture_bg["sigmaex_fit_sigma"])
+    kernel = _disk(int(args.snr_ap_radius))
+
+    rows: list[dict[str, object]] = []
+    for idx, row in enumerate(shape_rows, start=1):
+        x = float(row["x"])
+        y = float(row["y"])
+        pred_index = int(row["pred_index"])
+        ap_sum, ap_n = _aperture_sum(image, x, y, kernel)
+        global_flux = ap_sum - global_bg * float(ap_n)
+        global_snr = global_flux / global_sigma if global_sigma > 0 else math.nan
+        local_mean, local_median, local_std, local_n = _local_annulus_stats(
+            image,
+            x,
+            y,
+            r_in=float(args.snr_annulus_r_in),
+            r_out=float(args.snr_annulus_r_out),
+            source_exclude=source_exclude,
+            quality_exclude=local_non_background_exclude,
+            min_pixels=int(args.snr_min_annulus_pixels),
+        )
+        if math.isfinite(local_mean) and math.isfinite(local_std) and local_std > 0:
+            local_flux = ap_sum - local_mean * float(ap_n)
+            local_snr = local_flux / (local_std * math.sqrt(float(ap_n)))
+        else:
+            local_snr = math.nan
+        color = "cyan" if pred_index in pred_to_clean else "magenta"
+        rows.append(
+            {
+                "checkpoint_label": checkpoint_label,
+                "dataset": dataset_name,
+                "tile": tile_name,
+                "band": band,
+                "label": f"pred_{idx:04d}",
+                "pred_index": pred_index,
+                "x": x,
+                "y": y,
+                "matched_clean_gt": pred_index in pred_to_clean,
+                "reg_color": color,
+                "aperture_sum": ap_sum,
+                "aperture_pixels": ap_n,
+                "global_background_per_pixel": global_bg,
+                "global_aperture_sigma": global_sigma,
+                "global_snr": global_snr,
+                "local_annulus_mean": local_mean,
+                "local_annulus_median": local_median,
+                "local_annulus_std": local_std,
+                "local_annulus_pixels": local_n,
+                "local_require_background": local_require_background,
+                "local_snr": local_snr,
+            }
+        )
+
+    csv_path = path_prefix.with_suffix(".csv")
+    reg_path = path_prefix.with_suffix(".reg")
+    summary_path = path_prefix.with_suffix(".summary.json")
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    fields = [
+        "checkpoint_label",
+        "dataset",
+        "tile",
+        "band",
+        "label",
+        "pred_index",
+        "x",
+        "y",
+        "matched_clean_gt",
+        "reg_color",
+        "aperture_sum",
+        "aperture_pixels",
+        "global_background_per_pixel",
+        "global_aperture_sigma",
+        "global_snr",
+        "local_annulus_mean",
+        "local_annulus_median",
+        "local_annulus_std",
+        "local_annulus_pixels",
+        "local_require_background",
+        "local_snr",
+    ]
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    snr_field = str(args.snr_reg_snr_field)
+    reg_lines = REG_HEADER + [
+        f"# {checkpoint_label} {dataset_name} {PATCH}/{tile_name} {band}: detection SNR, field={snr_field}"
+    ]
+    for row in rows:
+        snr = float(row[snr_field])
+        text = f"SNR={snr:.2f}" if math.isfinite(snr) else "SNR=nan"
+        reg_lines.append(
+            _circle_line(
+                float(row["x"]),
+                float(row["y"]),
+                float(args.snr_reg_radius),
+                color=str(row["reg_color"]),
+                width=2,
+                text=text,
+            )
+        )
+    _write_text(reg_path, reg_lines)
+
+    summary = {
+        "checkpoint_label": checkpoint_label,
+        "dataset": dataset_name,
+        "tile": tile_name,
+        "band": band,
+        "image_source": image_source,
+        "background_source": str(args.snr_background_source),
+        "background_mode": background_mode,
+        "sigmaex_mode_used": sigmaex_mode,
+        "background_pixels": int(np.count_nonzero(background)) if background is not None else None,
+        "local_require_background": local_require_background,
+        "local_background_available": background is not None,
+        "source_exclude_pixels": int(np.count_nonzero(source_exclude)) if source_exclude is not None else 0,
+        "local_non_background_exclude_pixels": (
+            int(np.count_nonzero(local_non_background_exclude)) if local_non_background_exclude is not None else 0
+        ),
+        "pixel_background_sigmaex": pixel_bg,
+        "aperture_background_sigmaex": aperture_bg,
+        "aperture_background_sampling": bg_ap_meta,
+        "num_sources": len(rows),
+        "outputs": {"csv": str(csv_path), "reg": str(reg_path), "summary": str(summary_path)},
+    }
+    summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    return summary
+
+
 def _write_native_diff_reg(
     *,
     path: Path,
@@ -1208,7 +1518,15 @@ def _run_one(
     args: argparse.Namespace,
 ) -> dict[str, object]:
     tile_name = _tile_for_dataset(dataset_name, args)
-    loader = _dataset(dataset_root, dataset_name, bands, cfg, getattr(args, "image_cache_dir", None), tile_name=tile_name)
+    loader = _dataset(
+        dataset_root,
+        dataset_name,
+        bands,
+        cfg,
+        getattr(args, "image_cache_dir", None),
+        tile_name=tile_name,
+        data_format=str(getattr(args, "data_format", "cutout")),
+    )
     band_idx = list(bands).index(band)
     threshold = float(args.threshold if args.threshold is not None else cfg.get("confidence_threshold", 2.0))
     nms_radius = int(args.nms_radius if args.nms_radius is not None else cfg.get("nms_radius", 1))
@@ -1311,7 +1629,15 @@ def _run_one(
     masks_by_pred_index = {int(idx): mask for idx, mask in zip(mask_source_indices, masks)}
     mask_iou_by_pred_index = {int(idx): float(iou) for idx, iou in zip(mask_source_indices, mask_ious)}
 
-    clean_rows, clean_x, clean_y, gt_visibility_stats = _load_clean_rows(dataset_root, dataset_name, band, tile_name, args)
+    clean_rows, clean_x, clean_y, gt_visibility_stats = _load_clean_rows_for_run(
+        dataset_root,
+        dataset_name,
+        band,
+        tile_name,
+        args,
+        batch=batch,
+        band_idx=band_idx,
+    )
     clean_xy = np.column_stack([clean_x, clean_y]).astype(np.float32) if len(clean_x) else np.zeros((0, 2), np.float32)
     pred_to_clean, clean_used = _greedy_match(pred_xy, clean_xy, float(args.match_radius))
 
@@ -1359,6 +1685,7 @@ def _run_one(
     photometry_mode: str | None = None
     photometry_count: int | None = None
     tp_isolated_count: int | None = None
+    snr_summary: dict[str, object] | None = None
     if not bool(args.disable_photometry):
         photometry_mode, photometry_count, tp_isolated_count = _write_photometry_csv(
             photometry_csv,
@@ -1379,6 +1706,23 @@ def _run_one(
             gt_shape_max_ious=gt_shape_max_ious,
             isolated_path=tp_isolated_csv,
             isolated_max_shape_iou=float(args.tp_isolated_max_shape_iou),
+        )
+
+    snr_prefix = tile_out / f"{prefix}_source_snr"
+    if _should_write_snr(args, checkpoint_label):
+        snr_summary = _write_snr_diagnostics(
+            path_prefix=snr_prefix,
+            checkpoint_label=checkpoint_label,
+            dataset_name=dataset_name,
+            tile_name=tile_name,
+            band=band,
+            image=photometry_image_band,
+            image_source=photometry_image_source,
+            shape_rows=shape_rows,
+            pred_to_clean=pred_to_clean,
+            batch=batch,
+            band_idx=band_idx,
+            args=args,
         )
 
     native_extra_count: int | None = None
@@ -1441,6 +1785,9 @@ def _run_one(
         "tp_isolated_gt_photometry_csv": None if bool(args.disable_photometry) else str(tp_isolated_csv),
         "tp_isolated_gt_photometry_count": tp_isolated_count,
         "tp_isolated_max_shape_iou": float(args.tp_isolated_max_shape_iou),
+        "snr_csv": None if snr_summary is None else snr_summary["outputs"]["csv"],
+        "snr_reg": None if snr_summary is None else snr_summary["outputs"]["reg"],
+        "snr_summary": None if snr_summary is None else snr_summary["outputs"]["summary"],
     }
 
 
@@ -1451,6 +1798,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", "-c", type=Path, action="append", default=None, help="Can be passed multiple times")
     parser.add_argument("--checkpoint-label", "-l", action="append", default=None, help="One label per --checkpoint")
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
+    parser.add_argument(
+        "--data-format",
+        choices=("cutout", "zarr"),
+        default="cutout",
+        help="Input data format. zarr uses astro_train_zarr_data and reads images/PU masks directly from patch Zarr stores.",
+    )
+    parser.add_argument(
+        "--reference-root",
+        type=Path,
+        default=None,
+        help=(
+            "Optional old preprocessed root used only for GT reference catalogs/visibility files. "
+            "In zarr mode, missing reference catalogs fall back to source centers stored in the Zarr."
+        ),
+    )
     parser.add_argument(
         "--image-cache-dir",
         type=Path,
@@ -1574,8 +1936,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gt-photometry-zero-point", type=float, default=27.0, help="AB zero point for GT catalog flux columns such as ap2 and Kron.")
     parser.add_argument("--photometry-psf-factor", type=float, default=1.0)
     parser.add_argument("--tp-isolated-max-shape-iou", type=float, default=0.05, help="Write an extra CSV for TP sources whose GT Kron ellipse max IoU with any other clean GT ellipse is at most this value.")
+    parser.add_argument(
+        "--snr-epoch-label",
+        default=None,
+        help=(
+            "Write detection SNR CSV/REG/summary only for this checkpoint label, e.g. epoch_0018. "
+            "Use 'all' to run SNR for every checkpoint. Default disables SNR diagnostics."
+        ),
+    )
+    parser.add_argument("--snr-background-source", choices=("pu", "none"), default="pu")
+    parser.add_argument(
+        "--snr-local-require-background",
+        action="store_true",
+        help=(
+            "For local SNR, require annulus pixels to lie inside the loaded background mask. "
+            "Default is off because sparse background masks can make many local SNR values NaN."
+        ),
+    )
+    parser.add_argument("--snr-reg-snr-field", choices=("global_snr", "local_snr"), default="local_snr")
+    parser.add_argument("--snr-reg-radius", type=float, default=7.0)
+    parser.add_argument("--snr-ap-radius", type=int, default=6)
+    parser.add_argument("--snr-annulus-r-in", type=float, default=10.0)
+    parser.add_argument("--snr-annulus-r-out", type=float, default=15.0)
+    parser.add_argument("--snr-min-annulus-pixels", type=int, default=50)
+    parser.add_argument("--snr-num-background-apertures", type=int, default=20000)
+    parser.add_argument("--snr-sigmaex-sigma", type=float, default=3.0)
+    parser.add_argument("--snr-sigmaex-mode", default="all")
+    parser.add_argument("--snr-no-background-mask-sigmaex-mode", default="le_median")
+    parser.add_argument("--snr-sigmaex-nbins", type=int, default=300)
+    parser.add_argument("--snr-sigmaex-sample", type=int, default=1_000_000)
+    parser.add_argument("--snr-seed", type=int, default=20260710)
     parser.add_argument("--overlay-alpha", type=float, default=0.38)
     parser.add_argument("--max-contour-vertices", type=int, default=128)
+    parser.add_argument("--ellipse-text", action="store_true", help="Add text when outputting REG ellipses.")
     return parser.parse_args()
 
 
@@ -1585,6 +1978,8 @@ def main() -> int:
         raise ValueError("--max-mask-area-ratio must be in (0, 1]; use >=1 to disable large-mask filtering.")
     args.ckpt_dir = args.ckpt_dir.expanduser().resolve()
     args.data_root = args.data_root.expanduser().resolve()
+    if args.reference_root is not None:
+        args.reference_root = args.reference_root.expanduser().resolve()
     args.out_dir = args.out_dir.expanduser().resolve()
     if args.native_sam_dir is not None and str(args.native_sam_dir).lower() in {"", "none", "null"}:
         args.native_sam_dir = None

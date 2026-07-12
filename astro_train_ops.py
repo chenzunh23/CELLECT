@@ -93,6 +93,9 @@ class LossWeights:
     small_shape_ordinal_threshold: float = 2.0
     small_shape_scope: str = "ignore"
     shape_outer_weight: float = 1.0
+    shape_loss_mode: str = "source_center"
+    shape_center_size: int = 3
+    shape_geometry_loss: str = "legacy_area_ratio"
     center_position: float = 1.0
     shape_angle_weight: float = 4.0
     triplet_margin: float = 0.3
@@ -362,6 +365,104 @@ class HardTripletLoss(nn.Module):
         return self.margin_loss(dist_an, dist_ap, target)
 
 
+def source_center_shape_loss(
+    pred_shape: Tensor,
+    centers_list: Sequence[Tensor],
+    values_list: Sequence[Tensor],
+    classes_list: Sequence[Tensor],
+    *,
+    center_size: int,
+    center_only_factor: float,
+    angle_weight: float,
+    geometry_loss: str,
+) -> Tensor:
+    """Average shape error within each source core, then average over sources."""
+
+    if pred_shape.ndim != 4 or pred_shape.shape[1] < 3:
+        raise ValueError(f"pred_shape must be [N,C,H,W] with C>=3, got {tuple(pred_shape.shape)}")
+    if center_size <= 0 or center_size % 2 != 1:
+        raise ValueError(f"shape center size must be a positive odd integer, got {center_size}")
+    n, _channels, h, w = pred_shape.shape
+    if not (len(centers_list) == len(values_list) == len(classes_list) == n):
+        raise ValueError(
+            "source-level shape metadata must contain one entry per prediction: "
+            f"predictions={n}, centers={len(centers_list)}, values={len(values_list)}, classes={len(classes_list)}"
+        )
+
+    source_centers = []
+    source_values = []
+    source_classes = []
+    source_batch = []
+    for batch_idx, (centers, values, classes) in enumerate(zip(centers_list, values_list, classes_list)):
+        if centers.numel() == 0:
+            continue
+        centers = centers.to(device=pred_shape.device, dtype=torch.float32).reshape(-1, 2)
+        values = values.to(device=pred_shape.device, dtype=torch.float32).reshape(-1, 3)
+        classes = classes.to(device=pred_shape.device, dtype=torch.long).reshape(-1)
+        if not (len(centers) == len(values) == len(classes)):
+            raise ValueError("shape source centers, values, and classes must have equal lengths")
+        source_centers.append(centers)
+        source_values.append(values)
+        source_classes.append(classes)
+        source_batch.append(torch.full((len(centers),), batch_idx, device=pred_shape.device, dtype=torch.long))
+
+    if not source_centers:
+        return pred_shape.sum() * 0.0
+    centers = torch.cat(source_centers, dim=0)
+    values = torch.cat(source_values, dim=0)
+    classes = torch.cat(source_classes, dim=0)
+    batch_indices = torch.cat(source_batch, dim=0)
+    valid_sources = (
+        torch.isfinite(centers).all(dim=1)
+        & torch.isfinite(values).all(dim=1)
+        & (centers[:, 0] >= 0.0)
+        & (centers[:, 0] < float(w))
+        & (centers[:, 1] >= 0.0)
+        & (centers[:, 1] < float(h))
+        & (values[:, 0] > 0.0)
+        & (values[:, 1] > 0.0)
+    )
+    centers = centers[valid_sources]
+    values = values[valid_sources]
+    classes = classes[valid_sources]
+    batch_indices = batch_indices[valid_sources]
+
+    radius = center_size // 2
+    offsets_y, offsets_x = torch.meshgrid(
+        torch.arange(-radius, radius + 1, device=pred_shape.device),
+        torch.arange(-radius, radius + 1, device=pred_shape.device),
+        indexing="ij",
+    )
+    offsets_x = offsets_x.reshape(1, -1)
+    offsets_y = offsets_y.reshape(1, -1)
+    rounded = centers.round().to(dtype=torch.long)
+    rounded[:, 0].clamp_(0, w - 1)
+    rounded[:, 1].clamp_(0, h - 1)
+    sample_x = rounded[:, 0:1] + offsets_x
+    sample_y = rounded[:, 1:2] + offsets_y
+    valid_points = (sample_x >= 0) & (sample_x < w) & (sample_y >= 0) & (sample_y < h)
+    sample_x = sample_x.clamp(0, w - 1)
+    sample_y = sample_y.clamp(0, h - 1)
+    pred_hwc = pred_shape.permute(0, 2, 3, 1)
+    sampled_pred = pred_hwc[batch_indices[:, None], sample_y, sample_x]
+    sampled_target = values[:, None, :].expand_as(sampled_pred)
+    point_loss = shape_regression_loss_map(
+        sampled_pred.reshape(-1, sampled_pred.shape[-1], 1),
+        sampled_target.reshape(-1, sampled_target.shape[-1], 1),
+        angle_weight=angle_weight,
+        geometry_loss=geometry_loss,
+    ).reshape(sampled_pred.shape[:2])
+    valid_float = valid_points.to(dtype=point_loss.dtype)
+    per_source = (point_loss * valid_float).sum(dim=1) / valid_float.sum(dim=1).clamp_min(1.0)
+    source_weight = torch.ones_like(per_source)
+    source_weight = torch.where(
+        classes == 2,
+        source_weight * float(max(0.0, center_only_factor)),
+        source_weight,
+    )
+    return (per_source * source_weight).sum() / source_weight.sum().clamp_min(1.0)
+
+
 def dense_losses(
     outputs: Dict[str, Tensor],
     batch: Dict[str, object],
@@ -459,36 +560,52 @@ def dense_losses(
     if float(weights.shape_outer_weight) <= 0.0:
         shape_loss = outputs["shape"].sum() * 0.0
     else:
-        shape_target = batch["shape"].to(device=device, dtype=torch.float32)  # type: ignore[union-attr]
-        shape_weight = batch["shape_weight"].to(device=device, dtype=torch.float32)  # type: ignore[union-attr]
-        pseudo_mask = batch.get("pseudo_mask")
-        pseudo_bool = (
-            pseudo_mask.to(device=device, dtype=torch.bool)  # type: ignore[union-attr]
-            if pseudo_mask is not None
-            else None
-        )
-        ignore_mask = batch.get("ignore_mask")
-        if ignore_mask is not None:
-            ignore_bool = ignore_mask.to(device=device, dtype=torch.bool)  # type: ignore[union-attr]
-            if pseudo_bool is not None:
-                ignore_bool = ignore_bool & ~pseudo_bool
-            shape_weight = shape_weight * (~ignore_bool).to(dtype=torch.float32)
-        center_only_mask = batch.get("center_only_mask")
-        if center_only_mask is not None:
-            center_only_bool = center_only_mask.to(device=device, dtype=torch.bool)  # type: ignore[union-attr]
-            if pseudo_bool is not None:
-                center_only_bool = center_only_bool & ~pseudo_bool
-            center_only_factor = shape_weight.new_tensor(float(weights.center_only_shape_factor)).clamp(0.0, 1.0)
-            shape_weight = torch.where(center_only_bool, shape_weight * center_only_factor, shape_weight)
-        per_pixel_shape = shape_regression_loss_map(
-            outputs["shape"],
-            shape_target,
-            angle_weight=weights.shape_angle_weight,
-        )
-        if bool((shape_weight > 0).any()):
-            shape_loss = (per_pixel_shape * shape_weight).sum() / shape_weight.sum().clamp_min(1.0)
+        shape_loss_mode = str(weights.shape_loss_mode).lower()
+        if shape_loss_mode == "source_center":
+            shape_loss = source_center_shape_loss(
+                outputs["shape"],
+                batch["shape_source_centers"],  # type: ignore[arg-type]
+                batch["shape_source_values"],  # type: ignore[arg-type]
+                batch["shape_source_classes"],  # type: ignore[arg-type]
+                center_size=int(weights.shape_center_size),
+                center_only_factor=float(weights.center_only_shape_factor),
+                angle_weight=float(weights.shape_angle_weight),
+                geometry_loss=str(weights.shape_geometry_loss),
+            )
+        elif shape_loss_mode == "dense_pixel":
+            shape_target = batch["shape"].to(device=device, dtype=torch.float32)  # type: ignore[union-attr]
+            shape_weight = batch["shape_weight"].to(device=device, dtype=torch.float32)  # type: ignore[union-attr]
+            pseudo_mask = batch.get("pseudo_mask")
+            pseudo_bool = (
+                pseudo_mask.to(device=device, dtype=torch.bool)  # type: ignore[union-attr]
+                if pseudo_mask is not None
+                else None
+            )
+            ignore_mask = batch.get("ignore_mask")
+            if ignore_mask is not None:
+                ignore_bool = ignore_mask.to(device=device, dtype=torch.bool)  # type: ignore[union-attr]
+                if pseudo_bool is not None:
+                    ignore_bool = ignore_bool & ~pseudo_bool
+                shape_weight = shape_weight * (~ignore_bool).to(dtype=torch.float32)
+            center_only_mask = batch.get("center_only_mask")
+            if center_only_mask is not None:
+                center_only_bool = center_only_mask.to(device=device, dtype=torch.bool)  # type: ignore[union-attr]
+                if pseudo_bool is not None:
+                    center_only_bool = center_only_bool & ~pseudo_bool
+                center_only_factor = shape_weight.new_tensor(float(weights.center_only_shape_factor)).clamp(0.0, 1.0)
+                shape_weight = torch.where(center_only_bool, shape_weight * center_only_factor, shape_weight)
+            per_pixel_shape = shape_regression_loss_map(
+                outputs["shape"],
+                shape_target,
+                angle_weight=weights.shape_angle_weight,
+                geometry_loss=str(weights.shape_geometry_loss),
+            )
+            if bool((shape_weight > 0).any()):
+                shape_loss = (per_pixel_shape * shape_weight).sum() / shape_weight.sum().clamp_min(1.0)
+            else:
+                shape_loss = per_pixel_shape.mean() * 0.0
         else:
-            shape_loss = per_pixel_shape.mean() * 0.0
+            raise ValueError(f"shape_loss_mode must be source_center or dense_pixel, got {weights.shape_loss_mode!r}")
     if debug_timer is not None:
         debug_timer("dense.shape")
     # torch.cuda.synchronize()
@@ -573,6 +690,9 @@ def dense_losses_any(
         ),  # type: ignore[union-attr]
         "pseudo_mask": batch["band_pseudo_mask"].reshape(-1, *batch["band_pseudo_mask"].shape[2:]),  # type: ignore[union-attr]
         "centers": _flatten_band_centers(batch["band_centers"]),  # type: ignore[arg-type]
+        "shape_source_centers": _flatten_band_centers(batch["band_shape_source_centers"]),  # type: ignore[arg-type]
+        "shape_source_values": _flatten_band_centers(batch["band_shape_source_values"]),  # type: ignore[arg-type]
+        "shape_source_classes": _flatten_band_centers(batch["band_shape_source_classes"]),  # type: ignore[arg-type]
     }
     if "seg_logits" in outputs:
         flat_batch["seg"] = batch["band_seg"].reshape(-1, *batch["band_seg"].shape[2:])  # type: ignore[union-attr]

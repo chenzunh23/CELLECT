@@ -842,10 +842,96 @@ def _read_target_npz(path: Path) -> Dict[str, Tensor]:
         for key in ("confidence_weight", "seg_loss_weight"):
             if key in data:
                 targets[key] = torch.from_numpy(np.asarray(data[key], dtype=np.float32))
-        for key in ("visibility_center_only_centers", "visibility_ignore_centers"):
+        for key in ("visibility_center_only_centers", "visibility_ignore_centers", "shape_center_only_centers"):
             if key in data:
                 targets[key] = torch.from_numpy(np.asarray(data[key], dtype=np.float32)).reshape(-1, 2)
+        if "shape_source_centers" in data:
+            targets["shape_source_centers"] = torch.from_numpy(
+                np.asarray(data["shape_source_centers"], dtype=np.float32)
+            ).reshape(-1, 2)
+            targets["shape_source_values"] = torch.from_numpy(
+                np.asarray(data["shape_source_values"], dtype=np.float32)
+            ).reshape(-1, 3)
+            targets["shape_source_classes"] = torch.from_numpy(
+                np.asarray(data["shape_source_classes"], dtype=np.uint8)
+            ).reshape(-1)
+            targets["shape_source_ids"] = torch.from_numpy(
+                np.asarray(data["shape_source_ids"], dtype=np.int64)
+            ).reshape(-1)
     return _target_defaults(targets)
+
+
+def _source_shape_supervision(
+    target: Dict[str, Tensor],
+    clean_catalog: Dict[str, np.ndarray],
+    center_only_centers: np.ndarray,
+    *,
+    shape_source: str,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Return one shape target per source whose center lies inside the tile."""
+
+    h, w = int(target["shape"].shape[-2]), int(target["shape"].shape[-1])
+    clean_centers = np.asarray(clean_catalog["centers"], dtype=np.float32).reshape(-1, 2)
+    clean_ids = np.asarray(clean_catalog["ids"], dtype=np.int64).reshape(-1)
+    major, minor, angle = _ellipse_parameters(
+        np.asarray(clean_catalog["moments"], dtype=np.float32),
+        kron_radius=np.asarray(clean_catalog["kron_radius"], dtype=np.float32),
+        shape_source=shape_source,
+    )
+    clean_values = np.stack([major, minor, angle], axis=1).astype(np.float32, copy=False)
+    center_centers = np.asarray(center_only_centers, dtype=np.float32).reshape(-1, 2)
+
+    center_values = np.zeros((len(center_centers), 3), dtype=np.float32)
+    if len(center_centers):
+        finite = np.isfinite(center_centers).all(axis=1)
+        rounded = np.zeros_like(center_centers, dtype=np.int64)
+        rounded[finite] = np.rint(center_centers[finite]).astype(np.int64)
+        in_tile = (
+            finite
+            & (center_centers[:, 0] >= 0.0)
+            & (center_centers[:, 0] < float(w))
+            & (center_centers[:, 1] >= 0.0)
+            & (center_centers[:, 1] < float(h))
+        )
+        center_centers = center_centers[in_tile]
+        rounded = rounded[in_tile]
+        if len(rounded):
+            rounded[:, 0] = np.clip(rounded[:, 0], 0, w - 1)
+            rounded[:, 1] = np.clip(rounded[:, 1], 0, h - 1)
+        if len(rounded):
+            center_values = (
+                target["shape"][:, rounded[:, 1], rounded[:, 0]]
+                .transpose(0, 1)
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float32, copy=False)
+            )
+        else:
+            center_values = np.zeros((0, 3), dtype=np.float32)
+
+    centers = np.concatenate([clean_centers, center_centers], axis=0)
+    values = np.concatenate([clean_values, center_values], axis=0)
+    classes = np.concatenate(
+        [np.ones(len(clean_centers), dtype=np.uint8), np.full(len(center_centers), 2, dtype=np.uint8)]
+    )
+    ids = np.concatenate([clean_ids, np.full(len(center_centers), -1, dtype=np.int64)])
+    valid = (
+        np.isfinite(centers).all(axis=1)
+        & np.isfinite(values).all(axis=1)
+        & (centers[:, 0] >= 0.0)
+        & (centers[:, 0] < float(w))
+        & (centers[:, 1] >= 0.0)
+        & (centers[:, 1] < float(h))
+        & (values[:, 0] > 0.0)
+        & (values[:, 1] > 0.0)
+    )
+    return (
+        torch.from_numpy(centers[valid].astype(np.float32, copy=False)),
+        torch.from_numpy(values[valid].astype(np.float32, copy=False)),
+        torch.from_numpy(classes[valid]),
+        torch.from_numpy(ids[valid]),
+    )
 
 
 def load_pseudo_labels(path: Optional[Path]) -> Dict[str, Dict[str, List[dict]]]:
@@ -1327,6 +1413,46 @@ class AstroCutoutDataset(Dataset):
                     seg_weight=self.pseudo_seg_weight,
                     shape_weight=self.pseudo_shape_weight,
                 )
+
+        def shape_center_only_centers(target: Dict[str, Tensor], fallback: np.ndarray) -> np.ndarray:
+            stored = target.get("shape_center_only_centers")
+            if isinstance(stored, torch.Tensor):
+                return stored.detach().cpu().numpy().astype(np.float32, copy=False).reshape(-1, 2)
+            return np.asarray(fallback, dtype=np.float32).reshape(-1, 2)
+
+        def source_shape_supervision(
+            target: Dict[str, Tensor],
+            source_catalog: Dict[str, np.ndarray],
+            fallback_centers: np.ndarray,
+        ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+            keys = ("shape_source_centers", "shape_source_values", "shape_source_classes", "shape_source_ids")
+            if all(isinstance(target.get(key), torch.Tensor) for key in keys):
+                return tuple(target[key] for key in keys)  # type: ignore[return-value]
+            return _source_shape_supervision(
+                target,
+                source_catalog,
+                shape_center_only_centers(target, fallback_centers),
+                shape_source=self.shape_source,
+            )
+
+        shape_source_centers, shape_source_values, shape_source_classes, shape_source_ids = source_shape_supervision(
+            targets, catalog, dynamic_center_only_centers
+        )
+        band_shape_source_centers: List[Tensor] = []
+        band_shape_source_values: List[Tensor] = []
+        band_shape_source_classes: List[Tensor] = []
+        band_shape_source_ids: List[Tensor] = []
+        for band_idx, (band_target, band_catalog) in enumerate(zip(band_targets, band_catalogs)):
+            fallback = (
+                band_dynamic_center_only_centers[band_idx].detach().cpu().numpy()
+                if band_idx < len(band_dynamic_center_only_centers)
+                else np.zeros((0, 2), dtype=np.float32)
+            )
+            source_meta = source_shape_supervision(band_target, band_catalog, fallback)
+            band_shape_source_centers.append(source_meta[0])
+            band_shape_source_values.append(source_meta[1])
+            band_shape_source_classes.append(source_meta[2])
+            band_shape_source_ids.append(source_meta[3])
         centers = torch.from_numpy(catalog["centers"])
         band_centers = [torch.from_numpy(item["centers"]) for item in band_catalogs]
         band_ids = [torch.from_numpy(item["ids"]) for item in band_catalogs]
@@ -1440,6 +1566,17 @@ class AstroCutoutDataset(Dataset):
             for center in band_strict_center_only_centers:
                 if center.numel():
                     center[:, 0] = float(w - 1) - center[:, 0]
+            shape_source_centers = shape_source_centers.clone()
+            shape_source_values = shape_source_values.clone()
+            if shape_source_centers.numel():
+                shape_source_centers[:, 0] = float(w - 1) - shape_source_centers[:, 0]
+                shape_source_values[:, 2] = -shape_source_values[:, 2]
+            band_shape_source_centers = [source.clone() for source in band_shape_source_centers]
+            band_shape_source_values = [value.clone() for value in band_shape_source_values]
+            for source_centers, source_values in zip(band_shape_source_centers, band_shape_source_values):
+                if source_centers.numel():
+                    source_centers[:, 0] = float(w - 1) - source_centers[:, 0]
+                    source_values[:, 2] = -source_values[:, 2]
 
         return {
             "image": image,
@@ -1484,6 +1621,14 @@ class AstroCutoutDataset(Dataset):
             "band_strict_center_only_centers": band_strict_center_only_centers,
             "band_strict_ignore_centers": band_strict_ignore_centers,
             "band_rejected_ids": band_rejected_ids,
+            "shape_source_centers": shape_source_centers,
+            "shape_source_values": shape_source_values,
+            "shape_source_classes": shape_source_classes,
+            "shape_source_ids": shape_source_ids,
+            "band_shape_source_centers": band_shape_source_centers,
+            "band_shape_source_values": band_shape_source_values,
+            "band_shape_source_classes": band_shape_source_classes,
+            "band_shape_source_ids": band_shape_source_ids,
             "name": rec.name,
             "tile_name": rec.tile_name,
             "tract": rec.tract,
@@ -1687,6 +1832,14 @@ def collate_cutouts(batch: Sequence[Dict[str, object]]) -> Dict[str, object]:
         "band_strict_center_only_centers": [item["band_strict_center_only_centers"] for item in batch],
         "band_strict_ignore_centers": [item["band_strict_ignore_centers"] for item in batch],
         "band_rejected_ids": [item["band_rejected_ids"] for item in batch],
+        "shape_source_centers": [item["shape_source_centers"] for item in batch],
+        "shape_source_values": [item["shape_source_values"] for item in batch],
+        "shape_source_classes": [item["shape_source_classes"] for item in batch],
+        "shape_source_ids": [item["shape_source_ids"] for item in batch],
+        "band_shape_source_centers": [item["band_shape_source_centers"] for item in batch],
+        "band_shape_source_values": [item["band_shape_source_values"] for item in batch],
+        "band_shape_source_classes": [item["band_shape_source_classes"] for item in batch],
+        "band_shape_source_ids": [item["band_shape_source_ids"] for item in batch],
         "name": [item["name"] for item in batch],
         "tile_name": [item["tile_name"] for item in batch],
         "tract": [item["tract"] for item in batch],

@@ -18,7 +18,6 @@ import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Dict, Optional, Sequence
 
 import numpy as np
@@ -35,6 +34,7 @@ from astro_data_preprocessing import (  # noqa: E402
     _band_fits_path,
     _classify_clean_by_noncoadd_snr,
     _classify_pu_catalog,
+    _configure_worker_threads,
     _crop_full_mask_for_tile,
     _crop_image_for_tile,
     _find_denoised_patch_dir,
@@ -46,11 +46,14 @@ from astro_data_preprocessing import (  # noqa: E402
     _pu_dropped_sources,
     _read_det_background_mask,
     _read_exposure_image_plane,
+    _quality_mask_from_lsst_fits,
+    _restore_center_only_shape_targets,
     _read_table,
     _source_annulus_exclusion_mask,
     _variant_lsst_background_mask,
     _vstack_nonempty,
     add_ellipse_columns,
+    build_pu_runtime_config,
     crop_catalog_for_tile,
     make_pu_dense_targets,
     make_tile_specs,
@@ -86,97 +89,6 @@ def _expand_patch_tokens(values: Sequence[str]) -> list[str]:
     return unique
 
 
-def _legacy_args(args: argparse.Namespace) -> SimpleNamespace:
-    """Build the small namespace required by imported filtering functions."""
-
-    return SimpleNamespace(
-        coadd_root=str(args.coadd_root),
-        catalog_root=str(args.catalog_root),
-        band_catalog_root=str(args.band_catalog_root or args.catalog_root),
-        tract=int(args.tract),
-        catalog_hdu=int(args.catalog_hdu),
-        catalog_band=str(args.catalog_band),
-        x_col=args.x_col,
-        y_col=args.y_col,
-        source_filter=args.source_filter,
-        shape_source=args.target_shape_source,
-        target_shape_source=args.target_shape_source,
-        max_area_3sigma=400.0,
-        relaxed_area_3sigma=900.0,
-        area_filter_policy="max_area",
-        drop_children=False,
-        label_mode="pu",
-        ellipse_sigma=float(args.ellipse_sigma),
-        min_ellipse_axis=1.5,
-        pixel_scale_arcsec=float(args.pixel_scale_arcsec),
-        no_clean_nonfinite=False,
-        pu_a_flags=(),
-        pu_b_flags=tuple(args.b_flags),
-        pu_a_mode="any",
-        pu_b_mode="any",
-        pu_strict_flags=(),
-        pu_mag_column=args.mag_column,
-        pu_input_zeropoint=float(args.zeropoint),
-        pu_require_kron_refit_match=bool(args.require_kron_refit_match),
-        pu_kron_refit_csv=str(args.kron_refit_csv),
-        pu_kron_refit_radius_column=args.kron_refit_radius_column,
-        pu_kron_refit_good_column=args.kron_refit_good_column,
-        pu_a_area_max=float(args.a_area_max),
-        pu_a_faint_area_max=float(args.a_faint_area_max),
-        pu_a_faint_mag_min=float(args.a_faint_mag_min),
-        pu_b_mag_min=float(args.b_mag_min),
-        pu_b_mag_max=float(args.b_mag_max),
-        pu_use_band_limit_b_filter=False,
-        pu_band_limit_mags=None,
-        pu_band_limit_b_min_offset=-5.0,
-        pu_band_limit_b_max_offset=0.0,
-        pu_ap2_kron_abs_max=float(args.ap2_kron_abs_max),
-        pu_ap2_flux_column=args.ap2_flux_column,
-        pu_ap2_kron_flux_column=args.ap2_kron_flux_column,
-        pu_b_close_center_arcsec=float(args.close_center_arcsec),
-        pu_overlap_iou_threshold=0.33,
-        pu_b_ellipse_area_max=None,
-        pu_b_footprint_area_max=None,
-        pu_b_axis_ratio_max=float(args.axis_ratio_max),
-        pu_b_kron_radius_lt_sdss_major_ratio=0.5,
-        pu_drop_ellipse_area_min=float(args.drop_ellipse_area_min),
-        pu_ambiguous_area_max=None,
-        pu_neighbor_radius=0.0,
-        pu_center_distance_factor=0.0,
-        pu_containment_threshold=float(args.containment_threshold),
-        pu_mutual_overlap_threshold=0.0,
-        pu_overlap_sample_grid=16,
-        pu_ambiguous_mark="center_only",
-        pu_keep_all_ab_clean=True,
-        pu_enable_strict_bright_center_only=bool(args.enable_strict_bright_center_only),
-        pu_strict_bright_center_only_mag_threshold=args.strict_bright_center_only_mag_threshold,
-        pu_strict_ignore_mag_threshold=None,
-        pu_strict_bright_center_only_saturation_mags=args.strict_bright_center_only_saturation_mags,
-        pu_strict_ignore_saturation_mags=None,
-        pu_strict_bright_center_only_radius_column=args.strict_bright_center_only_radius_column,
-        pu_strict_bright_center_only_ellipse_sigma=float(args.strict_bright_center_only_ellipse_sigma),
-        pu_remeasure_ap2_kron_outliers=bool(args.remeasure_ap2_kron_outliers),
-        pu_remeasure_ap2_kron_threshold=np.nan,
-        pu_remeasure_clean_abs_max=float(args.ap2_kron_abs_max),
-        pu_remeasure_center_only_abs_max=1.5,
-        pu_remeasure_small_footprint_fill_threshold=0.2,
-        pu_remeasure_ignore_area_max=10000.0,
-        pu_remeasure_faint_mag_min=28.0,
-        pu_remeasure_faint_area_max=900.0,
-        pu_remeasure_axis_ratio_max=float(args.axis_ratio_max),
-        pu_remeasure_containment_threshold=float(args.containment_threshold),
-        noncoadd_snr_ap_radius=float(args.noncoadd_snr_ap_radius),
-        noncoadd_snr_annulus_r_in=float(args.noncoadd_snr_annulus_r_in),
-        noncoadd_snr_annulus_r_out=float(args.noncoadd_snr_annulus_r_out),
-        noncoadd_snr_ignore_thresh=float(args.noncoadd_snr_ignore_thresh),
-        noncoadd_snr_center_only_thresh=float(args.noncoadd_snr_center_only_thresh),
-        noncoadd_snr_source_mask_ellipse_sigma=float(args.noncoadd_snr_source_mask_ellipse_sigma),
-        noncoadd_snr_min_annulus_pixels=int(args.noncoadd_snr_min_annulus_pixels),
-        noncoadd_snr_use_source_mask=True,
-        noncoadd_snr_use_quality_mask=False,
-    )
-
-
 def _read_patch_image_meta(coadd_root: Path, band: str, tract: int, patch: str) -> tuple[tuple[int, int], tuple[int, int]]:
     from astropy.io import fits
 
@@ -188,7 +100,7 @@ def _read_patch_image_meta(coadd_root: Path, band: str, tract: int, patch: str) 
     return shape, origin
 
 
-def _classify_all_bands(args: argparse.Namespace, legacy: SimpleNamespace, patch: str) -> dict[str, tuple[Table, Table, Table, Table]]:
+def _classify_all_bands(args: argparse.Namespace, runtime: argparse.Namespace, patch: str) -> dict[str, tuple[Table, Table, Table, Table]]:
     catalog_root = Path(args.band_catalog_root or args.catalog_root).expanduser()
     out = {}
     for band in args.bands:
@@ -199,9 +111,35 @@ def _classify_all_bands(args: argparse.Namespace, legacy: SimpleNamespace, patch
             patch=patch,
             band=band,
         )
-        clean, center, ignore, _all, _result = _classify_pu_catalog(table, legacy, band=band, patch=patch)
-        clean, center, strict_center = _move_bright_clean_to_center_only(clean, center, legacy, band=band)
+        clean, center, ignore, _all, _result = _classify_pu_catalog(table, runtime, band=band, patch=patch)
+        clean, center, strict_center = _move_bright_clean_to_center_only(clean, center, runtime, band=band)
         out[band] = (clean, center, ignore, strict_center)
+    return out
+
+
+def _read_quality_masks(
+    args: argparse.Namespace,
+    patch: str,
+) -> dict[str, tuple[np.ndarray, tuple[int, int]]]:
+    if not bool(args.noncoadd_snr_use_quality_mask):
+        return {}
+    root = Path(args.coadd_root).expanduser()
+    planes = tuple(str(plane) for plane in args.noncoadd_snr_mask_planes if str(plane).strip())
+    out: dict[str, tuple[np.ndarray, tuple[int, int]]] = {}
+    for band in args.bands:
+        path = _band_fits_path(root, band, int(args.tract), patch)
+        mask = _quality_mask_from_lsst_fits(path, planes)
+        if mask is None:
+            print(f"WARNING: no usable quality mask for {patch} {band}: {path}", flush=True)
+            continue
+        shape_yx, origin_xy = _read_patch_image_meta(root, band, int(args.tract), patch)
+        if tuple(mask.shape) != tuple(shape_yx):
+            print(
+                f"WARNING: quality mask shape {mask.shape} != image shape {shape_yx} for {path}; ignoring mask",
+                flush=True,
+            )
+            continue
+        out[band] = (mask, origin_xy)
     return out
 
 
@@ -290,6 +228,8 @@ def _read_variant_images(args: argparse.Namespace, patch: str, variant: str) -> 
     if args.image_variant_groups:
         wanted = {g if g.startswith("group_") else f"group_{int(g):02d}" for g in args.image_variant_groups}
         groups = [g for g in groups if g.name in wanted]
+    if not groups:
+        raise FileNotFoundError(f"No requested image variant group directories found in {patch_dir}")
     out = {}
     for group in groups:
         band_images = {}
@@ -318,6 +258,62 @@ def _crop_sources(source_tuple, spec: TileSpec, args: argparse.Namespace, *, mar
     )
 
 
+def _shape_source_metadata(
+    clean_sources: Table,
+    center_only_sources: Table,
+    target: dict[str, np.ndarray],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    centers_parts = []
+    values_parts = []
+    classes_parts = []
+    ids_parts = []
+    h, w = np.asarray(target["pu_class_mask"]).shape
+    for table, class_id in ((clean_sources, 1), (center_only_sources, 2)):
+        if len(table) == 0:
+            continue
+        meta = _metadata_from_catalog(table)
+        centers = np.asarray(meta["centers"], dtype=np.float32).reshape(-1, 2)
+        ids = np.asarray(meta["ids"], dtype=np.int64).reshape(-1)
+        values = np.stack(
+            [
+                np.asarray(table["ellipse_major_sigma"], dtype=np.float32),
+                np.asarray(table["ellipse_minor_sigma"], dtype=np.float32),
+                np.asarray(table["ellipse_theta"], dtype=np.float32),
+            ],
+            axis=1,
+        )
+        finite_centers = np.isfinite(centers).all(axis=1)
+        valid = (
+            finite_centers
+            & np.isfinite(values).all(axis=1)
+            & (centers[:, 0] >= 0.0)
+            & (centers[:, 0] < float(w))
+            & (centers[:, 1] >= 0.0)
+            & (centers[:, 1] < float(h))
+            & (values[:, 0] > 0.0)
+            & (values[:, 1] > 0.0)
+        )
+        if not np.any(valid):
+            continue
+        centers_parts.append(centers[valid])
+        values_parts.append(values[valid])
+        classes_parts.append(np.full(int(valid.sum()), int(class_id), dtype=np.uint8))
+        ids_parts.append(ids[valid])
+    if not centers_parts:
+        return (
+            np.zeros((0, 2), dtype=np.float32),
+            np.zeros((0, 3), dtype=np.float32),
+            np.zeros((0,), dtype=np.uint8),
+            np.zeros((0,), dtype=np.int64),
+        )
+    return (
+        np.concatenate(centers_parts, axis=0),
+        np.concatenate(values_parts, axis=0),
+        np.concatenate(classes_parts, axis=0),
+        np.concatenate(ids_parts, axis=0),
+    )
+
+
 def _local_image_stack(images_by_band: dict[str, tuple[np.ndarray, tuple[int, int]]], sample: Sample, bands: Sequence[str]) -> np.ndarray:
     planes = []
     for band in bands:
@@ -334,8 +330,9 @@ def _target_for_sample(
     labels_by_band,
     images_by_band,
     backgrounds,
+    quality_masks,
     args,
-    legacy,
+    runtime,
 ) -> dict[str, object]:
     image_stack = _local_image_stack(images_by_band, sample, bands)
     image = astro_zscale_preprocess(image_stack, z_clip=args.z_clip).cpu().numpy().astype(args.image_dtype, copy=False)
@@ -346,6 +343,10 @@ def _target_for_sample(
     pu_class = []
     centers_by_band = []
     ids_by_band = []
+    shape_source_centers_by_band = []
+    shape_source_values_by_band = []
+    shape_source_classes_by_band = []
+    shape_source_ids_by_band = []
     for band_idx, band in enumerate(bands):
         clean_mask, center_mask, ignore_mask, strict_mask = _crop_sources(
             labels_by_band[band],
@@ -353,7 +354,7 @@ def _target_for_sample(
             args,
             margin=float(args.mask_margin),
         )
-        clean_tile, _center_tile, _ignore_tile, _strict_tile = _crop_sources(
+        clean_tile, center_tile, _ignore_tile, _strict_tile = _crop_sources(
             labels_by_band[band],
             sample.spec,
             args,
@@ -369,23 +370,28 @@ def _target_for_sample(
                     y_col=args.y_col,
                     ellipse_sigma=float(args.noncoadd_snr_source_mask_ellipse_sigma),
                 )
+            hard_exclude_mask = None
+            if band in quality_masks:
+                quality_mask, quality_origin = quality_masks[band]
+                hard_exclude_mask = _crop_full_mask_for_tile(quality_mask, sample.spec, quality_origin)
             normal_tile, snr_center_tile, snr_ignore_tile, _snr = _classify_clean_by_noncoadd_snr(
                 clean_tile,
                 image=image_stack[band_idx],
                 image_origin=(sample.spec.x0, sample.spec.y0),
-                args=legacy,
+                args=runtime,
                 annulus_exclude_mask=source_mask,
-                annulus_hard_exclude_mask=None,
+                annulus_hard_exclude_mask=hard_exclude_mask,
             )
             normal_mask, snr_center_mask, snr_ignore_mask, _snr = _classify_clean_by_noncoadd_snr(
                 clean_mask,
                 image=image_stack[band_idx],
                 image_origin=(sample.spec.x0, sample.spec.y0),
-                args=legacy,
+                args=runtime,
                 annulus_exclude_mask=source_mask,
-                annulus_hard_exclude_mask=None,
+                annulus_hard_exclude_mask=hard_exclude_mask,
             )
             clean_tile = normal_tile
+            center_tile = _vstack_nonempty([center_tile, snr_center_tile])
             clean_mask = normal_mask
             center_mask = _vstack_nonempty([center_mask, snr_center_mask])
             ignore_mask = _vstack_nonempty([ignore_mask, snr_ignore_mask])
@@ -408,6 +414,16 @@ def _target_for_sample(
             strict_center_only_sources=strict_mask,
             strict_center_only_ellipse_sigma=float(args.strict_bright_center_only_ellipse_sigma),
         )
+        _restore_center_only_shape_targets(
+            target,
+            center_mask,
+            sample.spec,
+            x_col=args.x_col,
+            y_col=args.y_col,
+            ellipse_sigma=float(args.ellipse_sigma),
+            confidence_levels=int(args.confidence_levels),
+            core_radius=int(args.core_radius),
+        )
         conf.append(np.asarray(target["confidence"], dtype=np.uint8))
         conf_weight.append(np.asarray(target["confidence_weight"], dtype=args.target_float_dtype))
         shape.append(np.asarray(target["shape"], dtype=args.target_float_dtype))
@@ -416,6 +432,15 @@ def _target_for_sample(
         meta = _metadata_from_catalog(clean_tile)
         centers_by_band.append(meta["centers"])
         ids_by_band.append(meta["ids"])
+        shape_centers, shape_values, shape_classes, shape_ids = _shape_source_metadata(
+            clean_tile,
+            center_tile,
+            target,
+        )
+        shape_source_centers_by_band.append(shape_centers)
+        shape_source_values_by_band.append(shape_values)
+        shape_source_classes_by_band.append(shape_classes)
+        shape_source_ids_by_band.append(shape_ids)
     return {
         "image": image,
         "confidence": np.stack(conf, axis=0),
@@ -425,6 +450,10 @@ def _target_for_sample(
         "pu_class": np.stack(pu_class, axis=0),
         "centers_by_band": centers_by_band,
         "ids_by_band": ids_by_band,
+        "shape_source_centers_by_band": shape_source_centers_by_band,
+        "shape_source_values_by_band": shape_source_values_by_band,
+        "shape_source_classes_by_band": shape_source_classes_by_band,
+        "shape_source_ids_by_band": shape_source_ids_by_band,
     }
 
 
@@ -436,22 +465,29 @@ def _write_dataset_zarr(
     labels_by_band,
     image_sources,
     background_sources,
+    quality_masks,
     args,
-    legacy,
+    runtime,
     attrs: dict,
 ) -> dict:
     manifest_path = output.parent / f"{output.name}_manifest.json"
+    staging = output.with_name(f".{output.name}.inprogress")
     if manifest_path.exists() and output.exists() and not bool(args.overwrite):
         print(f"[direct-zarr] skip complete existing store: {output}", flush=True)
         return json.loads(manifest_path.read_text(encoding="utf-8"))
     if output.exists() and not manifest_path.exists() and not bool(args.overwrite):
         print(f"[direct-zarr] removing incomplete existing store before rebuild: {output}", flush=True)
         shutil.rmtree(output)
+    if staging.exists():
+        print(f"[direct-zarr] removing stale staging store: {staging}", flush=True)
+        shutil.rmtree(staging)
     n = len(samples)
     b = len(bands)
     h = w = int(args.tile_size)
     chunk_tiles = max(1, int(args.chunk_tiles))
-    writer = ZarrGroupWriter(output, overwrite=bool(args.overwrite), attrs=attrs)
+    # Write under a non-*.zarr staging name so concurrent training discovery
+    # cannot observe arrays before the completion manifest is ready.
+    writer = ZarrGroupWriter(staging, overwrite=True, attrs=attrs)
     images = writer.array("images", shape=(n, b, h, w), chunks=(chunk_tiles, b, h, w), dtype=args.image_dtype)
     confidence = writer.array("band_confidence", shape=(n, b, h, w), chunks=(chunk_tiles, b, h, w), dtype=np.uint8)
     conf_weight = writer.array("band_conf_weight", shape=(n, b, h, w), chunks=(chunk_tiles, b, h, w), dtype=args.target_float_dtype)
@@ -461,6 +497,11 @@ def _write_dataset_zarr(
     centers_flat = []
     ids_flat = []
     offsets = np.zeros((n, b + 1), dtype=np.int64)
+    shape_centers_flat = []
+    shape_values_flat = []
+    shape_classes_flat = []
+    shape_ids_flat = []
+    shape_offsets = np.zeros((n, b + 1), dtype=np.int64)
 
     def load_one(sample: Sample):
         images_by_band = image_sources[sample.image_key]
@@ -471,8 +512,9 @@ def _write_dataset_zarr(
             labels_by_band=labels_by_band,
             images_by_band=images_by_band,
             backgrounds=backgrounds,
+            quality_masks=quality_masks,
             args=args,
-            legacy=legacy,
+            runtime=runtime,
         )
 
     for start in range(0, n, chunk_tiles):
@@ -490,6 +532,7 @@ def _write_dataset_zarr(
         for local_idx, pkg in enumerate(packages):
             sample_idx = start + local_idx
             offsets[sample_idx, 0] = len(centers_flat)
+            shape_offsets[sample_idx, 0] = len(shape_centers_flat)
             for band_idx in range(b):
                 centers = np.asarray(pkg["centers_by_band"][band_idx], dtype=np.float32).reshape(-1, 2)
                 ids = np.asarray(pkg["ids_by_band"][band_idx], dtype=np.int64).reshape(-1)
@@ -497,6 +540,16 @@ def _write_dataset_zarr(
                     centers_flat.extend(centers)
                     ids_flat.extend(ids)
                 offsets[sample_idx, band_idx + 1] = len(centers_flat)
+                source_centers = np.asarray(pkg["shape_source_centers_by_band"][band_idx], dtype=np.float32).reshape(-1, 2)
+                source_values = np.asarray(pkg["shape_source_values_by_band"][band_idx], dtype=np.float32).reshape(-1, 3)
+                source_classes = np.asarray(pkg["shape_source_classes_by_band"][band_idx], dtype=np.uint8).reshape(-1)
+                source_ids = np.asarray(pkg["shape_source_ids_by_band"][band_idx], dtype=np.int64).reshape(-1)
+                if len(source_centers):
+                    shape_centers_flat.extend(source_centers)
+                    shape_values_flat.extend(source_values)
+                    shape_classes_flat.extend(source_classes)
+                    shape_ids_flat.extend(source_ids)
+                shape_offsets[sample_idx, band_idx + 1] = len(shape_centers_flat)
         print(f"[direct-zarr] {output.name}: wrote samples {start + 1}-{end}/{n}", flush=True)
 
     centers_arr = np.asarray(centers_flat, dtype=np.float32).reshape(-1, 2)
@@ -504,6 +557,40 @@ def _write_dataset_zarr(
     writer.array("source_centers", shape=centers_arr.shape, chunks=(max(1, len(centers_arr)), 2), dtype=np.float32).write_full(centers_arr)
     writer.array("source_ids", shape=ids_arr.shape, chunks=(max(1, len(ids_arr)),), dtype=np.int64).write_full(ids_arr)
     writer.array("source_offsets", shape=offsets.shape, chunks=(max(1, n), b + 1), dtype=np.int64).write_full(offsets)
+    shape_centers_arr = np.asarray(shape_centers_flat, dtype=np.float32).reshape(-1, 2)
+    shape_values_arr = np.asarray(shape_values_flat, dtype=np.float32).reshape(-1, 3)
+    shape_classes_arr = np.asarray(shape_classes_flat, dtype=np.uint8).reshape(-1)
+    shape_ids_arr = np.asarray(shape_ids_flat, dtype=np.int64).reshape(-1)
+    writer.array(
+        "shape_source_centers",
+        shape=shape_centers_arr.shape,
+        chunks=(max(1, len(shape_centers_arr)), 2),
+        dtype=np.float32,
+    ).write_full(shape_centers_arr)
+    writer.array(
+        "shape_source_values",
+        shape=shape_values_arr.shape,
+        chunks=(max(1, len(shape_values_arr)), 3),
+        dtype=np.float32,
+    ).write_full(shape_values_arr)
+    writer.array(
+        "shape_source_classes",
+        shape=shape_classes_arr.shape,
+        chunks=(max(1, len(shape_classes_arr)),),
+        dtype=np.uint8,
+    ).write_full(shape_classes_arr)
+    writer.array(
+        "shape_source_ids",
+        shape=shape_ids_arr.shape,
+        chunks=(max(1, len(shape_ids_arr)),),
+        dtype=np.int64,
+    ).write_full(shape_ids_arr)
+    writer.array(
+        "shape_source_offsets",
+        shape=shape_offsets.shape,
+        chunks=(max(1, n), b + 1),
+        dtype=np.int64,
+    ).write_full(shape_offsets)
     writer.array("tile_x0", shape=(n,), chunks=(max(1, n),), dtype=np.int32).write_full(np.asarray([s.spec.x0 for s in samples], dtype=np.int32))
     writer.array("tile_y0", shape=(n,), chunks=(max(1, n),), dtype=np.int32).write_full(np.asarray([s.spec.y0 for s in samples], dtype=np.int32))
     writer.array("tile_name", shape=(n, 192), chunks=(max(1, n), 192), dtype=np.uint8).write_full(encode_fixed_utf8([s.name for s in samples], 192))
@@ -516,7 +603,20 @@ def _write_dataset_zarr(
         "bands": list(bands),
         "samples": [{"name": s.name, "x0": s.spec.x0, "y0": s.spec.y0, "group": s.group, "dataset_source": s.dataset_source} for s in samples],
     }
-    write_json(manifest_path, manifest)
+    backup = output.with_name(f".{output.name}.replaced")
+    if backup.exists():
+        shutil.rmtree(backup)
+    if output.exists():
+        output.rename(backup)
+    try:
+        staging.rename(output)
+        write_json(manifest_path, manifest)
+    except Exception:
+        if not output.exists() and backup.exists():
+            backup.rename(output)
+        raise
+    if backup.exists():
+        shutil.rmtree(backup)
     return manifest
 
 
@@ -539,7 +639,7 @@ def preprocess_patch(args: argparse.Namespace, patch: str) -> dict:
             "skipped_existing": True,
         }
 
-    legacy = _legacy_args(args)
+    runtime = build_pu_runtime_config(args)
     shape_yx, parent_origin = _read_patch_image_meta(Path(args.coadd_root).expanduser(), args.bands[0], int(args.tract), patch)
     args.parent_origin_xy = parent_origin
     specs = make_tile_specs(
@@ -556,8 +656,9 @@ def preprocess_patch(args: argparse.Namespace, patch: str) -> dict:
             raise RuntimeError(f"No tile matched --tile-filter {sorted(wanted)} for patch {patch}")
     if args.max_tiles is not None:
         specs = specs[: int(args.max_tiles)]
-    labels = _classify_all_bands(args, legacy, patch)
+    labels = _classify_all_bands(args, runtime, patch)
     backgrounds = _read_backgrounds(args, patch, shape_yx, parent_origin)
+    quality_masks = _read_quality_masks(runtime, patch)
     summaries = []
 
     if args.include_coadd:
@@ -572,15 +673,22 @@ def preprocess_patch(args: argparse.Namespace, patch: str) -> dict:
                 labels_by_band=labels,
                 image_sources=coadd_images,
                 background_sources={"coadd": backgrounds},
+                quality_masks=quality_masks,
                 args=args,
-                legacy=legacy,
-                attrs=_attrs(args, patch, "coadd", len(samples)),
+                runtime=runtime,
+                attrs=_attrs(args, runtime, patch, "coadd", len(samples)),
             )
         )
 
     if args.denoised_fits_root is not None:
         for variant in args.image_variants:
-            variant_images = _read_variant_images(args, patch, variant)
+            try:
+                variant_images = _read_variant_images(args, patch, variant)
+            except FileNotFoundError as exc:
+                if args.missing_variant_policy == "error":
+                    raise
+                print(f"[direct-zarr] skip {variant} patch {patch}: {exc}", flush=True)
+                continue
             variant_backgrounds = _variant_backgrounds_for_images(
                 args,
                 variant=variant,
@@ -598,18 +706,25 @@ def preprocess_patch(args: argparse.Namespace, patch: str) -> dict:
                     labels_by_band=labels,
                     image_sources=variant_images,
                     background_sources=variant_backgrounds,
+                    quality_masks=quality_masks,
                     args=args,
-                    legacy=legacy,
-                    attrs=_attrs(args, patch, variant, len(samples)),
+                    runtime=runtime,
+                    attrs=_attrs(args, runtime, patch, variant, len(samples)),
                 )
             )
     return {"patch": patch, "summaries": summaries}
 
 
-def _attrs(args: argparse.Namespace, patch: str, dataset_source: str, n: int) -> dict:
+def _attrs(
+    args: argparse.Namespace,
+    runtime: argparse.Namespace,
+    patch: str,
+    dataset_source: str,
+    n: int,
+) -> dict:
     return {
         "format": "cellect_direct_patch_zarr",
-        "format_version": 1,
+        "format_version": 2,
         "tract": str(args.tract),
         "patch": patch,
         "dataset_source": dataset_source,
@@ -621,6 +736,26 @@ def _attrs(args: argparse.Namespace, patch: str, dataset_source: str, n: int) ->
         "b_mag_max": float(args.b_mag_max),
         "image_variant_background_source": str(args.image_variant_background_source),
         "variant_lsst_background_root": str(args.variant_lsst_background_root) if args.variant_lsst_background_root is not None else None,
+        "center_only_shape_restored": True,
+        "noncoadd_snr_use_source_mask": bool(args.noncoadd_snr_use_source_mask),
+        "noncoadd_snr_use_quality_mask": bool(args.noncoadd_snr_use_quality_mask),
+        "noncoadd_snr_mask_planes": list(args.noncoadd_snr_mask_planes),
+        "noncoadd_snr_exclude_self_source": bool(args.noncoadd_snr_exclude_self_source),
+        "pu_runtime_config": {
+            "b_mag_min": float(runtime.pu_b_mag_min),
+            "b_mag_max": float(runtime.pu_b_mag_max),
+            "use_band_limit_b_filter": bool(runtime.pu_use_band_limit_b_filter),
+            "band_limit_mags": runtime.pu_band_limit_mags,
+            "ap2_kron_abs_max": float(runtime.pu_ap2_kron_abs_max),
+            "require_kron_refit_match": bool(runtime.pu_require_kron_refit_match),
+            "remeasure_ap2_kron_outliers": bool(runtime.pu_remeasure_ap2_kron_outliers),
+            "enable_strict_bright_center_only": bool(runtime.pu_enable_strict_bright_center_only),
+            "target_shape_source": str(runtime.target_shape_source),
+            "noncoadd_snr_use_source_mask": bool(runtime.noncoadd_snr_use_source_mask),
+            "noncoadd_snr_use_quality_mask": bool(runtime.noncoadd_snr_use_quality_mask),
+            "noncoadd_snr_mask_planes": list(runtime.noncoadd_snr_mask_planes),
+            "noncoadd_snr_exclude_self_source": bool(runtime.noncoadd_snr_exclude_self_source),
+        },
         "created_unix_time": time.time(),
     }
 
@@ -639,6 +774,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--catalog-hdu", type=int, default=1)
     p.add_argument("--image-variants", nargs="+", default=["denoised", "noisy"])
     p.add_argument("--image-variant-groups", nargs="*", default=())
+    p.add_argument(
+        "--missing-variant-policy",
+        choices=("skip", "error"),
+        default="skip",
+        help="How to handle requested denoised/noisy patch/group directories or FITS files that are absent.",
+    )
     p.add_argument("--include-coadd", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--tile-size", type=int, default=512)
     p.add_argument("--stride", type=int, default=368)
@@ -709,12 +850,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--noncoadd-snr-source-mask-ellipse-sigma", type=float, default=1.0)
     p.add_argument("--noncoadd-snr-min-annulus-pixels", type=int, default=50)
     p.add_argument("--noncoadd-snr-use-source-mask", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--noncoadd-snr-use-quality-mask", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument(
+        "--noncoadd-snr-mask-planes",
+        nargs="*",
+        default=["BRIGHT_OBJECT", "SAT", "BAD", "NO_DATA", "EDGE", "UNMASKEDNAN"],
+    )
+    p.add_argument("--noncoadd-snr-exclude-self-source", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--z-clip", nargs=2, type=float, default=None)
     p.add_argument("--image-dtype", choices=("float16", "float32"), default="float16")
     p.add_argument("--target-float-dtype", choices=("float16", "float32"), default="float16")
     p.add_argument("--chunk-tiles", type=int, default=8)
     p.add_argument("--tile-workers", type=int, default=2)
     p.add_argument("--patch-workers", type=int, default=1)
+    p.add_argument(
+        "--worker-threads",
+        type=int,
+        default=1,
+        help="Torch/BLAS/OpenMP threads per patch process; tile parallelism is controlled separately.",
+    )
     p.add_argument("--overwrite", action="store_true")
     return p
 
@@ -729,10 +883,15 @@ def main() -> int:
     output_root = Path(args.output_root).expanduser()
     output_root.mkdir(parents=True, exist_ok=True)
     if int(args.patch_workers) <= 1 or len(patches) <= 1:
+        _configure_worker_threads(int(args.worker_threads))
         summaries = [preprocess_patch(args, patch) for patch in patches]
     else:
         summaries = []
-        with ProcessPoolExecutor(max_workers=min(int(args.patch_workers), len(patches))) as ex:
+        with ProcessPoolExecutor(
+            max_workers=min(int(args.patch_workers), len(patches)),
+            initializer=_configure_worker_threads,
+            initargs=(int(args.worker_threads),),
+        ) as ex:
             futs = {ex.submit(preprocess_patch, args, patch): patch for patch in patches}
             for fut in as_completed(futs):
                 summaries.append(fut.result())
