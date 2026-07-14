@@ -2761,6 +2761,7 @@ def run_epoch(
     amp_dtype: Optional[torch.dtype] = None,
     scheduler_step: Optional[Callable[[], None]] = None,
     global_step_start: int = 0,
+    global_step_scale: int = 1,
     iteration_log_interval: int = 0,
     iteration_log_fn: Optional[Callable[[Dict[str, float], int], None]] = None,
     debug_batch_start: int = -1,
@@ -2889,9 +2890,17 @@ def run_epoch(
         )
         return {key: zero for key in keys}
 
-    progress = tqdm(loader, desc="train" if training else "eval", leave=False, disable=not show_progress)
-    for batch_idx, batch in enumerate(progress):
-        current_step = int(global_step_start) + int(batch_idx) + 1
+    step_scale = max(1, int(global_step_scale))
+    progress = tqdm(
+        total=len(loader) * step_scale,
+        desc="train" if training else "eval",
+        leave=False,
+        disable=not show_progress,
+        unit="global-batch",
+    )
+    for batch_idx, batch in enumerate(loader):
+        optimizer_step = int(global_step_start) // step_scale + int(batch_idx) + 1
+        current_step = int(global_step_start) + (int(batch_idx) + 1) * step_scale
         debug_this_batch = debug_enabled and debug_start <= int(batch_idx) <= debug_end
         debug_print = debug_this_batch and (bool(debug_batch_all_ranks) or rank == 0)
         t_after_data = time.perf_counter()
@@ -2948,7 +2957,7 @@ def run_epoch(
             mask_active = (
                 (not training)
                 or mask_interval <= 1
-                or ((current_step - 1) % mask_interval == 0)
+                or ((optimizer_step - 1) % mask_interval == 0)
             )
             if training and float(effective_mask_outer_weight) <= 0.0:
                 mask_active = False
@@ -3082,7 +3091,7 @@ def run_epoch(
             training
             and iteration_log_fn is not None
             and int(iteration_log_interval) > 0
-            and (current_step % int(iteration_log_interval) == 0)
+            and (optimizer_step % int(iteration_log_interval) == 0)
         )
         if should_log_iteration:
             local_metrics = {
@@ -3150,6 +3159,7 @@ def run_epoch(
             local_metrics["epoch"] = float(epoch_index)
             local_metrics["iteration"] = float(current_step)
             iteration_log_fn(local_metrics, current_step)
+        progress.update(step_scale)
         _sync_debug(debug_this_batch)
         t_done = time.perf_counter()
         if debug_print:
@@ -3165,6 +3175,7 @@ def run_epoch(
                 flush=True,
             )
         data_wait_start = time.perf_counter()
+    progress.close()
     if distributed and dist.is_available() and dist.is_initialized():
         keys = list(sums.keys())
         packed = torch.tensor([sums[key] for key in keys] + [float(count)], device=device, dtype=torch.float64)

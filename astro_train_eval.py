@@ -1428,6 +1428,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Force DDP find_unused_parameters=True. auto also enables this when static graph is disabled.",
     )
     parser.add_argument(
+        "--ddp-progress-step-mode",
+        choices=("global", "rank"),
+        default="global",
+        help=(
+            "DDP tqdm/W&B x-axis convention. global advances by world_size per synchronized iteration; "
+            "rank restores the original per-rank step count. This does not affect optimization or scheduling."
+        ),
+    )
+    parser.add_argument(
         "--patch-val",
         action="store_true",
         help="Split training and validation by random patch instead of random cutout. This is a coarser split that may better reflect generalization to new sky areas, but results in higher variance.",
@@ -2260,6 +2269,7 @@ def main() -> None:
             "distributed": distributed,
             "distributed_validation": bool(distributed and args.mode == "train"),
             "world_size": world_size,
+            "ddp_progress_step_mode": str(args.ddp_progress_step_mode),
             "dist_backend": backend,
             "amp": str(args.amp),
             "amp_dtype": str(amp_dtype).replace("torch.", "") if amp_dtype is not None else None,
@@ -2443,6 +2453,11 @@ def main() -> None:
                 )
             if train_epoch_setter is not None:
                 train_epoch_setter.set_epoch(epoch)
+            display_step_scale = (
+                world_size
+                if distributed and str(args.ddp_progress_step_mode) == "global"
+                else 1
+            )
             train_metrics = run_epoch(
                 model,
                 train_loader,
@@ -2471,6 +2486,7 @@ def main() -> None:
                 amp_dtype=amp_dtype,
                 scheduler_step=sam_iteration_scheduler.step if sam_iteration_scheduler is not None else None,
                 global_step_start=global_step,
+                global_step_scale=display_step_scale,
                 iteration_log_interval=int(args.wandb_log_interval),
                 iteration_log_fn=wandb_iteration_log_fn,
                 debug_batch_start=int(args.debug_batch_start),
@@ -2483,7 +2499,7 @@ def main() -> None:
                 mask_loss_interval=max(1, int(args.mask_loss_interval)),
                 mask_loss_interval_scale=bool(args.mask_loss_interval_scale),
             )
-            global_step += len(train_loader)
+            global_step += len(train_loader) * display_step_scale
 
             eval_model = _runtime_unwrap_model(model)
             run_detect = int(args.detect_every) > 0 and ((epoch + 1) % int(args.detect_every) == 0)

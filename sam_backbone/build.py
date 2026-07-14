@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from .image_encoder import ImageEncoderViT
 from .preprocess import astro_preprocess, pad_to_square, per_band_stats
+from .style_conditioning import ImageStyleRouter
 
 
 SAM_ENCODER_CONFIGS: Dict[str, Dict[str, Any]] = {
@@ -281,71 +282,6 @@ def build_per_band_sam_encoder(
         style_prompt_dim=style_prompt_dim,
         style_router_temperature=style_router_temperature,
     )
-
-
-class ImageStyleRouter(nn.Module):
-    """Infer a sample-level processed-image mixture from multi-band texture."""
-
-    def __init__(self, *, num_bands: int) -> None:
-        super().__init__()
-        self.num_bands = int(num_bands)
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=5, stride=2, padding=2, bias=False),
-            nn.GroupNorm(4, 16),
-            nn.SiLU(),
-            _RouterBlock(16, 24),
-            _RouterBlock(24, 32),
-            _RouterBlock(32, 48),
-            nn.Conv2d(48, 32, kernel_size=1, bias=False),
-            nn.GroupNorm(8, 32),
-            nn.SiLU(),
-        )
-        self.classifier = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.SiLU(),
-            nn.Linear(64, 16),
-            nn.SiLU(),
-            nn.Linear(16, 1),
-        )
-
-    def forward(self, image: Tensor) -> Tensor:
-        if image.ndim != 4 or image.shape[1] != self.num_bands:
-            raise ValueError(f"style router expected [B, {self.num_bands}, H, W], got {tuple(image.shape)}")
-        image = torch.nan_to_num(image.float()).clamp(-5.0, 5.0)
-        router_input = torch.stack(
-            (
-                image,
-                image - F.avg_pool2d(image, kernel_size=3, stride=1, padding=1),
-                image - F.avg_pool2d(image, kernel_size=7, stride=1, padding=3),
-            ),
-            dim=2,
-        ).reshape(image.shape[0] * self.num_bands, 3, *image.shape[-2:])
-        features = self.features(router_input)
-        mean = features.mean(dim=(-2, -1))
-        std = features.float().var(dim=(-2, -1), unbiased=False).add(1e-6).sqrt().to(mean.dtype)
-        per_band = torch.cat((mean, std), dim=1).reshape(image.shape[0], self.num_bands, -1)
-        sample = torch.cat(
-            (
-                per_band.mean(dim=1),
-                per_band.float().var(dim=1, unbiased=False).add(1e-6).sqrt().to(per_band.dtype),
-            ),
-            dim=1,
-        )
-        return self.classifier(sample).squeeze(1)
-
-
-class _RouterBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int) -> None:
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels, 3, stride=2, padding=1, groups=in_channels, bias=False),
-            nn.Conv2d(in_channels, out_channels, 1, bias=False),
-            nn.GroupNorm(8 if out_channels % 8 == 0 else 4, out_channels),
-            nn.SiLU(),
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.block(x)
 
 
 def _load_state_dict(checkpoint: str | Path | Mapping[str, Tensor]) -> Mapping[str, Tensor]:

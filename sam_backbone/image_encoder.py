@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from typing import Optional, Sequence, Tuple, Type
 
 from .common import LayerNorm2d, MLPBlock
+from .style_conditioning import ConditionalStyleAdapter
 
 
 # This class and its supporting functions below lightly adapted from the ViTDet backbone available at: https://github.com/facebookresearch/detectron2/blob/main/detectron2/modeling/backbone/vit.py # noqa
@@ -137,33 +138,6 @@ class ImageEncoderViT(nn.Module):
         x = self.neck(x.permute(0, 3, 1, 2))
 
         return x
-
-
-class ConditionalStyleAdapter(nn.Module):
-    """Zero-initialized residual adapter conditioned by a learned style prompt."""
-
-    def __init__(self, embed_dim: int, *, prompt_dim: int, adapter_dim: int) -> None:
-        super().__init__()
-        if prompt_dim <= 0 or adapter_dim <= 0:
-            raise ValueError("prompt_dim and adapter_dim must be positive")
-        self.norm = nn.LayerNorm(embed_dim)
-        self.feature_down = nn.Linear(embed_dim, adapter_dim)
-        self.prompt_down = nn.Linear(prompt_dim, adapter_dim, bias=False)
-        self.activation = nn.GELU()
-        self.up = nn.Linear(adapter_dim, embed_dim)
-        nn.init.zeros_(self.up.weight)
-        nn.init.zeros_(self.up.bias)
-
-    def forward(self, x: torch.Tensor, prompt: Optional[torch.Tensor]) -> torch.Tensor:
-        if prompt is None:
-            raise ValueError("ConditionalStyleAdapter requires a style prompt")
-        if prompt.ndim != 2 or prompt.shape[0] != x.shape[0]:
-            raise ValueError(
-                f"style prompt must be [B, D] with B={x.shape[0]}, got {tuple(prompt.shape)}"
-            )
-        hidden = self.feature_down(self.norm(x))
-        hidden = hidden + self.prompt_down(prompt).to(dtype=hidden.dtype)[:, None, None, :]
-        return x + self.up(self.activation(hidden))
 
 
 class Block(nn.Module):

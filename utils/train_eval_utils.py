@@ -27,8 +27,16 @@ class _DDPModelWrapper(nn.Module):
         super().__init__()
         self._ddp_wrapped_model = model
 
-    def forward(self, image: torch.Tensor) -> dict[str, torch.Tensor]:
-        outputs = self._ddp_wrapped_model(image)
+    def forward(
+        self,
+        image: torch.Tensor,
+        *,
+        processing_ids: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        if processing_ids is None:
+            outputs = self._ddp_wrapped_model(image)
+        else:
+            outputs = self._ddp_wrapped_model(image, processing_ids=processing_ids)
         dummy = image.new_zeros(())
         base_model = unwrap_model(self._ddp_wrapped_model)
         for name in ("EX", "EN", "prompt_encoder", "mask_decoder"):

@@ -16,6 +16,7 @@ from .automatic_mask_generator import SamAutomaticMaskGenerator
 from .build_sam import build_sam, build_sam_vit_b, build_sam_vit_h, build_sam_vit_l, sam_model_registry
 from .decoder import CenterEnhancementNet2D, SamCellectDecoder
 from .image_encoder import ImageEncoderViT
+from .style_conditioning import ConditionalStyleAdapter, ImageStyleRouter
 from .losses import prompt_pred_ratio, sam_prompt_mask_losses
 from .mask_decoder import MaskDecoder
 from .matcher import AstroMatchNet2D, ENNet2D, EXNet2D
@@ -28,6 +29,8 @@ from .transformer import TwoWayTransformer
 
 __all__ = [
     "ImageEncoderViT",
+    "ConditionalStyleAdapter",
+    "ImageStyleRouter",
     "CenterEnhancementNet2D",
     "SAM_ENCODER_CONFIGS",
     "SamCellect2D",
