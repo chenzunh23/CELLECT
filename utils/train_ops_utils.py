@@ -116,7 +116,15 @@ def flatten_per_band_outputs(outputs: Dict[str, Tensor]) -> Dict[str, Tensor]:
     first = next((value for value in outputs.values() if torch.is_tensor(value)), None)
     if first is None or first.ndim != 5:
         return outputs
-    return {key: value.reshape(value.shape[0] * value.shape[1], *value.shape[2:]) for key, value in outputs.items()}
+    batch, bands = first.shape[:2]
+    return {
+        key: (
+            value.reshape(batch * bands, *value.shape[2:])
+            if value.ndim >= 2 and tuple(value.shape[:2]) == (batch, bands)
+            else value
+        )
+        for key, value in outputs.items()
+    }
 
 
 def flatten_band_centers(nested: Sequence[Sequence[Tensor]]) -> List[Tensor]:

@@ -42,6 +42,9 @@ def build_sam_image_encoder(
     patch_size: int = 16,
     out_chans: int = 256,
     strict: bool = False,
+    style_prompt_dim: int = 0,
+    style_prompt_layers: Sequence[int] = (),
+    style_adapter_dim: int = 32,
 ) -> ImageEncoderViT:
     """Build a 512-native SAM image encoder and optionally load SAM weights."""
 
@@ -65,6 +68,9 @@ def build_sam_image_encoder(
         window_size=14,
         in_chans=3,
         out_chans=int(out_chans),
+        style_prompt_dim=int(style_prompt_dim),
+        style_prompt_layers=tuple(style_prompt_layers),
+        style_adapter_dim=int(style_adapter_dim),
     )
     if checkpoint is not None:
         load_sam_encoder_checkpoint(encoder, checkpoint, strict=strict)
@@ -131,6 +137,9 @@ class SamPerBandImageEncoder(nn.Module):
         astro_preprocess_clip_sigma: float = 3.0,
         astro_preprocess_sigma_iters: int = -1,
         astro_preprocess_z_clip: Optional[Tuple[float, float]] = None,
+        style_prompt_enabled: bool = False,
+        style_prompt_dim: int = 32,
+        style_router_temperature: float = 1.0,
     ) -> None:
         super().__init__()
         self.image_encoder = image_encoder
@@ -139,6 +148,20 @@ class SamPerBandImageEncoder(nn.Module):
         self.astro_preprocess_clip_sigma = float(astro_preprocess_clip_sigma)
         self.astro_preprocess_sigma_iters = int(astro_preprocess_sigma_iters)
         self.astro_preprocess_z_clip = astro_preprocess_z_clip
+        self.style_prompt_enabled = bool(style_prompt_enabled)
+        self.style_router_temperature = float(style_router_temperature)
+        if self.style_router_temperature <= 0.0:
+            raise ValueError("style_router_temperature must be positive")
+        if self.style_prompt_enabled:
+            self.style_router = ImageStyleRouter(num_bands=self.num_bands)
+            self.style_prompt_raw = nn.Parameter(torch.empty(int(style_prompt_dim)))
+            self.style_prompt_processed = nn.Parameter(torch.empty(int(style_prompt_dim)))
+            nn.init.normal_(self.style_prompt_raw, std=0.02)
+            nn.init.normal_(self.style_prompt_processed, std=0.02)
+        else:
+            self.style_router = None
+            self.register_parameter("style_prompt_raw", None)
+            self.register_parameter("style_prompt_processed", None)
 
     @property
     def img_size(self) -> int:
@@ -177,11 +200,22 @@ class SamPerBandImageEncoder(nn.Module):
             x = torch.nan_to_num(x.to(dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
 
         processed = x
+        style_logit: Optional[Tensor] = None
+        style_alpha: Optional[Tensor] = None
+        flat_style_prompt: Optional[Tensor] = None
+        if self.style_router is not None:
+            style_logit = self.style_router(processed)
+            style_alpha = torch.sigmoid(style_logit / self.style_router_temperature)
+            sample_prompt = (
+                (1.0 - style_alpha[:, None]) * self.style_prompt_raw[None]
+                + style_alpha[:, None] * self.style_prompt_processed[None]
+            )
+            flat_style_prompt = sample_prompt[:, None, :].expand(-1, bands, -1).reshape(batch * bands, -1)
         stats = per_band_stats(processed) if return_stats else None
         padded = pad_to_square(processed, self.img_size)
         flat = padded.reshape(batch * bands, 1, self.img_size, self.img_size)
         flat_rgb = flat.expand(-1, 3, -1, -1).contiguous()
-        flat_features = self.image_encoder(flat_rgb)
+        flat_features = self.image_encoder(flat_rgb, style_prompt=flat_style_prompt)
         features = flat_features.reshape(batch, bands, *flat_features.shape[1:])
 
         if not return_flat and not return_stats and not return_input:
@@ -200,6 +234,9 @@ class SamPerBandImageEncoder(nn.Module):
             out["per_band_stats"] = stats
         if return_input:
             out["preprocessed_images"] = processed
+        if style_logit is not None and style_alpha is not None:
+            out["style_logit"] = style_logit
+            out["style_alpha"] = style_alpha
         if return_flat:
             out["flat_rgb"] = flat_rgb
         return out
@@ -217,6 +254,11 @@ def build_per_band_sam_encoder(
     astro_preprocess_clip_sigma: float = 3.0,
     astro_preprocess_sigma_iters: int = -1,
     astro_preprocess_z_clip: Optional[Tuple[float, float]] = None,
+    style_prompt_enabled: bool = False,
+    style_prompt_dim: int = 32,
+    style_prompt_layers: Sequence[int] = (),
+    style_adapter_dim: int = 32,
+    style_router_temperature: float = 1.0,
 ) -> SamPerBandImageEncoder:
     encoder = build_sam_image_encoder(
         model_type,
@@ -224,6 +266,9 @@ def build_per_band_sam_encoder(
         image_size=image_size,
         patch_size=patch_size,
         strict=strict,
+        style_prompt_dim=int(style_prompt_dim) if style_prompt_enabled else 0,
+        style_prompt_layers=tuple(style_prompt_layers) if style_prompt_enabled else (),
+        style_adapter_dim=int(style_adapter_dim),
     )
     return SamPerBandImageEncoder(
         encoder,
@@ -232,7 +277,75 @@ def build_per_band_sam_encoder(
         astro_preprocess_clip_sigma=astro_preprocess_clip_sigma,
         astro_preprocess_sigma_iters=astro_preprocess_sigma_iters,
         astro_preprocess_z_clip=astro_preprocess_z_clip,
+        style_prompt_enabled=style_prompt_enabled,
+        style_prompt_dim=style_prompt_dim,
+        style_router_temperature=style_router_temperature,
     )
+
+
+class ImageStyleRouter(nn.Module):
+    """Infer a sample-level processed-image mixture from multi-band texture."""
+
+    def __init__(self, *, num_bands: int) -> None:
+        super().__init__()
+        self.num_bands = int(num_bands)
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=5, stride=2, padding=2, bias=False),
+            nn.GroupNorm(4, 16),
+            nn.SiLU(),
+            _RouterBlock(16, 24),
+            _RouterBlock(24, 32),
+            _RouterBlock(32, 48),
+            nn.Conv2d(48, 32, kernel_size=1, bias=False),
+            nn.GroupNorm(8, 32),
+            nn.SiLU(),
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.SiLU(),
+            nn.Linear(64, 16),
+            nn.SiLU(),
+            nn.Linear(16, 1),
+        )
+
+    def forward(self, image: Tensor) -> Tensor:
+        if image.ndim != 4 or image.shape[1] != self.num_bands:
+            raise ValueError(f"style router expected [B, {self.num_bands}, H, W], got {tuple(image.shape)}")
+        image = torch.nan_to_num(image.float()).clamp(-5.0, 5.0)
+        router_input = torch.stack(
+            (
+                image,
+                image - F.avg_pool2d(image, kernel_size=3, stride=1, padding=1),
+                image - F.avg_pool2d(image, kernel_size=7, stride=1, padding=3),
+            ),
+            dim=2,
+        ).reshape(image.shape[0] * self.num_bands, 3, *image.shape[-2:])
+        features = self.features(router_input)
+        mean = features.mean(dim=(-2, -1))
+        std = features.float().var(dim=(-2, -1), unbiased=False).add(1e-6).sqrt().to(mean.dtype)
+        per_band = torch.cat((mean, std), dim=1).reshape(image.shape[0], self.num_bands, -1)
+        sample = torch.cat(
+            (
+                per_band.mean(dim=1),
+                per_band.float().var(dim=1, unbiased=False).add(1e-6).sqrt().to(per_band.dtype),
+            ),
+            dim=1,
+        )
+        return self.classifier(sample).squeeze(1)
+
+
+class _RouterBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int) -> None:
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, 3, stride=2, padding=1, groups=in_channels, bias=False),
+            nn.Conv2d(in_channels, out_channels, 1, bias=False),
+            nn.GroupNorm(8 if out_channels % 8 == 0 else 4, out_channels),
+            nn.SiLU(),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.block(x)
 
 
 def _load_state_dict(checkpoint: str | Path | Mapping[str, Tensor]) -> Mapping[str, Tensor]:

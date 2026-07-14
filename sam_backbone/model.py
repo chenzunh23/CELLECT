@@ -32,6 +32,7 @@ class SamCellect2D(nn.Module):
         self.decoder = decoder
         self.image_size = int(image_size)
         self.patch_size = int(patch_size)
+        self.supports_processing_ids = True
         image_embedding_size = self.image_size // self.patch_size
         self.prompt_encoder = PromptEncoder(
             embed_dim=256,
@@ -58,6 +59,7 @@ class SamCellect2D(nn.Module):
         *,
         zscale_cache: Optional[Tensor] = None,
         input_is_preprocessed: bool = False,
+        processing_ids: Optional[Tensor] = None,
     ) -> Dict[str, Tensor]:
         encoded = self.encoder(
             x,
@@ -67,8 +69,16 @@ class SamCellect2D(nn.Module):
         )
         features = encoded["features"]
         images = encoded["preprocessed_images"]
-        outputs = self.decoder(features, images=images, output_size=tuple(x.shape[-2:]))
+        outputs = self.decoder(
+            features,
+            images=images,
+            output_size=tuple(x.shape[-2:]),
+            processing_ids=processing_ids,
+        )
         outputs["image_embeddings"] = features
+        if "style_logit" in encoded:
+            outputs["style_logit"] = encoded["style_logit"]
+            outputs["style_alpha"] = encoded["style_alpha"]
         return outputs
 
     def forward_sam_masks(
@@ -151,6 +161,12 @@ def build_sam_cellect2d(
     use_cen: bool = True,
     cen_input_image: bool = True,
     cen_width: int = 8,
+    decoder_denoised_film: bool = False,
+    encoder_style_prompt: bool = False,
+    style_prompt_dim: int = 32,
+    style_prompt_layers: Sequence[int] = (2, 5, 8),
+    style_adapter_dim: int = 32,
+    style_router_temperature: float = 1.0,
     candidate_count: int = 5,
     shape_feature_dim: int = 6,
     enable_matchers: bool = False,
@@ -171,6 +187,11 @@ def build_sam_cellect2d(
         astro_preprocess_clip_sigma=astro_preprocess_clip_sigma,
         astro_preprocess_sigma_iters=astro_preprocess_sigma_iters,
         astro_preprocess_z_clip=astro_preprocess_z_clip,
+        style_prompt_enabled=encoder_style_prompt,
+        style_prompt_dim=style_prompt_dim,
+        style_prompt_layers=style_prompt_layers,
+        style_adapter_dim=style_adapter_dim,
+        style_router_temperature=style_router_temperature,
     )
     decoder = SamCellectDecoder(
         in_channels=256,
@@ -182,6 +203,7 @@ def build_sam_cellect2d(
         use_cen=use_cen,
         cen_input_image=cen_input_image,
         cen_width=cen_width,
+        use_denoised_film=decoder_denoised_film,
     )
     model = SamCellect2D(
         encoder,

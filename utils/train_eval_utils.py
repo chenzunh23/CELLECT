@@ -409,7 +409,13 @@ def sam_optimizer_param_groups(
     for name, param in base_model.named_parameters():
         if not param.requires_grad:
             continue
-        if name.startswith("encoder."):
+        if name.startswith((
+            "encoder.style_router.",
+            "encoder.style_prompt_",
+            "encoder.image_encoder.style_adapters.",
+        )):
+            head_params.append(param)
+        elif name.startswith("encoder."):
             encoder_params.append(param)
         elif name.startswith(("prompt_encoder.", "mask_decoder.")):
             sam_decoder_params.append(param)

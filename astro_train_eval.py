@@ -56,6 +56,7 @@ from astro_train_ops import (
     evaluate_detection,
     generate_pu_pseudo_labels,
     parse_ex_band_pairs,
+    model_forward_with_batch_context,
     run_epoch,
     unwrap_model,
     validate_epoch,
@@ -465,7 +466,7 @@ def _write_eval_sources_csv(
 
     for batch in tqdm(loader, desc="eval-csv", leave=False, disable=not show_progress):
         image = batch["image"].to(device=device, dtype=torch.float32, non_blocking=True)  # type: ignore[union-attr]
-        outputs = model(image)
+        outputs = model_forward_with_batch_context(model, image, batch)
         per_band_outputs = outputs["confidence"].ndim == 5
         if per_band_outputs and use_ex_link_postprocess and hasattr(base_model, "EX"):
             pred_list, components_all = detect_centers_with_ex_link(
@@ -875,6 +876,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--disable-sam-cen",
         action="store_true",
         help="Disable the CELLECT-style CEN confidence module in --model-variant sam_per_band.",
+    )
+    parser.add_argument(
+        "--sam-decoder-film",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable zero-initialized decoder FiLM for denoised samples. Coadd/noisy remain on the identity path. "
+            "When omitted, this is inferred from --checkpoint and otherwise disabled."
+        ),
+    )
+    parser.add_argument(
+        "--sam-encoder-style-prompt",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable image-routed raw/processed prompts in SAM ViT-B blocks 2, 5, and 8. "
+            "The router uses image content at inference; dataset labels are only an auxiliary training target."
+        ),
+    )
+    parser.add_argument("--style-prompt-dim", type=int, default=32)
+    parser.add_argument("--style-adapter-dim", type=int, default=32)
+    parser.add_argument("--style-router-temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--style-router-loss-weight",
+        type=float,
+        default=0.1,
+        help="Balanced denoised-vs-non-denoised auxiliary router loss; effective only with encoder style prompts.",
     )
     parser.add_argument(
         "--single-band-detector",
@@ -1626,6 +1654,9 @@ def main() -> None:
             confidence_pos_weight=float(args.confidence_pos_weight),
             confidence_loss_mode=str(args.confidence_loss_mode),
             confidence_ce_weights=tuple(float(v) for v in args.confidence_ce_weights),
+            style_router_loss_weight=(
+                float(args.style_router_loss_weight) if bool(args.sam_encoder_style_prompt) else 0.0
+            ),
             small_shape_loss_weight=float(args.small_shape_loss_weight),
             small_shape_area_min=float(args.small_shape_area_min),
             small_shape_area_tau=float(args.small_shape_area_tau),
@@ -1893,6 +1924,38 @@ def main() -> None:
         )
 
         if model_variant == "sam_per_band":
+            if args.sam_encoder_style_prompt is None:
+                args.sam_encoder_style_prompt = False
+                if args.checkpoint:
+                    style_ckpt = torch.load(_expand_path(args.checkpoint), map_location="cpu")
+                    style_state = style_ckpt.get("model", style_ckpt) if isinstance(style_ckpt, dict) else style_ckpt
+                    if isinstance(style_state, dict):
+                        args.sam_encoder_style_prompt = any(
+                            "encoder.style_router." in str(key)
+                            or "encoder.image_encoder.style_adapters." in str(key)
+                            for key in style_state
+                        )
+                    del style_ckpt, style_state
+            if args.sam_decoder_film is None:
+                args.sam_decoder_film = False
+                if args.checkpoint:
+                    film_ckpt = torch.load(_expand_path(args.checkpoint), map_location="cpu")
+                    film_state = film_ckpt.get("model", film_ckpt) if isinstance(film_ckpt, dict) else film_ckpt
+                    if isinstance(film_state, dict):
+                        args.sam_decoder_film = any(
+                            "decoder.denoised_film." in str(key) for key in film_state
+                        )
+                    del film_ckpt, film_state
+            if bool(args.sam_encoder_style_prompt) and args.sam_model_type != "vit_b":
+                raise ValueError("--sam-encoder-style-prompt currently supports vit_b only")
+            if bool(args.sam_encoder_style_prompt) and bool(args.sam_decoder_film):
+                raise ValueError("--sam-encoder-style-prompt and --sam-decoder-film cannot be enabled together")
+            weights = replace(
+                weights,
+                style_router_loss_weight=(
+                    float(args.style_router_loss_weight) if bool(args.sam_encoder_style_prompt) else 0.0
+                ),
+            )
             model = build_sam_cellect2d(
                 args.sam_model_type,
                 checkpoint=_expand_path(args.sam_checkpoint) if args.sam_checkpoint else None,
@@ -1912,6 +1975,12 @@ def main() -> None:
                 use_cen=not args.disable_sam_cen,
                 cen_input_image=True,
                 cen_width=max(2, args.base_channels // 4),
+                decoder_denoised_film=bool(args.sam_decoder_film),
+                encoder_style_prompt=bool(args.sam_encoder_style_prompt),
+                style_prompt_dim=int(args.style_prompt_dim),
+                style_prompt_layers=(2, 5, 8),
+                style_adapter_dim=int(args.style_adapter_dim),
+                style_router_temperature=float(args.style_router_temperature),
                 candidate_count=args.matcher_candidate_count,
                 shape_feature_dim=6,
                 enable_matchers=False,
@@ -1952,7 +2021,36 @@ def main() -> None:
         if args.checkpoint:
             ckpt = torch.load(_expand_path(args.checkpoint), map_location=device)
             state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
-            model.load_state_dict(state)
+            if model_variant == "sam_per_band" and (
+                bool(args.sam_decoder_film) or bool(args.sam_encoder_style_prompt)
+            ):
+                incompatible = model.load_state_dict(state, strict=False)
+                allowed_missing_prefixes = []
+                if bool(args.sam_decoder_film):
+                    allowed_missing_prefixes.append("decoder.denoised_film.")
+                if bool(args.sam_encoder_style_prompt):
+                    allowed_missing_prefixes.extend((
+                        "encoder.style_router.",
+                        "encoder.style_prompt_",
+                        "encoder.image_encoder.style_adapters.",
+                    ))
+                invalid_missing = [
+                    key for key in incompatible.missing_keys
+                    if not str(key).startswith(tuple(allowed_missing_prefixes))
+                ]
+                if invalid_missing or incompatible.unexpected_keys:
+                    raise RuntimeError(
+                        "Checkpoint is incompatible with the requested SAM conditioning modules: "
+                        f"missing={invalid_missing}, unexpected={incompatible.unexpected_keys}"
+                    )
+                if incompatible.missing_keys and is_main:
+                    print(
+                        f"Initialized requested SAM conditioning modules; checkpoint omitted "
+                        f"{len(incompatible.missing_keys)} new parameter(s).",
+                        flush=True,
+                    )
+            else:
+                model.load_state_dict(state)
             if hasattr(model, "EX") and hasattr(model, "EN"):
                 if isinstance(ckpt, dict) and ckpt.get("EX") is not None:
                     model.EX.load_state_dict(ckpt["EX"])
@@ -2126,6 +2224,13 @@ def main() -> None:
             "sam_model_type": str(args.sam_model_type) if model_variant == "sam_per_band" else None,
             "sam_checkpoint": str(_expand_path(args.sam_checkpoint)) if model_variant == "sam_per_band" and args.sam_checkpoint else None,
             "sam_cen_enabled": bool(model_variant == "sam_per_band" and not args.disable_sam_cen),
+            "sam_decoder_film": bool(model_variant == "sam_per_band" and args.sam_decoder_film),
+            "sam_encoder_style_prompt": bool(model_variant == "sam_per_band" and args.sam_encoder_style_prompt),
+            "style_prompt_dim": int(args.style_prompt_dim),
+            "style_adapter_dim": int(args.style_adapter_dim),
+            "style_prompt_layers": [2, 5, 8] if bool(args.sam_encoder_style_prompt) else [],
+            "style_router_temperature": float(args.style_router_temperature),
+            "style_router_loss_weight": float(weights.style_router_loss_weight),
             "sam_astro_preprocess_in_model": bool(False) if model_variant == "sam_per_band" else None,
             "sam_compile": bool(model_variant == "sam_per_band" and args.sam_compile),
             "sam_compile_backend": str(args.sam_compile_backend) if model_variant == "sam_per_band" and args.sam_compile else None,
@@ -2253,6 +2358,7 @@ def main() -> None:
                 shape_outer_weight=0.0,
                 center_position=0.0,
                 small_shape_loss_weight=0.0,
+                style_router_loss_weight=0.0,
                 detach_mask_prompt_shapes=True,
             )
 
@@ -2270,6 +2376,8 @@ def main() -> None:
                 filtered["center"] = float(metrics["center"])
             if float(active_weights.small_shape_loss_weight) > 0.0 and "small_shape" in metrics:
                 filtered["small_shape"] = float(metrics["small_shape"])
+            if float(active_weights.style_router_loss_weight) > 0.0 and "style_router" in metrics:
+                filtered["style_router"] = float(metrics["style_router"])
             if bool(args.enable_triplet) and float(active_weights.triplet_outer_weight) > 0.0 and "triplet" in metrics:
                 filtered["triplet"] = float(metrics["triplet"])
             if bool(ex_enabled) and float(active_weights.matcher_outer_weight) > 0.0 and "ex_class" in metrics:

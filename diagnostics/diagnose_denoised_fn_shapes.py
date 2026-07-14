@@ -555,7 +555,7 @@ def _run_record(
         if model is None:
             raise RuntimeError("model is required when not reusing legacy SAM output")
         image = batch["image"].to(device=device, dtype=torch.float32)
-        outputs = model(image)
+        outputs = vis.model_forward_with_batch_context(model, image, batch)
         outputs_i = vis._band_outputs(outputs, band_idx)
         threshold = float(args.threshold if args.threshold is not None else cfg.get("confidence_threshold", 2.0))
         nms_radius = int(args.nms_radius if args.nms_radius is not None else cfg.get("nms_radius", 1))

@@ -22,6 +22,7 @@ if str(CELLECT_ROOT) not in sys.path:
     sys.path.insert(0, str(CELLECT_ROOT))
 
 from astro_train_data import AstroCutoutDataset, collate_cutouts, discover_cutout_records  # noqa: E402
+from astro_train_ops import model_forward_with_batch_context  # noqa: E402
 from sam_backbone import build_sam_cellect2d  # noqa: E402
 
 
@@ -78,6 +79,19 @@ def _make_model(cfg: dict, checkpoint: Path, device: torch.device, bands: Sequen
     if variant != "sam_per_band":
         raise ValueError(f"{checkpoint} is model_variant={variant!r}; expected sam_per_band")
 
+    ckpt = torch.load(checkpoint, map_location=device)
+    state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+    film_from_state = isinstance(state, dict) and any(
+        "decoder.denoised_film." in str(key) for key in state
+    )
+    style_from_state = isinstance(state, dict) and any(
+        "encoder.style_router." in str(key) or "encoder.image_encoder.style_adapters." in str(key)
+        for key in state
+    )
+    style_enabled = bool(
+        top.get("sam_encoder_style_prompt", cfg.get("sam_encoder_style_prompt", False))
+        or style_from_state
+    )
     base_channels = int(top.get("base_channels") or cfg.get("base_channels", 32))
     model = build_sam_cellect2d(
         str(top.get("sam_model_type") or cfg.get("sam_model_type", "vit_b")),
@@ -93,14 +107,22 @@ def _make_model(cfg: dict, checkpoint: Path, device: torch.device, bands: Sequen
         use_cen=bool(top.get("sam_cen_enabled", not bool(cfg.get("disable_sam_cen", False)))),
         cen_input_image=True,
         cen_width=max(2, base_channels // 4),
+        decoder_denoised_film=bool(
+            top.get("sam_decoder_film", cfg.get("sam_decoder_film", False)) or film_from_state
+        ),
+        encoder_style_prompt=style_enabled,
+        style_prompt_dim=int(top.get("style_prompt_dim", cfg.get("style_prompt_dim", 32))),
+        style_prompt_layers=tuple(top.get("style_prompt_layers", cfg.get("style_prompt_layers", (2, 5, 8)))),
+        style_adapter_dim=int(top.get("style_adapter_dim", cfg.get("style_adapter_dim", 32))),
+        style_router_temperature=float(
+            top.get("style_router_temperature", cfg.get("style_router_temperature", 1.0))
+        ),
         candidate_count=int(cfg.get("matcher_candidate_count", 5)),
         shape_feature_dim=6,
         enable_matchers=False,
         astro_preprocess_in_model=False,
     ).to(device)
 
-    ckpt = torch.load(checkpoint, map_location=device)
-    state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     incompatible = model.load_state_dict(_strip_module_prefix(state), strict=False)
     if incompatible.missing_keys or incompatible.unexpected_keys:
         print(
@@ -298,7 +320,7 @@ def main() -> int:
         image = batch["image"].to(device=device, dtype=torch.float32)
         raw = _raw_band_image(batch, band_idx, int(cfg.get("fits_hdu", 1)))
         with torch.no_grad():
-            outputs = model(image)
+            outputs = model_forward_with_batch_context(model, image, batch)
         logits = outputs["confidence"][0, band_idx]
         targets = {
             "band_confidence": batch["band_confidence"][0, band_idx],

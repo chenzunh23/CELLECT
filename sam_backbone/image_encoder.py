@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from typing import Optional, Tuple, Type
+from typing import Optional, Sequence, Tuple, Type
 
 from .common import LayerNorm2d, MLPBlock
 
@@ -33,6 +33,9 @@ class ImageEncoderViT(nn.Module):
         rel_pos_zero_init: bool = True,
         window_size: int = 0,
         global_attn_indexes: Tuple[int, ...] = (),
+        style_prompt_dim: int = 0,
+        style_prompt_layers: Sequence[int] = (),
+        style_adapter_dim: int = 32,
     ) -> None:
         """
         Args:
@@ -86,6 +89,21 @@ class ImageEncoderViT(nn.Module):
             )
             self.blocks.append(block)
 
+        self.style_prompt_layers = tuple(int(index) for index in style_prompt_layers)
+        invalid_layers = [index for index in self.style_prompt_layers if index < 0 or index >= depth]
+        if invalid_layers:
+            raise ValueError(f"style prompt layer indexes are outside [0, {depth}): {invalid_layers}")
+        self.style_adapters = nn.ModuleDict(
+            {
+                str(index): ConditionalStyleAdapter(
+                    embed_dim,
+                    prompt_dim=int(style_prompt_dim),
+                    adapter_dim=int(style_adapter_dim),
+                )
+                for index in self.style_prompt_layers
+            }
+        )
+
         self.neck = nn.Sequential(
             nn.Conv2d(
                 embed_dim,
@@ -104,17 +122,48 @@ class ImageEncoderViT(nn.Module):
             LayerNorm2d(out_chans),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, style_prompt: Optional[torch.Tensor] = None) -> torch.Tensor:
         x = self.patch_embed(x)
         if self.pos_embed is not None:
             x = x + self.pos_embed
 
-        for blk in self.blocks:
+        if self.style_adapters and style_prompt is None:
+            raise ValueError("style_prompt is required when encoder style adapters are enabled")
+        for index, blk in enumerate(self.blocks):
             x = blk(x)
+            if str(index) in self.style_adapters:
+                x = self.style_adapters[str(index)](x, style_prompt)
 
         x = self.neck(x.permute(0, 3, 1, 2))
 
         return x
+
+
+class ConditionalStyleAdapter(nn.Module):
+    """Zero-initialized residual adapter conditioned by a learned style prompt."""
+
+    def __init__(self, embed_dim: int, *, prompt_dim: int, adapter_dim: int) -> None:
+        super().__init__()
+        if prompt_dim <= 0 or adapter_dim <= 0:
+            raise ValueError("prompt_dim and adapter_dim must be positive")
+        self.norm = nn.LayerNorm(embed_dim)
+        self.feature_down = nn.Linear(embed_dim, adapter_dim)
+        self.prompt_down = nn.Linear(prompt_dim, adapter_dim, bias=False)
+        self.activation = nn.GELU()
+        self.up = nn.Linear(adapter_dim, embed_dim)
+        nn.init.zeros_(self.up.weight)
+        nn.init.zeros_(self.up.bias)
+
+    def forward(self, x: torch.Tensor, prompt: Optional[torch.Tensor]) -> torch.Tensor:
+        if prompt is None:
+            raise ValueError("ConditionalStyleAdapter requires a style prompt")
+        if prompt.ndim != 2 or prompt.shape[0] != x.shape[0]:
+            raise ValueError(
+                f"style prompt must be [B, D] with B={x.shape[0]}, got {tuple(prompt.shape)}"
+            )
+        hidden = self.feature_down(self.norm(x))
+        hidden = hidden + self.prompt_down(prompt).to(dtype=hidden.dtype)[:, None, None, :]
+        return x + self.up(self.activation(hidden))
 
 
 class Block(nn.Module):

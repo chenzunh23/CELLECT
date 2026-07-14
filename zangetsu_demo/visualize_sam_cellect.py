@@ -29,7 +29,7 @@ if str(CELLECT_ROOT) not in sys.path:
     sys.path.insert(0, str(CELLECT_ROOT))
 
 from astro_train_data import AstroCutoutDataset, collate_cutouts, discover_cutout_records  # noqa: E402
-from astro_train_ops import detect_centers, unwrap_model  # noqa: E402
+from astro_train_ops import detect_centers, model_forward_with_batch_context, unwrap_model  # noqa: E402
 from astro_train_zarr_data import ZarrCutoutDataset, discover_zarr_records  # noqa: E402
 from sam_backbone import build_sam_cellect2d  # noqa: E402
 
@@ -91,6 +91,19 @@ def _make_model(cfg: dict, checkpoint: Path, device: torch.device, bands: Sequen
     if variant != "sam_per_band":
         raise ValueError(f"{checkpoint} is model_variant={variant!r}; this visualizer expects sam_per_band checkpoints")
 
+    ckpt = torch.load(checkpoint, map_location=device)
+    state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+    film_from_state = isinstance(state, dict) and any(
+        "decoder.denoised_film." in str(key) for key in state
+    )
+    style_from_state = isinstance(state, dict) and any(
+        "encoder.style_router." in str(key) or "encoder.image_encoder.style_adapters." in str(key)
+        for key in state
+    )
+    style_enabled = bool(
+        top.get("sam_encoder_style_prompt", cfg.get("sam_encoder_style_prompt", False))
+        or style_from_state
+    )
     base_channels = int(top.get("base_channels") or cfg.get("base_channels", 32))
     model = build_sam_cellect2d(
         str(top.get("sam_model_type") or cfg.get("sam_model_type", "vit_b")),
@@ -106,14 +119,22 @@ def _make_model(cfg: dict, checkpoint: Path, device: torch.device, bands: Sequen
         use_cen=bool(top.get("sam_cen_enabled", not bool(cfg.get("disable_sam_cen", False)))),
         cen_input_image=True,
         cen_width=max(2, base_channels // 4),
+        decoder_denoised_film=bool(
+            top.get("sam_decoder_film", cfg.get("sam_decoder_film", False)) or film_from_state
+        ),
+        encoder_style_prompt=style_enabled,
+        style_prompt_dim=int(top.get("style_prompt_dim", cfg.get("style_prompt_dim", 32))),
+        style_prompt_layers=tuple(top.get("style_prompt_layers", cfg.get("style_prompt_layers", (2, 5, 8)))),
+        style_adapter_dim=int(top.get("style_adapter_dim", cfg.get("style_adapter_dim", 32))),
+        style_router_temperature=float(
+            top.get("style_router_temperature", cfg.get("style_router_temperature", 1.0))
+        ),
         candidate_count=int(cfg.get("matcher_candidate_count", 5)),
         shape_feature_dim=6,
         enable_matchers=False,
         astro_preprocess_in_model=False,
     ).to(device)
 
-    ckpt = torch.load(checkpoint, map_location=device)
-    state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     incompatible = model.load_state_dict(_strip_module_prefix(state), strict=False)
     if incompatible.missing_keys or incompatible.unexpected_keys:
         print(
@@ -426,7 +447,82 @@ def _load_clean_rows(root: Path, dataset_name: str, band: str, tile_name: str, a
     return rows[keep], x[keep], y[keep], stats
 
 
-def _zarr_clean_rows_from_batch(batch: dict, band_idx: int) -> tuple[Table, np.ndarray, np.ndarray, dict[str, int]]:
+def _zarr_clean_rows_from_batch(
+    batch: dict,
+    band_idx: int,
+    *,
+    visibility_filter: str,
+) -> tuple[Table, np.ndarray, np.ndarray, dict[str, int]]:
+    def _band_array(key: str, dtype) -> np.ndarray | None:
+        nested = batch.get(key, [])
+        if not isinstance(nested, (list, tuple)) or not nested:
+            return None
+        sample = nested[0]
+        if not isinstance(sample, (list, tuple)) or len(sample) <= int(band_idx):
+            return None
+        value = sample[int(band_idx)]
+        if torch.is_tensor(value):
+            return value.detach().cpu().numpy().astype(dtype, copy=False)
+        return np.asarray(value, dtype=dtype)
+
+    shape_centers = _band_array("band_shape_source_centers", np.float32)
+    shape_values = _band_array("band_shape_source_values", np.float32)
+    shape_classes = _band_array("band_shape_source_classes", np.uint8)
+    shape_ids = _band_array("band_shape_source_ids", np.int64)
+    if shape_centers is not None and shape_values is not None and shape_classes is not None:
+        shape_centers = shape_centers.reshape(-1, 2)
+        shape_values = shape_values.reshape(-1, 3)
+        shape_classes = shape_classes.reshape(-1)
+        if not (len(shape_centers) == len(shape_values) == len(shape_classes)):
+            raise ValueError(
+                "Zarr shape source centers, values, and classes must have equal lengths: "
+                f"{len(shape_centers)}, {len(shape_values)}, {len(shape_classes)}"
+            )
+        valid = (
+            np.isfinite(shape_centers).all(axis=1)
+            & np.isfinite(shape_values).all(axis=1)
+            & (shape_values[:, 0] > 0.0)
+            & (shape_values[:, 1] > 0.0)
+            & np.isin(shape_classes, (1, 2))
+        )
+        centers = shape_centers[valid]
+        values = shape_values[valid]
+        classes = shape_classes[valid]
+        ids = None
+        if shape_ids is not None:
+            shape_ids = shape_ids.reshape(-1)
+            if len(shape_ids) != len(shape_centers):
+                raise ValueError(
+                    "Zarr shape source ids must match shape source centers: "
+                    f"{len(shape_ids)} != {len(shape_centers)}"
+                )
+            ids = shape_ids[valid]
+
+        class_names = np.where(classes == 2, "center_only", "clean")
+        keep = np.asarray(
+            [_visibility_keep(str(cls), str(visibility_filter)) for cls in class_names],
+            dtype=bool,
+        )
+        rows = Table()
+        rows["centroid_local_x"] = centers[keep, 0]
+        rows["centroid_local_y"] = centers[keep, 1]
+        rows["ellipse_major_sigma"] = values[keep, 0]
+        rows["ellipse_minor_sigma"] = values[keep, 1]
+        rows["ellipse_theta"] = values[keep, 2]
+        rows["visibility_class"] = class_names[keep]
+        if ids is not None:
+            rows["source_id"] = ids[keep]
+        stats = {
+            "raw_gt": int(len(centers)),
+            "visibility_clean_gt": int(np.count_nonzero(classes == 1)),
+            "visibility_center_only_gt": int(np.count_nonzero(classes == 2)),
+            "visibility_ignore_gt": 0,
+            "filtered_gt": int(np.count_nonzero(keep)),
+        }
+        return rows, centers[keep, 0].copy(), centers[keep, 1].copy(), stats
+
+    # Stores created before source-level shape metadata can only recover clean
+    # centers. Keep the old center-only-free fallback for those stores.
     centers = np.zeros((0, 2), dtype=np.float32)
     try:
         band_centers = batch.get("band_centers", [])
@@ -476,7 +572,11 @@ def _load_clean_rows_for_run(
         if path.exists():
             return _load_clean_rows(candidate_root, dataset_name, band, tile_name, args)
     if str(getattr(args, "data_format", "cutout")) == "zarr":
-        return _zarr_clean_rows_from_batch(batch, band_idx)
+        return _zarr_clean_rows_from_batch(
+            batch,
+            band_idx,
+            visibility_filter=str(args.gt_visibility_filter),
+        )
     tried = ", ".join(str(root / dataset_name / TRACT / PATCH / "band_reference_catalogs" / band / f"meas-{band}-{TRACT}-{PATCH}.fits") for root in seen)
     raise FileNotFoundError(f"Missing reference catalog for {dataset_name}/{PATCH}/{tile_name}/{band}; tried {tried}")
 
@@ -1540,7 +1640,7 @@ def _run_one(
 
     for batch in loader:
         image = batch["image"].to(device=device, dtype=torch.float32)
-        outputs = model(image)
+        outputs = model_forward_with_batch_context(model, image, batch)
         outputs_i = _band_outputs(outputs, band_idx)
         pred_list = detect_centers(
             outputs_i,
@@ -1668,12 +1768,21 @@ def _run_one(
             _ellipse_line(row["x"], row["y"], row["major"], row["minor"], row["theta"], color=color, width=2, text=f"id={idx}")
         )
 
-    fn_lines = REG_HEADER + [f"# {checkpoint_label} {dataset_name} {PATCH}/{tile_name} {band}: clean-source false negatives"]
+    fn_lines = REG_HEADER + [
+        f"# {checkpoint_label} {dataset_name} {PATCH}/{tile_name} {band}: clean/center-only false negatives",
+        "# red=clean FN; magenta=center-only FN",
+    ]
     for gi in range(len(clean_rows)):
         if gi in clean_used:
             continue
-        fn_lines.append(_ellipse_from_row(clean_rows[gi], float(clean_x[gi]), float(clean_y[gi]), "red", width=2))
-        fn_lines.append(_circle_line(float(clean_x[gi]), float(clean_y[gi]), float(args.center_radius), color="red", width=1))
+        row = clean_rows[gi]
+        names = set(row.colnames) if hasattr(row, "colnames") else set()
+        cls = str(row["visibility_class"]) if "visibility_class" in names else "clean"
+        color = "magenta" if cls == "center_only" else "red"
+        fn_lines.append(_ellipse_from_row(row, float(clean_x[gi]), float(clean_y[gi]), color, width=2))
+        fn_lines.append(
+            _circle_line(float(clean_x[gi]), float(clean_y[gi]), float(args.center_radius), color=color, width=1)
+        )
 
     _write_text(mask_reg, mask_lines)
     _write_text(center_reg, center_lines)

@@ -76,6 +76,29 @@ def unwrap_model(model: nn.Module) -> nn.Module:
         return current
 
 
+def model_forward_with_batch_context(
+    model: nn.Module,
+    image: Tensor,
+    batch: Dict[str, object],
+) -> Dict[str, Tensor]:
+    """Forward a model with optional dataset-processing context."""
+
+    base_model = unwrap_model(model)
+    if not bool(getattr(base_model, "supports_processing_ids", False)):
+        return model(image)
+    processing_ids = batch.get("processing_id")
+    if processing_ids is None:
+        sources = batch.get("dataset_source", [])
+        processing_ids = torch.tensor(
+            [1 if str(source).lower() == "denoised" else 0 for source in sources],
+            dtype=torch.long,
+        )
+    if not torch.is_tensor(processing_ids):
+        processing_ids = torch.as_tensor(processing_ids, dtype=torch.long)
+    processing_ids = processing_ids.to(device=image.device, dtype=torch.long, non_blocking=True)
+    return model(image, processing_ids=processing_ids)
+
+
 @dataclass(frozen=True)
 class LossWeights:
     """CELLECT constants carried into the 2D astronomy training loop."""
@@ -87,6 +110,7 @@ class LossWeights:
     confidence_pos_weight: float = 32.0
     confidence_loss_mode: str = "ordinal_legacy"
     confidence_ce_weights: Tuple[float, ...] = (1.0, 4.0, 8.0, 16.0, 32.0)
+    style_router_loss_weight: float = 0.0
     small_shape_loss_weight: float = 0.0
     small_shape_area_min: float = 20.0
     small_shape_area_tau: float = 5.0
@@ -699,7 +723,7 @@ def dense_losses_any(
         flat_batch["seg_loss_weight"] = batch["band_seg_loss_weight"].reshape(
             -1, *batch["band_seg_loss_weight"].shape[2:]
         )  # type: ignore[union-attr]
-    return dense_losses(
+    losses = dense_losses(
         flat_outputs,
         flat_batch,
         weights=weights,
@@ -707,6 +731,34 @@ def dense_losses_any(
         center_radius_px=center_radius_px,
         debug_timer=debug_timer,
     )
+    style_logit = outputs.get("style_logit")
+    if style_logit is None or float(weights.style_router_loss_weight) <= 0.0:
+        style_router_loss = outputs["confidence"].sum() * 0.0
+    else:
+        processing_ids = batch.get("processing_id")
+        if processing_ids is None:
+            processing_ids = torch.tensor(
+                [1 if str(source).lower() == "denoised" else 0 for source in batch.get("dataset_source", [])],
+                device=style_logit.device,
+                dtype=torch.float32,
+            )
+        else:
+            processing_ids = torch.as_tensor(processing_ids, device=style_logit.device, dtype=torch.float32)
+        per_sample = F.binary_cross_entropy_with_logits(
+            style_logit.float().reshape(-1),
+            processing_ids.reshape(-1),
+            reduction="none",
+        )
+        positive = processing_ids.reshape(-1) > 0.5
+        if bool(positive.any()) and bool((~positive).any()):
+            style_router_loss = 0.5 * per_sample[positive].mean() + 0.5 * per_sample[~positive].mean()
+        else:
+            style_router_loss = per_sample.mean()
+    losses["style_router"] = style_router_loss
+    losses["total"] = losses["total"] + float(weights.style_router_loss_weight) * style_router_loss
+    if debug_timer is not None:
+        debug_timer("dense.style_router")
+    return losses
 
 
 def center_localization_loss(outputs: Dict[str, Tensor], centers_list: Sequence[Tensor], *, radius_px: float) -> Tensor:
@@ -2068,7 +2120,7 @@ def generate_pu_pseudo_labels(
 
     for batch in tqdm(loader, desc="pu-pseudo-detect", leave=False, disable=not show_progress):
         images = batch["image"].to(device=device, dtype=torch.float32, non_blocking=True)  # type: ignore[union-attr]
-        outputs = model(images)
+        outputs = model_forward_with_batch_context(model, images, batch)
         if outputs["seg_logits"].ndim == 5:
             flat_outputs = _flatten_per_band_outputs(outputs)
             detection_items = detect_centers_with_scores(
@@ -2731,6 +2783,7 @@ def run_epoch(
         "shape": 0.0,
         "center": 0.0,
         "small_shape": 0.0,
+        "style_router": 0.0,
         "triplet": 0.0,
         "ex_class": 0.0,
         "en_class": 0.0,
@@ -2876,7 +2929,7 @@ def run_epoch(
         t_transfer = time.perf_counter()
         _phase_debug(debug_print, "h2d", t_transfer - t0)
         with _autocast_context(device, amp_dtype):
-            outputs = model(image)
+            outputs = model_forward_with_batch_context(model, image, batch)
             _sync_debug(debug_this_batch)
             t_forward = time.perf_counter()
             _phase_debug(debug_print, "forward", t_forward - t_transfer)
@@ -3005,6 +3058,7 @@ def run_epoch(
         sums["shape"] += float(losses["shape"].detach()) * batch_size
         sums["center"] += float(losses["center"].detach()) * batch_size
         sums["small_shape"] += float(losses["small_shape"].detach()) * batch_size
+        sums["style_router"] += float(losses["style_router"].detach()) * batch_size
         sums["triplet"] += float(triplet.detach()) * batch_size
         sums["ex_class"] += float(ex_class.detach()) * batch_size
         sums["en_class"] += float(en_class.detach()) * batch_size
@@ -3044,6 +3098,11 @@ def run_epoch(
                 local_metrics["loss/center"] = float(losses["center"].detach())
             if float(weights.small_shape_loss_weight) > 0.0:
                 local_metrics["loss/small_shape"] = float(losses["small_shape"].detach())
+            if float(weights.style_router_loss_weight) > 0.0:
+                local_metrics["loss/style_router"] = float(losses["style_router"].detach())
+                style_alpha = outputs.get("style_alpha")
+                if style_alpha is not None:
+                    local_metrics["style/alpha_mean"] = float(style_alpha.detach().float().mean())
             if triplet_enabled and float(weights.triplet_outer_weight) > 0.0:
                 local_metrics["loss/triplet"] = float(triplet.detach())
             if ex_enabled and float(weights.matcher_outer_weight) > 0.0:
@@ -3163,6 +3222,7 @@ def validate_epoch(
         "shape": 0.0,
         "center": 0.0,
         "small_shape": 0.0,
+        "style_router": 0.0,
         "triplet": 0.0,
         "ex_class": 0.0,
         "en_class": 0.0,
@@ -3188,7 +3248,7 @@ def validate_epoch(
     for batch in tqdm(loader, desc=desc, leave=False, disable=not show_progress):
         image = batch["image"].to(device=device, dtype=torch.float32, non_blocking=True)
         with _autocast_context(device, amp_dtype):
-            outputs = model(image)
+            outputs = model_forward_with_batch_context(model, image, batch)
             losses = dense_losses_any(outputs, batch, weights=weights, device=device, center_radius_px=center_radius_px)
             total = losses["total"]
             mask_losses = sam_prompt_mask_losses(
@@ -3285,6 +3345,7 @@ def validate_epoch(
         sums["shape"] += float(losses["shape"].detach()) * batch_size
         sums["center"] += float(losses["center"].detach()) * batch_size
         sums["small_shape"] += float(losses["small_shape"].detach()) * batch_size
+        sums["style_router"] += float(losses["style_router"].detach()) * batch_size
         sums["triplet"] += float(triplet.detach()) * batch_size
         sums["ex_class"] += float(ex_class.detach()) * batch_size
         sums["en_class"] += float(en_class.detach()) * batch_size
@@ -3359,7 +3420,7 @@ def evaluate_detection(
     totals = _init_detection_totals(band_names, collect_candidate_stats=collect_candidate_stats)
     for batch in tqdm(loader, desc="detect", leave=False, disable=not show_progress):
         image = batch["image"].to(device=device, dtype=torch.float32, non_blocking=True)
-        outputs = model(image)
+        outputs = model_forward_with_batch_context(model, image, batch)
         _update_detection_totals(
             totals,
             base_model,

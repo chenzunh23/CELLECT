@@ -1846,6 +1846,10 @@ def collate_cutouts(batch: Sequence[Dict[str, object]]) -> Dict[str, object]:
         "patch": [item["patch"] for item in batch],
         "relative_root": [item["relative_root"] for item in batch],
         "dataset_source": [item["dataset_source"] for item in batch],
+        "processing_id": torch.tensor(
+            [1 if str(item["dataset_source"]).lower() == "denoised" else 0 for item in batch],
+            dtype=torch.long,
+        ),
         "x0": [item["x0"] for item in batch],
         "y0": [item["y0"] for item in batch],
         "image_paths": [item["image_paths"] for item in batch],

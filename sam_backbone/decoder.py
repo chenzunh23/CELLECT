@@ -41,6 +41,25 @@ def _norm_lrelu_upscale_conv_norm_lrelu(in_ch: int, out_ch: int) -> nn.Sequentia
     )
 
 
+class DenoisedFiLM2d(nn.Module):
+    """Apply a learned channel-wise affine transform to denoised samples only."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.gamma = nn.Parameter(torch.zeros(int(channels)))
+        self.beta = nn.Parameter(torch.zeros(int(channels)))
+
+    def forward(self, x: Tensor, processing_ids: Tensor) -> Tensor:
+        if processing_ids.ndim != 1 or processing_ids.shape[0] != x.shape[0]:
+            raise ValueError(
+                f"processing_ids must have shape ({x.shape[0]},), got {tuple(processing_ids.shape)}"
+            )
+        denoised = (processing_ids == 1).to(device=x.device, dtype=x.dtype).view(-1, 1, 1, 1)
+        gamma = self.gamma.to(dtype=x.dtype).view(1, -1, 1, 1)
+        beta = self.beta.to(dtype=x.dtype).view(1, -1, 1, 1)
+        return x * (1.0 + denoised * gamma) + denoised * beta
+
+
 class CenterEnhancementNet2D(nn.Module):
     """CELLECT-style 2D center enhancement network.
 
@@ -145,6 +164,7 @@ class SamCellectDecoder(nn.Module):
         use_cen: bool = True,
         cen_input_image: bool = True,
         cen_width: int = 8,
+        use_denoised_film: bool = False,
     ) -> None:
         super().__init__()
         if len(tuple(decoder_channels)) != 4:
@@ -155,6 +175,7 @@ class SamCellectDecoder(nn.Module):
         self.shape_channels = int(shape_channels)
         self.use_cen = bool(use_cen)
         self.cen_input_image = bool(cen_input_image)
+        self.use_denoised_film = bool(use_denoised_film)
         self.pred_channels = self.shape_channels
 
         c1, c2, c3, c4 = [int(ch) for ch in decoder_channels]
@@ -164,6 +185,20 @@ class SamCellectDecoder(nn.Module):
         self.up3 = _norm_lrelu_upscale_conv_norm_lrelu(c2, c3)
         self.up4 = _norm_lrelu_upscale_conv_norm_lrelu(c3, c4)
         self.refine = _conv_norm_lrelu(c4, c4)
+
+        film_channels = {
+            "stem": c1,
+            "up1": c1,
+            "up2": c2,
+            "up3": c3,
+            "up4": c4,
+            "refine": c4,
+        }
+        self.denoised_film = nn.ModuleDict(
+            {name: DenoisedFiLM2d(channels) for name, channels in film_channels.items()}
+            if self.use_denoised_film
+            else {}
+        )
 
         self.confidence_head = nn.Conv2d(c4, self.confidence_levels, kernel_size=1, bias=False)
         self.shape_refine = _conv_norm_lrelu(c4 + self.confidence_levels, c4)
@@ -175,6 +210,7 @@ class SamCellectDecoder(nn.Module):
         *,
         images: Optional[Tensor] = None,
         output_size: Optional[Tuple[int, int]] = None,
+        processing_ids: Optional[Tensor] = None,
     ) -> Dict[str, Tensor]:
         per_band = image_embeddings.ndim == 5
         if per_band:
@@ -190,12 +226,20 @@ class SamCellectDecoder(nn.Module):
         else:
             raise ValueError(f"SamCellectDecoder expects 4D or 5D features, got {tuple(image_embeddings.shape)}")
 
-        out = self.stem(flat)
-        out = self.up1(out)
-        ds2 = self.up2(out)
-        ds3 = self.up3(ds2)
-        out = self.up4(ds3)
-        out = self.refine(out)
+        flat_processing_ids = self._flatten_processing_ids(
+            processing_ids,
+            batch=batch,
+            bands=bands,
+            flat_batch=int(flat.shape[0]),
+            device=flat.device,
+        )
+
+        out = self._forward_film_stage("stem", self.stem, flat, flat_processing_ids)
+        out = self._forward_film_stage("up1", self.up1, out, flat_processing_ids)
+        ds2 = self._forward_film_stage("up2", self.up2, out, flat_processing_ids)
+        ds3 = self._forward_film_stage("up3", self.up3, ds2, flat_processing_ids)
+        out = self._forward_film_stage("up4", self.up4, ds3, flat_processing_ids)
+        out = self._forward_film_stage("refine", self.refine, out, flat_processing_ids)
 
         confidence = self.confidence_head(out)
         target_size = tuple(output_size) if output_size is not None else tuple(confidence.shape[-2:])
@@ -217,6 +261,48 @@ class SamCellectDecoder(nn.Module):
                 for key, value in outputs.items()
             }
         return outputs
+
+    def _forward_film_stage(
+        self,
+        name: str,
+        stage: nn.Sequential,
+        x: Tensor,
+        processing_ids: Tensor,
+    ) -> Tensor:
+        if not self.use_denoised_film:
+            return stage(x)
+        # Every decoder stage ends in normalization + activation. Modulate
+        # between them so the next stage's normalization cannot cancel FiLM.
+        last_index = len(stage) - 1
+        for index, layer in enumerate(stage):
+            if index == last_index:
+                x = self.denoised_film[name](x, processing_ids)
+            x = layer(x)
+        return x
+
+    @staticmethod
+    def _flatten_processing_ids(
+        processing_ids: Optional[Tensor],
+        *,
+        batch: Optional[int],
+        bands: Optional[int],
+        flat_batch: int,
+        device: torch.device,
+    ) -> Tensor:
+        if processing_ids is None:
+            return torch.zeros(flat_batch, device=device, dtype=torch.long)
+        ids = processing_ids.to(device=device, dtype=torch.long, non_blocking=True)
+        if batch is not None and bands is not None:
+            if ids.ndim == 1 and ids.shape[0] == batch:
+                ids = ids[:, None].expand(batch, bands)
+            elif ids.ndim != 2 or tuple(ids.shape) != (batch, bands):
+                raise ValueError(
+                    f"processing_ids must be [B] or [B, bands] for per-band features, got {tuple(ids.shape)}"
+                )
+            ids = ids.reshape(flat_batch)
+        elif ids.ndim != 1 or ids.shape[0] != flat_batch:
+            raise ValueError(f"processing_ids must have shape ({flat_batch},), got {tuple(ids.shape)}")
+        return ids
 
     def _shape_from_raw(self, raw_shape: Tensor) -> Tensor:
         if self.shape_channels >= 2:
