@@ -84,6 +84,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", "-c", type=Path, action="append", default=None, help="Can be passed multiple times")
     parser.add_argument("--checkpoint-label", "-l", action="append", default=None, help="One label per --checkpoint")
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
+    parser.add_argument("--data-format", choices=("cutout", "zarr"), default="cutout")
+    parser.add_argument(
+        "--reference-root",
+        type=Path,
+        default=None,
+        help="Optional legacy preprocessed root containing GT catalogs when --data-format=zarr.",
+    )
+    parser.add_argument(
+        "--catalog-root",
+        type=Path,
+        default=None,
+        help="Unfiltered source catalog root joined to authoritative Zarr source IDs for magnitude metrics.",
+    )
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--datasets", nargs="+", default=list(DEFAULT_DATASETS))
     parser.add_argument("--tract", default="9813")
@@ -155,6 +168,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--multimask", action="store_true", default=None)
     parser.add_argument("--singlemask", dest="multimask", action="store_false")
     parser.add_argument("--mask-chunk-size", type=int, default=128)
+    parser.add_argument(
+        "--skip-mask-decoder",
+        action="store_true",
+        help="Skip SAM mask decoding; completeness/purity and fixed-aperture magnitudes remain available.",
+    )
     parser.add_argument("--mask-threshold", type=float, default=0.0)
     parser.add_argument("--min-mask-area", type=int, default=15)
     parser.add_argument("--max-mask-area-ratio", type=float, default=0.50)
@@ -235,6 +253,21 @@ def _mag_in(values: np.ndarray, lo: float, hi: float) -> np.ndarray:
 
 
 def _discover_tiles(args: argparse.Namespace, dataset_name: str) -> list[str]:
+    if str(getattr(args, "data_format", "cutout")) == "zarr":
+        records = vis.discover_zarr_records(args.data_root, bands=args.bands)
+        group_prefix = f"group_{int(args.group):02d}_" if str(args.group).lower() != "all" else ""
+        if dataset_name == "coadd":
+            group_prefix = ""
+        tiles = sorted(
+            {
+                rec.tile_name
+                for rec in records
+                if str(rec.dataset_source) == str(dataset_name)
+                and rec.patch == args.patch
+                and (not group_prefix or rec.tile_name.startswith(group_prefix))
+            }
+        )
+        return tiles[: int(args.max_tiles)] if args.max_tiles is not None else tiles
     if dataset_name == "coadd":
         tract_root = args.data_root / args.tract
     else:
@@ -301,7 +334,12 @@ def _load_clean_rows_compat(
     tile_name: str,
     args: argparse.Namespace | None = None,
 ):
-    for path in _clean_catalog_candidates(root, dataset_name, band, tile_name):
+    catalog_root = (
+        Path(args.reference_root)
+        if args is not None and getattr(args, "reference_root", None) is not None
+        else root
+    )
+    for path in _clean_catalog_candidates(catalog_root, dataset_name, band, tile_name):
         if path.exists():
             rows, x, y = vis._local_rows(_table(path), tile_name)
             if args is None:
@@ -314,7 +352,7 @@ def _load_clean_rows_compat(
                 }
                 return rows, x, y, stats
             points = np.column_stack([x, y]).astype(np.float32) if len(x) else np.zeros((0, 2), dtype=np.float32)
-            center_only, ignored = _visibility_centers(root, dataset_name, band, tile_name)
+            center_only, ignored = _visibility_centers(catalog_root, dataset_name, band, tile_name)
             radius = float(getattr(args, "gt_visibility_match_radius", 1.0))
             ignored_match = _within_any_radius(points, ignored, radius)
             center_only_match = _within_any_radius(points, center_only, radius) & ~ignored_match
@@ -333,7 +371,7 @@ def _load_clean_rows_compat(
             # Keep raw row order so photometry gt_index matches gt_photometry.csv.
             # Visibility filtering is applied later in metric aggregation.
             return rows, x, y, stats
-    searched = "\n  ".join(str(path) for path in _clean_catalog_candidates(root, dataset_name, band, tile_name))
+    searched = "\n  ".join(str(path) for path in _clean_catalog_candidates(catalog_root, dataset_name, band, tile_name))
     raise FileNotFoundError(f"No GT catalog found for {dataset_name}/{vis.PATCH}/{tile_name}/{band}. Searched:\n  {searched}")
 
 
@@ -399,8 +437,19 @@ def _dataset_compat(
     cfg: dict,
     image_cache_dir: Path | None = None,
     tile_name: str | None = None,
+    data_format: str = "cutout",
 ):
     tile = str(tile_name) if tile_name else str(vis.TILE)
+    if str(data_format) == "zarr":
+        return vis._ORIGINAL_DATASET(
+            root,
+            dataset_name,
+            bands,
+            cfg,
+            image_cache_dir=image_cache_dir,
+            tile_name=tile,
+            data_format="zarr",
+        )
     tile_dirs = [
         root / dataset_name / vis.TRACT / vis.PATCH / "cutouts" / tile,
         root / vis.TRACT / vis.PATCH / "cutouts" / tile,
@@ -414,6 +463,7 @@ def _dataset_compat(
             cfg,
             image_cache_dir=image_cache_dir,
             tile_name=tile,
+            data_format="cutout",
         )
     image_paths: list[str] = []
     for band in bands:
@@ -425,7 +475,17 @@ def _dataset_compat(
         image_paths.append(str(matches[0]))
     image_np = read_fits_bands(tuple(image_paths), hdu=int(cfg.get("fits_hdu", 1)))
     image = astro_zscale_preprocess(image_np).to(dtype=torch.float32)
-    return [{"image": image.unsqueeze(0), "image_paths": tuple(image_paths)}]
+    return [
+        {
+            "image": image.unsqueeze(0),
+            "image_paths": [tuple(image_paths)],
+            "dataset_source": [str(dataset_name)],
+            "processing_id": torch.tensor(
+                [1 if str(dataset_name).lower() == "denoised" else 0],
+                dtype=torch.long,
+            ),
+        }
+    ]
 
 
 def _install_visualizer_io_patch() -> None:
@@ -477,6 +537,7 @@ def _resolve_visual_defaults(args: argparse.Namespace, cfg: dict) -> None:
     args.native_sam_dir = None
     args.native_sam_dataset = "coadd"
     args.native_match_radius = args.match_radius
+    args.return_gt_metric_rows = True
 
 
 def _disable_visual_products() -> None:
@@ -494,9 +555,10 @@ def _gt_mag_rows(args: argparse.Namespace, dataset_name: str, tile_name: str) ->
     vis.TRACT = args.tract
     vis.PATCH = args.patch
     vis.TILE = tile_name
-    rows, x, y, _stats = vis._load_clean_rows(args.data_root, dataset_name, args.band, tile_name)
+    reference_root = args.reference_root if getattr(args, "reference_root", None) is not None else args.data_root
+    rows, x, y, _stats = vis._load_clean_rows(reference_root, dataset_name, args.band, tile_name)
     gt_xy = np.column_stack([x, y]).astype(np.float32) if len(x) else np.zeros((0, 2), dtype=np.float32)
-    center_only_xy, ignore_xy = _visibility_centers(args.data_root, dataset_name, args.band, tile_name)
+    center_only_xy, ignore_xy = _visibility_centers(reference_root, dataset_name, args.band, tile_name)
     ignore_mask = _within_any_radius(gt_xy, ignore_xy, float(args.gt_visibility_match_radius))
     center_only_mask = _within_any_radius(gt_xy, center_only_xy, float(args.gt_visibility_match_radius)) & ~ignore_mask
     out: list[dict[str, object]] = []
@@ -554,9 +616,10 @@ def _run_tile_local(
         )
     finally:
         args.tile_name = previous_tile_name
+    embedded_gt_rows = row.pop("_gt_metric_rows", None)
     row["checkpoint"] = str(checkpoint)
     row["checkpoint_epoch"] = vis._checkpoint_epoch(checkpoint)
-    tile_gt_rows = _gt_mag_rows(args, dataset_name, tile_name)
+    tile_gt_rows = embedded_gt_rows if embedded_gt_rows is not None else _gt_mag_rows(args, dataset_name, tile_name)
     raw_gt_count = len(tile_gt_rows)
     filtered_gt_count = sum(
         1
@@ -1342,6 +1405,10 @@ def main() -> int:
     args = _parse_args()
     args.ckpt_dir = args.ckpt_dir.expanduser().resolve()
     args.data_root = args.data_root.expanduser().resolve()
+    if args.reference_root is not None:
+        args.reference_root = args.reference_root.expanduser().resolve()
+    if args.catalog_root is not None:
+        args.catalog_root = args.catalog_root.expanduser().resolve()
     args.out_dir = args.out_dir.expanduser().resolve()
     args.out_dir.mkdir(parents=True, exist_ok=True)
     if os.environ.get("CELLECT_DEBUG_IMPORT"):
@@ -1412,6 +1479,13 @@ def main() -> int:
 
     manifest = {
         "data_root": str(args.data_root),
+        "data_format": str(args.data_format),
+        "reference_root": None if args.reference_root is None else str(args.reference_root),
+        "catalog_root": None if args.catalog_root is None else str(args.catalog_root),
+        "gt_classification_source": (
+            "zarr_shape_source_classes" if str(args.data_format) == "zarr" and str(args.gt_visibility_filter) != "raw"
+            else "reference_catalog_visibility"
+        ),
         "out_dir": str(args.out_dir),
         "datasets": list(args.datasets),
         "tract": args.tract,
@@ -1431,6 +1505,8 @@ def main() -> int:
         "tile_worker_devices": list(args.tile_worker_devices or []),
         "gt_flux_scale_for_ratios": float(args.gt_flux_scale_for_ratios),
         "reverse_mag_axis": bool(args.reverse_mag_axis),
+        "skip_mask_decoder": bool(args.skip_mask_decoder),
+        "mask_photometry_available": not bool(args.skip_mask_decoder),
     }
     (args.out_dir / "evaluation_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     print(f"wrote {args.out_dir}", flush=True)

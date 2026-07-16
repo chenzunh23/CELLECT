@@ -424,7 +424,11 @@ def _visibility_keep(cls: str, mode: str) -> bool:
 
 
 def _load_clean_rows(root: Path, dataset_name: str, band: str, tile_name: str, args: argparse.Namespace) -> tuple[Table, np.ndarray, np.ndarray, dict[str, int]]:
-    path = root / dataset_name / TRACT / PATCH / "band_reference_catalogs" / band / f"meas-{band}-{TRACT}-{PATCH}.fits"
+    candidates = [
+        root / dataset_name / TRACT / PATCH / "band_reference_catalogs" / band / f"meas-{band}-{TRACT}-{PATCH}.fits",
+        root / TRACT / PATCH / "band_reference_catalogs" / band / f"meas-{band}-{TRACT}-{PATCH}.fits",
+    ]
+    path = next((candidate for candidate in candidates if candidate.exists()), candidates[0])
     rows, x, y = _local_rows(_table(path), tile_name)
     points = np.column_stack([x, y]).astype(np.float32) if len(x) else np.zeros((0, 2), dtype=np.float32)
     center_only, ignored = _visibility_centers(root, dataset_name, band, tile_name)
@@ -547,6 +551,40 @@ def _zarr_clean_rows_from_batch(
     return rows, centers[:, 0].copy(), centers[:, 1].copy(), stats
 
 
+def _enrich_zarr_rows_from_catalog(
+    rows: Table,
+    args: argparse.Namespace,
+    band: str,
+) -> Table:
+    """Join authoritative Zarr classes/centers to the unfiltered source catalog."""
+
+    if "source_id" not in rows.colnames:
+        return rows
+    catalog_root = getattr(args, "catalog_root", None)
+    if catalog_root is None:
+        return rows
+    root = Path(catalog_root).expanduser().resolve()
+    candidates = [
+        root / TRACT / band / PATCH / f"meas-{band}-{TRACT}-{PATCH}.fits",
+        root / band / PATCH / f"meas-{band}-{TRACT}-{PATCH}.fits",
+        root / TRACT / PATCH / "band_reference_catalogs" / band / f"meas-{band}-{TRACT}-{PATCH}.fits",
+    ]
+    path = next((candidate for candidate in candidates if candidate.exists()), None)
+    if path is None:
+        return rows
+    catalog = _table(path)
+    if "id" not in catalog.colnames:
+        return rows
+    index_by_id = {int(source_id): idx for idx, source_id in enumerate(catalog["id"])}
+    source_ids = np.asarray(rows["source_id"], dtype=np.int64)
+    if not all(int(source_id) in index_by_id for source_id in source_ids):
+        return rows
+    enriched = catalog[[index_by_id[int(source_id)] for source_id in source_ids]].copy()
+    for name in rows.colnames:
+        enriched[name] = rows[name]
+    return enriched
+
+
 def _load_clean_rows_for_run(
     root: Path,
     dataset_name: str,
@@ -557,6 +595,14 @@ def _load_clean_rows_for_run(
     batch: dict,
     band_idx: int,
 ) -> tuple[Table, np.ndarray, np.ndarray, dict[str, int]]:
+    if str(getattr(args, "data_format", "cutout")) == "zarr" and str(args.gt_visibility_filter) != "raw":
+        rows, x, y, stats = _zarr_clean_rows_from_batch(
+            batch,
+            band_idx,
+            visibility_filter=str(args.gt_visibility_filter),
+        )
+        rows = _enrich_zarr_rows_from_catalog(rows, args, band)
+        return rows, x, y, stats
     reference_root = getattr(args, "reference_root", None)
     roots = []
     if reference_root is not None:
@@ -568,8 +614,11 @@ def _load_clean_rows_for_run(
         if candidate_root in seen:
             continue
         seen.add(candidate_root)
-        path = candidate_root / dataset_name / TRACT / PATCH / "band_reference_catalogs" / band / f"meas-{band}-{TRACT}-{PATCH}.fits"
-        if path.exists():
+        paths = [
+            candidate_root / dataset_name / TRACT / PATCH / "band_reference_catalogs" / band / f"meas-{band}-{TRACT}-{PATCH}.fits",
+            candidate_root / TRACT / PATCH / "band_reference_catalogs" / band / f"meas-{band}-{TRACT}-{PATCH}.fits",
+        ]
+        if any(path.exists() for path in paths):
             return _load_clean_rows(candidate_root, dataset_name, band, tile_name, args)
     if str(getattr(args, "data_format", "cutout")) == "zarr":
         return _zarr_clean_rows_from_batch(
@@ -577,7 +626,14 @@ def _load_clean_rows_for_run(
             band_idx,
             visibility_filter=str(args.gt_visibility_filter),
         )
-    tried = ", ".join(str(root / dataset_name / TRACT / PATCH / "band_reference_catalogs" / band / f"meas-{band}-{TRACT}-{PATCH}.fits") for root in seen)
+    tried = ", ".join(
+        str(path)
+        for candidate_root in seen
+        for path in (
+            candidate_root / dataset_name / TRACT / PATCH / "band_reference_catalogs" / band / f"meas-{band}-{TRACT}-{PATCH}.fits",
+            candidate_root / TRACT / PATCH / "band_reference_catalogs" / band / f"meas-{band}-{TRACT}-{PATCH}.fits",
+        )
+    )
     raise FileNotFoundError(f"Missing reference catalog for {dataset_name}/{PATCH}/{tile_name}/{band}; tried {tried}")
 
 
@@ -765,6 +821,36 @@ def _raw_band_image_from_batch(batch: dict, band_idx: int, cfg: dict) -> tuple[n
             return None, "batch_image"
     raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
     return raw, str(path)
+
+
+def _raw_band_image_from_reference(
+    args: argparse.Namespace,
+    dataset_name: str,
+    tile_name: str,
+    band: str,
+    cfg: dict,
+) -> tuple[np.ndarray | None, str]:
+    reference_root = getattr(args, "reference_root", None)
+    if reference_root is None:
+        return None, "batch_image"
+    root = Path(reference_root).expanduser().resolve()
+    tile_dirs = [
+        root / dataset_name / TRACT / PATCH / "cutouts" / tile_name / band,
+        root / TRACT / PATCH / "cutouts" / tile_name / band,
+    ]
+    for tile_dir in tile_dirs:
+        for path in sorted(tile_dir.glob("*.fits")):
+            hdu = int(cfg.get("fits_hdu", 1))
+            try:
+                raw = np.asarray(fits.getdata(path, hdu), dtype=np.float32)
+            except Exception:
+                try:
+                    raw = np.asarray(fits.getdata(path, "IMAGE"), dtype=np.float32)
+                except Exception:
+                    continue
+            raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+            return raw, str(path)
+    return None, "batch_image"
 
 
 PHOTOMETRY_COLUMNS = [
@@ -1654,6 +1740,14 @@ def _run_one(
         shape = outputs_i["shape"][0].detach().float().cpu().numpy().astype(np.float32)
         image_band = image[0, band_idx].detach().cpu().numpy().astype(np.float32)
         raw_band, photometry_image_source = _raw_band_image_from_batch(batch, band_idx, cfg)
+        if raw_band is None:
+            raw_band, photometry_image_source = _raw_band_image_from_reference(
+                args,
+                dataset_name,
+                tile_name,
+                band,
+                cfg,
+            )
         photometry_image_band = raw_band if raw_band is not None else image_band
         image_embeddings = outputs["image_embeddings"]
         break
@@ -1669,7 +1763,7 @@ def _run_one(
     mask_area_median: float | None = None
     mask_iou_median: float | None = None
     mask_stability_median: float | None = None
-    if shape_rows:
+    if shape_rows and not bool(getattr(args, "skip_mask_decoder", False)):
         points = torch.tensor([[row["x"], row["y"]] for row in shape_rows], device=device, dtype=torch.float32)
         boxes = None
         if not bool(args.mask_prompt_center_only):
@@ -1852,6 +1946,29 @@ def _run_one(
         )
         native_reg_path = str(native_diff_reg)
 
+    gt_metric_rows: list[dict[str, object]] | None = None
+    if bool(getattr(args, "return_gt_metric_rows", False)):
+        gt_metric_rows = []
+        for gt_index, row in enumerate(clean_rows):
+            names = set(row.colnames) if hasattr(row, "colnames") else set()
+            visibility_class = str(row["visibility_class"]) if "visibility_class" in names else "clean"
+            ap_flux, ap_mag = _gt_ap2_flux_mag(row, zero_point=float(args.gt_photometry_zero_point))
+            kron_flux, kron_mag = _gt_kron_flux_mag(row, zero_point=float(args.gt_photometry_zero_point))
+            gt_metric_rows.append(
+                {
+                    "dataset": dataset_name,
+                    "tile": tile_name,
+                    "gt_index": int(gt_index),
+                    "gt_ap2_flux": ap_flux,
+                    "gt_ap2mag": ap_mag,
+                    "gt_kron_flux": kron_flux,
+                    "gt_kron_mag": kron_mag,
+                    "visibility_class": visibility_class,
+                    "visibility_keep_snr_ge2": int(visibility_class in {"clean", "center_only"}),
+                    "visibility_keep_snr_ge3": int(visibility_class == "clean"),
+                }
+            )
+
     return {
         "checkpoint_label": checkpoint_label,
         "dataset": dataset_name,
@@ -1897,6 +2014,7 @@ def _run_one(
         "snr_csv": None if snr_summary is None else snr_summary["outputs"]["csv"],
         "snr_reg": None if snr_summary is None else snr_summary["outputs"]["reg"],
         "snr_summary": None if snr_summary is None else snr_summary["outputs"]["summary"],
+        "_gt_metric_rows": gt_metric_rows,
     }
 
 
@@ -1921,6 +2039,12 @@ def parse_args() -> argparse.Namespace:
             "Optional old preprocessed root used only for GT reference catalogs/visibility files. "
             "In zarr mode, missing reference catalogs fall back to source centers stored in the Zarr."
         ),
+    )
+    parser.add_argument(
+        "--catalog-root",
+        type=Path,
+        default=None,
+        help="Unfiltered source catalog root used to attach magnitudes to Zarr source IDs.",
     )
     parser.add_argument(
         "--image-cache-dir",
@@ -2014,6 +2138,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--stability-score-offset", type=float, default=1.0)
     parser.add_argument("--mask-chunk-size", type=int, default=128)
+    parser.add_argument(
+        "--skip-mask-decoder",
+        action="store_true",
+        help="Skip SAM mask decoding when only center/shape or fixed-aperture metrics are needed.",
+    )
     parser.add_argument(
         "--multimask",
         action="store_true",

@@ -1,4 +1,17 @@
-"""Evaluate AstroCELLECT center completeness by reference magnitude.
+"""Evaluate AstroCELLECT completeness and purity by reference magnitude.
+
+The default CLI delegates to ``evaluate_sam_cellect_photometry.py``, which is
+the maintained evaluator for current ``sam_per_band`` checkpoints.  It restores
+the model from ``run_config.json`` (including style prompts and decoder FiLM),
+uses ordinal-expectation center detection, evaluates coadd/denoised/noisy, and
+writes both magnitude-binned completeness and purity.
+
+Pass ``--legacy`` to run the historical AstroUNet/MultiBand evaluator retained
+below for old checkpoints.  All other arguments in the default mode are the
+arguments documented by ``evaluate_sam_cellect_photometry.py --help``.
+
+Center completeness/purity runs skip SAM mask decoding by default.  Pass
+``--with-mask-decoder`` to restore mask photometry and mask flux-ratio plots.
 
 This script mirrors the completeness side of
 ``lsst_pipeline/utils/run_cutout_magnitude_experiment.py``: reference catalog
@@ -17,6 +30,7 @@ import argparse
 import csv
 import json
 import math
+import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -31,15 +45,13 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from astro_cellect2d import AstroUNet2D, FusedEncoderMultiBandAstroCELLECT2D, MultiBandAstroCELLECT2D
-from astro_train_eval import (
+from astro_train_data import (
     AstroCutoutDataset,
     CutoutRecord,
     collate_cutouts,
-    detect_centers,
-    detect_centers_with_en,
-    detect_centers_with_ex_link,
     discover_cutout_records,
 )
+from astro_train_ops import detect_centers, detect_centers_with_en, detect_centers_with_ex_link
 
 
 DEFAULT_LSST_AGGREGATE = Path(
@@ -642,7 +654,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ellipse-sigma", type=float, default=2.0)
     parser.add_argument("--core-radius", type=int, default=2)
     parser.add_argument("--confidence-threshold", type=float, default=0.0)
-    parser.add_argument("--confidence-score", choices=("cellect", "raw", "ordinal_prob", "ordinal_expectation"), default="cellect")
+    parser.add_argument("--confidence-score", choices=("cellect", "raw", "ordinal_prob", "ordinal_expectation"), default="ordinal_expectation")
     parser.add_argument("--nms-radius", type=int, default=1)
     parser.add_argument("--use-en-postprocess", action="store_true")
     parser.add_argument("--en-postprocess-threshold", type=float, default=0.6)
@@ -667,7 +679,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
+def legacy_main() -> None:
     args = build_arg_parser().parse_args()
     args.root = _expand(args.root)
     args.checkpoint = _expand(args.checkpoint)
@@ -731,5 +743,23 @@ def main() -> None:
     print(f"wrote {args.out_dir / 'magnitude_completeness_comparison.csv'}")
 
 
+def main() -> int:
+    """Dispatch to the maintained SAM evaluator unless legacy mode is explicit."""
+
+    if "--legacy" in sys.argv[1:]:
+        sys.argv.remove("--legacy")
+        legacy_main()
+        return 0
+
+    from evaluate_sam_cellect_photometry import main as sam_main
+
+    with_mask_decoder = "--with-mask-decoder" in sys.argv[1:]
+    if with_mask_decoder:
+        sys.argv.remove("--with-mask-decoder")
+    if not with_mask_decoder and "--skip-mask-decoder" not in sys.argv[1:]:
+        sys.argv.append("--skip-mask-decoder")
+    return int(sam_main())
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
