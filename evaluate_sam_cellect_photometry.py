@@ -67,6 +67,8 @@ DEFAULT_DATA_ROOT = Path("/nvme0/zc/scarlet/preprocessed")
 DEFAULT_OUT_DIR = CELLECT_ROOT / "output/sam_cellect_patch45_group1_photometry_eval"
 DEFAULT_BANDS = ("HSC-G", "HSC-R", "HSC-I", "HSC-Z", "HSC-Y")
 DEFAULT_DATASETS = ("coadd", "denoised")
+DEFAULT_IMAGE_PHOTOMETRY_ZERO_POINT = 31.4
+DEFAULT_GT_PHOTOMETRY_ZERO_POINT = 27.0
 DEFAULT_GT_FLUX_SCALE_FOR_RATIOS =  1 # 10.0 ** (0.4 * (31.4 - 27.0))
 RATIO_SPECS = (
     ("pred_ap2_over_gt_ap2", "ap_flux", "gt_ap2_flux", "predicted ap2 / scaled GT ap2"),
@@ -194,8 +196,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--photometry-sigma-clip", type=float, default=3.0)
     parser.add_argument("--photometry-method", choices=("center", "exact", "subpixel"), default="exact")
     parser.add_argument("--photometry-annulus-method", choices=("center", "exact", "subpixel"), default="center")
-    parser.add_argument("--photometry-zero-point", type=float, default=27.0)
-    parser.add_argument("--gt-photometry-zero-point", type=float, default=27.0)
+    parser.add_argument(
+        "--photometry-zero-point",
+        type=float,
+        default=DEFAULT_IMAGE_PHOTOMETRY_ZERO_POINT,
+        help="AB zero point for measured coadd/noisy/denoised image fluxes. Old LSST FITS use 31.4 for nJy-scale pixels.",
+    )
+    parser.add_argument(
+        "--gt-photometry-zero-point",
+        type=float,
+        default=DEFAULT_GT_PHOTOMETRY_ZERO_POINT,
+        help="AB zero point for GT catalog flux columns such as ap2 and Kron.",
+    )
     parser.add_argument("--photometry-psf-factor", type=float, default=1.0)
     parser.add_argument("--tp-isolated-max-shape-iou", type=float, default=0.05)
 
@@ -318,6 +330,8 @@ def _table(path: Path) -> "vis.Table":
 def _clean_catalog_candidates(root: Path, dataset_name: str, band: str, tile_name: str) -> list[Path]:
     base_tile = _base_tile_name(tile_name)
     return [
+        root / f"meas-{band}-{vis.TRACT}-{vis.PATCH}.fits",
+        root / band / f"meas-{band}-{vis.TRACT}-{vis.PATCH}.fits",
         root / dataset_name / vis.TRACT / vis.PATCH / "reference_catalogs" / f"{base_tile}_meas.fits",
         root / vis.TRACT / vis.PATCH / "reference_catalogs" / f"{base_tile}_meas.fits",
         root / dataset_name / vis.TRACT / vis.PATCH / "reference_catalogs_csv" / f"{base_tile}_meas.csv",
@@ -620,6 +634,11 @@ def _run_tile_local(
     row["checkpoint"] = str(checkpoint)
     row["checkpoint_epoch"] = vis._checkpoint_epoch(checkpoint)
     tile_gt_rows = embedded_gt_rows if embedded_gt_rows is not None else _gt_mag_rows(args, dataset_name, tile_name)
+    if embedded_gt_rows is not None:
+        gt_mag_col = str(getattr(args, "curve_gt_mag_col", "gt_ap2mag"))
+        has_finite_gt_mag = any(math.isfinite(_float(row.get(gt_mag_col))) for row in tile_gt_rows)
+        if tile_gt_rows and not has_finite_gt_mag:
+            tile_gt_rows = _gt_mag_rows(args, dataset_name, tile_name)
     raw_gt_count = len(tile_gt_rows)
     filtered_gt_count = sum(
         1
@@ -893,6 +912,35 @@ def _ensure_gt_visibility_rows(args: argparse.Namespace, gt_rows: Sequence[dict]
             merged.setdefault("visibility_keep_snr_ge2", 1)
             merged.setdefault("visibility_keep_snr_ge3", 1)
             out.append(merged)
+    return out
+
+
+def _recalibrate_prediction_photometry_rows(args: argparse.Namespace, rows: Sequence[dict]) -> list[dict]:
+    """Recompute predicted-source magnitudes from stored image fluxes.
+
+    Older output CSVs may contain ``*_abmag`` values written with a different
+    image zero point.  The raw aperture/mask fluxes are still valid, so derive
+    the nJy and AB magnitude columns from the current ``--photometry-zero-point``
+    before binning by predicted magnitude.
+    """
+    out: list[dict] = []
+    zp = float(args.photometry_zero_point)
+    psf_factor = float(args.photometry_psf_factor)
+    specs = (
+        ("ap_flux", "ap_flux_njy", "ap_abmag"),
+        ("kron_flux", "kron_flux_njy", "kron_abmag"),
+        ("mask_flux", "mask_flux_njy", "mask_abmag"),
+    )
+    for row in rows:
+        merged = dict(row)
+        for flux_col, njy_col, mag_col in specs:
+            flux = _float(merged.get(flux_col))
+            if not math.isfinite(flux):
+                continue
+            njy, mag = vis._flux_to_njy_mag(flux, zero_point=zp, psf_factor=psf_factor)
+            merged[njy_col] = njy
+            merged[mag_col] = mag
+        out.append(merged)
     return out
 
 
@@ -1433,6 +1481,7 @@ def main() -> int:
         _write_csv(args.out_dir / "per_source_photometry.csv", phot_rows)
         _write_csv(args.out_dir / "gt_photometry.csv", gt_rows)
 
+    phot_rows = _recalibrate_prediction_photometry_rows(args, phot_rows)
     metric_rows, aggregate_rows = _aggregate_bins(args, phot_rows, gt_rows)
     _write_csv(args.out_dir / "magnitude_bin_metrics.csv", metric_rows)
     _write_csv(args.out_dir / "magnitude_bin_metrics_aggregate.csv", aggregate_rows)
@@ -1499,6 +1548,11 @@ def main() -> int:
         "metric_rows": len(metric_rows),
         "ratio_rows": len(ratio_detail),
         "ratio_source": args.ratio_source,
+        "photometry_zero_point": float(args.photometry_zero_point),
+        "gt_photometry_zero_point": float(args.gt_photometry_zero_point),
+        "curve_pred_mag_col": str(args.curve_pred_mag_col),
+        "curve_gt_mag_col": str(args.curve_gt_mag_col),
+        "prediction_photometry_recomputed_from_flux": True,
         "gt_visibility_filter": str(args.gt_visibility_filter),
         "gt_visibility_match_radius": float(args.gt_visibility_match_radius),
         "tile_workers": int(args.tile_workers),

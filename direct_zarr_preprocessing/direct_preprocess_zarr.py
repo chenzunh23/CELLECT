@@ -38,6 +38,7 @@ from astro_data_preprocessing import (  # noqa: E402
     _crop_full_mask_for_tile,
     _crop_image_for_tile,
     _find_denoised_patch_dir,
+    _fits_open_with_path_warnings,
     _find_image_hdu_index,
     _metadata_from_catalog,
     _move_bright_clean_to_center_only,
@@ -90,10 +91,8 @@ def _expand_patch_tokens(values: Sequence[str]) -> list[str]:
 
 
 def _read_patch_image_meta(coadd_root: Path, band: str, tract: int, patch: str) -> tuple[tuple[int, int], tuple[int, int]]:
-    from astropy.io import fits
-
     path = _band_fits_path(coadd_root, band, tract, patch)
-    with fits.open(path, memmap=True, ignore_missing_end=True) as hdul:
+    with _fits_open_with_path_warnings(path, memmap=True, ignore_missing_end=True) as hdul:
         hdu = hdul[_find_image_hdu_index(hdul)]
         origin = _origin_from_ltv(hdu.header)
         shape = tuple(int(v) for v in hdu.data.shape)
@@ -457,6 +456,173 @@ def _target_for_sample(
     }
 
 
+def _copy_target_package(pkg: dict[str, object]) -> dict[str, object]:
+    out: dict[str, object] = {}
+    for key, value in pkg.items():
+        if isinstance(value, np.ndarray):
+            out[key] = value.copy()
+        elif isinstance(value, list):
+            out[key] = [np.asarray(item).copy() for item in value]
+        else:
+            out[key] = value
+    return out
+
+
+def _source_rows_by_key(pkg: dict[str, object], band_idx: int) -> dict[tuple[str, object], tuple[np.ndarray, np.ndarray, int, int]]:
+    centers = np.asarray(pkg["shape_source_centers_by_band"][band_idx], dtype=np.float32).reshape(-1, 2)
+    values = np.asarray(pkg["shape_source_values_by_band"][band_idx], dtype=np.float32).reshape(-1, 3)
+    classes = np.asarray(pkg["shape_source_classes_by_band"][band_idx], dtype=np.uint8).reshape(-1)
+    ids = np.asarray(pkg["shape_source_ids_by_band"][band_idx], dtype=np.int64).reshape(-1)
+    rows: dict[tuple[str, object], tuple[np.ndarray, np.ndarray, int, int]] = {}
+    for idx, (center, value, class_id, source_id) in enumerate(zip(centers, values, classes, ids)):
+        if int(source_id) >= 0:
+            key = ("id", int(source_id))
+        else:
+            rounded = tuple(np.round(center.astype(np.float64), 3).tolist())
+            key = ("xy", rounded)
+        rows.setdefault(key, (center, value, int(class_id), int(source_id)))
+    return rows
+
+
+def _select_source_rows(
+    *,
+    primary_rows: dict[tuple[str, object], tuple[np.ndarray, np.ndarray, int, int]],
+    secondary_rows: dict[tuple[str, object], tuple[np.ndarray, np.ndarray, int, int]],
+    keys: Sequence[tuple[str, object]],
+    class_id: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    centers = []
+    values = []
+    classes = []
+    ids = []
+    for key in keys:
+        row = primary_rows.get(key) or secondary_rows.get(key)
+        if row is None:
+            continue
+        center, value, _old_class, source_id = row
+        centers.append(center)
+        values.append(value)
+        classes.append(int(class_id))
+        ids.append(int(source_id))
+    if not centers:
+        return (
+            np.zeros((0, 2), dtype=np.float32),
+            np.zeros((0, 3), dtype=np.float32),
+            np.zeros((0,), dtype=np.uint8),
+            np.zeros((0,), dtype=np.int64),
+        )
+    return (
+        np.asarray(centers, dtype=np.float32).reshape(-1, 2),
+        np.asarray(values, dtype=np.float32).reshape(-1, 3),
+        np.asarray(classes, dtype=np.uint8),
+        np.asarray(ids, dtype=np.int64),
+    )
+
+
+def _align_denoised_noisy_snr_packages(
+    denoised_pkg: dict[str, object],
+    noisy_pkg: dict[str, object],
+    *,
+    primary: str,
+) -> dict[str, object]:
+    if primary not in {"denoised", "noisy"}:
+        raise ValueError(f"primary must be denoised or noisy, got {primary!r}")
+    primary_pkg = denoised_pkg if primary == "denoised" else noisy_pkg
+    secondary_pkg = noisy_pkg if primary == "denoised" else denoised_pkg
+    out = _copy_target_package(primary_pkg)
+
+    primary_pu = np.asarray(primary_pkg["pu_class"], dtype=np.uint8)
+    secondary_pu = np.asarray(secondary_pkg["pu_class"], dtype=np.uint8)
+    if primary_pu.shape != secondary_pu.shape:
+        raise ValueError(f"cannot align PU masks with shapes {primary_pu.shape} and {secondary_pu.shape}")
+
+    out_pu = np.asarray(out["pu_class"], dtype=np.uint8)
+    out_conf = np.asarray(out["confidence"], dtype=np.uint8)
+    out_conf_weight = np.asarray(out["confidence_weight"])
+    out_shape = np.asarray(out["shape"])
+    out_shape_weight = np.asarray(out["shape_weight"])
+    primary_conf = np.asarray(primary_pkg["confidence"], dtype=np.uint8)
+    secondary_conf = np.asarray(secondary_pkg["confidence"], dtype=np.uint8)
+    primary_shape = np.asarray(primary_pkg["shape"])
+    secondary_shape = np.asarray(secondary_pkg["shape"])
+    primary_shape_weight = np.asarray(primary_pkg["shape_weight"])
+    secondary_shape_weight = np.asarray(secondary_pkg["shape_weight"])
+
+    centers_by_band = []
+    ids_by_band = []
+    shape_centers_by_band = []
+    shape_values_by_band = []
+    shape_classes_by_band = []
+    shape_ids_by_band = []
+
+    for band_idx in range(primary_pu.shape[0]):
+        den_pu = primary_pu[band_idx] if primary == "denoised" else secondary_pu[band_idx]
+        noi_pu = secondary_pu[band_idx] if primary == "denoised" else primary_pu[band_idx]
+        clean = (den_pu == 1) & (noi_pu == 1)
+        center = ((den_pu == 2) | (den_pu == 5) | (noi_pu == 2) | (noi_pu == 5)) & ~clean
+        background = (den_pu == 4) & (noi_pu == 4) & ~clean & ~center
+        merged = np.full(den_pu.shape, 3, dtype=np.uint8)
+        merged[background] = 4
+        merged[center] = 2
+        merged[clean] = 1
+        out_pu[band_idx] = merged
+
+        supervised = clean | background
+        out_conf_weight[band_idx] = supervised.astype(out_conf_weight.dtype, copy=False)
+        out_conf[band_idx] = np.maximum(primary_conf[band_idx], secondary_conf[band_idx])
+
+        take_secondary = secondary_shape_weight[band_idx] > primary_shape_weight[band_idx]
+        out_shape[band_idx] = primary_shape[band_idx]
+        if np.any(take_secondary):
+            out_shape[band_idx, :, take_secondary] = secondary_shape[band_idx, :, take_secondary]
+        merged_shape_weight = np.maximum(primary_shape_weight[band_idx], secondary_shape_weight[band_idx])
+        merged_shape_weight = np.where(clean | center, merged_shape_weight, 0).astype(out_shape_weight.dtype, copy=False)
+        out_shape_weight[band_idx] = merged_shape_weight
+
+        den_rows = _source_rows_by_key(denoised_pkg, band_idx)
+        noi_rows = _source_rows_by_key(noisy_pkg, band_idx)
+        den_clean = {key for key, row in den_rows.items() if row[2] == 1}
+        noi_clean = {key for key, row in noi_rows.items() if row[2] == 1}
+        clean_keys = sorted(den_clean & noi_clean, key=lambda item: (item[0], item[1]))
+        den_center = {key for key, row in den_rows.items() if row[2] in (2, 5)}
+        noi_center = {key for key, row in noi_rows.items() if row[2] in (2, 5)}
+        center_keys = sorted((den_center | noi_center) - set(clean_keys), key=lambda item: (item[0], item[1]))
+
+        primary_rows = den_rows if primary == "denoised" else noi_rows
+        secondary_rows = noi_rows if primary == "denoised" else den_rows
+        clean_centers, clean_values, clean_classes, clean_ids = _select_source_rows(
+            primary_rows=primary_rows,
+            secondary_rows=secondary_rows,
+            keys=clean_keys,
+            class_id=1,
+        )
+        center_centers, center_values, center_classes, center_ids = _select_source_rows(
+            primary_rows=primary_rows,
+            secondary_rows=secondary_rows,
+            keys=center_keys,
+            class_id=2,
+        )
+        centers_by_band.append(clean_centers)
+        ids_by_band.append(clean_ids)
+        shape_centers_by_band.append(np.concatenate([clean_centers, center_centers], axis=0))
+        shape_values_by_band.append(np.concatenate([clean_values, center_values], axis=0))
+        shape_classes_by_band.append(np.concatenate([clean_classes, center_classes], axis=0))
+        shape_ids_by_band.append(np.concatenate([clean_ids, center_ids], axis=0))
+
+    out["pu_class"] = out_pu
+    out["confidence"] = out_conf
+    out["confidence_weight"] = out_conf_weight
+    out["shape"] = out_shape
+    out["shape_weight"] = out_shape_weight
+    out["centers_by_band"] = centers_by_band
+    out["ids_by_band"] = ids_by_band
+    out["shape_source_centers_by_band"] = shape_centers_by_band
+    out["shape_source_values_by_band"] = shape_values_by_band
+    out["shape_source_classes_by_band"] = shape_classes_by_band
+    out["shape_source_ids_by_band"] = shape_ids_by_band
+    return out
+
+
 def _write_dataset_zarr(
     *,
     output: Path,
@@ -469,6 +635,7 @@ def _write_dataset_zarr(
     args,
     runtime,
     attrs: dict,
+    package_loader=None,
 ) -> dict:
     manifest_path = output.parent / f"{output.name}_manifest.json"
     staging = output.with_name(f".{output.name}.inprogress")
@@ -504,6 +671,8 @@ def _write_dataset_zarr(
     shape_offsets = np.zeros((n, b + 1), dtype=np.int64)
 
     def load_one(sample: Sample):
+        if package_loader is not None:
+            return package_loader(sample)
         images_by_band = image_sources[sample.image_key]
         backgrounds = background_sources.get(sample.image_key, {})
         return _target_for_sample(
@@ -620,6 +789,73 @@ def _write_dataset_zarr(
     return manifest
 
 
+def _write_aligned_denoised_noisy_zarrs(
+    *,
+    output_root: Path,
+    patch: str,
+    specs: Sequence[TileSpec],
+    labels,
+    variant_images_by_name,
+    variant_backgrounds_by_name,
+    quality_masks,
+    args,
+    runtime,
+) -> list[dict]:
+    missing = [variant for variant in ("denoised", "noisy") if variant not in variant_images_by_name]
+    if missing:
+        raise FileNotFoundError(f"cannot align denoised/noisy labels; missing variants: {', '.join(missing)}")
+    common_groups = sorted(set(variant_images_by_name["denoised"]) & set(variant_images_by_name["noisy"]))
+    if not common_groups:
+        raise FileNotFoundError("cannot align denoised/noisy labels; no common image groups")
+    summaries = []
+    for variant in ("denoised", "noisy"):
+        samples = _make_samples(variant, specs, common_groups)
+
+        def load_aligned(sample: Sample, *, primary_variant=variant):
+            paired = {}
+            for pair_variant in ("denoised", "noisy"):
+                pair_sample = Sample(
+                    name=f"{sample.image_key}_{sample.spec.name}",
+                    spec=sample.spec,
+                    dataset_source=pair_variant,
+                    group=sample.image_key,
+                    image_key=sample.image_key,
+                )
+                paired[pair_variant] = _target_for_sample(
+                    pair_sample,
+                    bands=args.bands,
+                    labels_by_band=labels,
+                    images_by_band=variant_images_by_name[pair_variant][sample.image_key],
+                    backgrounds=variant_backgrounds_by_name[pair_variant].get(sample.image_key, {}),
+                    quality_masks=quality_masks,
+                    args=args,
+                    runtime=runtime,
+                )
+            return _align_denoised_noisy_snr_packages(
+                paired["denoised"],
+                paired["noisy"],
+                primary=primary_variant,
+            )
+
+        out = output_root / variant / f"{patch}.zarr"
+        summaries.append(
+            _write_dataset_zarr(
+                output=out,
+                samples=samples,
+                bands=args.bands,
+                labels_by_band=labels,
+                image_sources=variant_images_by_name[variant],
+                background_sources=variant_backgrounds_by_name[variant],
+                quality_masks=quality_masks,
+                args=args,
+                runtime=runtime,
+                attrs=_attrs(args, runtime, patch, variant, len(samples)),
+                package_loader=load_aligned,
+            )
+        )
+    return summaries
+
+
 def preprocess_patch(args: argparse.Namespace, patch: str) -> dict:
     output_root = Path(args.output_root).expanduser() / str(args.tract)
     expected_manifests = []
@@ -681,6 +917,39 @@ def preprocess_patch(args: argparse.Namespace, patch: str) -> dict:
         )
 
     if args.denoised_fits_root is not None:
+        if bool(args.align_denoised_noisy_snr_labels):
+            variant_images_by_name = {}
+            variant_backgrounds_by_name = {}
+            for variant in args.image_variants:
+                try:
+                    variant_images = _read_variant_images(args, patch, variant)
+                except FileNotFoundError as exc:
+                    if args.missing_variant_policy == "error":
+                        raise
+                    print(f"[direct-zarr] skip {variant} patch {patch}: {exc}", flush=True)
+                    continue
+                variant_images_by_name[variant] = variant_images
+                variant_backgrounds_by_name[variant] = _variant_backgrounds_for_images(
+                    args,
+                    variant=variant,
+                    patch=patch,
+                    variant_images=variant_images,
+                    coadd_backgrounds=backgrounds,
+                )
+            summaries.extend(
+                _write_aligned_denoised_noisy_zarrs(
+                    output_root=output_root,
+                    patch=patch,
+                    specs=specs,
+                    labels=labels,
+                    variant_images_by_name=variant_images_by_name,
+                    variant_backgrounds_by_name=variant_backgrounds_by_name,
+                    quality_masks=quality_masks,
+                    args=args,
+                    runtime=runtime,
+                )
+            )
+            return {"patch": patch, "summaries": summaries}
         for variant in args.image_variants:
             try:
                 variant_images = _read_variant_images(args, patch, variant)
@@ -741,6 +1010,13 @@ def _attrs(
         "noncoadd_snr_use_quality_mask": bool(args.noncoadd_snr_use_quality_mask),
         "noncoadd_snr_mask_planes": list(args.noncoadd_snr_mask_planes),
         "noncoadd_snr_exclude_self_source": bool(args.noncoadd_snr_exclude_self_source),
+        "align_denoised_noisy_snr_labels": bool(args.align_denoised_noisy_snr_labels),
+        "aligned_variant_label_contract": (
+            "clean=denoised_clean AND noisy_clean; center_only=denoised/noisy center-only union; "
+            "background=denoised_background AND noisy_background; remaining=ignore"
+            if bool(args.align_denoised_noisy_snr_labels)
+            else None
+        ),
         "pu_runtime_config": {
             "b_mag_min": float(runtime.pu_b_mag_min),
             "b_mag_max": float(runtime.pu_b_mag_max),
@@ -857,6 +1133,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=["BRIGHT_OBJECT", "SAT", "BAD", "NO_DATA", "EDGE", "UNMASKEDNAN"],
     )
     p.add_argument("--noncoadd-snr-exclude-self-source", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument(
+        "--align-denoised-noisy-snr-labels",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "For denoised/noisy variant Zarrs, align PU labels after the per-variant SNR/background pass: "
+            "clean is the denoised/noisy clean intersection, center-only is the union of either center-only class, "
+            "background is the denoised/noisy background intersection, and all remaining pixels are ignore."
+        ),
+    )
     p.add_argument("--z-clip", nargs=2, type=float, default=None)
     p.add_argument("--image-dtype", choices=("float16", "float32"), default="float16")
     p.add_argument("--target-float-dtype", choices=("float16", "float32"), default="float16")

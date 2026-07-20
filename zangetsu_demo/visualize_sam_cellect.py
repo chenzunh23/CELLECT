@@ -565,6 +565,8 @@ def _enrich_zarr_rows_from_catalog(
         return rows
     root = Path(catalog_root).expanduser().resolve()
     candidates = [
+        root / f"meas-{band}-{TRACT}-{PATCH}.fits",
+        root / band / f"meas-{band}-{TRACT}-{PATCH}.fits",
         root / TRACT / band / PATCH / f"meas-{band}-{TRACT}-{PATCH}.fits",
         root / band / PATCH / f"meas-{band}-{TRACT}-{PATCH}.fits",
         root / TRACT / PATCH / "band_reference_catalogs" / band / f"meas-{band}-{TRACT}-{PATCH}.fits",

@@ -32,6 +32,7 @@ import subprocess
 import sys
 import traceback
 import warnings
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -42,6 +43,23 @@ from astropy.io import fits
 from astropy.io.fits.verify import VerifyWarning
 from astropy.table import Table, vstack
 from astropy.units import UnitsWarning
+
+
+@contextmanager
+def _fits_open_with_path_warnings(path: Path, *args, **kwargs):
+    """Open a FITS file while annotating Astropy truncation warnings with path."""
+    path = Path(path)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with fits.open(path, *args, **kwargs) as hdul:
+            yield hdul
+    for item in caught:
+        message = str(item.message)
+        if "File may have been truncated" in message:
+            print(f"WARNING: FITS file may be truncated: {path}: {message}", flush=True)
+        else:
+            warnings.warn(item.message, item.category, stacklevel=2)
+
 
 warnings.filterwarnings(
     "ignore",
@@ -321,7 +339,7 @@ def _quality_mask_from_lsst_fits(path: Path, mask_planes: Sequence[str]) -> Opti
     if not path.exists() or not mask_planes:
         return None
     try:
-        with fits.open(path, memmap=False) as hdul:
+        with _fits_open_with_path_warnings(path, memmap=False) as hdul:
             plane_indices = _plane_hdu_indices(hdul)
             mask_idx = plane_indices.get("MASK")
             if mask_idx is None:
@@ -390,7 +408,7 @@ def crop_exposure_cutout(
     clean_nonfinite: bool = True,
     overwrite: bool = True,
 ) -> None:
-    with fits.open(source_path, memmap=False) as hdul:
+    with _fits_open_with_path_warnings(source_path, memmap=False) as hdul:
         plane_indices = _plane_hdu_indices(hdul)
         source_origin = _origin_from_ltv(hdul[plane_indices["IMAGE"]].header)
         local_x0 = int(parent_x0 - source_origin[0])
@@ -615,7 +633,7 @@ def _resolve_lsst_background_det_path(
 
 def _read_det_background_mask(path: Path, shape_yx: Tuple[int, int], origin_xy: Tuple[int, int] = (0, 0)) -> np.ndarray:
     """Return True for pixels outside LSST detection footprints."""
-    with fits.open(path, memmap=True, ignore_missing_end=True) as hdul:
+    with _fits_open_with_path_warnings(path, memmap=True, ignore_missing_end=True) as hdul:
         if len(hdul) <= 4:
             return ~np.zeros(shape_yx, dtype=bool)
         spans = hdul[4].data
@@ -1398,7 +1416,7 @@ def _remeasure_ap2_kron_outliers(
         return class_override, diagnostics, stats
 
     try:
-        with fits.open(archive_path, memmap=True, ignore_missing_end=True) as archive_hdul:
+        with _fits_open_with_path_warnings(archive_path, memmap=True, ignore_missing_end=True) as archive_hdul:
             if len(archive_hdul) <= 4:
                 raise RuntimeError("archive catalog lacks footprint archive HDUs")
             archive_main = archive_hdul[int(args.catalog_hdu)].data
@@ -2393,7 +2411,7 @@ def write_ids_metadata(table: Table, output_npz: Path) -> None:
 
 
 def _read_exposure_image_plane(source_path: Path, *, clean_nonfinite: bool = True) -> Tuple[np.ndarray, Tuple[int, int]]:
-    with fits.open(source_path, memmap=False) as hdul:
+    with _fits_open_with_path_warnings(source_path, memmap=False) as hdul:
         plane_indices = _plane_hdu_indices(hdul)
         hdu = hdul[plane_indices["IMAGE"]]
         data = np.asarray(hdu.data, dtype=np.float32).copy()
@@ -3761,7 +3779,7 @@ def _preprocess_patch(
 
     first_band = bands[0]
     first_path = _band_fits_path(coadd_root, first_band, args.tract, patch)
-    with fits.open(first_path, memmap=True) as hdul:
+    with _fits_open_with_path_warnings(first_path, memmap=True) as hdul:
         image_hdu = hdul[_find_image_hdu_index(hdul)]
         image_shape_yx = image_hdu.data.shape
         image_origin = _origin_from_ltv(image_hdu.header)
