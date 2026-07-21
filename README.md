@@ -18,7 +18,21 @@ astro_data_preprocessing.py             Preprocessing implementation
 astro_train_eval.py                     Train/evaluate AstroCELLECT and SAM-CELLECT
 evaluate_sam_cellect_photometry.py      Patch/tile photometry evaluation
 zangetsu_demo/visualize_sam_cellect.py  Small-tile visualization and mask overlays
+scripts/swims_cellect_pipeline.py       SWIMS tiling, source detection, REG, and optional masks
 ```
+
+## SWIMS Inference
+
+`scripts/swims_cellect_pipeline.py` applies existing CELLECT SAM checkpoints to
+SWIMS stacked or single-exposure FITS images without requiring a reference
+catalog. It rotates neither field by default, rejects 512x512 tiles whose
+largest connected invalid region exceeds 30%, writes source CSV and DS9 REG
+files, and can write an instance-mask FITS, label CSV, and zscale overlay PNG
+per accepted tile with `--output-masks`. Overlay order places smaller masks on
+top of larger overlapping detections.
+
+See [docs/swims_cellect.md](docs/swims_cellect.md) for checkpoint presets,
+input discovery, tiling rules, and runnable examples.
 
 ## Environment
 
