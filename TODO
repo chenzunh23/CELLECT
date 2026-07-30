@@ -1,0 +1,35 @@
+# TODO 0730
+
+## CHUNK TILES=32 NOT 8
+
+## Naming and Label Semantics
+
+- Normalize center-only naming.
+- Current `center_only_external` is expected to provide weak shape supervision, so the name is misleading.
+- Current `strict_center_only_external` is semantically appropriate for labels that only train center/confidence and do not train shape.
+- Decide final label taxonomy before merging into formal preprocessing.
+
+## Environment Management
+
+- Move project environment management to `uv`.
+- Document reproducible setup for core CELLECT, data filtering, SAM-related scripts, and LSST-adjacent utilities.
+
+## Configuration Management
+
+- Replace large argparse-style command surfaces with `tyro`, `hydra`, and YAML configs.
+- Save resolved configs with every generated output directory.
+- Ensure preprocessing/debug outputs are reproducible from the saved config.
+
+## Image Scaling
+
+- Continue testing zscore without an upper clip.
+- Compare against current clipped zscore, log, lupton, and anscombe variants.
+- Decide how unbounded zscore should affect bright-region detection and SAM-style inputs.
+
+## External Bright Labels Simplification
+
+- Simplify `external_bright_labels` logic:
+  - Isolated clusters become `center_only` regardless of size.
+  - GAIA-matched clusters follow GAIA labels/centers directly.
+  - Non-GAIA-matched clusters become `ignore`.
+- Keep `NB0387` using a looser bright-region threshold because source density is low.

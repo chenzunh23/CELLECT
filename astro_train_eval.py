@@ -43,6 +43,7 @@ from astro_train_zarr_data import (
     ZarrChunkBatchIterableDataset,
     ZarrChunkLocalBatchSampler,
     ZarrCutoutDataset,
+    discover_zarr_image_records,
     discover_zarr_records,
     zarr_passthrough_batch,
 )
@@ -670,6 +671,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--zarr-drop-last",
         action="store_true",
         help="Drop incomplete chunk-local batches in Zarr mode.",
+    )
+    parser.add_argument(
+        "--zarr-random-image-batches",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "In Zarr train mode, use single-band image-level stores for SAM detector training. "
+            "Batch size then means total images, not multi-band groups."
+        ),
     )
     parser.add_argument(
         "--root",
@@ -1463,6 +1473,20 @@ def main() -> None:
         args.disable_ex_loss = True
         args.use_ex_link_postprocess = False
         args.train_detect_ex_link = False
+    if args.zarr_random_image_batches:
+        if args.data_format != "zarr":
+            raise ValueError("--zarr-random-image-batches requires --data-format zarr")
+        if args.mode != "train":
+            print("WARNING: --zarr-random-image-batches is train-only; eval uses regular multiband Zarr discovery.")
+            args.zarr_random_image_batches = False
+        elif args.model_variant == "auto":
+            args.model_variant = "sam_per_band"
+        elif args.model_variant != "sam_per_band":
+            raise ValueError("--zarr-random-image-batches is currently implemented only for --model-variant sam_per_band")
+        args.disable_ex_loss = True
+        args.use_ex_link_postprocess = False
+        args.train_detect_ex_link = False
+        args.enable_triplet = False
     if args.model_variant == "sam_per_band":
         args.seg_loss_weight = 0.0
         args.disable_ex_loss = True
@@ -1521,7 +1545,15 @@ def main() -> None:
         if args.data_format == "zarr":
             if reference_dir is not None or cutout_dir is not None or band_reference_root is not None:
                 raise ValueError("--reference-dir/--cutout-dir/--band-reference-root are legacy-only options")
-            records = discover_zarr_records(root, bands=args.bands, max_records=discover_max_records)
+            if args.mode == "train" and bool(args.zarr_random_image_batches):
+                records = discover_zarr_image_records(root, bands=args.bands, max_records=discover_max_records)
+                if is_main:
+                    print(
+                        f"Using {len(records)} image-level Zarr records for SAM training; "
+                        f"batch-size={args.batch_size} counts images."
+                    )
+            else:
+                records = discover_zarr_records(root, bands=args.bands, max_records=discover_max_records)
         else:
             records = discover_cutout_records(
                 root,
@@ -1814,6 +1846,15 @@ def main() -> None:
             val_loader = DataLoader(val_iter_ds, **_zarr_iter_loader_kwargs())
             train_epoch_setter = train_iter_ds
             if train_iter_ds is not None and is_main:
+                train_batches = len(train_iter_ds)
+                if train_batches == 0:
+                    raise ValueError(
+                        "Zarr worker-owned train iterator produced 0 batches. "
+                        f"batch_size={int(args.batch_size)}, zarr_drop_last={bool(args.zarr_drop_last)}, "
+                        f"max_local_chunk_size={int(train_iter_ds.max_local_chunk_size())}. "
+                        "Use batch_size <= the Zarr chunk tile count, disable --zarr-drop-last, "
+                        "or regenerate Zarr with a larger --chunk-tiles/CHUNK_TILES."
+                    )
                 incomplete_train_batches = int(train_iter_ds.incomplete_batch_count())
                 if incomplete_train_batches > 0:
                     message = (
@@ -1867,6 +1908,15 @@ def main() -> None:
             train_loader = DataLoader(train_ds, **_zarr_loader_kwargs(train_sampler)) if train_sampler is not None else None
             val_loader = DataLoader(val_ds, **_zarr_loader_kwargs(val_batch_sampler))
             if train_sampler is not None and is_main:
+                train_batches = len(train_sampler)
+                if train_batches == 0:
+                    raise ValueError(
+                        "Zarr chunk-local train sampler produced 0 batches. "
+                        f"batch_size={int(args.batch_size)}, zarr_drop_last={bool(args.zarr_drop_last)}, "
+                        f"max_local_chunk_size={int(train_sampler.max_local_chunk_size())}. "
+                        "Use batch_size <= the Zarr chunk tile count, disable --zarr-drop-last, "
+                        "or regenerate Zarr with a larger --chunk-tiles/CHUNK_TILES."
+                    )
                 incomplete_train_batches = sum(1 for batch in train_sampler if len(batch) < int(args.batch_size))
                 if incomplete_train_batches > 0:
                     message = (
@@ -1945,6 +1995,17 @@ def main() -> None:
                             for key in style_state
                         )
                     del style_ckpt, style_state
+            if (
+                args.mode == "train"
+                and bool(args.zarr_random_image_batches)
+                and bool(args.sam_encoder_style_prompt)
+            ):
+                if is_main:
+                    print(
+                        "WARNING: disabling --sam-encoder-style-prompt for image-level Zarr training; "
+                        "image-level batches contain one band per sample, so the multiband style router is incompatible."
+                    )
+                args.sam_encoder_style_prompt = False
             if args.sam_decoder_film is None:
                 args.sam_decoder_film = False
                 if args.checkpoint:

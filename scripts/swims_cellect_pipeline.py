@@ -228,6 +228,15 @@ def _config_value(args: argparse.Namespace, cfg: dict, name: str, default: objec
     return cfg.get(name, default) if value is None else value
 
 
+def _apply_output_mode(args: argparse.Namespace) -> None:
+    """Resolve convenience output modes before validating combinations."""
+
+    if args.regs_only:
+        args.save_tiles = False
+        args.output_tile_regs = True
+        args.output_masks = False
+
+
 def _checkpoint_label(path: Path) -> str:
     return f"{path.parent.name}_{path.stem}"
 
@@ -661,20 +670,21 @@ def process_image(
     for future in overlay_futures:
         future.result()
 
-    with (image_dir / "tiles.csv").open("w", newline="", encoding="ascii") as handle:
-        fields = (
-            "tile",
-            "x0",
-            "y0",
-            "invalid_fraction",
-            "largest_invalid_component_fraction",
-            "tile_fits",
-            "centers_reg",
-            "shapes_reg",
-        )
-        writer = csv.DictWriter(handle, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(tile_rows)
+    if not args.regs_only:
+        with (image_dir / "tiles.csv").open("w", newline="", encoding="ascii") as handle:
+            fields = (
+                "tile",
+                "x0",
+                "y0",
+                "invalid_fraction",
+                "largest_invalid_component_fraction",
+                "tile_fits",
+                "centers_reg",
+                "shapes_reg",
+            )
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(tile_rows)
 
     deduplicated = deduplicate_rows(detections, float(args.merge_radius))
     _world_coordinates(wcs_header, deduplicated)
@@ -683,9 +693,12 @@ def process_image(
         label = _checkpoint_label(args.checkpoint)
         stem = f"{record.path.stem}_{label}"
         catalog_path = image_dir / f"{stem}_sources.csv"
-        _write_csv(catalog_path, deduplicated)
+        if not args.regs_only:
+            _write_csv(catalog_path, deduplicated)
         centers, shapes = _write_regs(image_dir, stem, deduplicated)
-        outputs = {"catalog": str(catalog_path), "centers_reg": str(centers), "shapes_reg": str(shapes)}
+        outputs = {"centers_reg": str(centers), "shapes_reg": str(shapes)}
+        if not args.regs_only:
+            outputs["catalog"] = str(catalog_path)
     summary = {
         "input": str(record.path),
         "field_chip": record.field_chip,
@@ -698,6 +711,7 @@ def process_image(
         "raw_tile_detections": len(detections),
         "deduplicated_sources": len(deduplicated),
         "decoded_masks": decoded_masks,
+        "regs_only": bool(args.regs_only),
         "mask_output_enabled": bool(args.output_masks),
         "tile_reg_output_enabled": bool(args.output_tile_regs),
         "threshold": threshold,
@@ -736,6 +750,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-invalid-component-fraction", type=float, default=0.30)
     parser.add_argument("--save-tiles", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--regs-only",
+        action="store_true",
+        help=(
+            "Write tile-local and full-image center/shape REG files without tile FITS, "
+            "CSV catalogs, masks, or overlays. Summary and manifest JSON files are retained."
+        ),
+    )
     parser.add_argument(
         "--output-tile-regs",
         action=argparse.BooleanOptionalAction,
@@ -784,6 +806,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    _apply_output_mode(args)
     args.swims_root = args.swims_root.expanduser().resolve()
     args.out_dir = args.out_dir.expanduser().resolve()
     args.cellect_root = args.cellect_root.expanduser().resolve()
@@ -862,6 +885,7 @@ def main() -> int:
         "input_kind": args.input_kind,
         "tile_size": args.tile_size,
         "stride": args.stride,
+        "regs_only": bool(args.regs_only),
         "max_invalid_component_fraction": args.max_invalid_component_fraction,
         "images": summaries,
     }

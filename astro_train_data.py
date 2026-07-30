@@ -774,6 +774,7 @@ _SPATIAL_TARGET_KEYS = (
     "strict_ignore_mask",
     "source_union_mask",
     "background_mask",
+    "bright_mask",
     "pu_class_mask",
     "confidence_weight",
     "seg_loss_weight",
@@ -801,8 +802,14 @@ def _target_defaults(targets: Dict[str, Tensor]) -> Dict[str, Tensor]:
     targets["source_union_mask"] = (
         (targets["source_union_mask"] > 0) | clean_bool | center_only_bool | ignore_bool
     ).to(dtype=torch.uint8)
+    targets.setdefault("bright_mask", torch.zeros((h, w), dtype=torch.uint8, device=device))
+    targets["bright_mask"] = (
+        (targets["bright_mask"] > 0) & ~clean_bool & ~center_only_bool & ~ignore_bool
+    ).to(dtype=torch.uint8)
     targets.setdefault("background_mask", (targets["source_union_mask"] == 0).to(dtype=torch.uint8))
-    targets["background_mask"] = ((targets["background_mask"] > 0) & (targets["source_union_mask"] == 0)).to(dtype=torch.uint8)
+    targets["background_mask"] = (
+        (targets["background_mask"] > 0) & (targets["source_union_mask"] == 0) & (targets["bright_mask"] == 0)
+    ).to(dtype=torch.uint8)
     targets.setdefault("pu_class_mask", targets["clean_mask"].to(dtype=torch.uint8))
     targets.setdefault("pseudo_mask", torch.zeros((h, w), dtype=torch.uint8, device=device))
     if not has_confidence_weight:
@@ -813,7 +820,9 @@ def _target_defaults(targets: Dict[str, Tensor]) -> Dict[str, Tensor]:
         center_only_confidence.to(dtype=torch.float32) * 0.25,
     )
     if not has_seg_loss_weight:
-        reliable = ((targets["clean_mask"] > 0) | (targets["background_mask"] > 0)).to(dtype=torch.bool)
+        reliable = (
+            (targets["clean_mask"] > 0) | (targets["background_mask"] > 0) | (targets["bright_mask"] > 0)
+        ).to(dtype=torch.bool)
         targets["seg_loss_weight"] = reliable.to(dtype=torch.float32)
     return targets
 
@@ -834,6 +843,7 @@ def _read_target_npz(path: Path) -> Dict[str, Tensor]:
             "strict_ignore_mask",
             "source_union_mask",
             "background_mask",
+            "bright_mask",
             "pu_class_mask",
             "pseudo_mask",
         ):
@@ -1593,6 +1603,7 @@ class AstroCutoutDataset(Dataset):
             "strict_ignore_mask": targets["strict_ignore_mask"],
             "source_union_mask": targets["source_union_mask"],
             "background_mask": targets["background_mask"],
+            "bright_mask": targets["bright_mask"],
             "pu_class_mask": targets["pu_class_mask"],
             "pseudo_mask": targets["pseudo_mask"],
             "band_seg": torch.stack([target["seg"] for target in band_targets]),
@@ -1608,6 +1619,7 @@ class AstroCutoutDataset(Dataset):
             "band_strict_ignore_mask": torch.stack([target["strict_ignore_mask"] for target in band_targets]),
             "band_source_union_mask": torch.stack([target["source_union_mask"] for target in band_targets]),
             "band_background_mask": torch.stack([target["background_mask"] for target in band_targets]),
+            "band_bright_mask": torch.stack([target["bright_mask"] for target in band_targets]),
             "band_pu_class_mask": torch.stack([target["pu_class_mask"] for target in band_targets]),
             "band_pseudo_mask": torch.stack([target["pseudo_mask"] for target in band_targets]),
             "centers": centers,
@@ -1804,6 +1816,7 @@ def collate_cutouts(batch: Sequence[Dict[str, object]]) -> Dict[str, object]:
         "strict_ignore_mask": torch.stack([item["strict_ignore_mask"] for item in batch]),  # type: ignore[index]
         "source_union_mask": torch.stack([item["source_union_mask"] for item in batch]),  # type: ignore[index]
         "background_mask": torch.stack([item["background_mask"] for item in batch]),  # type: ignore[index]
+        "bright_mask": torch.stack([item["bright_mask"] for item in batch]),  # type: ignore[index]
         "pu_class_mask": torch.stack([item["pu_class_mask"] for item in batch]),  # type: ignore[index]
         "pseudo_mask": torch.stack([item["pseudo_mask"] for item in batch]),  # type: ignore[index]
         "band_seg": torch.stack([item["band_seg"] for item in batch]),  # type: ignore[index]
@@ -1819,6 +1832,7 @@ def collate_cutouts(batch: Sequence[Dict[str, object]]) -> Dict[str, object]:
         "band_strict_ignore_mask": torch.stack([item["band_strict_ignore_mask"] for item in batch]),  # type: ignore[index]
         "band_source_union_mask": torch.stack([item["band_source_union_mask"] for item in batch]),  # type: ignore[index]
         "band_background_mask": torch.stack([item["band_background_mask"] for item in batch]),  # type: ignore[index]
+        "band_bright_mask": torch.stack([item["band_bright_mask"] for item in batch]),  # type: ignore[index]
         "band_pu_class_mask": torch.stack([item["band_pu_class_mask"] for item in batch]),  # type: ignore[index]
         "band_pseudo_mask": torch.stack([item["band_pseudo_mask"] for item in batch]),  # type: ignore[index]
         "centers": [item["centers"] for item in batch],

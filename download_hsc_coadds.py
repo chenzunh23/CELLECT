@@ -36,7 +36,7 @@ from typing import Callable, Iterable
 
 DEFAULT_BASE_URL = (
     "https://hsc-release.mtk.nao.ac.jp/archive/filetree/pdr3_dud/"
-    "deepCoadd-results/HSC-{band}/{tract}/{patch}/"
+    "deepCoadd-results/{band_dir}/{tract}/{patch}/"
 )
 DEFAULT_FILE_TYPES = ("calexp", "meas", "det")
 DEFAULT_BANDS = ("G", "R", "I", "Z", "Y")
@@ -74,14 +74,20 @@ def parse_args() -> argparse.Namespace:
         "--data-root",
         required=True,
         type=Path,
-        help="Output root. Files are saved under <data_root>/<tract>/HSC-<band>/<patch>/.",
+        help=(
+            "Output root. Files are saved under <data_root>/<tract>/<band-dir>/<patch>/, "
+            "where broad bands use HSC-G/HSC-R/... and narrow bands use NB0387/NB0816/..."
+        ),
     )
     parser.add_argument("--tract", default="9813", help="HSC tract ID. Default: 9813.")
     parser.add_argument(
         "--bands",
         nargs="+",
         default=list(DEFAULT_BANDS),
-        help="Bands, e.g. G R I Z Y NB0816. Prefix HSC- is optional.",
+        help=(
+            "Bands, e.g. G R I Z Y NB0816. Prefix HSC- is optional for broad bands. "
+            "Narrow bands are used as-is, e.g. NB0816."
+        ),
     )
     parser.add_argument(
         "--patches",
@@ -107,7 +113,7 @@ def parse_args() -> argparse.Namespace:
         "--base-url",
         default=DEFAULT_BASE_URL,
         help=(
-            "URL template. Available fields: {band}, {tract}, {patch}. "
+            "URL template. Available fields: {band}, {band_dir}, {tract}, {patch}. "
             f"Default: {DEFAULT_BASE_URL}"
         ),
     )
@@ -222,6 +228,13 @@ def normalize_band(band: str) -> str:
     if band.upper().startswith("HSC-"):
         band = band[4:]
     return band.upper()
+
+
+def band_directory_name(band: str) -> str:
+    band = normalize_band(band)
+    if band.startswith("NB"):
+        return band
+    return f"HSC-{band}"
 
 
 def load_patches(values: Iterable[str], patch_file: Path | None) -> list[str]:
@@ -516,10 +529,13 @@ def validate_heavy_footprints(
                         )
                 if heavy_table is not None and "image" in getattr(heavy_table, "names", ()):
                     try:
-                        sample_count = min(16, heavy_rows)
-                        if sample_count:
-                            value_count = sum(len(heavy_table["image"][idx]) for idx in range(sample_count))
-                            if value_count <= 0:
+                        if heavy_rows:
+                            has_nonempty_image = False
+                            for idx in range(heavy_rows):
+                                if len(heavy_table["image"][idx]) > 0:
+                                    has_nonempty_image = True
+                                    break
+                            if not has_nonempty_image:
                                 return False, "HeavyFootprintF image arrays are empty"
                     except Exception as exc:  # noqa: BLE001
                         return False, f"failed to inspect HeavyFootprintF image arrays: {exc}"
@@ -810,8 +826,9 @@ def download_one(
 
 
 def make_directory_url(base_url: str, band: str, tract: str, patch: str) -> str:
+    band_dir = band_directory_name(band)
     patch_for_url = urllib.parse.quote(patch, safe=",")
-    url = base_url.format(band=band, tract=tract, patch=patch_for_url)
+    url = base_url.format(band=band, band_dir=band_dir, tract=tract, patch=patch_for_url)
     if not url.endswith("/"):
         url += "/"
     return url
@@ -860,10 +877,11 @@ def main() -> int:
 
     tasks: list[DownloadTask] = []
     for band in bands:
+        band_dir = band_directory_name(band)
         for patch in patches:
             directory_url = make_directory_url(args.base_url, band, args.tract, patch)
             if not args.no_progress and sys.stderr.isatty():
-                print(f"\rScanning HSC-{band} patch {patch}...".ljust(80), end="", file=sys.stderr)
+                print(f"\rScanning {band_dir} patch {patch}...".ljust(80), end="", file=sys.stderr)
             try:
                 urls = discover_fits_with_retries(
                     opener,
@@ -893,7 +911,7 @@ def main() -> int:
 
             for url in urls:
                 filename = Path(urllib.parse.unquote(urllib.parse.urlparse(url).path)).name
-                dest = args.data_root / str(args.tract) / f"HSC-{band}" / patch / filename
+                dest = args.data_root / str(args.tract) / band_dir / patch / filename
                 tasks.append(DownloadTask(url=url, dest=dest, band=band, patch=patch))
 
     if not args.no_progress and sys.stderr.isatty():

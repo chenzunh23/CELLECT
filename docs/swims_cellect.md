@@ -25,6 +25,11 @@ beside its two matching REG files, or `--no-output-tile-regs` to suppress the
 per-tile REG products. Full-image REG files are still written after overlap
 deduplication.
 
+Use `--regs-only` when only DS9 products are needed. It writes both tile-local
+and deduplicated full-image center/shape REG files, while suppressing tile FITS,
+CSV catalogs, masks, and overlays. The compact summary and manifest JSON files
+are retained.
+
 Optionally, `--output-masks` runs the SAM mask decoder and writes exactly one
 integer instance-label FITS, one label CSV, and one zscale mask-overlay PNG per
 accepted tile. Pixel value 0 is background and positive values are local
@@ -81,6 +86,17 @@ To inspect the accepted cutouts before inference:
 By default tiles are streamed and not saved. Use `--save-tiles` only when the
 intermediate FITS files are needed, because processing all noisy exposures can
 consume several GB.
+
+For REG-only inference:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 /home/czh23/miniconda3/envs/cellect/bin/python \
+  scripts/swims_cellect_pipeline.py \
+  --input-kind stack \
+  --checkpoint /data/czh23/ckpts/sam_shape_0719/epoch_0030.pt \
+  --regs-only \
+  --out-dir output/swims_shape0719_regs_20260721
+```
 
 For direct DS9 inspection of one tile and both of its region layers:
 

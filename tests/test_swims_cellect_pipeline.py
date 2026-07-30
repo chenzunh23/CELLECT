@@ -60,3 +60,14 @@ def test_tile_regs_use_local_ds9_coordinates() -> None:
         )
         assert "circle(11.000,21.000,3)" in centers.read_text()
         assert "ellipse(11.000,21.000,4.000,2.000,0.000)" in shapes.read_text()
+
+
+def test_regs_only_disables_non_reg_products() -> None:
+    args = MODULE.build_parser().parse_args(
+        ["--regs-only", "--save-tiles", "--output-masks", "--no-output-tile-regs"]
+    )
+    MODULE._apply_output_mode(args)
+    assert args.regs_only
+    assert not args.save_tiles
+    assert args.output_tile_regs
+    assert not args.output_masks

@@ -122,11 +122,10 @@ def load_sam_encoder_checkpoint(
 class SamPerBandImageEncoder(nn.Module):
     """Run one shared SAM image encoder independently for every band.
 
-    Forward input is ``[B, bands, H, W]``.  The bands are flattened to
-    ``[B * bands, 1, H, W]``, repeated to RGB, encoded, and reshaped back to
-    ``[B, bands, 256, H/16, W/16]``.  This keeps training/evaluation statistics
-    aligned with CELLECT's per-band convention while using the actual encoder
-    batch size ``B * bands``.
+    Forward input is either ``[B, bands, H, W]`` or ``[B, bands, 3, H, W]``.
+    Grayscale inputs are repeated to RGB; 3-channel inputs are passed to SAM as
+    native RGB-like channels.  The encoder output is reshaped back to
+    ``[B, bands, 256, H/16, W/16]``.
     """
 
     def __init__(
@@ -182,25 +181,41 @@ class SamPerBandImageEncoder(nn.Module):
         return_stats: bool = False,
         return_input: bool = False,
     ) -> Tensor | dict[str, Tensor | dict[str, Tensor] | int]:
-        if x.ndim != 4:
-            raise ValueError(f"SamPerBandImageEncoder expects BCHW input, got shape {tuple(x.shape)}")
-        batch, bands, height, width = x.shape
-        if bands != self.num_bands:
-            raise ValueError(f"input has {bands} bands but encoder was configured for {self.num_bands}")
+        if x.ndim == 4:
+            has_rgb_axis = False
+            batch, bands, height, width = x.shape
+        elif x.ndim == 5 and int(x.shape[2]) == 3:
+            has_rgb_axis = True
+            batch, bands, _rgb, height, width = x.shape
+        else:
+            raise ValueError(
+                f"SamPerBandImageEncoder expects [B, band, H, W] or [B, band, 3, H, W], got shape {tuple(x.shape)}"
+            )
+        if bands != self.num_bands and self.style_router is not None:
+            raise ValueError(
+                f"input has {bands} bands but encoder style router was configured for {self.num_bands}"
+            )
 
         if zscale_cache is not None:
+            if has_rgb_axis:
+                raise ValueError("zscale_cache is only supported for grayscale [B, band, H, W] SAM inputs")
             x = astro_preprocess(x, zscale_cache=zscale_cache, cache_is_preprocessed=True).to(device=x.device)
+            processed_rgb = None
         elif self.astro_preprocess_in_model and not input_is_preprocessed:
+            if has_rgb_axis:
+                raise ValueError("in-model astro preprocessing is only supported for grayscale [B, band, H, W] SAM inputs")
             x = astro_preprocess(
                 x,
                 clip_sigma=self.astro_preprocess_clip_sigma,
                 sigma_iters=self.astro_preprocess_sigma_iters,
                 z_clip=self.astro_preprocess_z_clip,
             )
+            processed_rgb = None
         else:
             x = torch.nan_to_num(x.to(dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
+            processed_rgb = x if has_rgb_axis else None
 
-        processed = x
+        processed = x.mean(dim=2) if has_rgb_axis else x
         style_logit: Optional[Tensor] = None
         style_alpha: Optional[Tensor] = None
         flat_style_prompt: Optional[Tensor] = None
@@ -213,9 +228,13 @@ class SamPerBandImageEncoder(nn.Module):
             )
             flat_style_prompt = sample_prompt[:, None, :].expand(-1, bands, -1).reshape(batch * bands, -1)
         stats = per_band_stats(processed) if return_stats else None
-        padded = pad_to_square(processed, self.img_size)
-        flat = padded.reshape(batch * bands, 1, self.img_size, self.img_size)
-        flat_rgb = flat.expand(-1, 3, -1, -1).contiguous()
+        if processed_rgb is not None:
+            flat_rgb_input = processed_rgb.reshape(batch * bands, 3, height, width)
+            flat_rgb = pad_to_square(flat_rgb_input, self.img_size).contiguous()
+        else:
+            padded = pad_to_square(processed, self.img_size)
+            flat = padded.reshape(batch * bands, 1, self.img_size, self.img_size)
+            flat_rgb = flat.expand(-1, 3, -1, -1).contiguous()
         flat_features = self.image_encoder(flat_rgb, style_prompt=flat_style_prompt)
         features = flat_features.reshape(batch, bands, *flat_features.shape[1:])
 

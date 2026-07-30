@@ -239,6 +239,10 @@ class ZarrChunkLocalBatchSampler(Sampler[list[int]]):
                 total += (len(chunk) + self.batch_size - 1) // self.batch_size
         return total
 
+    def max_local_chunk_size(self) -> int:
+        chunks = self._rank_chunks()
+        return max((len(chunk) for chunk in chunks), default=0)
+
 
 class ZarrChunkBatchIterableDataset(IterableDataset):
     """Worker-owned Zarr chunk iterator that yields already-collated batches."""
@@ -360,6 +364,10 @@ class ZarrChunkBatchIterableDataset(IterableDataset):
     def local_sample_count(self) -> int:
         return sum(len(chunk) for chunk in self._rank_chunks(epoch=self._epoch_value()))
 
+    def max_local_chunk_size(self) -> int:
+        chunks = self._rank_chunks(epoch=self._epoch_value())
+        return max((len(chunk) for chunk in chunks), default=0)
+
 
 def discover_zarr_records(
     root: Path,
@@ -383,6 +391,8 @@ def discover_zarr_records(
         attrs = reader.attrs
         if attrs.get("format") == "cellect_direct_patch_zarr" and not manifest_path.exists():
             print(f"[zarr] skip incomplete direct store without manifest: {store}", flush=True)
+            continue
+        if bool(attrs.get("image_level_training", False)):
             continue
         store_bands = tuple(str(b) for b in attrs.get("bands", []))
         if wanted_bands and store_bands and tuple(wanted_bands) != store_bands:
@@ -423,6 +433,77 @@ def discover_zarr_records(
     return records
 
 
+def discover_zarr_image_records(
+    root: Path,
+    *,
+    bands: Sequence[str],
+    max_records: int | None = None,
+) -> list[CutoutRecord]:
+    """Discover single-band image-level Zarr samples for SAM detector training."""
+
+    root = Path(root).expanduser().resolve()
+    stores = sorted(root.rglob("*.zarr"))
+    records: list[CutoutRecord] = []
+    wanted_bands = {str(band) for band in bands}
+    for store in stores:
+        manifest_path = store.parent / f"{store.name}_manifest.json"
+        try:
+            reader = PatchZarrReader(store)
+        except (FileNotFoundError, json.JSONDecodeError) as exc:
+            if not manifest_path.exists():
+                print(f"[zarr] skip incomplete store without manifest: {store} ({exc})", flush=True)
+                continue
+            raise
+        attrs = reader.attrs
+        if attrs.get("format") == "cellect_direct_patch_zarr" and not manifest_path.exists():
+            print(f"[zarr] skip incomplete direct store without manifest: {store}", flush=True)
+            continue
+        if not bool(attrs.get("image_level_training", False)):
+            continue
+        store_bands = tuple(str(b) for b in attrs.get("bands", []))
+        if len(store_bands) != 1:
+            continue
+        band = store_bands[0]
+        if wanted_bands and band not in wanted_bands:
+            continue
+        n = int(reader.meta("images").shape[0])
+        tile_x0 = reader.read_full_small("tile_x0").astype(np.int32, copy=False)
+        tile_y0 = reader.read_full_small("tile_y0").astype(np.int32, copy=False)
+        tile_names = _decode_fixed_utf8(reader.read_full_small("tile_name"))
+        groups = _decode_fixed_utf8(reader.read_full_small("group"))
+        dataset_sources = _decode_fixed_utf8(reader.read_full_small("dataset_source"))
+        tract = str(attrs.get("tract", ""))
+        patch = str(attrs.get("patch", store.stem))
+        try:
+            rel_root = str(store.parent.relative_to(root))
+        except ValueError:
+            rel_root = ""
+        for i in range(n):
+            dataset_source = dataset_sources[i] if i < len(dataset_sources) else str(attrs.get("dataset_source", "zarr"))
+            group = groups[i] if i < len(groups) else ""
+            tile_name = tile_names[i] if i < len(tile_names) else f"sample_{i:06d}"
+            parts = [value for value in (tract, dataset_source, patch, group, band, tile_name) if value]
+            records.append(
+                CutoutRecord(
+                    name="/".join(parts),
+                    image_paths=(_zarr_uri(store, i),),
+                    meas_path="",
+                    x0=int(tile_x0[i]),
+                    y0=int(tile_y0[i]),
+                    tile_name=tile_name,
+                    tract=tract,
+                    patch=patch,
+                    relative_root=rel_root,
+                    dataset_source=dataset_source or "zarr",
+                )
+            )
+            if max_records is not None and len(records) >= int(max_records):
+                return records
+    if not records:
+        raise RuntimeError(f"No image-level Zarr records found under {root}")
+    return records
+
+
 def _target_defaults_from_pu(
     *,
     confidence: Tensor,
@@ -436,6 +517,7 @@ def _target_defaults_from_pu(
     ignore = pu == 3
     background = pu == 4
     strict_center = pu == 5
+    bright = pu == 6
     source_union = clean | center | ignore | strict_center
     return {
         "seg": clean.to(dtype=torch.long),
@@ -450,7 +532,8 @@ def _target_defaults_from_pu(
         "strict_center_only_mask": strict_center.to(dtype=torch.uint8),
         "strict_ignore_mask": torch.zeros_like(pu, dtype=torch.uint8),
         "source_union_mask": source_union.to(dtype=torch.uint8),
-        "background_mask": background.to(dtype=torch.uint8),
+        "background_mask": (background & ~bright).to(dtype=torch.uint8),
+        "bright_mask": bright.to(dtype=torch.uint8),
         "pu_class_mask": pu.to(dtype=torch.uint8),
         "pseudo_mask": torch.zeros_like(pu, dtype=torch.uint8),
     }
@@ -588,6 +671,7 @@ class ZarrCutoutDataset(Dataset):
             "strict_ignore_mask": primary["strict_ignore_mask"],
             "source_union_mask": primary["source_union_mask"],
             "background_mask": primary["background_mask"],
+            "bright_mask": primary["bright_mask"],
             "pu_class_mask": primary["pu_class_mask"],
             "pseudo_mask": primary["pseudo_mask"],
             "band_seg": torch.stack([target["seg"] for target in band_targets]),
@@ -603,6 +687,7 @@ class ZarrCutoutDataset(Dataset):
             "band_strict_ignore_mask": torch.stack([target["strict_ignore_mask"] for target in band_targets]),
             "band_source_union_mask": torch.stack([target["source_union_mask"] for target in band_targets]),
             "band_background_mask": torch.stack([target["background_mask"] for target in band_targets]),
+            "band_bright_mask": torch.stack([target["bright_mask"] for target in band_targets]),
             "band_pu_class_mask": torch.stack([target["pu_class_mask"] for target in band_targets]),
             "band_pseudo_mask": torch.stack([target["pseudo_mask"] for target in band_targets]),
             "centers": centers,

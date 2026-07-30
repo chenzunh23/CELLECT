@@ -324,8 +324,10 @@ class SamCellectDecoder(nn.Module):
 
     @staticmethod
     def _flatten_images(images: Tensor, *, batch: int, bands: int) -> Tensor:
+        if images.ndim == 5 and int(images.shape[2]) == 3:
+            images = images.mean(dim=2)
         if images.ndim != 4:
-            raise ValueError(f"per-band decoder images must be [B, band, H, W], got {tuple(images.shape)}")
+            raise ValueError(f"per-band decoder images must be [B, band, H, W] or [B, band, 3, H, W], got {tuple(images.shape)}")
         if images.shape[0] != batch or images.shape[1] != bands:
             raise ValueError(
                 f"image shape {tuple(images.shape[:2])} does not match feature batch/bands {(batch, bands)}"
