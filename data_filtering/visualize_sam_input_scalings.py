@@ -82,7 +82,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--lupton-minimum-mode",
         choices=["fixed", "zscore-mean", "zscore-median", "raw-median", "image-min"],
-        default="fixed",
+        default="zscore-median",
         help="Source for Lupton minimum. fixed uses --lupton-minimum; zscore-* reuses the current SAM zscore background estimate.",
     )
     p.add_argument("--lupton-stretch", type=float, default=0.5)

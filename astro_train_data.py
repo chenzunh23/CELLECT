@@ -792,10 +792,10 @@ def _target_defaults(targets: Dict[str, Tensor]) -> Dict[str, Tensor]:
     targets.setdefault("ignore_mask", torch.zeros((h, w), dtype=torch.uint8, device=device))
     targets.setdefault("strict_center_only_mask", torch.zeros((h, w), dtype=torch.uint8, device=device))
     targets.setdefault("strict_ignore_mask", torch.zeros((h, w), dtype=torch.uint8, device=device))
-    strict_as_center = ((targets["strict_center_only_mask"] > 0) | (targets["strict_ignore_mask"] > 0)).to(dtype=torch.bool)
     clean_bool = targets["clean_mask"] > 0
-    center_only_bool = ((targets["center_only_mask"] > 0) | strict_as_center) & ~clean_bool
-    ignore_bool = (targets["ignore_mask"] > 0) & ~clean_bool & ~center_only_bool
+    strict_bool = targets["strict_center_only_mask"] > 0
+    center_only_bool = (targets["center_only_mask"] > 0) & ~clean_bool
+    ignore_bool = (targets["ignore_mask"] > 0) & ~clean_bool & ~center_only_bool & ~strict_bool
     targets["center_only_mask"] = center_only_bool.to(dtype=torch.uint8)
     targets["ignore_mask"] = ignore_bool.to(dtype=torch.uint8)
     targets.setdefault("source_union_mask", (targets["clean_mask"] > 0).to(dtype=torch.uint8))
@@ -804,16 +804,24 @@ def _target_defaults(targets: Dict[str, Tensor]) -> Dict[str, Tensor]:
     ).to(dtype=torch.uint8)
     targets.setdefault("bright_mask", torch.zeros((h, w), dtype=torch.uint8, device=device))
     targets["bright_mask"] = (
-        (targets["bright_mask"] > 0) & ~clean_bool & ~center_only_bool & ~ignore_bool
+        (targets["bright_mask"] > 0) & ~clean_bool & ~center_only_bool & ~ignore_bool & ~strict_bool
     ).to(dtype=torch.uint8)
     targets.setdefault("background_mask", (targets["source_union_mask"] == 0).to(dtype=torch.uint8))
     targets["background_mask"] = (
-        (targets["background_mask"] > 0) & (targets["source_union_mask"] == 0) & (targets["bright_mask"] == 0)
+        (targets["background_mask"] > 0)
+        & (targets["source_union_mask"] == 0)
+        & (targets["bright_mask"] == 0)
+        & ~strict_bool
     ).to(dtype=torch.uint8)
     targets.setdefault("pu_class_mask", targets["clean_mask"].to(dtype=torch.uint8))
     targets.setdefault("pseudo_mask", torch.zeros((h, w), dtype=torch.uint8, device=device))
     if not has_confidence_weight:
-        targets["confidence_weight"] = clean_bool.to(dtype=torch.float32)
+        targets["confidence_weight"] = (
+            clean_bool
+            | (targets["background_mask"] > 0)
+            | (targets["bright_mask"] > 0)
+            | strict_bool
+        ).to(dtype=torch.float32)
     center_only_confidence = center_only_bool & (targets["confidence"] > 0)
     targets["confidence_weight"] = torch.maximum(
         targets["confidence_weight"].to(dtype=torch.float32),
@@ -821,9 +829,16 @@ def _target_defaults(targets: Dict[str, Tensor]) -> Dict[str, Tensor]:
     )
     if not has_seg_loss_weight:
         reliable = (
-            (targets["clean_mask"] > 0) | (targets["background_mask"] > 0) | (targets["bright_mask"] > 0)
+            (targets["clean_mask"] > 0)
+            | (targets["background_mask"] > 0)
+            | (targets["bright_mask"] > 0)
+            | strict_bool
         ).to(dtype=torch.bool)
-        targets["seg_loss_weight"] = reliable.to(dtype=torch.float32)
+        targets["seg_loss_weight"] = torch.where(
+            reliable,
+            targets["confidence_weight"].to(dtype=torch.float32),
+            torch.zeros((h, w), dtype=torch.float32, device=device),
+        )
     return targets
 
 

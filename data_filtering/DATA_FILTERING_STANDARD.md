@@ -82,8 +82,24 @@ too little footprint support:
 area > 500 and aperture_pixel_count / aperture_area < 0.3
 ```
 
-These sources can supervise center/confidence weakly but should not supervise
-shape.
+This rule came from the 2026-07-23 request recorded in
+`/home/czh23/.codex/history.jsonl` around the `data_filter_0723/refit_diagnostics`
+work.  The intent was explicit: these sources have a usable center, but their
+Kron aperture/shape extends far beyond the supported footprint, so shape should
+not be trained.
+
+Historical code stored them as `center_only` plus
+`pu_no_shape_supervision=True`:
+
+```text
+center_only_by_fill = area > 500 and fill_ratio < 0.3
+no_shape_supervision = center_only_by_fill
+```
+
+In the v3 label vocabulary, this fill-ratio class maps to
+`strict_center_only`, not `weak_shape`.  It trains the center/confidence only and
+must have zero shape/mask supervision.  This is separate from the AP2-SNR
+post-filter below, whose historical `center_only` maps to `weak_shape`.
 
 ### Refined Bright AP2-Kron Hard Reject
 
@@ -197,6 +213,45 @@ Narrow-band defaults:
 AP2 SNR <= 5             -> ignore
 5 < AP2 SNR < 8          -> center_only
 area > 500 and SNR <= 8  -> center_only
+```
+
+In the v3 label vocabulary, this historical `center_only` class maps to
+`weak_shape`: it keeps center/confidence supervision and may keep weak shape
+supervision according to the downstream shape-weight policy.  This AP2-SNR
+post-filter does **not** create `strict_center_only` sources.  `strict_center_only`
+is reserved for hard center-only labels such as Gaia-inserted bright-star
+centers, geometric bright-component centers, or explicitly shape-forbidden
+sources.
+
+The 2026-07-23 diagnostic run in
+`output/data_filter_0723/snr_post_filter_45` was generated from the request:
+
+```text
+area > 500 and SNR <= 8 -> center_only
+broad bands:  AP2 SNR <= 3 ignore, 3-5 center_only
+narrow bands: AP2 SNR <= 5 ignore, 5-8 center_only
+```
+
+Its implementation was `scripts/apply_snr_post_filter_regions.py`.  That script
+normalizes any input `strict_center_only` row to `center_only` before applying
+SNR:
+
+```text
+old_norm = "center_only" if old_class == "strict_center_only" else old_class
+```
+
+and writes only three output classes: `clean`, `center_only`, and `ignore`.
+The saved summaries confirm the intended broad/narrow split:
+
+```text
+HSC-I 4,5 broad:  before clean=24850 center_only=351 ignore=745
+                  after  clean=23069 center_only=1594 ignore=1283
+HSC-Z 4,5 broad:  before clean=23703 center_only=441 ignore=719
+                  after  clean=20314 center_only=2844 ignore=1705
+NB0816 4,5 narrow: before clean=16285 center_only=728 ignore=917
+                   after  clean=9496 center_only=3171 ignore=5263
+NB1010 4,5 narrow: before clean=6035 center_only=387 ignore=630
+                   after  clean=3206 center_only=1148 ignore=2698
 ```
 
 After this pass, a final close-center dedup can demote duplicates to ignore.

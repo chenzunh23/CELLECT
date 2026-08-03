@@ -165,7 +165,18 @@ def _selector_parts(spec: str) -> tuple[str, str]:
 def _record_group_name(rec: CutoutRecord) -> str:
     tile_name = str(getattr(rec, "tile_name", "") or "")
     match = re.match(r"^(group_[^_]+)_", tile_name)
-    return str(match.group(1)) if match else ""
+    if match:
+        return str(match.group(1))
+    name = str(getattr(rec, "name", "") or "")
+    match = re.search(r"(?:^|/)(group_\d+)(?:/|$)", name)
+    if match:
+        return str(match.group(1))
+    for uri in getattr(rec, "image_paths", ()) or ():
+        text = str(uri)
+        match = re.search(r"__?(group_\d+)(?:\\.zarr|/|#|$)", text)
+        if match:
+            return str(match.group(1))
+    return ""
 
 
 def _is_random_group_selector(group_selector: str) -> bool:

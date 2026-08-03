@@ -477,6 +477,55 @@ def matching_gaia_rows_to_cluster(
     return sorted(matches, key=lambda item: (base.finite_float(item[0].get("phot_g_mean_mag"), float("inf")), item[2]))
 
 
+def assign_gaia_rows_to_clusters(
+    clusters: list[list[int]],
+    sources: list[dict[str, object]],
+    gaia_rows: list[dict[str, object]],
+    *,
+    source_match_pixels: float,
+    centroid_match_pixels: float,
+) -> dict[int, list[tuple[dict[str, object], str, float]]]:
+    """Greedily assign each Gaia row to its nearest matching HSC cluster.
+
+    A cluster may receive multiple Gaia centers, but a Gaia center should not
+    create duplicate strict labels through nearby fragmented HSC clusters.
+    """
+
+    candidates: list[tuple[float, float, int, dict[str, object], str, float]] = []
+    for cluster_pos, cluster in enumerate(clusters):
+        for gaia, mode, dist_pix in matching_gaia_rows_to_cluster(
+            cluster,
+            sources,
+            gaia_rows,
+            source_match_pixels=source_match_pixels,
+            centroid_match_pixels=centroid_match_pixels,
+        ):
+            gmag = base.finite_float(gaia.get("phot_g_mean_mag"), float("inf"))
+            candidates.append((float(dist_pix), float(gmag), int(cluster_pos), gaia, mode, float(dist_pix)))
+    assigned: dict[int, list[tuple[dict[str, object], str, float]]] = defaultdict(list)
+    used_gaia: set[str] = set()
+    for _dist, _gmag, cluster_pos, gaia, mode, dist_pix in sorted(candidates, key=lambda item: (item[0], item[1])):
+        gaia_key = str(gaia.get("source_id", f"{float(gaia['x']):.6f},{float(gaia['y']):.6f}"))
+        if gaia_key in used_gaia:
+            continue
+        used_gaia.add(gaia_key)
+        assigned[int(cluster_pos)].append((gaia, mode, dist_pix))
+    return assigned
+
+
+def source_intersects_any(
+    source_idx: int,
+    candidate_indices: list[int],
+    sources: list[dict[str, object]],
+) -> bool:
+    for other_idx in candidate_indices:
+        if int(other_idx) == int(source_idx):
+            continue
+        if base.approximate_ellipse_iou(sources[source_idx], sources[other_idx]) > 0.0:
+            return True
+    return False
+
+
 def assign_labels_no_upper_source_clusters(
     *,
     sources: list[dict[str, object]],
@@ -523,7 +572,7 @@ def assign_labels_no_upper_source_clusters(
             "has_bright_gaia": False,
             "source_cluster_no_upper": True,
         }
-        if len(cluster) == 1:
+        if len(cluster) == 1 and not source_intersects_any(cluster[0], list(range(len(sources))), sources):
             source = sources[cluster[0]]
             if float(source["area"]) < 1000.0:
                 source["final_label"] = "clean"
@@ -561,8 +610,8 @@ def assign_labels_no_upper_source_clusters(
         cluster_in_bad = any(bool(sources[idx].get("center_in_bad_mask", False)) for idx in cluster)
         if gaia_matches:
             for idx in cluster:
-                sources[idx]["final_label"] = "ignore"
-                sources[idx]["reason"] = "no_upper_gaia_matched_cluster_hsc_fragment_ignore"
+                sources[idx]["final_label"] = "restricted_bright_region"
+                sources[idx]["reason"] = "no_upper_gaia_matched_cluster_hsc_fragment_restricted"
                 draw_source_ellipse(bright_mask, sources[idx])
             synthetic_rows = []
             for gaia, mode, dist_pix in gaia_matches:
@@ -721,54 +770,6 @@ def assign_labels_v2(
     cluster_rows: list[dict[str, object]] = []
     next_cluster_id = 1
     for comp in sorted(pending_by_component):
-        bright_gaia_rows = [
-            gaia
-            for gaia in gaia_by_component.get(comp, [])
-            if math.isfinite(base.finite_float(gaia.get("phot_g_mean_mag"), float("inf")))
-            and base.finite_float(gaia.get("phot_g_mean_mag"), float("inf")) <= float(gaia_bright_mag_threshold)
-        ]
-        if use_bright_gaia_component_override and bright_gaia_rows:
-            cluster_id = next_cluster_id
-            next_cluster_id += 1
-            for idx in pending_by_component[comp]:
-                sources[idx]["cluster_id"] = cluster_id
-                sources[idx]["cluster_size"] = len(pending_by_component[comp])
-                sources[idx]["cluster_has_bright_gaia"] = True
-                sources[idx]["final_label"] = "restricted_bright_region"
-                sources[idx]["reason"] = "same_bright_gaia_component_hsc_fragment"
-            synthetic_rows = [
-                synthetic_gaia_source(
-                    gaia,
-                    comp=comp,
-                    component_area=component_areas.get(comp, 0),
-                    cluster_id=cluster_id,
-                    cluster_size=len(pending_by_component[comp]) + len(bright_gaia_rows),
-                )
-                for gaia in sorted(bright_gaia_rows, key=lambda row: base.finite_float(row.get("phot_g_mean_mag"), float("inf")))
-            ]
-            sources.extend(synthetic_rows)
-            component_meta.setdefault(comp, {})["cluster_count"] = 1
-            component_meta.setdefault(comp, {})["candidate_source_count"] = len(pending_by_component[comp])
-            cluster_rows.append(
-                {
-                    "cluster_id": cluster_id,
-                    "component_id": comp,
-                    "component_area": component_areas.get(comp, 0),
-                    "cluster_size": len(pending_by_component[comp]),
-                    "cluster_in_bad_mask": any(bool(sources[idx]["center_in_bad_mask"]) for idx in pending_by_component[comp]),
-                    "component_has_bright_gaia": True,
-                    "chosen_source_id": " ".join(str(row["source_id"]) for row in synthetic_rows),
-                    "chosen_final_label": "strict_center_only_external",
-                    "chosen_reason": "component_bright_gaia_direct_strict_center_only",
-                    "gaia_source_id": " ".join(str(row["gaia_source_id"]) for row in synthetic_rows),
-                    "gaia_g_mag": " ".join(str(row["gaia_g_mag"]) for row in synthetic_rows),
-                    "gaia_match_arcsec": " ".join("0.0000" for _row in synthetic_rows),
-                    "gaia_match_pixels": " ".join("0.000" for _row in synthetic_rows),
-                    "gaia_match_mode": "bright_gaia_component_direct",
-                    "source_ids": " ".join(str(sources[idx]["source_id"]) for idx in pending_by_component[comp]),
-                }
-            )
-            continue
         if (
             int(large_component_fast_center_only_source_min) > 0
             and len(pending_by_component[comp]) >= int(large_component_fast_center_only_source_min)
@@ -816,7 +817,14 @@ def assign_labels_v2(
         has_bright_gaia = component_has_bright_gaia(
             comp, gaia_by_component, gaia_bright_mag_threshold=gaia_bright_mag_threshold
         )
-        for cluster in clusters:
+        gaia_by_cluster = assign_gaia_rows_to_clusters(
+            clusters,
+            sources,
+            gaia_by_component.get(comp, []),
+            source_match_pixels=float(cluster_source_match_pixels),
+            centroid_match_pixels=float(cluster_centroid_match_pixels),
+        )
+        for cluster_pos, cluster in enumerate(clusters):
             cluster_id = next_cluster_id
             next_cluster_id += 1
             chosen_idx = min(cluster, key=lambda idx: float(sources[idx]["mag"]))
@@ -825,17 +833,7 @@ def assign_labels_v2(
                 chosen_idx = min(cluster, key=lambda idx: (float(sources[idx]["area"]) >= float(drop_area_max), float(sources[idx]["mag"])))
                 chosen = sources[chosen_idx]
             cluster_in_bad_mask = any(bool(sources[idx]["center_in_bad_mask"]) for idx in cluster)
-            gaia, gaia_idx, dist_arcsec, dist_pix, match_mode = base.nearest_gaia_to_cluster(
-                cluster,
-                sources,
-                gaia_by_component.get(comp, []),
-                match_radius_arcsec=float(match_radius_arcsec),
-                source_match_pixels=float(cluster_source_match_pixels),
-                centroid_match_pixels=float(cluster_centroid_match_pixels),
-            )
-            if gaia_idx is not None:
-                chosen_idx = gaia_idx
-                chosen = sources[chosen_idx]
+            matched_gaia = gaia_by_cluster.get(cluster_pos, [])
 
             for idx in cluster:
                 sources[idx]["cluster_id"] = cluster_id
@@ -843,7 +841,7 @@ def assign_labels_v2(
                 sources[idx]["cluster_has_bright_gaia"] = has_bright_gaia
 
             cluster_finalized = False
-            if len(cluster) == 1:
+            if len(cluster) == 1 and not source_intersects_any(cluster[0], pending_by_component[comp], sources):
                 only = sources[cluster[0]]
                 only_is_galaxy = str(only.get("class")) == "galaxy"
                 only_is_unknown = str(only.get("class")) == "unknown"
@@ -865,44 +863,39 @@ def assign_labels_v2(
                     only["reason"] = "isolated_large_bright_component_galaxy_center_only"
                     cluster_finalized = True
 
-            if not cluster_finalized and gaia is not None:
-                attach_gaia(chosen, gaia, dist_arcsec, dist_pix, match_mode)
-                gmag = base.finite_float(gaia.get("phot_g_mean_mag"), float("inf"))
-                if math.isfinite(gmag) and gmag <= float(gaia_bright_mag_threshold):
-                    chosen_label = "strict_center_only_external"
-                    chosen_reason = "gaia_bright_star_strict_center_only"
-                elif str(chosen["class"]) == "galaxy" and source_shape_usable(
-                    chosen, max_area=shape_max_area, max_axis_ratio=shape_axis_ratio_max
-                ):
-                    chosen_label = "center_only_external"
-                    chosen_reason = "gaia_matched_hsc_galaxy_center_only"
-                else:
-                    chosen_label = "strict_center_only_external"
-                    chosen_reason = "gaia_matched_star_or_unknown_strict_center_only"
+            synthetic_rows: list[dict[str, object]] = []
+            if not cluster_finalized and matched_gaia:
                 for idx in cluster:
-                    if idx == chosen_idx:
-                        sources[idx]["final_label"] = chosen_label
-                        sources[idx]["reason"] = chosen_reason
-                    else:
-                        sources[idx]["final_label"] = "restricted_bright_region"
-                        sources[idx]["reason"] = "same_cluster_has_gaia_not_chosen"
+                    sources[idx]["final_label"] = "restricted_bright_region"
+                    sources[idx]["reason"] = "gaia_matched_cluster_hsc_fragment_restricted"
+                synthetic_rows = [
+                    synthetic_gaia_source(
+                        gaia,
+                        comp=comp,
+                        component_area=component_areas.get(comp, 0),
+                        cluster_id=cluster_id,
+                        cluster_size=len(cluster) + len(matched_gaia),
+                    )
+                    for gaia, _mode, _dist_pix in sorted(
+                        matched_gaia,
+                        key=lambda item: (base.finite_float(item[0].get("phot_g_mean_mag"), float("inf")), item[2]),
+                    )
+                ]
+                for synthetic, (_gaia, mode, dist_pix) in zip(synthetic_rows, sorted(
+                    matched_gaia,
+                    key=lambda item: (base.finite_float(item[0].get("phot_g_mean_mag"), float("inf")), item[2]),
+                )):
+                    synthetic["reason"] = "gaia_cluster_direct_strict_center_only"
+                    synthetic["gaia_match_pixels"] = float(dist_pix)
+                    synthetic["gaia_match_arcsec"] = float(dist_pix) * 0.168
+                    synthetic["gaia_match_mode"] = f"cluster_{mode}"
+                sources.extend(synthetic_rows)
                 cluster_finalized = True
 
             if not cluster_finalized:
-                chosen_is_galaxy = str(chosen["class"]) == "galaxy"
-                chosen_shape_ok = source_shape_usable(chosen, max_area=shape_max_area, max_axis_ratio=shape_axis_ratio_max)
-                if chosen_is_galaxy and chosen_shape_ok:
-                    for idx in cluster:
-                        if idx == chosen_idx:
-                            sources[idx]["final_label"] = "center_only_external"
-                            sources[idx]["reason"] = "brightest_hsc_galaxy_center_only"
-                        else:
-                            sources[idx]["final_label"] = "restricted_bright_region"
-                            sources[idx]["reason"] = "same_cluster_galaxy_member_not_chosen"
-                else:
-                    for idx in cluster:
-                        sources[idx]["final_label"] = "ignore"
-                        sources[idx]["reason"] = "no_gaia_non_galaxy_or_bad_shape_ignore"
+                for idx in cluster:
+                    sources[idx]["final_label"] = "ignore"
+                    sources[idx]["reason"] = "bright_cluster_no_gaia_match_ignore"
 
             cluster_rows.append(
                 {
@@ -912,14 +905,16 @@ def assign_labels_v2(
                     "cluster_size": len(cluster),
                     "cluster_in_bad_mask": cluster_in_bad_mask,
                     "component_has_bright_gaia": has_bright_gaia,
-                    "chosen_source_id": sources[chosen_idx]["source_id"],
-                    "chosen_final_label": sources[chosen_idx]["final_label"],
-                    "chosen_reason": sources[chosen_idx]["reason"],
-                    "gaia_source_id": gaia["source_id"] if gaia is not None else "",
-                    "gaia_g_mag": gaia["phot_g_mean_mag"] if gaia is not None else "",
-                    "gaia_match_arcsec": dist_arcsec if gaia is not None else "",
-                    "gaia_match_pixels": dist_pix if gaia is not None else "",
-                    "gaia_match_mode": match_mode,
+                    "chosen_source_id": " ".join(str(row["source_id"]) for row in synthetic_rows)
+                    if synthetic_rows
+                    else sources[chosen_idx]["source_id"],
+                    "chosen_final_label": "strict_center_only_external" if synthetic_rows else sources[chosen_idx]["final_label"],
+                    "chosen_reason": "gaia_cluster_direct_strict_center_only" if synthetic_rows else sources[chosen_idx]["reason"],
+                    "gaia_source_id": " ".join(str(row["gaia_source_id"]) for row in synthetic_rows),
+                    "gaia_g_mag": " ".join(str(row["gaia_g_mag"]) for row in synthetic_rows),
+                    "gaia_match_arcsec": " ".join(str(row["gaia_match_arcsec"]) for row in synthetic_rows),
+                    "gaia_match_pixels": " ".join(str(row["gaia_match_pixels"]) for row in synthetic_rows),
+                    "gaia_match_mode": " ".join(str(row["gaia_match_mode"]) for row in synthetic_rows),
                     "source_ids": " ".join(str(sources[idx]["source_id"]) for idx in cluster),
                 }
             )

@@ -31,6 +31,8 @@ except Exception as exc:  # pragma: no cover
 warnings.filterwarnings("ignore", category=UnitsWarning)
 warnings.filterwarnings("ignore", message="Warning: converting a masked element to nan.")
 
+from data_filtering.sam_input_scaling import current_sam_zscore
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -235,7 +237,7 @@ def finite_values(image: np.ndarray) -> np.ndarray:
 
 def standardize_clip(arr: np.ndarray) -> np.ndarray:
     vals = finite_values(arr)
-    mean = float(np.mean(vals))
+    mean = float(np.median(vals))
     std = float(np.std(vals))
     if not math.isfinite(std) or std <= 0:
         std = 1.0
@@ -257,8 +259,8 @@ def log_mapping(image: np.ndarray, *, a: float, high_percentile: float) -> np.nd
 
 
 def lupton_mapping(image: np.ndarray, *, stretch: float, q: float) -> np.ndarray:
-    vals = finite_values(image)
-    minimum = float(np.mean(vals))
+    _z, stats = current_sam_zscore(image)
+    minimum = float(stats.get("zscore_median", stats["median"]))
     rgb = make_lupton_rgb(image, image, image, minimum=minimum, stretch=float(stretch), Q=float(q), output_dtype=float)
     return np.asarray(rgb[..., 0], dtype=np.float32)
 

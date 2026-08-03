@@ -2441,17 +2441,12 @@ def _update_detection_totals(
             if per_band_outputs and "band_ignore_centers" in batch
             else (batch["ignore_centers"] if "ignore_centers" in batch else _empty_center_list(len(pred_list)))  # type: ignore[assignment]
         )
-        strict_center_list = (
-            _flatten_band_centers(batch["band_strict_center_only_centers"])  # type: ignore[arg-type]
-            if per_band_outputs and "band_strict_center_only_centers" in batch
-            else (batch["strict_center_only_centers"] if "strict_center_only_centers" in batch else _empty_center_list(len(pred_list)))  # type: ignore[assignment]
-        )
         strict_ignore_list = (
             _flatten_band_centers(batch["band_strict_ignore_centers"])  # type: ignore[arg-type]
             if per_band_outputs and "band_strict_ignore_centers" in batch
             else (batch["strict_ignore_centers"] if "strict_ignore_centers" in batch else _empty_center_list(len(pred_list)))  # type: ignore[assignment]
         )
-        ordinary_ignore_list = _merge_center_lists(ordinary_base, strict_center_list, strict_ignore_list)
+        ordinary_ignore_list = _merge_center_lists(ordinary_base, strict_ignore_list)
     elif per_band_outputs:
         flat_outputs = _flatten_per_band_outputs(outputs)
         if bool(collect_candidate_stats):
@@ -2490,17 +2485,12 @@ def _update_detection_totals(
             if "band_ignore_centers" in batch
             else _empty_center_list(len(pred_list))
         )
-        strict_center_list = (
-            _flatten_band_centers(batch["band_strict_center_only_centers"])  # type: ignore[arg-type]
-            if "band_strict_center_only_centers" in batch
-            else _empty_center_list(len(pred_list))
-        )
         strict_ignore_list = (
             _flatten_band_centers(batch["band_strict_ignore_centers"])  # type: ignore[arg-type]
             if "band_strict_ignore_centers" in batch
             else _empty_center_list(len(pred_list))
         )
-        ordinary_ignore_list = _merge_center_lists(ordinary_base, strict_center_list, strict_ignore_list)
+        ordinary_ignore_list = _merge_center_lists(ordinary_base, strict_ignore_list)
     else:
         if bool(collect_candidate_stats):
             _, _, candidate_debug = _compute_detection_peak_maps(
@@ -2528,11 +2518,8 @@ def _update_detection_totals(
             [item for item in batch["background_mask"]] if "background_mask" in batch else [None for _ in pred_list]  # type: ignore[index]
         )
         ordinary_base = batch["ignore_centers"] if "ignore_centers" in batch else _empty_center_list(len(pred_list))  # type: ignore[assignment]
-        strict_center_list = (
-            batch["strict_center_only_centers"] if "strict_center_only_centers" in batch else _empty_center_list(len(pred_list))  # type: ignore[assignment]
-        )
         strict_ignore_list = batch["strict_ignore_centers"] if "strict_ignore_centers" in batch else _empty_center_list(len(pred_list))  # type: ignore[assignment]
-        ordinary_ignore_list = _merge_center_lists(ordinary_base, strict_center_list, strict_ignore_list)
+        ordinary_ignore_list = _merge_center_lists(ordinary_base, strict_ignore_list)
 
     per_band_counts = totals["per_band_counts"]
     assert isinstance(per_band_counts, dict)

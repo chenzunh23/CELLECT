@@ -137,6 +137,19 @@ def cluster_sources(
     return uf.groups()
 
 
+def source_intersects_any(
+    source_idx: int,
+    candidate_indices: list[int],
+    sources: list[dict[str, object]],
+) -> bool:
+    for other_idx in candidate_indices:
+        if int(other_idx) == int(source_idx):
+            continue
+        if approximate_ellipse_iou(sources[source_idx], sources[other_idx]) > 0.0:
+            return True
+    return False
+
+
 def matching_gaia_rows_to_cluster(
     cluster: list[int],
     sources: list[dict[str, object]],
@@ -277,7 +290,7 @@ def assign_no_upper_source_clusters(
             "source_cluster_no_upper": True,
         }
 
-        if len(cluster) == 1:
+        if len(cluster) == 1 and not source_intersects_any(cluster[0], list(range(len(sources))), sources):
             source = sources[cluster[0]]
             if float(source["area"]) < float(config.isolated_clean_area_max):
                 source["final_label"] = "clean"
@@ -316,8 +329,8 @@ def assign_no_upper_source_clusters(
         cluster_in_bad = any(bool(sources[idx].get("center_in_bad_mask", False)) for idx in cluster)
         if gaia_matches:
             for idx in cluster:
-                sources[idx]["final_label"] = "ignore"
-                sources[idx]["reason"] = "no_upper_gaia_matched_cluster_hsc_fragment_ignore"
+                sources[idx]["final_label"] = "restricted_bright_region"
+                sources[idx]["reason"] = "no_upper_gaia_matched_cluster_hsc_fragment_restricted"
                 draw_source_ellipse(bright_mask, sources[idx])
             synthetic_rows = []
             for gaia, mode, dist_pix in gaia_matches:

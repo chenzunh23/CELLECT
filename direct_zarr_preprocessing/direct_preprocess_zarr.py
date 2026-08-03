@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Dict, Optional, Sequence
 
 import numpy as np
+from astropy.io import fits
 from astropy.table import Table, vstack
 
 if __package__ in (None, ""):
@@ -33,6 +34,7 @@ from astro_data_preprocessing import (  # noqa: E402
     _band_det_path,
     _band_fits_path,
     _apply_external_bright_labels,
+    _apply_external_bright_rows,
     _classify_pu_catalog,
     _configure_worker_threads,
     _crop_full_mask_for_tile,
@@ -68,6 +70,7 @@ from data_filtering.calexp_quality import (  # noqa: E402
     parse_score_weights,
 )
 from data_filtering.sam_input_scaling import build_bright_mask, scale_training_image  # noqa: E402
+from data_filtering.integrated_bright_labels import build_integrated_bright_components, build_integrated_bright_labels  # noqa: E402
 from direct_zarr_preprocessing.zarr_writer import ZarrGroupWriter, encode_fixed_utf8, write_json  # noqa: E402
 
 DEFAULT_BANDS = ("HSC-G", "HSC-R", "HSC-I", "HSC-Z", "HSC-Y")
@@ -109,10 +112,39 @@ def _read_patch_image_meta(coadd_root: Path, band: str, tract: int, patch: str) 
     return shape, origin
 
 
-def _classify_all_bands(args: argparse.Namespace, runtime: argparse.Namespace, patch: str) -> dict[str, tuple[Table, Table, Table, Table]]:
+def _read_exposure_image_mask_headers(path: Path) -> tuple[np.ndarray, np.ndarray, fits.Header, fits.Header, tuple[int, int]]:
+    with _fits_open_with_path_warnings(path, memmap=True, ignore_missing_end=True) as hdul:
+        image_idx = None
+        mask_idx = None
+        for idx, hdu in enumerate(hdul):
+            name = str(getattr(hdu, "name", "")).upper()
+            if image_idx is None and name == "IMAGE" and hdu.data is not None:
+                image_idx = idx
+            if mask_idx is None and name == "MASK" and hdu.data is not None:
+                mask_idx = idx
+        if image_idx is None:
+            image_idx = _find_image_hdu_index(hdul)
+        if mask_idx is None:
+            mask_idx = 2 if len(hdul) > 2 and hdul[2].data is not None else image_idx
+        image_hdu = hdul[int(image_idx)]
+        mask_hdu = hdul[int(mask_idx)]
+        image = np.asarray(image_hdu.data, dtype=np.float32).copy()
+        if not np.all(np.isfinite(image)):
+            fill = float(np.nanmedian(image[np.isfinite(image)])) if np.any(np.isfinite(image)) else 0.0
+            image = np.nan_to_num(image, nan=fill, posinf=fill, neginf=fill).astype(np.float32, copy=False)
+        mask = np.asarray(mask_hdu.data)
+        return image, mask, image_hdu.header.copy(), mask_hdu.header.copy(), _origin_from_ltv(image_hdu.header)
+
+
+def _classify_all_bands(
+    args: argparse.Namespace,
+    runtime: argparse.Namespace,
+    patch: str,
+) -> tuple[dict[str, tuple[Table, Table, Table, Table]], dict[str, tuple[np.ndarray, tuple[int, int]]]]:
     catalog_root = Path(args.band_catalog_root or args.catalog_root).expanduser()
     image_root = Path(args.coadd_root).expanduser()
     out = {}
+    integrated_bright: dict[str, tuple[np.ndarray, tuple[int, int]]] = {}
     for band in args.bands:
         catalog_path = _band_catalog_path(catalog_root, band, int(args.tract), patch)
         if not catalog_path.exists() and str(getattr(args, "missing_band_policy", "error")) == "skip":
@@ -127,17 +159,20 @@ def _classify_all_bands(args: argparse.Namespace, runtime: argparse.Namespace, p
                     _band_fits_path(image_root, band, int(args.tract), patch),
                     clean_nonfinite=True,
                 )
-                bright_mask = build_bright_mask(
-                    image,
-                    mode=str(getattr(args, "pu_bright_mask_mode", "log-lupton")),
-                    threshold=float(getattr(args, "pu_bright_z_threshold", 3.0)),
-                    dilation=int(getattr(args, "pu_bright_mask_dilate", 2)),
-                    log_a=float(getattr(args, "pu_bright_log_a", 300.0)),
-                    log_high_percentile=float(getattr(args, "pu_bright_log_high_percentile", 99.5)),
-                    lupton_stretch=float(getattr(args, "pu_bright_lupton_stretch", 0.5)),
-                    lupton_q=float(getattr(args, "pu_bright_lupton_q", 20.0)),
-                    anscombe_scale=float(getattr(args, "pu_bright_anscombe_scale", 1000.0)),
-                )
+                if bool(getattr(args, "integrated_bright_labels", False)):
+                    bright_mask, _labels = build_integrated_bright_components(image, band=band, args=runtime)
+                else:
+                    bright_mask = build_bright_mask(
+                        image,
+                        mode=str(getattr(args, "pu_bright_mask_mode", "log-lupton")),
+                        threshold=float(getattr(args, "pu_bright_z_threshold", 3.0)),
+                        dilation=int(getattr(args, "pu_bright_mask_dilate", 2)),
+                        log_a=float(getattr(args, "pu_bright_log_a", 300.0)),
+                        log_high_percentile=float(getattr(args, "pu_bright_log_high_percentile", 99.5)),
+                        lupton_stretch=float(getattr(args, "pu_bright_lupton_stretch", 0.5)),
+                        lupton_q=float(getattr(args, "pu_bright_lupton_q", 20.0)),
+                        anscombe_scale=float(getattr(args, "pu_bright_anscombe_scale", 1000.0)),
+                    )
             except Exception as exc:
                 print(
                     f"WARNING: failed to build coadd bright mask for catalog filtering {patch} {band}: {exc}",
@@ -169,7 +204,46 @@ def _classify_all_bands(args: argparse.Namespace, runtime: argparse.Namespace, p
             bright_region_mask=bright_mask,
             bright_region_origin=bright_origin,
         )
-        clean, center, strict_center = _move_bright_clean_to_center_only(clean, center, runtime, band=band)
+        if bool(getattr(args, "integrated_bright_labels", False)):
+            strict_center = clean[:0].copy(copy_data=True)
+        else:
+            clean, center, strict_center = _move_bright_clean_to_center_only(clean, center, runtime, band=band)
+        if bool(getattr(args, "integrated_bright_labels", False)):
+            exposure_path = _band_fits_path(image_root, band, int(args.tract), patch)
+            image, mask, image_header, mask_header, image_origin = _read_exposure_image_mask_headers(exposure_path)
+            rows, integrated_mask, stats = build_integrated_bright_labels(
+                pu_all=pu_all,
+                clean=clean,
+                center_only=center,
+                ignore=ignore,
+                strict_center_only=strict_center,
+                image=image,
+                image_header=image_header,
+                mask=mask,
+                mask_header=mask_header,
+                image_origin=image_origin,
+                args=runtime,
+                band=band,
+                patch=patch,
+            )
+            clean, center, ignore, strict_center, _integrated_stats = _apply_external_bright_rows(
+                clean,
+                center,
+                ignore,
+                strict_center,
+                pu_all,
+                runtime,
+                rows,
+            )
+            integrated_bright[band] = (np.asarray(integrated_mask, dtype=bool), image_origin)
+            print(
+                f"[direct-zarr] integrated bright {patch} {band}: "
+                f"sources={stats.get('integrated_bright_sources', 0)} "
+                f"assigned={stats.get('integrated_bright_assigned', 0)} "
+                f"kept_original={stats.get('integrated_bright_unassigned_outside_component', 0)} "
+                f"components={stats.get('integrated_bright_components', 0)}",
+                flush=True,
+            )
         clean, center, ignore, strict_center, _external_stats = _apply_external_bright_labels(
             clean,
             center,
@@ -183,7 +257,7 @@ def _classify_all_bands(args: argparse.Namespace, runtime: argparse.Namespace, p
         out[band] = (clean, center, ignore, strict_center)
     if not out:
         raise RuntimeError(f"No usable band catalogs found for patch {patch}")
-    return out
+    return out, integrated_bright
 
 
 def _read_quality_masks(
@@ -209,6 +283,32 @@ def _read_quality_masks(
             )
             continue
         out[band] = (mask, origin_xy)
+    return out
+
+
+def _read_pu_pixel_ignore_masks(
+    args: argparse.Namespace,
+    patch: str,
+) -> dict[str, tuple[np.ndarray, tuple[int, int]]]:
+    planes = tuple(str(plane).strip() for plane in getattr(args, "pu_ignore_mask_planes", ()) or () if str(plane).strip())
+    if not planes:
+        return {}
+    root = Path(args.coadd_root).expanduser()
+    out: dict[str, tuple[np.ndarray, tuple[int, int]]] = {}
+    for band in args.bands:
+        path = _band_fits_path(root, band, int(args.tract), patch)
+        mask = _quality_mask_from_lsst_fits(path, planes)
+        if mask is None:
+            print(f"WARNING: no usable PU pixel ignore mask for {patch} {band}: {path}", flush=True)
+            continue
+        shape_yx, origin_xy = _read_patch_image_meta(root, band, int(args.tract), patch)
+        if tuple(mask.shape) != tuple(shape_yx):
+            print(
+                f"WARNING: PU pixel ignore mask shape {mask.shape} != image shape {shape_yx} for {path}; ignoring mask",
+                flush=True,
+            )
+            continue
+        out[band] = (np.asarray(mask, dtype=bool), origin_xy)
     return out
 
 
@@ -608,6 +708,7 @@ def _target_for_sample(
     images_by_band,
     backgrounds,
     bright_backgrounds,
+    pixel_ignore_masks,
     quality_masks,
     args,
     runtime,
@@ -621,6 +722,8 @@ def _target_for_sample(
     pu_class = []
     centers_by_band = []
     ids_by_band = []
+    strict_centers_by_band = []
+    strict_ids_by_band = []
     shape_source_centers_by_band = []
     shape_source_values_by_band = []
     shape_source_classes_by_band = []
@@ -682,6 +785,10 @@ def _target_for_sample(
         if band in bright_backgrounds:
             bright_mask, bright_origin = bright_backgrounds[band]
             bright_background = _crop_full_mask_for_tile(bright_mask, sample.spec, bright_origin)
+        pixel_ignore = None
+        if band in pixel_ignore_masks:
+            ignore_mask_pixels, ignore_origin = pixel_ignore_masks[band]
+            pixel_ignore = _crop_full_mask_for_tile(ignore_mask_pixels, sample.spec, ignore_origin)
         target = make_pu_dense_targets(
             clean_mask,
             center_mask,
@@ -693,8 +800,12 @@ def _target_for_sample(
             confidence_levels=int(args.confidence_levels),
             core_radius=int(args.core_radius),
             center_only_weight=float(args.center_only_weight),
+            background_weight=float(args.background_weight),
+            bright_weight=float(args.bright_weight),
+            strict_center_only_weight=float(args.strict_center_only_weight),
             lsst_background_mask=lsst_background,
             bright_background_mask=bright_background,
+            pixel_ignore_mask=pixel_ignore,
             strict_center_only_sources=strict_mask,
             strict_center_only_ellipse_sigma=float(args.strict_bright_center_only_ellipse_sigma),
         )
@@ -716,6 +827,9 @@ def _target_for_sample(
         meta = _metadata_from_catalog(clean_tile)
         centers_by_band.append(meta["centers"])
         ids_by_band.append(meta["ids"])
+        strict_meta = _metadata_from_catalog(_strict_tile)
+        strict_centers_by_band.append(strict_meta["centers"])
+        strict_ids_by_band.append(strict_meta["ids"])
         shape_centers, shape_values, shape_classes, shape_ids = _shape_source_metadata(
             clean_tile,
             center_tile,
@@ -734,6 +848,8 @@ def _target_for_sample(
         "pu_class": np.stack(pu_class, axis=0),
         "centers_by_band": centers_by_band,
         "ids_by_band": ids_by_band,
+        "strict_centers_by_band": strict_centers_by_band,
+        "strict_ids_by_band": strict_ids_by_band,
         "shape_source_centers_by_band": shape_source_centers_by_band,
         "shape_source_values_by_band": shape_source_values_by_band,
         "shape_source_classes_by_band": shape_source_classes_by_band,
@@ -767,6 +883,39 @@ def _source_rows_by_key(pkg: dict[str, object], band_idx: int) -> dict[tuple[str
             key = ("xy", rounded)
         rows.setdefault(key, (center, value, int(class_id), int(source_id)))
     return rows
+
+
+def _center_rows_by_key(centers: np.ndarray, ids: np.ndarray) -> dict[tuple[str, object], tuple[np.ndarray, int]]:
+    centers = np.asarray(centers, dtype=np.float32).reshape(-1, 2)
+    ids = np.asarray(ids, dtype=np.int64).reshape(-1)
+    rows: dict[tuple[str, object], tuple[np.ndarray, int]] = {}
+    for center, source_id in zip(centers, ids):
+        if int(source_id) >= 0:
+            key = ("id", int(source_id))
+        else:
+            key = ("xy", tuple(np.round(center.astype(np.float64), 3).tolist()))
+        rows.setdefault(key, (center, int(source_id)))
+    return rows
+
+
+def _select_center_rows(
+    *,
+    primary_rows: dict[tuple[str, object], tuple[np.ndarray, int]],
+    secondary_rows: dict[tuple[str, object], tuple[np.ndarray, int]],
+    keys: Sequence[tuple[str, object]],
+) -> tuple[np.ndarray, np.ndarray]:
+    centers = []
+    ids = []
+    for key in keys:
+        row = primary_rows.get(key) or secondary_rows.get(key)
+        if row is None:
+            continue
+        center, source_id = row
+        centers.append(center)
+        ids.append(int(source_id))
+    if not centers:
+        return np.zeros((0, 2), dtype=np.float32), np.zeros((0,), dtype=np.int64)
+    return np.asarray(centers, dtype=np.float32).reshape(-1, 2), np.asarray(ids, dtype=np.int64)
 
 
 def _select_source_rows(
@@ -835,6 +984,8 @@ def _align_denoised_noisy_snr_packages(
 
     centers_by_band = []
     ids_by_band = []
+    strict_centers_by_band = []
+    strict_ids_by_band = []
     shape_centers_by_band = []
     shape_values_by_band = []
     shape_classes_by_band = []
@@ -844,18 +995,27 @@ def _align_denoised_noisy_snr_packages(
         den_pu = primary_pu[band_idx] if primary == "denoised" else secondary_pu[band_idx]
         noi_pu = secondary_pu[band_idx] if primary == "denoised" else primary_pu[band_idx]
         clean = (den_pu == 1) & (noi_pu == 1)
-        center = ((den_pu == 2) | (den_pu == 5) | (noi_pu == 2) | (noi_pu == 5)) & ~clean
-        bright = ((den_pu == 6) | (noi_pu == 6)) & ~clean & ~center
-        background = (den_pu == 4) & (noi_pu == 4) & ~clean & ~center & ~bright
+        strict = ((den_pu == 5) | (noi_pu == 5)) & ~clean
+        center = ((den_pu == 2) | (noi_pu == 2)) & ~clean & ~strict
+        bright = ((den_pu == 6) | (noi_pu == 6)) & ~clean & ~center & ~strict
+        background = (den_pu == 4) & (noi_pu == 4) & ~clean & ~center & ~strict & ~bright
         merged = np.full(den_pu.shape, 3, dtype=np.uint8)
         merged[background] = 4
         merged[bright] = 6
         merged[center] = 2
+        merged[strict] = 5
         merged[clean] = 1
         out_pu[band_idx] = merged
 
-        supervised = clean | background
-        out_conf_weight[band_idx] = supervised.astype(out_conf_weight.dtype, copy=False)
+        supervised = clean | background | bright | strict
+        primary_conf_weight = np.asarray(primary_pkg["confidence_weight"])[band_idx]
+        secondary_conf_weight = np.asarray(secondary_pkg["confidence_weight"])[band_idx]
+        merged_conf_weight = np.maximum(primary_conf_weight, secondary_conf_weight)
+        out_conf_weight[band_idx] = np.where(
+            supervised,
+            merged_conf_weight,
+            0,
+        ).astype(out_conf_weight.dtype, copy=False)
         out_conf[band_idx] = np.maximum(primary_conf[band_idx], secondary_conf[band_idx])
 
         take_secondary = secondary_shape_weight[band_idx] > primary_shape_weight[band_idx]
@@ -889,8 +1049,26 @@ def _align_denoised_noisy_snr_packages(
             keys=center_keys,
             class_id=2,
         )
+        den_strict = _center_rows_by_key(
+            np.asarray(denoised_pkg.get("strict_centers_by_band", [np.zeros((0, 2), dtype=np.float32)] * primary_pu.shape[0])[band_idx], dtype=np.float32),
+            np.asarray(denoised_pkg.get("strict_ids_by_band", [np.zeros((0,), dtype=np.int64)] * primary_pu.shape[0])[band_idx], dtype=np.int64),
+        )
+        noi_strict = _center_rows_by_key(
+            np.asarray(noisy_pkg.get("strict_centers_by_band", [np.zeros((0, 2), dtype=np.float32)] * primary_pu.shape[0])[band_idx], dtype=np.float32),
+            np.asarray(noisy_pkg.get("strict_ids_by_band", [np.zeros((0,), dtype=np.int64)] * primary_pu.shape[0])[band_idx], dtype=np.int64),
+        )
+        strict_keys = sorted((set(den_strict) | set(noi_strict)) - set(clean_keys), key=lambda item: (item[0], item[1]))
+        primary_strict = den_strict if primary == "denoised" else noi_strict
+        secondary_strict = noi_strict if primary == "denoised" else den_strict
+        strict_centers, strict_ids = _select_center_rows(
+            primary_rows=primary_strict,
+            secondary_rows=secondary_strict,
+            keys=strict_keys,
+        )
         centers_by_band.append(clean_centers)
         ids_by_band.append(clean_ids)
+        strict_centers_by_band.append(strict_centers)
+        strict_ids_by_band.append(strict_ids)
         shape_centers_by_band.append(np.concatenate([clean_centers, center_centers], axis=0))
         shape_values_by_band.append(np.concatenate([clean_values, center_values], axis=0))
         shape_classes_by_band.append(np.concatenate([clean_classes, center_classes], axis=0))
@@ -903,6 +1081,8 @@ def _align_denoised_noisy_snr_packages(
     out["shape_weight"] = out_shape_weight
     out["centers_by_band"] = centers_by_band
     out["ids_by_band"] = ids_by_band
+    out["strict_centers_by_band"] = strict_centers_by_band
+    out["strict_ids_by_band"] = strict_ids_by_band
     out["shape_source_centers_by_band"] = shape_centers_by_band
     out["shape_source_values_by_band"] = shape_values_by_band
     out["shape_source_classes_by_band"] = shape_classes_by_band
@@ -919,6 +1099,7 @@ def _write_dataset_zarr(
     image_sources,
     background_sources,
     bright_background_sources,
+    pixel_ignore_masks,
     quality_masks,
     args,
     runtime,
@@ -956,6 +1137,9 @@ def _write_dataset_zarr(
     centers_flat = []
     ids_flat = []
     offsets = np.zeros((n, b + 1), dtype=np.int64)
+    strict_centers_flat = []
+    strict_ids_flat = []
+    strict_offsets = np.zeros((n, b + 1), dtype=np.int64)
     shape_centers_flat = []
     shape_values_flat = []
     shape_classes_flat = []
@@ -975,6 +1159,7 @@ def _write_dataset_zarr(
             images_by_band=images_by_band,
             backgrounds=backgrounds,
             bright_backgrounds=bright_backgrounds,
+            pixel_ignore_masks=pixel_ignore_masks,
             quality_masks=quality_masks,
             args=args,
             runtime=runtime,
@@ -996,6 +1181,7 @@ def _write_dataset_zarr(
         for local_idx, pkg in enumerate(packages):
             sample_idx = start + local_idx
             offsets[sample_idx, 0] = len(centers_flat)
+            strict_offsets[sample_idx, 0] = len(strict_centers_flat)
             shape_offsets[sample_idx, 0] = len(shape_centers_flat)
             for band_idx in range(b):
                 centers = np.asarray(pkg["centers_by_band"][band_idx], dtype=np.float32).reshape(-1, 2)
@@ -1004,6 +1190,12 @@ def _write_dataset_zarr(
                     centers_flat.extend(centers)
                     ids_flat.extend(ids)
                 offsets[sample_idx, band_idx + 1] = len(centers_flat)
+                strict_centers = np.asarray(pkg.get("strict_centers_by_band", [])[band_idx], dtype=np.float32).reshape(-1, 2)
+                strict_ids = np.asarray(pkg.get("strict_ids_by_band", [])[band_idx], dtype=np.int64).reshape(-1)
+                if len(strict_centers):
+                    strict_centers_flat.extend(strict_centers)
+                    strict_ids_flat.extend(strict_ids)
+                strict_offsets[sample_idx, band_idx + 1] = len(strict_centers_flat)
                 source_centers = np.asarray(pkg["shape_source_centers_by_band"][band_idx], dtype=np.float32).reshape(-1, 2)
                 source_values = np.asarray(pkg["shape_source_values_by_band"][band_idx], dtype=np.float32).reshape(-1, 3)
                 source_classes = np.asarray(pkg["shape_source_classes_by_band"][band_idx], dtype=np.uint8).reshape(-1)
@@ -1014,13 +1206,34 @@ def _write_dataset_zarr(
                     shape_classes_flat.extend(source_classes)
                     shape_ids_flat.extend(source_ids)
                 shape_offsets[sample_idx, band_idx + 1] = len(shape_centers_flat)
-        print(f"[direct-zarr] {output.name}: wrote samples {start + 1}-{end}/{n}", flush=True)
+        store_label = "/".join(output.parts[-4:]) if len(output.parts) >= 4 else str(output)
+        print(f"[direct-zarr] {store_label}: wrote samples {start + 1}-{end}/{n}", flush=True)
 
     centers_arr = np.asarray(centers_flat, dtype=np.float32).reshape(-1, 2)
     ids_arr = np.asarray(ids_flat, dtype=np.int64).reshape(-1)
     writer.array("source_centers", shape=centers_arr.shape, chunks=(max(1, len(centers_arr)), 2), dtype=np.float32).write_full(centers_arr)
     writer.array("source_ids", shape=ids_arr.shape, chunks=(max(1, len(ids_arr)),), dtype=np.int64).write_full(ids_arr)
     writer.array("source_offsets", shape=offsets.shape, chunks=(max(1, n), b + 1), dtype=np.int64).write_full(offsets)
+    strict_centers_arr = np.asarray(strict_centers_flat, dtype=np.float32).reshape(-1, 2)
+    strict_ids_arr = np.asarray(strict_ids_flat, dtype=np.int64).reshape(-1)
+    writer.array(
+        "strict_center_only_centers",
+        shape=strict_centers_arr.shape,
+        chunks=(max(1, len(strict_centers_arr)), 2),
+        dtype=np.float32,
+    ).write_full(strict_centers_arr)
+    writer.array(
+        "strict_center_only_ids",
+        shape=strict_ids_arr.shape,
+        chunks=(max(1, len(strict_ids_arr)),),
+        dtype=np.int64,
+    ).write_full(strict_ids_arr)
+    writer.array(
+        "strict_center_only_offsets",
+        shape=strict_offsets.shape,
+        chunks=(max(1, n), b + 1),
+        dtype=np.int64,
+    ).write_full(strict_offsets)
     shape_centers_arr = np.asarray(shape_centers_flat, dtype=np.float32).reshape(-1, 2)
     shape_values_arr = np.asarray(shape_values_flat, dtype=np.float32).reshape(-1, 3)
     shape_classes_arr = np.asarray(shape_classes_flat, dtype=np.uint8).reshape(-1)
@@ -1093,6 +1306,7 @@ def _write_aligned_denoised_noisy_zarrs(
     variant_images_by_name,
     variant_backgrounds_by_name,
     variant_bright_backgrounds_by_name,
+    pixel_ignore_masks,
     quality_masks,
     args,
     runtime,
@@ -1136,6 +1350,7 @@ def _write_aligned_denoised_noisy_zarrs(
                     images_by_band=variant_images_by_name[pair_variant][sample.image_key],
                     backgrounds=variant_backgrounds_by_name[pair_variant].get(sample.image_key, {}),
                     bright_backgrounds=variant_bright_backgrounds_by_name[pair_variant].get(sample.image_key, {}),
+                    pixel_ignore_masks=pixel_ignore_masks,
                     quality_masks=quality_masks,
                     args=args,
                     runtime=runtime,
@@ -1156,6 +1371,7 @@ def _write_aligned_denoised_noisy_zarrs(
                 image_sources=variant_images_by_name[variant],
                 background_sources=variant_backgrounds_by_name[variant],
                 bright_background_sources=variant_bright_backgrounds_by_name[variant],
+                pixel_ignore_masks=pixel_ignore_masks,
                 quality_masks=quality_masks,
                 args=args,
                 runtime=runtime,
@@ -1184,6 +1400,7 @@ def _write_aligned_denoised_noisy_image_level_zarrs(
     variant_images_by_name,
     variant_backgrounds_by_name,
     variant_bright_backgrounds_by_name,
+    pixel_ignore_masks,
     quality,
     quality_masks,
     args,
@@ -1232,6 +1449,7 @@ def _write_aligned_denoised_noisy_image_level_zarrs(
                             images_by_band={sample_band: variant_images_by_name[pair_variant][sample.image_key][sample_band]},
                             backgrounds=variant_backgrounds_by_name[pair_variant].get(sample.image_key, {}),
                             bright_backgrounds=variant_bright_backgrounds_by_name[pair_variant].get(sample.image_key, {}),
+                            pixel_ignore_masks=pixel_ignore_masks,
                             quality_masks=quality_masks,
                             args=args,
                             runtime=runtime,
@@ -1273,6 +1491,7 @@ def _write_aligned_denoised_noisy_image_level_zarrs(
                             image_key,
                             band,
                         ),
+                        pixel_ignore_masks=pixel_ignore_masks,
                         quality_masks=quality_masks,
                         args=args,
                         runtime=runtime,
@@ -1294,6 +1513,7 @@ def _write_image_level_zarrs(
     background_sources,
     bright_background_sources,
     quality,
+    pixel_ignore_masks,
     quality_masks,
     args,
     runtime,
@@ -1340,6 +1560,7 @@ def _write_image_level_zarrs(
                     image_sources={image_key: {band: images_by_band[band]}},
                     background_sources=_single_band_sources(background_sources, image_key, band),
                     bright_background_sources=_single_band_sources(bright_background_sources, image_key, band),
+                    pixel_ignore_masks=pixel_ignore_masks,
                     quality_masks=quality_masks,
                     args=args,
                     runtime=runtime,
@@ -1390,8 +1611,9 @@ def preprocess_patch(args: argparse.Namespace, patch: str) -> dict:
             raise RuntimeError(f"No tile matched --tile-filter {sorted(wanted)} for patch {patch}")
     if args.max_tiles is not None:
         specs = specs[: int(args.max_tiles)]
-    labels = _classify_all_bands(args, runtime, patch)
+    labels, integrated_bright_backgrounds = _classify_all_bands(args, runtime, patch)
     backgrounds = _read_backgrounds(args, patch, shape_yx, parent_origin)
+    pixel_ignore_masks = _read_pu_pixel_ignore_masks(args, patch)
     quality_masks = _read_quality_masks(args, patch)
     quality = _quality_allowed_tiles(args, patch, specs)
     summaries = []
@@ -1404,7 +1626,11 @@ def preprocess_patch(args: argparse.Namespace, patch: str) -> dict:
         coadd_bands = [band for band in args.bands if band in labels and band in coadd_images["coadd"]]
         if not coadd_bands:
             raise FileNotFoundError(f"No usable coadd bands found for patch {patch}")
-        coadd_bright_backgrounds = _bright_backgrounds_for_images(args, coadd_images, patch=patch)
+        coadd_bright_backgrounds = (
+            {"coadd": integrated_bright_backgrounds}
+            if integrated_bright_backgrounds
+            else _bright_backgrounds_for_images(args, coadd_images, patch=patch)
+        )
         if bool(args.write_image_level_zarr):
             summaries.extend(
                 _write_image_level_zarrs(
@@ -1417,6 +1643,7 @@ def preprocess_patch(args: argparse.Namespace, patch: str) -> dict:
                     background_sources={"coadd": backgrounds},
                     bright_background_sources=coadd_bright_backgrounds,
                     quality=quality,
+                    pixel_ignore_masks=pixel_ignore_masks,
                     quality_masks=quality_masks,
                     args=args,
                     runtime=runtime,
@@ -1434,6 +1661,7 @@ def preprocess_patch(args: argparse.Namespace, patch: str) -> dict:
                     image_sources=coadd_images,
                     background_sources={"coadd": backgrounds},
                     bright_background_sources=coadd_bright_backgrounds,
+                    pixel_ignore_masks=pixel_ignore_masks,
                     quality_masks=quality_masks,
                     args=args,
                     runtime=runtime,
@@ -1449,9 +1677,14 @@ def preprocess_patch(args: argparse.Namespace, patch: str) -> dict:
         if coadd_images_for_bright is None and (
             bool(getattr(args, "pu_enable_bright_background_mask", False))
             or getattr(args, "external_bright_label_root", None) is not None
+            or bool(getattr(args, "integrated_bright_labels", False))
         ):
             coadd_images_for_bright = {"coadd": _read_coadd_images(args, patch)}
-            coadd_bright_backgrounds = _bright_backgrounds_for_images(args, coadd_images_for_bright, patch=patch)
+            coadd_bright_backgrounds = (
+                {"coadd": integrated_bright_backgrounds}
+                if integrated_bright_backgrounds
+                else _bright_backgrounds_for_images(args, coadd_images_for_bright, patch=patch)
+            )
         if bool(args.align_denoised_noisy_snr_labels) and {"denoised", "noisy"}.issubset(set(args.image_variants)):
             variant_images_by_name = {}
             variant_backgrounds_by_name = {}
@@ -1501,6 +1734,7 @@ def preprocess_patch(args: argparse.Namespace, patch: str) -> dict:
                         variant_backgrounds_by_name=variant_backgrounds_by_name,
                         variant_bright_backgrounds_by_name=variant_bright_backgrounds_by_name,
                         quality=quality,
+                        pixel_ignore_masks=pixel_ignore_masks,
                         quality_masks=quality_masks,
                         args=args,
                         runtime=runtime,
@@ -1516,6 +1750,7 @@ def preprocess_patch(args: argparse.Namespace, patch: str) -> dict:
                         variant_images_by_name=variant_images_by_name,
                         variant_backgrounds_by_name=variant_backgrounds_by_name,
                         variant_bright_backgrounds_by_name=variant_bright_backgrounds_by_name,
+                        pixel_ignore_masks=pixel_ignore_masks,
                         quality_masks=quality_masks,
                         args=args,
                         runtime=runtime,
@@ -1550,6 +1785,7 @@ def preprocess_patch(args: argparse.Namespace, patch: str) -> dict:
                         background_sources=variant_backgrounds,
                         bright_background_sources=variant_bright_backgrounds,
                         quality=quality,
+                        pixel_ignore_masks=pixel_ignore_masks,
                         quality_masks=quality_masks,
                         args=args,
                         runtime=runtime,
@@ -1575,6 +1811,7 @@ def preprocess_patch(args: argparse.Namespace, patch: str) -> dict:
                         image_sources=variant_images,
                         background_sources=variant_backgrounds,
                         bright_background_sources=variant_bright_backgrounds,
+                        pixel_ignore_masks=pixel_ignore_masks,
                         quality_masks=quality_masks,
                         args=args,
                         runtime=runtime,
@@ -1607,17 +1844,24 @@ def _attrs(
         "filter_contract": "PU broad fixed B magnitude range; no band-limit B filter switch",
         "b_mag_min": float(args.b_mag_min),
         "b_mag_max": float(args.b_mag_max),
+        "center_only_weight": float(args.center_only_weight),
+        "background_weight": float(args.background_weight),
+        "bright_weight": float(args.bright_weight),
+        "strict_center_only_weight": float(args.strict_center_only_weight),
         "image_variant_background_source": str(args.image_variant_background_source),
         "variant_lsst_background_root": str(args.variant_lsst_background_root) if args.variant_lsst_background_root is not None else None,
         "center_only_shape_restored": True,
         "noncoadd_snr_use_source_mask": bool(args.noncoadd_snr_use_source_mask),
         "noncoadd_snr_use_quality_mask": bool(args.noncoadd_snr_use_quality_mask),
         "noncoadd_snr_mask_planes": list(args.noncoadd_snr_mask_planes),
+        "pu_ignore_mask_planes": list(getattr(args, "pu_ignore_mask_planes", ()) or ()),
         "noncoadd_snr_exclude_self_source": bool(args.noncoadd_snr_exclude_self_source),
         "align_denoised_noisy_snr_labels": bool(args.align_denoised_noisy_snr_labels),
         "pu_enable_bright_background_mask": bool(args.pu_enable_bright_background_mask),
         "pu_bright_mask_mode": str(args.pu_bright_mask_mode),
         "external_bright_label_root": str(args.external_bright_label_root) if args.external_bright_label_root is not None else None,
+        "integrated_bright_labels": bool(getattr(args, "integrated_bright_labels", False)),
+        "integrated_bright_gaia_fits": str(getattr(args, "integrated_bright_gaia_fits", "")),
         "image_scaling_mode": str(args.image_scaling_mode),
         "image_rgb_channels": 3 if _image_has_rgb_axis(args) else 1,
         "aligned_variant_label_contract": (
@@ -1642,6 +1886,7 @@ def _attrs(
             "noncoadd_snr_use_source_mask": bool(runtime.noncoadd_snr_use_source_mask),
             "noncoadd_snr_use_quality_mask": bool(runtime.noncoadd_snr_use_quality_mask),
             "noncoadd_snr_mask_planes": list(runtime.noncoadd_snr_mask_planes),
+            "pu_ignore_mask_planes": list(getattr(runtime, "pu_ignore_mask_planes", ()) or ()),
             "noncoadd_snr_exclude_self_source": bool(runtime.noncoadd_snr_exclude_self_source),
         },
         "created_unix_time": time.time(),
@@ -1771,11 +2016,49 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "into the dense-target bright region."
         ),
     )
+    p.add_argument(
+        "--external-bright-label-policy",
+        choices=("error", "warn", "ignore"),
+        default="error",
+        help="Behavior when --external-bright-label-root is set but a patch/band CSV or mask is missing.",
+    )
+    p.add_argument(
+        "--integrated-bright-labels",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Run the build_external_bright_labels_v2 bright-source relabeling pipeline in memory during "
+            "preprocessing. This replaces the temporary --external-bright-label-root workflow."
+        ),
+    )
+    p.add_argument("--integrated-bright-gaia-fits", "--bright-gaia-fits", dest="integrated_bright_gaia_fits", type=Path, default=Path("output/gaia_dr3_cosmos.fits"))
+    p.add_argument("--integrated-bright-mask-names", nargs="*", default=("SAT", "BAD", "EDGE"))
+    p.add_argument("--integrated-bright-use-bad-mask-first-step", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--integrated-bright-use-gaia-component-override", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--integrated-bright-add-empty-large-component-centers", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--integrated-bright-empty-large-component-area-min", type=float, default=1000.0)
+    p.add_argument("--integrated-bright-large-component-fast-source-min", type=int, default=0)
+    p.add_argument("--integrated-bright-component-search-radius", type=int, default=5)
+    p.add_argument("--integrated-bright-match-radius-arcsec", type=float, default=1.0)
+    p.add_argument("--integrated-bright-gaia-bright-mag-threshold", type=float, default=17.5)
+    p.add_argument("--integrated-bright-cluster-iou-threshold", type=float, default=1.0 / 3.0)
+    p.add_argument("--integrated-bright-cluster-max-center-distance", type=float, default=50.0)
+    p.add_argument("--integrated-bright-cluster-max-area", type=float, default=10000.0)
+    p.add_argument("--integrated-bright-cluster-source-match-pixels", type=float, default=6.0)
+    p.add_argument("--integrated-bright-cluster-centroid-match-pixels", type=float, default=10.0)
+    p.add_argument("--integrated-bright-isolated-clean-area-max", type=float, default=1000.0)
+    p.add_argument("--integrated-bright-shape-max-area", type=float, default=10000.0)
+    p.add_argument("--integrated-bright-shape-axis-ratio-max", type=float, default=5.0)
+    p.add_argument("--integrated-bright-drop-area-max", type=float, default=10000.0)
+    p.add_argument("--integrated-bright-log-a", type=float, default=float("nan"), help="Override per-band bright log scale. Default: broad=1000, NB1010=100, NB0387=3000.")
     p.add_argument("--ellipse-sigma", type=float, default=1.0)
     p.add_argument("--mask-margin", type=float, default=64.0)
     p.add_argument("--confidence-levels", type=int, default=5)
     p.add_argument("--core-radius", type=int, default=2)
     p.add_argument("--center-only-weight", type=float, default=0.25)
+    p.add_argument("--background-weight", type=float, default=1.0)
+    p.add_argument("--bright-weight", type=float, default=1.0)
+    p.add_argument("--strict-center-only-weight", type=float, default=1.0)
     p.add_argument("--background-policy", choices=("existing", "none"), default="existing")
     p.add_argument(
         "--variant-lsst-background-root",
@@ -1821,6 +2104,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--noncoadd-snr-mask-planes",
         nargs="*",
         default=["BRIGHT_OBJECT", "SAT", "BAD", "NO_DATA", "EDGE", "UNMASKEDNAN"],
+    )
+    p.add_argument(
+        "--pu-ignore-mask-planes",
+        nargs="*",
+        default=["SAT", "BAD", "EDGE"],
+        help=(
+            "LSST/HSC MASK planes painted as dense PU ignore pixels. Priority is below clean/center/"
+            "strict-center/bright and above background. Pass an empty value to disable."
+        ),
     )
     p.add_argument("--noncoadd-snr-exclude-self-source", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument(
@@ -1884,6 +2176,16 @@ def main() -> int:
     args.image_dtype = np.dtype(args.image_dtype)
     args.target_float_dtype = np.dtype(args.target_float_dtype)
     args.z_clip = tuple(args.z_clip) if args.z_clip is not None else None
+    bright_mode = str(args.pu_bright_mask_mode).strip().lower().replace("_", "-")
+    if (
+        bright_mode in {"zscore-no-upper", "zscore-unbounded"}
+        and args.external_bright_label_root is None
+        and not bool(args.integrated_bright_labels)
+    ):
+        raise RuntimeError(
+            "pu-bright-mask-mode=zscore-no-upper/zscore-unbounded does not build an image-threshold bright mask. "
+            "Pass --integrated-bright-labels or --external-bright-label-root."
+        )
     patches = _expand_patch_tokens(args.patches)
     output_root = Path(args.output_root).expanduser()
     output_root.mkdir(parents=True, exist_ok=True)

@@ -6,11 +6,14 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import os
 import sys
 import warnings
 from pathlib import Path
 
 import numpy as np
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-cellect")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:

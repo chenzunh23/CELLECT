@@ -518,21 +518,25 @@ def _target_defaults_from_pu(
     background = pu == 4
     strict_center = pu == 5
     bright = pu == 6
-    source_union = clean | center | ignore | strict_center
+    source_union = clean | center | ignore
     return {
         "seg": clean.to(dtype=torch.long),
         "confidence": confidence.to(dtype=torch.long),
         "shape": shape.to(dtype=torch.float32),
         "shape_weight": shape_weight.to(dtype=torch.float32),
         "confidence_weight": conf_weight.to(dtype=torch.float32),
-        "seg_loss_weight": (clean | background).to(dtype=torch.float32),
+        "seg_loss_weight": torch.where(
+            clean | background | strict_center | bright,
+            conf_weight.to(dtype=torch.float32),
+            torch.zeros_like(conf_weight, dtype=torch.float32),
+        ),
         "clean_mask": clean.to(dtype=torch.uint8),
         "center_only_mask": center.to(dtype=torch.uint8),
         "ignore_mask": ignore.to(dtype=torch.uint8),
         "strict_center_only_mask": strict_center.to(dtype=torch.uint8),
         "strict_ignore_mask": torch.zeros_like(pu, dtype=torch.uint8),
         "source_union_mask": source_union.to(dtype=torch.uint8),
-        "background_mask": (background & ~bright).to(dtype=torch.uint8),
+        "background_mask": background.to(dtype=torch.uint8),
         "bright_mask": bright.to(dtype=torch.uint8),
         "pu_class_mask": pu.to(dtype=torch.uint8),
         "pseudo_mask": torch.zeros_like(pu, dtype=torch.uint8),
@@ -579,6 +583,24 @@ class ZarrCutoutDataset(Dataset):
             band_ids.append(torch.from_numpy(ids_flat[s0:s1]))
         centers = band_centers[0] if band_centers else torch.empty((0, 2), dtype=torch.float32)
         ids = band_ids[0] if band_ids else torch.empty((0,), dtype=torch.long)
+        empty_centers = [torch.empty((0, 2), dtype=torch.float32) for _ in band_targets]
+        empty_ids = [torch.empty((0,), dtype=torch.long) for _ in band_targets]
+        band_strict_center_only_centers = list(empty_centers)
+        band_strict_center_only_ids = list(empty_ids)
+        if reader.has_array("strict_center_only_offsets"):
+            strict_offsets = reader.read_full_small("strict_center_only_offsets").astype(np.int64, copy=False)
+            strict_centers_flat = reader.read_full_small("strict_center_only_centers").astype(np.float32, copy=False)
+            strict_ids_flat = (
+                reader.read_full_small("strict_center_only_ids").astype(np.int64, copy=False)
+                if reader.has_array("strict_center_only_ids")
+                else np.full((len(strict_centers_flat),), -1, dtype=np.int64)
+            )
+            band_strict_center_only_centers = []
+            band_strict_center_only_ids = []
+            for b in range(int(image.shape[0])):
+                s0, s1 = int(strict_offsets[sample_idx, b]), int(strict_offsets[sample_idx, b + 1])
+                band_strict_center_only_centers.append(torch.from_numpy(strict_centers_flat[s0:s1]))
+                band_strict_center_only_ids.append(torch.from_numpy(strict_ids_flat[s0:s1]))
 
         band_shape_source_centers = []
         band_shape_source_values = []
@@ -654,8 +676,6 @@ class ZarrCutoutDataset(Dataset):
         shape_source_values = band_shape_source_values[0]
         shape_source_classes = band_shape_source_classes[0]
         shape_source_ids = band_shape_source_ids[0]
-        empty_centers = [torch.empty((0, 2), dtype=torch.float32) for _ in band_targets]
-        empty_ids = [torch.empty((0,), dtype=torch.long) for _ in band_targets]
         return {
             "image": image,
             "seg": primary["seg"],
@@ -693,13 +713,14 @@ class ZarrCutoutDataset(Dataset):
             "centers": centers,
             "ids": ids,
             "ignore_centers": torch.empty((0, 2), dtype=torch.float32),
-            "strict_center_only_centers": torch.empty((0, 2), dtype=torch.float32),
+            "strict_center_only_centers": band_strict_center_only_centers[0] if band_strict_center_only_centers else torch.empty((0, 2), dtype=torch.float32),
             "strict_ignore_centers": torch.empty((0, 2), dtype=torch.float32),
             "band_centers": band_centers,
             "band_ids": band_ids,
             "band_ignore_centers": list(empty_centers),
-            "band_strict_center_only_centers": list(empty_centers),
+            "band_strict_center_only_centers": band_strict_center_only_centers,
             "band_strict_ignore_centers": list(empty_centers),
+            "band_strict_center_only_ids": band_strict_center_only_ids,
             "band_rejected_ids": list(empty_ids),
             "shape_source_centers": shape_source_centers,
             "shape_source_values": shape_source_values,

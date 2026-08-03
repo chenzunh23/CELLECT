@@ -48,6 +48,7 @@ NONCOADD_SNR_USE_SOURCE_MASK="${NONCOADD_SNR_USE_SOURCE_MASK:-1}"
 NONCOADD_SNR_USE_QUALITY_MASK="${NONCOADD_SNR_USE_QUALITY_MASK:-1}"
 NONCOADD_SNR_EXCLUDE_SELF_SOURCE="${NONCOADD_SNR_EXCLUDE_SELF_SOURCE:-1}"
 NONCOADD_SNR_MASK_PLANES="${NONCOADD_SNR_MASK_PLANES:-BRIGHT_OBJECT SAT BAD NO_DATA EDGE UNMASKEDNAN}"
+PU_IGNORE_MASK_PLANES="${PU_IGNORE_MASK_PLANES-SAT BAD EDGE}"
 ALIGN_DENOISED_NOISY_SNR_LABELS="${ALIGN_DENOISED_NOISY_SNR_LABELS:-1}"
 ENABLE_BRIGHT_BACKGROUND_MASK="${ENABLE_BRIGHT_BACKGROUND_MASK:-0}"
 PU_BRIGHT_MASK_MODE="${PU_BRIGHT_MASK_MODE:-log-lupton}"
@@ -59,6 +60,11 @@ PU_BRIGHT_ANSCOMBE_SCALE="${PU_BRIGHT_ANSCOMBE_SCALE:-1000}"
 PU_BRIGHT_Z_THRESHOLD="${PU_BRIGHT_Z_THRESHOLD:-3.0}"
 PU_BRIGHT_MASK_DILATE="${PU_BRIGHT_MASK_DILATE:-2}"
 EXTERNAL_BRIGHT_LABEL_ROOT="${EXTERNAL_BRIGHT_LABEL_ROOT:-}"
+EXTERNAL_BRIGHT_LABEL_POLICY="${EXTERNAL_BRIGHT_LABEL_POLICY:-error}"
+INTEGRATED_BRIGHT_LABELS="${INTEGRATED_BRIGHT_LABELS:-0}"
+INTEGRATED_BRIGHT_GAIA_FITS="${INTEGRATED_BRIGHT_GAIA_FITS:-${ROOT_DIR}/output/gaia_dr3_cosmos.fits}"
+INTEGRATED_BRIGHT_USE_BAD_MASK_FIRST_STEP="${INTEGRATED_BRIGHT_USE_BAD_MASK_FIRST_STEP:-0}"
+INTEGRATED_BRIGHT_LOG_A="${INTEGRATED_BRIGHT_LOG_A:-}"
 IMAGE_SCALING_MODE="${IMAGE_SCALING_MODE:-astro-zscore}"
 IMAGE_LOG_A="${IMAGE_LOG_A:-300}"
 IMAGE_LOG_HIGH_PERCENTILE="${IMAGE_LOG_HIGH_PERCENTILE:-99.5}"
@@ -73,6 +79,10 @@ CENTER_ONLY_FILL_RATIO_MAX="${CENTER_ONLY_FILL_RATIO_MAX:-0.3}"
 AP2_KRON_BRIGHT_MAG_THRESHOLD="${AP2_KRON_BRIGHT_MAG_THRESHOLD:-22}"
 AP2_KRON_BRIGHT_ABS_MAX="${AP2_KRON_BRIGHT_ABS_MAX:-2}"
 AP2_KRON_LARGE_BRIGHT_REGION_AREA_MIN="${AP2_KRON_LARGE_BRIGHT_REGION_AREA_MIN:-1000}"
+CENTER_ONLY_WEIGHT="${CENTER_ONLY_WEIGHT:-0.25}"
+BACKGROUND_WEIGHT="${BACKGROUND_WEIGHT:-1.0}"
+BRIGHT_WEIGHT="${BRIGHT_WEIGHT:-1.0}"
+STRICT_CENTER_ONLY_WEIGHT="${STRICT_CENTER_ONLY_WEIGHT:-1.0}"
 MAG_MIN="${MAG_MIN:-15}"
 MAG_MAX="${MAG_MAX:-35}"
 
@@ -93,6 +103,10 @@ args=(
   --ap2-kron-bright-mag-threshold "${AP2_KRON_BRIGHT_MAG_THRESHOLD}"
   --ap2-kron-bright-abs-max "${AP2_KRON_BRIGHT_ABS_MAX}"
   --ap2-kron-large-bright-region-area-min "${AP2_KRON_LARGE_BRIGHT_REGION_AREA_MIN}"
+  --center-only-weight "${CENTER_ONLY_WEIGHT}"
+  --background-weight "${BACKGROUND_WEIGHT}"
+  --bright-weight "${BRIGHT_WEIGHT}"
+  --strict-center-only-weight "${STRICT_CENTER_ONLY_WEIGHT}"
   --tile-workers "${TILE_WORKERS}"
   --patch-workers "${PATCH_WORKERS}"
   --worker-threads "${WORKER_THREADS}"
@@ -139,7 +153,24 @@ if [[ "${ENABLE_BRIGHT_BACKGROUND_MASK}" == "1" ]]; then
   )
 fi
 if [[ -n "${EXTERNAL_BRIGHT_LABEL_ROOT}" ]]; then
-  args+=(--external-bright-label-root "${EXTERNAL_BRIGHT_LABEL_ROOT}")
+  args+=(
+    --external-bright-label-root "${EXTERNAL_BRIGHT_LABEL_ROOT}"
+    --external-bright-label-policy "${EXTERNAL_BRIGHT_LABEL_POLICY}"
+  )
+fi
+if [[ "${INTEGRATED_BRIGHT_LABELS}" == "1" ]]; then
+  args+=(
+    --integrated-bright-labels
+    --integrated-bright-gaia-fits "${INTEGRATED_BRIGHT_GAIA_FITS}"
+  )
+  if [[ "${INTEGRATED_BRIGHT_USE_BAD_MASK_FIRST_STEP}" == "1" ]]; then
+    args+=(--integrated-bright-use-bad-mask-first-step)
+  else
+    args+=(--no-integrated-bright-use-bad-mask-first-step)
+  fi
+  if [[ -n "${INTEGRATED_BRIGHT_LOG_A}" ]]; then
+    args+=(--integrated-bright-log-a "${INTEGRATED_BRIGHT_LOG_A}")
+  fi
 fi
 if [[ "${OVERWRITE}" == "1" ]]; then
   args+=(--overwrite)
@@ -180,6 +211,13 @@ if [[ -n "${NONCOADD_SNR_MASK_PLANES}" ]]; then
   # shellcheck disable=SC2206
   mask_plane_args=(${NONCOADD_SNR_MASK_PLANES})
   args+=(--noncoadd-snr-mask-planes "${mask_plane_args[@]}")
+fi
+if [[ -n "${PU_IGNORE_MASK_PLANES}" ]]; then
+  # shellcheck disable=SC2206
+  pu_ignore_mask_plane_args=(${PU_IGNORE_MASK_PLANES})
+  args+=(--pu-ignore-mask-planes "${pu_ignore_mask_plane_args[@]}")
+else
+  args+=(--pu-ignore-mask-planes)
 fi
 if [[ -n "${COMPARE_ORIGIN:-}" ]]; then
   args+=(--compare-origin ${COMPARE_ORIGIN})

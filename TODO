@@ -33,3 +33,17 @@
   - GAIA-matched clusters follow GAIA labels/centers directly.
   - Non-GAIA-matched clusters become `ignore`.
 - Keep `NB0387` using a looser bright-region threshold because source density is low.
+
+## External Bright Labels Integration
+
+- Treat `EXTERNAL_BRIGHT_LABEL_ROOT=/home/czh23/CELLECT/output/data_filter_0729/...` as a temporary compatibility path only.
+- Integrate the external bright-label pipeline directly into direct Zarr preprocessing instead of requiring a separately generated CSV/FITS tree.
+- The integrated path should:
+  - run after refit/A/B filtering and before dense target painting;
+  - reuse in-memory refit/source tables, bright masks, GAIA matches, and cluster assignments;
+  - avoid writing and re-reading per-band CSV/REG/FITS intermediates during normal preprocessing;
+  - keep plotting/REG diagnostics as an optional debug output, not a production dependency;
+  - cache expensive patch-level products such as GAIA queries, bright components, LSST mask unions, and source-cluster graphs;
+  - support zscore-no-upper without image-threshold bright components by using source clusters plus GAIA and cluster aperture unions;
+  - support anscombe/log-lupton bright regions through the same internal API.
+- Current guardrail: `zscore-no-upper` preprocessing must fail if no external bright labels are provided. This prevents silently generating Zarr labels with missing large-bright-source center supervision, but it is not the final production design.

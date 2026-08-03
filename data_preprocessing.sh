@@ -77,6 +77,7 @@ NONCOADD_SNR_ANNULUS_R_OUT="${NONCOADD_SNR_ANNULUS_R_OUT:-15.0}"
 NONCOADD_SNR_SOURCE_MASK_ELLIPSE_SIGMA="${NONCOADD_SNR_SOURCE_MASK_ELLIPSE_SIGMA:-1.0}"
 NONCOADD_SNR_MIN_ANNULUS_PIXELS="${NONCOADD_SNR_MIN_ANNULUS_PIXELS:-50}"
 NONCOADD_SNR_MASK_PLANES="${NONCOADD_SNR_MASK_PLANES:-BRIGHT_OBJECT SAT BAD NO_DATA EDGE UNMASKEDNAN}"
+PU_IGNORE_MASK_PLANES="${PU_IGNORE_MASK_PLANES-SAT BAD EDGE}"
 NONCOADD_SNR_USE_SOURCE_MASK="${NONCOADD_SNR_USE_SOURCE_MASK:-1}"
 NONCOADD_SNR_USE_QUALITY_MASK="${NONCOADD_SNR_USE_QUALITY_MASK:-1}"
 
@@ -99,6 +100,10 @@ PU_AP2_KRON_SMALL_BRIGHT_AREA_RATIO_MAX="${PU_AP2_KRON_SMALL_BRIGHT_AREA_RATIO_M
 PU_AP2_KRON_SMALL_BRIGHT_AREA_ABS_MIN="${PU_AP2_KRON_SMALL_BRIGHT_AREA_ABS_MIN:-1.0}"
 PU_CENTER_ONLY_FILL_AREA_MIN="${PU_CENTER_ONLY_FILL_AREA_MIN:-500}"
 PU_CENTER_ONLY_FILL_RATIO_MAX="${PU_CENTER_ONLY_FILL_RATIO_MAX:-0.3}"
+PU_CENTER_ONLY_WEIGHT="${PU_CENTER_ONLY_WEIGHT:-0.25}"
+PU_BACKGROUND_WEIGHT="${PU_BACKGROUND_WEIGHT:-1.0}"
+PU_BRIGHT_WEIGHT="${PU_BRIGHT_WEIGHT:-1.0}"
+PU_STRICT_CENTER_ONLY_WEIGHT="${PU_STRICT_CENTER_ONLY_WEIGHT:-1.0}"
 PU_AP2_KRON_BRIGHT_MAG_THRESHOLD="${PU_AP2_KRON_BRIGHT_MAG_THRESHOLD:-22}"
 PU_AP2_KRON_BRIGHT_ABS_MAX="${PU_AP2_KRON_BRIGHT_ABS_MAX:-2}"
 PU_AP2_KRON_LARGE_BRIGHT_REGION_AREA_MIN="${PU_AP2_KRON_LARGE_BRIGHT_REGION_AREA_MIN:-1000}"
@@ -120,6 +125,11 @@ PU_BRIGHT_ANSCOMBE_SCALE="${PU_BRIGHT_ANSCOMBE_SCALE:-1000}"
 PU_BRIGHT_Z_THRESHOLD="${PU_BRIGHT_Z_THRESHOLD:-3.0}"
 PU_BRIGHT_MASK_DILATE="${PU_BRIGHT_MASK_DILATE:-2}"
 EXTERNAL_BRIGHT_LABEL_ROOT="${EXTERNAL_BRIGHT_LABEL_ROOT:-}"
+EXTERNAL_BRIGHT_LABEL_POLICY="${EXTERNAL_BRIGHT_LABEL_POLICY:-error}"
+INTEGRATED_BRIGHT_LABELS="${INTEGRATED_BRIGHT_LABELS:-0}"
+INTEGRATED_BRIGHT_GAIA_FITS="${INTEGRATED_BRIGHT_GAIA_FITS:-/home/czh23/CELLECT/output/gaia_dr3_cosmos.fits}"
+INTEGRATED_BRIGHT_USE_BAD_MASK_FIRST_STEP="${INTEGRATED_BRIGHT_USE_BAD_MASK_FIRST_STEP:-0}"
+INTEGRATED_BRIGHT_LOG_A="${INTEGRATED_BRIGHT_LOG_A:-}"
 
 WRITE_CLEAN_REGIONS="${WRITE_CLEAN_REGIONS:-0}"
 CLEAN_REGION_OUT_DIR="${CLEAN_REGION_OUT_DIR:-output/preprocessed_clean_regions}"
@@ -397,6 +407,13 @@ run_preprocess() {
   if [[ "${USE_LSST_DETECTION_CALEXP_CUTOUTS}" == "1" ]]; then
     optional_args+=(--use-lsst-detection-calexp-cutouts)
   fi
+  if [[ -n "${PU_IGNORE_MASK_PLANES}" ]]; then
+    split_words "${PU_IGNORE_MASK_PLANES}"
+    local pu_ignore_mask_plane_args=("${SPLIT_WORDS_OUT[@]}")
+    optional_args+=(--pu-ignore-mask-planes "${pu_ignore_mask_plane_args[@]}")
+  else
+    optional_args+=(--pu-ignore-mask-planes)
+  fi
   if [[ "${ENABLE_STRICT_BRIGHT_CENTER_ONLY}" == "1" ]]; then
     optional_args+=(
       --pu-enable-strict-bright-center-only
@@ -418,7 +435,24 @@ run_preprocess() {
     )
   fi
   if [[ -n "${EXTERNAL_BRIGHT_LABEL_ROOT}" ]]; then
-    optional_args+=(--external-bright-label-root "${EXTERNAL_BRIGHT_LABEL_ROOT}")
+    optional_args+=(
+      --external-bright-label-root "${EXTERNAL_BRIGHT_LABEL_ROOT}"
+      --external-bright-label-policy "${EXTERNAL_BRIGHT_LABEL_POLICY}"
+    )
+  fi
+  if [[ "${INTEGRATED_BRIGHT_LABELS}" == "1" ]]; then
+    optional_args+=(
+      --integrated-bright-labels
+      --integrated-bright-gaia-fits "${INTEGRATED_BRIGHT_GAIA_FITS}"
+    )
+    if [[ "${INTEGRATED_BRIGHT_USE_BAD_MASK_FIRST_STEP}" == "1" ]]; then
+      optional_args+=(--integrated-bright-use-bad-mask-first-step)
+    else
+      optional_args+=(--no-integrated-bright-use-bad-mask-first-step)
+    fi
+    if [[ -n "${INTEGRATED_BRIGHT_LOG_A}" ]]; then
+      optional_args+=(--integrated-bright-log-a "${INTEGRATED_BRIGHT_LOG_A}")
+    fi
   fi
   optional_args+=(
     --pu-ap2-kron-bright-mag-threshold "${PU_AP2_KRON_BRIGHT_MAG_THRESHOLD}"
@@ -506,6 +540,10 @@ run_preprocess() {
     --pu-ap2-kron-flux-column "${PU_AP2_KRON_FLUX_COLUMN}" \
     --pu-center-only-fill-area-min "${PU_CENTER_ONLY_FILL_AREA_MIN}" \
     --pu-center-only-fill-ratio-max "${PU_CENTER_ONLY_FILL_RATIO_MAX}" \
+    --pu-center-only-weight "${PU_CENTER_ONLY_WEIGHT}" \
+    --pu-background-weight "${PU_BACKGROUND_WEIGHT}" \
+    --pu-bright-weight "${PU_BRIGHT_WEIGHT}" \
+    --pu-strict-center-only-weight "${PU_STRICT_CENTER_ONLY_WEIGHT}" \
     --pu-remeasure-clean-abs-max "${PU_AP2_KRON_ABS_MAX}" \
     --pu-remeasure-center-only-abs-max "${PU_REMEASURE_CENTER_ONLY_ABS_MAX}" \
     --pu-remeasure-small-footprint-fill-threshold "${PU_REMEASURE_SMALL_FOOTPRINT_FILL_THRESHOLD}" \
@@ -611,6 +649,7 @@ main() {
   echo "STRICT_CENTER_ONLY_SATURATION_MAGS=${STRICT_CENTER_ONLY_SATURATION_MAGS}"
   echo "LSST_BACKGROUND_POLICY=${LSST_BACKGROUND_POLICY}"
   echo "VARIANT_LSST_BACKGROUND_ROOT=${VARIANT_LSST_BACKGROUND_ROOT:-<none>}"
+  echo "PU_IGNORE_MASK_PLANES=${PU_IGNORE_MASK_PLANES:-<disabled>}"
   echo "LSST_BACKGROUND_DETECT_CUTOUTS=${LSST_BACKGROUND_DETECT_CUTOUTS}"
   echo "USE_LSST_DETECTION_CALEXP_CUTOUTS=${USE_LSST_DETECTION_CALEXP_CUTOUTS}"
   echo "WRITE_CLEAN_REGIONS=${WRITE_CLEAN_REGIONS}"

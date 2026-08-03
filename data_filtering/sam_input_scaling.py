@@ -59,20 +59,26 @@ def current_sam_zscore(
     clip_hi = raw_median + float(clip_sigma) * raw_sigma
     clipped_values = np.minimum(values, clip_hi)
     mean, median, std = sigma_clipped_stats(clipped_values, sigma=float(clip_sigma), maxiters=None)
-    mean = float(mean) if np.isfinite(mean) else float(np.mean(clipped_values))
+    sigma_mean = float(mean) if np.isfinite(mean) else float(np.mean(clipped_values))
     median = float(median) if np.isfinite(median) else float(np.median(clipped_values))
     std = float(std) if np.isfinite(std) and std > 0 else float(np.std(clipped_values))
     if not np.isfinite(std) or std <= 0.0:
         std = 1.0
-    safe = np.where(np.isfinite(image), image, mean).astype(np.float32, copy=False)
+    safe = np.where(np.isfinite(image), image, median).astype(np.float32, copy=False)
     capped = np.minimum(safe, clip_hi)
-    z = np.clip((capped - mean) / std, z_clip[0], z_clip[1]).astype(np.float32)
+    z = np.clip((capped - median) / std, z_clip[0], z_clip[1]).astype(np.float32)
     return z, {
         "raw_median": raw_median,
         "raw_min": raw_min,
         "raw_sigma": raw_sigma,
         "clip_hi": clip_hi,
-        "mean": mean,
+        "zscore_mean": sigma_mean,
+        "zscore_median": median,
+        "sigma_mean": sigma_mean,
+        # Historical callers used "mean"/"median" for the zscore background.
+        # Keep both as the median because this is the value used to center the
+        # SAM-style zscore image.
+        "mean": median,
         "median": median,
         "std": std,
         "clip_hi_pixel_fraction": float(np.count_nonzero(values >= clip_hi) / values.size),
@@ -87,20 +93,25 @@ def no_first_clip_zscore(
     z_clip: tuple[float, float] = (-3.0, 3.0),
 ) -> tuple[np.ndarray, dict[str, float]]:
     values = finite_values(image)
-    mean, _median, std = sigma_clipped_stats(values, sigma=float(clip_sigma), maxiters=None)
-    mean = float(mean) if np.isfinite(mean) else float(np.mean(values))
+    mean, median, std = sigma_clipped_stats(values, sigma=float(clip_sigma), maxiters=None)
+    sigma_mean = float(mean) if np.isfinite(mean) else float(np.mean(values))
+    median = float(median) if np.isfinite(median) else float(np.median(values))
     std = float(std) if np.isfinite(std) and std > 0 else float(np.std(values))
     if not np.isfinite(std) or std <= 0.0:
         std = 1.0
-    safe = np.where(np.isfinite(image), image, mean).astype(np.float32, copy=False)
+    safe = np.where(np.isfinite(image), image, median).astype(np.float32, copy=False)
     upper = z_clip[1]
-    z_raw = (safe - mean) / std
+    z_raw = (safe - median) / std
     if np.isfinite(upper):
         z = np.clip(z_raw, z_clip[0], upper).astype(np.float32)
     else:
         z = np.maximum(z_raw, z_clip[0]).astype(np.float32)
     return z, {
-        "mean": mean,
+        "zscore_mean": sigma_mean,
+        "zscore_median": median,
+        "sigma_mean": sigma_mean,
+        "mean": median,
+        "median": median,
         "std": std,
         "zmax_pixel_fraction": float(np.count_nonzero(z >= upper) / z.size) if np.isfinite(upper) else 0.0,
     }
@@ -182,9 +193,9 @@ def resolve_minimum(mode: str, fixed: float, zscore_stats: dict[str, float]) -> 
     if mode == "fixed":
         return float(fixed)
     if mode == "zscore-mean":
-        return float(zscore_stats["mean"])
+        return float(zscore_stats.get("zscore_mean", zscore_stats["mean"]))
     if mode == "zscore-median":
-        return float(zscore_stats["median"])
+        return float(zscore_stats.get("zscore_median", zscore_stats["median"]))
     if mode == "raw-median":
         return float(zscore_stats["raw_median"])
     if mode == "image-min":
@@ -240,7 +251,7 @@ def build_bright_mask(
         )
         lupton_map, _lupton_stats = lupton_single(
             image,
-            minimum=float(current_stats["mean"]),
+            minimum=float(current_stats["zscore_median"]),
             stretch=float(lupton_stretch),
             q=float(lupton_q),
         )
@@ -308,7 +319,7 @@ def scale_training_image(
         )
         lupton_map, _lupton_stats = lupton_single(
             image,
-            minimum=float(current_stats["mean"]),
+            minimum=float(current_stats["zscore_median"]),
             stretch=float(lupton_stretch),
             q=float(lupton_q),
         )

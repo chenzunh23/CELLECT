@@ -111,6 +111,7 @@ def build_pu_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
             "noncoadd_snr_mask_planes",
             ("BRIGHT_OBJECT", "SAT", "BAD", "NO_DATA", "EDGE", "UNMASKEDNAN"),
         ),
+        "pu_ignore_mask_planes": ("pu_ignore_mask_planes", ("SAT", "BAD", "EDGE")),
         "noncoadd_snr_exclude_self_source": ("noncoadd_snr_exclude_self_source", True),
     }
     for canonical, (alias, default) in aliases.items():
