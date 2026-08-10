@@ -9,7 +9,7 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 
 from .image_encoder import ImageEncoderViT
-from .preprocess import astro_preprocess, pad_to_square, per_band_stats
+from .preprocess import astro_preprocess, pad_to_patch_multiple, pad_to_square, per_band_stats
 from .style_conditioning import ImageStyleRouter
 
 
@@ -140,6 +140,7 @@ class SamPerBandImageEncoder(nn.Module):
         style_prompt_enabled: bool = False,
         style_prompt_dim: int = 32,
         style_router_temperature: float = 1.0,
+        dynamic_image_size: bool = False,
     ) -> None:
         super().__init__()
         self.image_encoder = image_encoder
@@ -150,6 +151,7 @@ class SamPerBandImageEncoder(nn.Module):
         self.astro_preprocess_z_clip = astro_preprocess_z_clip
         self.style_prompt_enabled = bool(style_prompt_enabled)
         self.style_router_temperature = float(style_router_temperature)
+        self.dynamic_image_size = bool(dynamic_image_size)
         if self.style_router_temperature <= 0.0:
             raise ValueError("style_router_temperature must be positive")
         if self.style_prompt_enabled:
@@ -230,11 +232,24 @@ class SamPerBandImageEncoder(nn.Module):
         stats = per_band_stats(processed) if return_stats else None
         if processed_rgb is not None:
             flat_rgb_input = processed_rgb.reshape(batch * bands, 3, height, width)
-            flat_rgb = pad_to_square(flat_rgb_input, self.img_size).contiguous()
+            if self.dynamic_image_size:
+                flat_rgb = pad_to_patch_multiple(
+                    flat_rgb_input,
+                    self.patch_size,
+                    max_size=self.img_size,
+                ).contiguous()
+            else:
+                flat_rgb = pad_to_square(flat_rgb_input, self.img_size).contiguous()
         else:
-            padded = pad_to_square(processed, self.img_size)
-            flat = padded.reshape(batch * bands, 1, self.img_size, self.img_size)
+            padded = (
+                pad_to_patch_multiple(processed, self.patch_size, max_size=self.img_size)
+                if self.dynamic_image_size
+                else pad_to_square(processed, self.img_size)
+            )
+            padded_height, padded_width = (int(v) for v in padded.shape[-2:])
+            flat = padded.reshape(batch * bands, 1, padded_height, padded_width)
             flat_rgb = flat.expand(-1, 3, -1, -1).contiguous()
+        padded_height, padded_width = (int(v) for v in flat_rgb.shape[-2:])
         flat_features = self.image_encoder(flat_rgb, style_prompt=flat_style_prompt)
         features = flat_features.reshape(batch, bands, *flat_features.shape[1:])
 
@@ -249,6 +264,8 @@ class SamPerBandImageEncoder(nn.Module):
             "num_bands": int(bands),
             "input_height": int(height),
             "input_width": int(width),
+            "padded_height": padded_height,
+            "padded_width": padded_width,
         }
         if stats is not None:
             out["per_band_stats"] = stats
@@ -279,6 +296,7 @@ def build_per_band_sam_encoder(
     style_prompt_layers: Sequence[int] = (),
     style_adapter_dim: int = 32,
     style_router_temperature: float = 1.0,
+    dynamic_image_size: bool = False,
 ) -> SamPerBandImageEncoder:
     encoder = build_sam_image_encoder(
         model_type,
@@ -300,6 +318,7 @@ def build_per_band_sam_encoder(
         style_prompt_enabled=style_prompt_enabled,
         style_prompt_dim=style_prompt_dim,
         style_router_temperature=style_router_temperature,
+        dynamic_image_size=dynamic_image_size,
     )
 
 

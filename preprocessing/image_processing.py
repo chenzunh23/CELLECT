@@ -18,10 +18,12 @@ from data_filtering.sam_input_scaling import build_bright_mask, scale_training_i
 class ImageProcessingConfig:
     scaling_mode: str = "zscore-log-lupton-rgb"
     hdu: int | str = 1
+    clip_threshold: float = 3.0
     log_a: float | None = None
     log_high_percentile: float = 99.5
     lupton_stretch: float = 0.5
     lupton_q: float = 20.0
+    anscombe_clip: bool = False
     anscombe_scale: float = 1.0
 
 
@@ -29,11 +31,13 @@ class ImageProcessingConfig:
 class BrightRegionConfig:
     mode: str = "log-lupton"
     threshold: float = 2.99
+    clip_threshold: float = 3.0
     dilation: int = 2
     log_a: float = 1000.0
     log_high_percentile: float = 99.5
     lupton_stretch: float = 0.5
     lupton_q: float = 20.0
+    anscombe_clip: bool = False
     anscombe_scale: float = 1000.0
 
 
@@ -45,13 +49,14 @@ def read_fits_image(path: Path | str, *, hdu: int | str = 1) -> tuple[np.ndarray
 
 
 def scale_image_for_training(image: np.ndarray, *, config: ImageProcessingConfig) -> np.ndarray:
-    kwargs = {}
+    kwargs = {"clip_threshold": float(config.clip_threshold)}
     if config.log_a is not None:
         kwargs["log_a"] = config.log_a
     kwargs["log_high_percentile"] = float(config.log_high_percentile)
     kwargs["lupton_stretch"] = float(config.lupton_stretch)
     kwargs["lupton_q"] = float(config.lupton_q)
     if "anscombe" in config.scaling_mode:
+        kwargs["anscombe_clip"] = config.anscombe_clip
         kwargs["anscombe_scale"] = config.anscombe_scale
     return scale_training_image(image, mode=config.scaling_mode, **kwargs)
 
@@ -90,11 +95,13 @@ def build_bright_components(image: np.ndarray, *, config: BrightRegionConfig = B
         image,
         mode=config.mode,
         threshold=float(config.threshold),
+        clip_threshold=float(config.clip_threshold),
         dilation=int(config.dilation),
         log_a=float(config.log_a),
         log_high_percentile=float(config.log_high_percentile),
         lupton_stretch=float(config.lupton_stretch),
         lupton_q=float(config.lupton_q),
+        anscombe_clip=bool(config.anscombe_clip),
         anscombe_scale=float(config.anscombe_scale),
     )
     try:

@@ -84,10 +84,12 @@ class StoreTask:
     bright_mask_mode: str
     bright_threshold: float
     bright_dilation: int
+    clip_threshold: float
     image_log_a: float
     image_log_high_percentile: float
     image_lupton_stretch: float
     image_lupton_q: float
+    image_anscombe_clip: bool
     image_anscombe_scale: float
     bright_log_a: float
     bright_log_high_percentile: float
@@ -317,10 +319,12 @@ def _scale_image_chw(raw_image: np.ndarray, task: StoreTask) -> np.ndarray:
         raw_image,
         config=ImageProcessingConfig(
             scaling_mode=task.image_scaling_mode,
+            clip_threshold=float(task.clip_threshold),
             log_a=_image_log_a(task),
             log_high_percentile=float(task.image_log_high_percentile),
             lupton_stretch=float(task.image_lupton_stretch),
             lupton_q=float(task.image_lupton_q),
+            anscombe_clip=bool(task.image_anscombe_clip),
             anscombe_scale=float(task.image_anscombe_scale),
         ),
     )
@@ -344,11 +348,13 @@ def _classify_patch(task: StoreTask, image: np.ndarray, image_header: fits.Heade
     bright_config = BrightRegionConfig(
         mode=task.bright_mask_mode,
         threshold=float(task.bright_threshold),
+        clip_threshold=float(task.clip_threshold),
         dilation=int(task.bright_dilation),
         log_a=_bright_log_a(task),
         log_high_percentile=float(task.bright_log_high_percentile),
         lupton_stretch=float(task.bright_lupton_stretch),
         lupton_q=float(task.bright_lupton_q),
+        anscombe_clip=bool(task.image_anscombe_clip),
         anscombe_scale=float(task.bright_anscombe_scale),
     )
     bright_region, components = build_bright_components(image, config=bright_config)
@@ -706,10 +712,13 @@ def _build_store(task: StoreTask) -> dict[str, object]:
             "bright_mask_mode": task.bright_mask_mode,
             "bright_threshold": float(task.bright_threshold),
             "bright_dilation": int(task.bright_dilation),
+            "clip_threshold": float(task.clip_threshold),
+            "image_clip_threshold": float(task.clip_threshold),
             "image_log_a": float(_image_log_a(task)),
             "image_log_high_percentile": float(task.image_log_high_percentile),
             "image_lupton_stretch": float(task.image_lupton_stretch),
             "image_lupton_q": float(task.image_lupton_q),
+            "image_anscombe_clip": bool(task.image_anscombe_clip),
             "image_anscombe_scale": float(task.image_anscombe_scale),
             "bright_log_a": float(_bright_log_a(task)),
             "bright_log_high_percentile": float(task.bright_log_high_percentile),
@@ -805,10 +814,12 @@ def _make_tasks(args: argparse.Namespace) -> list[StoreTask]:
                             bright_mask_mode=str(args.bright_mask_mode),
                             bright_threshold=float(args.bright_threshold),
                             bright_dilation=int(args.bright_dilation),
+                            clip_threshold=float(args.clip_threshold),
                             image_log_a=image_log_a,
                             image_log_high_percentile=float(args.image_log_high_percentile),
                             image_lupton_stretch=image_lupton_stretch,
                             image_lupton_q=image_lupton_q,
+                            image_anscombe_clip=bool(args.image_anscombe_clip),
                             image_anscombe_scale=float(args.image_anscombe_scale),
                             bright_log_a=bright_log_a,
                             bright_log_high_percentile=float(args.bright_log_high_percentile),
@@ -863,10 +874,12 @@ def _make_tasks(args: argparse.Namespace) -> list[StoreTask]:
                             bright_mask_mode=str(args.bright_mask_mode),
                             bright_threshold=float(args.bright_threshold),
                             bright_dilation=int(args.bright_dilation),
+                            clip_threshold=float(args.clip_threshold),
                             image_log_a=image_log_a,
                             image_log_high_percentile=float(args.image_log_high_percentile),
                             image_lupton_stretch=image_lupton_stretch,
                             image_lupton_q=image_lupton_q,
+                            image_anscombe_clip=bool(args.image_anscombe_clip),
                             image_anscombe_scale=float(args.image_anscombe_scale),
                             bright_log_a=bright_log_a,
                             bright_log_high_percentile=float(args.bright_log_high_percentile),
@@ -921,6 +934,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bright-mask-mode", default="log-lupton")
     parser.add_argument("--bright-threshold", type=float, default=2.99)
     parser.add_argument("--bright-dilation", type=int, default=2)
+    parser.add_argument("--clip-threshold", type=float, default=3.0, help="Clip image after scaling.")
     parser.add_argument("--log-a", type=float, default=float("nan"), help="Compatibility override for both --image-log-a and --bright-log-a.")
     parser.add_argument("--image-log-a", type=float, default=float("nan"), help="Log exponent for the RGB image written to zarr; default is per-band broad=1000, NB1010=100, NB0387=3000.")
     parser.add_argument("--bright-log-a", type=float, default=float("nan"), help="Log exponent for bright-region labels; default is broad=1000, NB1010=100, NB0387=3000.")
@@ -932,6 +946,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-lupton-q", type=float, default=20.0)
     parser.add_argument("--bright-lupton-stretch", type=float, default=0.5)
     parser.add_argument("--bright-lupton-q", type=float, default=20.0)
+    parser.add_argument("--image-anscombe-clip", action="store_true", help="Clip image by removing pixels more than 3 raw standard deviations from the raw mean.")
     parser.add_argument("--image-anscombe-scale", type=float, default=1000.0)
     parser.add_argument("--bright-anscombe-scale", type=float, default=1000.0)
     parser.add_argument("--cluster-source-match-pixels", type=float, default=6.0)

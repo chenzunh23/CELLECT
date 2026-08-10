@@ -126,7 +126,16 @@ class ImageEncoderViT(nn.Module):
     def forward(self, x: torch.Tensor, style_prompt: Optional[torch.Tensor] = None) -> torch.Tensor:
         x = self.patch_embed(x)
         if self.pos_embed is not None:
-            x = x + self.pos_embed
+            pos_embed = self.pos_embed
+            if tuple(pos_embed.shape[1:3]) != tuple(x.shape[1:3]):
+                pos_embed = F.interpolate(
+                    pos_embed.permute(0, 3, 1, 2).float(),
+                    size=tuple(x.shape[1:3]),
+                    mode="bicubic",
+                    align_corners=False,
+                ).permute(0, 2, 3, 1)
+                pos_embed = pos_embed.to(device=x.device, dtype=x.dtype)
+            x = x + pos_embed
 
         if self.style_adapters and style_prompt is None:
             raise ValueError("style_prompt is required when encoder style adapters are enabled")

@@ -65,8 +65,8 @@ CONF_COLORS = {
 }
 
 SOURCE_CLASS_COLORS = {
-    1: "green",
-    2: "cyan",
+    1: "cyan", # green
+    2: "blue", # cyan
     4: "magenta",
     5: "magenta",
     6: "orange",
@@ -216,6 +216,26 @@ def save_png(path: Path, rgb: np.ndarray, *, title: str = "", scale: int = 1) ->
     plt.close(fig)
 
 
+def save_pixel_png(path: Path, rgb: np.ndarray, *, scale: int = 1) -> None:
+    """Save an image-coordinate RGB array without axes, title, or padding.
+
+    The visualization helpers in this module draw in image coordinates with
+    y=0 at the lower edge.  PNG files are row-major with y=0 at the upper edge,
+    so this function flips before writing.  This keeps a 512x512 cutout exactly
+    512x512 on disk, which is important when overlay coordinates are inspected.
+    """
+    from PIL import Image
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    arr = np.asarray(rgb, dtype=np.float32)
+    arr = np.clip(np.rint(np.flipud(arr) * 255.0), 0, 255).astype(np.uint8)
+    image = Image.fromarray(arr, mode="RGB")
+    scale_i = max(1, int(scale))
+    if scale_i > 1:
+        image = image.resize((image.width * scale_i, image.height * scale_i), resample=Image.Resampling.NEAREST)
+    image.save(path)
+
+
 def save_heatmap(path: Path, plane: np.ndarray, *, title: str = "", vmin: float | None = None, vmax: float | None = None) -> None:
     import matplotlib
 
@@ -230,6 +250,58 @@ def save_heatmap(path: Path, plane: np.ndarray, *, title: str = "", vmin: float 
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
     fig.savefig(path, bbox_inches="tight", pad_inches=0.03)
     plt.close(fig)
+
+
+def input_channel_display_limits(
+    channel: np.ndarray,
+    *,
+    scaling: str,
+    channel_index: int | None = None,
+    clip_threshold: float = 3.0,
+) -> tuple[float, float]:
+    """Return the display interval used for model-input channel plots.
+
+    Most training scalings store standardized channels clipped to [-3, 3].
+    ``zscore-no-upper`` deliberately has no finite upper clip, so for that
+    mode the exact finite min/max of the input channel is the displayed range,
+    matching matplotlib's default heatmap semantics.
+    """
+    label = str(scaling).strip().lower().replace("_", "-")
+    arr = np.asarray(channel, dtype=np.float32)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return (0.0, 1.0)
+    if "no-upper" in label or "unbounded" in label:
+        lo = float(np.min(finite))
+        hi = float(np.max(finite))
+    else:
+        threshold = float(clip_threshold)
+        if not np.isfinite(threshold) or threshold <= 0.0:
+            threshold = 3.0
+        lo, hi = -threshold, threshold
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        lo, hi = float(np.min(finite)), float(np.max(finite))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        return (0.0, 1.0)
+    return (lo, hi)
+
+
+def input_channel_to_rgb(
+    channel: np.ndarray,
+    *,
+    scaling: str,
+    channel_index: int | None = None,
+    clip_threshold: float = 3.0,
+) -> np.ndarray:
+    lo, hi = input_channel_display_limits(
+        channel,
+        scaling=scaling,
+        channel_index=channel_index,
+        clip_threshold=clip_threshold,
+    )
+    gray = np.clip((np.asarray(channel, dtype=np.float32) - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+    gray = np.nan_to_num(gray, nan=0.0, posinf=1.0, neginf=0.0).astype(np.float32)
+    return np.repeat(gray[..., None], 3, axis=2)
 
 
 def ellipse_line(
@@ -302,6 +374,11 @@ def draw_ellipses(
     *,
     color: str | None = None,
     point_color: str | None = None,
+    draw_centers: bool = True,
+    input_scaled_background: bool = False,
+    input_scaling: str | None = None,
+    input_channel_index: int | None = None,
+    input_clip_threshold: float = 3.0,
 ) -> np.ndarray:
     import matplotlib
 
@@ -311,7 +388,17 @@ def draw_ellipses(
     from matplotlib.patches import Ellipse
 
     fig, ax = plt.subplots(figsize=(image.shape[1] / 100.0, image.shape[0] / 100.0), dpi=100)
-    ax.imshow(zscale_gray(image), origin="lower", cmap="gray", vmin=0.0, vmax=1.0, interpolation="nearest")
+    if input_scaled_background:
+        rgb = input_channel_to_rgb(
+            image,
+            scaling=input_scaling or "zscore",
+            channel_index=input_channel_index,
+            clip_threshold=float(input_clip_threshold),
+        )
+        gray = rgb[..., 0]
+    else:
+        gray = zscale_gray(image)
+    ax.imshow(gray, origin="lower", cmap="gray", vmin=0.0, vmax=1.0, interpolation="nearest")
     for row in sorted(rows, key=lambda r: abs(float(r["major"]) * float(r["minor"])), reverse=True):
         row_color = color or SOURCE_CLASS_COLORS.get(int(row.get("class_id", 1)), "yellow")
         row_point_color = point_color or row_color
@@ -327,7 +414,8 @@ def draw_ellipses(
                 alpha=0.95,
             )
         )
-        ax.plot(float(row["x"]), float(row["y"]), marker="+", color=row_point_color, markersize=3.5, mew=0.8)
+        if draw_centers:
+            ax.plot(float(row["x"]), float(row["y"]), marker="+", color=row_point_color, markersize=3.5, mew=0.8)
     ax.set_xlim(0, image.shape[1])
     ax.set_ylim(0, image.shape[0])
     ax.set_axis_off()
@@ -488,7 +576,8 @@ def resolve_zarr_sample(
     matches = []
     readers_by_store: dict[str, PatchZarrReader] = {}
     for rec in records:
-        if patch and rec.patch != patch:
+        rec_patch = str(rec.patch).split("__", 1)[0]
+        if patch and rec.patch != patch and rec_patch != patch:
             continue
         if tile_name and not tile_name_matches(rec.tile_name, tile_name):
             continue
@@ -549,10 +638,15 @@ def normalize_group_name(group: str | None) -> str | None:
 
 
 def zarr_sample_group(reader: PatchZarrReader, sample_idx: int) -> str:
-    if not reader.has_array("group"):
+    if reader.has_array("group"):
+        groups = decode_fixed_utf8(reader.read_full_small("group"))
+        if int(sample_idx) < len(groups) and groups[int(sample_idx)]:
+            return groups[int(sample_idx)]
+    stem = reader.root.stem
+    if "__" not in stem:
         return ""
-    groups = decode_fixed_utf8(reader.read_full_small("group"))
-    return groups[int(sample_idx)] if int(sample_idx) < len(groups) else ""
+    suffix = stem.split("__", 1)[1]
+    return suffix if suffix.startswith("group_") else ""
 
 
 def tile_name_matches(actual: str, requested: str) -> bool:
@@ -611,7 +705,12 @@ def build_scaled_tensor_from_fits(
     width: int,
     height: int,
     scaling_mode: str,
+    clip_threshold: float,
     log_a: float,
+    log_high_percentile: float,
+    lupton_stretch: float,
+    lupton_q: float,
+    anscombe_clip: bool,
     anscombe_scale: float,
 ) -> tuple[torch.Tensor, list[np.ndarray], list[np.ndarray], list[fits.Header]]:
     raw_images: list[np.ndarray] = []
@@ -622,7 +721,17 @@ def build_scaled_tensor_from_fits(
         local_x0, local_y0 = crop_origin_for_image(full, header, x0=x0, y0=y0, width=width, height=height)
         crop, valid = crop_or_pad(full, x0=local_x0, y0=local_y0, width=width, height=height)
         crop = np.where(valid, crop, np.nan).astype(np.float32)
-        scaled = make_training_rgb(crop, mode=scaling_mode, log_a=log_a, anscombe_scale=anscombe_scale)
+        scaled = make_training_rgb(
+            crop,
+            mode=scaling_mode,
+            clip_threshold=clip_threshold,
+            log_a=log_a,
+            log_high_percentile=log_high_percentile,
+            lupton_stretch=lupton_stretch,
+            lupton_q=lupton_q,
+            anscombe_clip=anscombe_clip,
+            anscombe_scale=anscombe_scale,
+        )
         raw_images.append(np.nan_to_num(crop, nan=0.0, posinf=0.0, neginf=0.0)[:height, :width])
         scaled_images.append(scaled[:, :height, :width])
         headers.append(header)
@@ -630,19 +739,44 @@ def build_scaled_tensor_from_fits(
     return tensor, raw_images, scaled_images, headers
 
 
-def make_training_rgb(image: np.ndarray, *, mode: str, log_a: float = 300.0, anscombe_scale: float = 1000.0) -> np.ndarray:
+def make_training_rgb(
+    image: np.ndarray,
+    *,
+    mode: str,
+    clip_threshold: float = 3.0,
+    log_a: float = 300.0,
+    log_high_percentile: float = 99.5,
+    lupton_stretch: float = 0.5,
+    lupton_q: float = 20.0,
+    anscombe_clip: bool = False,
+    anscombe_scale: float = 1000.0,
+) -> np.ndarray:
     normalized = str(mode).strip().lower().replace("_", "-")
     if normalized in {"zscore-clip", "zscore", "clip"}:
-        return scale_training_image(image, mode="zscore-rgb")
+        return scale_training_image(image, mode="zscore-rgb", clip_threshold=float(clip_threshold))
     if normalized in {"zscore-no-clip", "zscore-noclip"}:
-        z, _stats = no_first_clip_zscore(image, z_clip=(-3.0, 3.0))
+        z, _stats = no_first_clip_zscore(image, z_clip=(-float(clip_threshold), float(clip_threshold)))
         return np.stack([z, z, z], axis=0).astype(np.float32)
     if normalized in {"zscore-no-upper", "zscore-unbounded"}:
-        return scale_training_image(image, mode="zscore-no-upper-rgb")
+        return scale_training_image(image, mode="zscore-no-upper-rgb", clip_threshold=float(clip_threshold))
     if normalized in {"log-lupton", "lupton-log", "zscore-log-lupton"}:
-        return scale_training_image(image, mode="zscore-log-lupton-rgb", log_a=log_a)
+        return scale_training_image(
+            image,
+            mode="zscore-log-lupton-rgb",
+            clip_threshold=float(clip_threshold),
+            log_a=log_a,
+            log_high_percentile=float(log_high_percentile),
+            lupton_stretch=float(lupton_stretch),
+            lupton_q=float(lupton_q),
+        )
     if normalized == "anscombe":
-        return scale_training_image(image, mode="anscombe-rgb", anscombe_scale=anscombe_scale)
+        return scale_training_image(
+            image,
+            mode="anscombe-rgb",
+            clip_threshold=float(clip_threshold),
+            anscombe_clip=bool(anscombe_clip),
+            anscombe_scale=anscombe_scale,
+        )
     raise ValueError(f"unknown scaling mode: {mode}")
 
 
@@ -668,7 +802,14 @@ def sam_uint8_from_scaled(chw: np.ndarray) -> np.ndarray:
     return np.clip(np.rint(rgb * 255.0), 0, 255).astype(np.uint8)
 
 
-def load_cellect_model(checkpoint: Path, config: Path | None, device: torch.device, bands: Sequence[str]) -> tuple[torch.nn.Module, dict]:
+def load_cellect_model(
+    checkpoint: Path,
+    config: Path | None,
+    device: torch.device,
+    bands: Sequence[str],
+    *,
+    dynamic_image_size: bool | None = None,
+) -> tuple[torch.nn.Module, dict]:
     cfg = read_json(config if config is not None else checkpoint.parent / "run_config.json")
     top = cfg.get("_top", {})
     ckpt = torch.load(checkpoint, map_location=device)
@@ -680,6 +821,8 @@ def load_cellect_model(checkpoint: Path, config: Path | None, device: torch.devi
     )
     film_from_state = isinstance(state, dict) and any("decoder.denoised_film." in str(k) for k in state)
     base_channels = int(top.get("base_channels") or cfg.get("base_channels", 32))
+    if dynamic_image_size is None:
+        dynamic_image_size = bool(top.get("sam_dynamic_image_size", cfg.get("sam_dynamic_image_size", False)))
     model = build_sam_cellect2d(
         str(top.get("sam_model_type") or cfg.get("sam_model_type", "vit_b")),
         checkpoint=None,
@@ -704,6 +847,7 @@ def load_cellect_model(checkpoint: Path, config: Path | None, device: torch.devi
         shape_feature_dim=6,
         enable_matchers=False,
         astro_preprocess_in_model=False,
+        dynamic_image_size=bool(dynamic_image_size),
     ).to(device)
     incompatible = model.load_state_dict(strip_module_prefix(state), strict=False)
     if incompatible.missing_keys or incompatible.unexpected_keys:

@@ -166,11 +166,13 @@ def _classify_all_bands(
                         image,
                         mode=str(getattr(args, "pu_bright_mask_mode", "log-lupton")),
                         threshold=float(getattr(args, "pu_bright_z_threshold", 3.0)),
+                        clip_threshold=float(getattr(args, "pu_bright_clip_threshold", getattr(args, "image_clip_threshold", 3.0))),
                         dilation=int(getattr(args, "pu_bright_mask_dilate", 2)),
                         log_a=float(getattr(args, "pu_bright_log_a", 300.0)),
                         log_high_percentile=float(getattr(args, "pu_bright_log_high_percentile", 99.5)),
                         lupton_stretch=float(getattr(args, "pu_bright_lupton_stretch", 0.5)),
                         lupton_q=float(getattr(args, "pu_bright_lupton_q", 20.0)),
+                        anscombe_clip=bool(getattr(args, "pu_bright_anscombe_clip", False)),
                         anscombe_scale=float(getattr(args, "pu_bright_anscombe_scale", 1000.0)),
                     )
             except Exception as exc:
@@ -399,11 +401,13 @@ def _bright_backgrounds_for_images(
                     image,
                     mode=str(getattr(args, "pu_bright_mask_mode", "log-lupton")),
                     threshold=float(getattr(args, "pu_bright_z_threshold", 3.0)),
+                    clip_threshold=float(getattr(args, "pu_bright_clip_threshold", getattr(args, "image_clip_threshold", 3.0))),
                     dilation=int(getattr(args, "pu_bright_mask_dilate", 2)),
                     log_a=float(getattr(args, "pu_bright_log_a", 300.0)),
                     log_high_percentile=float(getattr(args, "pu_bright_log_high_percentile", 99.5)),
                     lupton_stretch=float(getattr(args, "pu_bright_lupton_stretch", 0.5)),
                     lupton_q=float(getattr(args, "pu_bright_lupton_q", 20.0)),
+                    anscombe_clip=bool(getattr(args, "pu_bright_anscombe_clip", False)),
                     anscombe_scale=float(getattr(args, "pu_bright_anscombe_scale", 1000.0)),
                 )
             if use_external_bright:
@@ -684,10 +688,12 @@ def _scaled_image_stack(
             raw_stack[band_idx],
             mode=mode,
             z_clip=tuple(args.z_clip) if args.z_clip is not None else None,
+            clip_threshold=float(getattr(args, "image_clip_threshold", 3.0)),
             log_a=float(getattr(args, "image_log_a", 300.0)),
             log_high_percentile=float(getattr(args, "image_log_high_percentile", 99.5)),
             lupton_stretch=float(getattr(args, "image_lupton_stretch", 0.5)),
             lupton_q=float(getattr(args, "image_lupton_q", 20.0)),
+            anscombe_clip=bool(getattr(args, "image_anscombe_clip", False)),
             anscombe_scale=float(getattr(args, "image_anscombe_scale", 1000.0)),
         )
         for band_idx in range(raw_stack.shape[0])
@@ -1859,10 +1865,12 @@ def _attrs(
         "align_denoised_noisy_snr_labels": bool(args.align_denoised_noisy_snr_labels),
         "pu_enable_bright_background_mask": bool(args.pu_enable_bright_background_mask),
         "pu_bright_mask_mode": str(args.pu_bright_mask_mode),
+        "pu_bright_clip_threshold": float(args.pu_bright_clip_threshold),
         "external_bright_label_root": str(args.external_bright_label_root) if args.external_bright_label_root is not None else None,
         "integrated_bright_labels": bool(getattr(args, "integrated_bright_labels", False)),
         "integrated_bright_gaia_fits": str(getattr(args, "integrated_bright_gaia_fits", "")),
         "image_scaling_mode": str(args.image_scaling_mode),
+        "image_clip_threshold": float(args.image_clip_threshold),
         "image_rgb_channels": 3 if _image_has_rgb_axis(args) else 1,
         "aligned_variant_label_contract": (
             "clean=denoised_clean AND noisy_clean; center_only=denoised/noisy center-only union; "
@@ -2001,6 +2009,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--pu-bright-log-high-percentile", type=float, default=99.5)
     p.add_argument("--pu-bright-lupton-stretch", type=float, default=0.5)
     p.add_argument("--pu-bright-lupton-q", type=float, default=20.0)
+    p.add_argument("--pu-bright-clip-threshold", type=float, default=None)
+    p.add_argument("--pu-bright-anscombe-clip", action="store_true")
     p.add_argument("--pu-bright-anscombe-scale", type=float, default=1000.0)
     p.add_argument("--pu-bright-z-threshold", type=float, default=3.0)
     p.add_argument("--pu-bright-mask-dilate", type=int, default=2)
@@ -2154,6 +2164,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--image-log-high-percentile", type=float, default=99.5)
     p.add_argument("--image-lupton-stretch", type=float, default=0.5)
     p.add_argument("--image-lupton-q", type=float, default=20.0)
+    p.add_argument("--image-clip-threshold", type=float, default=3.0)
+    p.add_argument("--image-anscombe-clip", action="store_true")
     p.add_argument("--image-anscombe-scale", type=float, default=1000.0)
     p.add_argument("--image-dtype", choices=("float16", "float32"), default="float16")
     p.add_argument("--target-float-dtype", choices=("float16", "float32"), default="float16")
@@ -2176,6 +2188,8 @@ def main() -> int:
     args.image_dtype = np.dtype(args.image_dtype)
     args.target_float_dtype = np.dtype(args.target_float_dtype)
     args.z_clip = tuple(args.z_clip) if args.z_clip is not None else None
+    if args.pu_bright_clip_threshold is None:
+        args.pu_bright_clip_threshold = float(args.image_clip_threshold)
     bright_mode = str(args.pu_bright_mask_mode).strip().lower().replace("_", "-")
     if (
         bright_mode in {"zscore-no-upper", "zscore-unbounded"}

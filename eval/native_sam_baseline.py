@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import contextlib
+import io
 import json
 import os
 import sys
@@ -13,6 +15,7 @@ from pathlib import Path
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/cellect_mplconfig")
 
 import numpy as np
+import torch
 from astropy.io import fits
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -21,13 +24,13 @@ if str(REPO_ROOT) not in sys.path:
 
 from eval.eval_utils import (
     SamAutomaticMaskGenerator,
+    crop_origin_for_image,
     crop_or_pad,
     labelmap_from_amg,
     load_native_sam,
     make_training_rgb,
     mask_overlay,
     read_fits_image,
-    sam_uint8_from_scaled,
     save_heatmap,
     save_png,
     scaled_rgb_for_display,
@@ -57,6 +60,11 @@ def parse_args() -> argparse.Namespace:
         help="Repeat to run selected scalings. Defaults to zscore_clip, zscore_no_clip, log_lupton, anscombe.",
     )
     p.add_argument("--log-a", type=float, default=300.0)
+    p.add_argument("--clip-threshold", type=float, default=3.0)
+    p.add_argument("--log-high-percentile", type=float, default=99.5)
+    p.add_argument("--lupton-stretch", type=float, default=0.5)
+    p.add_argument("--lupton-q", type=float, default=20.0)
+    p.add_argument("--anscombe-clip", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--anscombe-scale", type=float, default=1000.0)
     p.add_argument("--points-per-side", type=int, default=64)
     p.add_argument("--points-per-batch", type=int, default=64)
@@ -64,6 +72,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--stability-score-thresh", type=float, default=0.95)
     p.add_argument("--crop-n-layers", type=int, default=1)
     p.add_argument("--min-mask-region-area", type=int, default=15)
+    p.add_argument(
+        "--max-mask-area-fraction",
+        type=float,
+        default=0.15,
+        help="Drop AMG masks larger than this fraction of the evaluated crop area. Use <=0 to disable.",
+    )
     p.add_argument("--out-dir", type=Path, default=Path("output/eval_visualizations/native_sam"))
     return p.parse_args()
 
@@ -90,6 +104,14 @@ def _write_ann_csv(path: Path, annotations: list[dict]) -> None:
             )
 
 
+def _use_scaled_float_input(model) -> None:
+    """Disable native SAM RGB8 mean/std normalization for pre-scaled float inputs."""
+    with torch.no_grad():
+        model.pixel_mean.zero_()
+        model.pixel_std.fill_(1.0)
+    print("Using pre-scaled float SAM input with pixel normalization mean=0 and std=1", flush=True)
+
+
 def main() -> int:
     args = parse_args()
     modes = args.scaling_mode or ["zscore_clip", "zscore_no_clip", "log_lupton", "anscombe"]
@@ -102,7 +124,9 @@ def main() -> int:
     if len(bands) != len(paths):
         raise ValueError("--band must be repeated once per --input")
 
-    model = load_native_sam(str(args.model_type), args.checkpoint.expanduser().resolve(), str(args.device))
+    with contextlib.redirect_stdout(io.StringIO()):
+        model = load_native_sam(str(args.model_type), args.checkpoint.expanduser().resolve(), str(args.device))
+    _use_scaled_float_input(model)
     generator = SamAutomaticMaskGenerator(
         model,
         points_per_side=int(args.points_per_side),
@@ -117,13 +141,36 @@ def main() -> int:
     summaries = []
     for path, band in zip(paths, bands):
         image, header, hdu = read_fits_image(path, hdu=args.hdu)
-        crop, valid = crop_or_pad(image, x0=int(args.x0), y0=int(args.y0), width=width, height=height)
+        local_x0, local_y0 = crop_origin_for_image(
+            image,
+            header,
+            x0=int(args.x0),
+            y0=int(args.y0),
+            width=width,
+            height=height,
+        )
+        crop, valid = crop_or_pad(image, x0=local_x0, y0=local_y0, width=width, height=height)
         crop = np.where(valid, crop, np.nan).astype(np.float32)
         clean_crop = np.nan_to_num(crop, nan=0.0, posinf=0.0, neginf=0.0)[:height, :width]
         for mode in modes:
-            scaled = make_training_rgb(crop, mode=str(mode), log_a=float(args.log_a), anscombe_scale=float(args.anscombe_scale))
-            sam_input = sam_uint8_from_scaled(scaled)
+            scaled = make_training_rgb(
+                crop,
+                mode=str(mode),
+                clip_threshold=float(args.clip_threshold),
+                log_a=float(args.log_a),
+                log_high_percentile=float(args.log_high_percentile),
+                lupton_stretch=float(args.lupton_stretch),
+                lupton_q=float(args.lupton_q),
+                anscombe_clip=bool(args.anscombe_clip),
+                anscombe_scale=float(args.anscombe_scale),
+            )
+            sam_input = np.moveaxis(scaled[:, :height, :width], 0, -1).astype(np.float32, copy=False)
             annotations = generator.generate(sam_input)
+            raw_mask_count = len(annotations)
+            max_area_fraction = float(args.max_mask_area_fraction)
+            max_mask_area = int(round(max_area_fraction * float(height * width))) if max_area_fraction > 0 else 0
+            if max_mask_area > 0:
+                annotations = [ann for ann in annotations if int(ann.get("area", 0)) <= max_mask_area]
             label_map = labelmap_from_amg(annotations, height=height, width=width)
             mode_name = str(mode).replace("_", "-")
             out_dir = args.out_dir.expanduser().resolve() / f"{Path(path).stem}_x{args.x0}_y{args.y0}" / str(band) / mode_name
@@ -149,11 +196,18 @@ def main() -> int:
                     "band": str(band),
                     "hdu": int(hdu),
                     "scaling_mode": str(mode),
+                    "raw_masks": int(raw_mask_count),
                     "masks": int(np.count_nonzero(np.unique(label_map) > 0)),
+                    "max_mask_area_fraction": max_area_fraction,
+                    "max_mask_area_pixels": int(max_mask_area),
                     "out_dir": str(out_dir),
                 }
             )
-            print(f"[done] {band} {mode_name}: masks={summaries[-1]['masks']} out={out_dir}", flush=True)
+            print(
+                f"[done] {band} {mode_name}: masks={summaries[-1]['masks']}/{raw_mask_count} "
+                f"max_area={max_mask_area if max_mask_area > 0 else 'off'} out={out_dir}",
+                flush=True,
+            )
 
     args.out_dir.expanduser().resolve().mkdir(parents=True, exist_ok=True)
     (args.out_dir.expanduser().resolve() / "manifest.json").write_text(json.dumps({"summary": summaries}, indent=2) + "\n", encoding="utf-8")

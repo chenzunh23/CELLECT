@@ -135,6 +135,8 @@ def _compile_sam_runtime_model(model: nn.Module, args: argparse.Namespace, *, is
         "backend": str(getattr(args, "sam_compile_backend", "inductor")),
         "fullgraph": bool(getattr(args, "sam_compile_fullgraph", False)),
     }
+    if bool(getattr(args, "sam_dynamic_image_size", False)):
+        kwargs["dynamic"] = True
     mode = str(getattr(args, "sam_compile_mode", "default"))
     if mode and mode != "default":
         kwargs["mode"] = mode
@@ -161,6 +163,8 @@ def _compile_sam_mask_decoder_modules(model: nn.Module, args: argparse.Namespace
         "backend": str(getattr(args, "sam_compile_backend", "inductor")),
         "fullgraph": bool(getattr(args, "sam_compile_fullgraph", False)),
     }
+    if bool(getattr(args, "sam_dynamic_image_size", False)):
+        kwargs["dynamic"] = True
     mode = str(getattr(args, "sam_compile_mode", "default"))
     if mode and mode != "default":
         kwargs["mode"] = mode
@@ -881,6 +885,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--sam-checkpoint",
         default=None,
         help="Official SAM checkpoint for --model-variant sam_per_band. This is separate from --checkpoint.",
+    )
+    parser.add_argument(
+        "--sam-dynamic-image-size",
+        action="store_true",
+        help=(
+            "For sam_per_band inputs up to 512x512, pad only to the nearest patch-size multiple and "
+            "dynamically size image/prompt positional encodings and SAM mask outputs. Disabled by default, "
+            "which preserves fixed 512x512 SAM padding."
+        ),
     )
     parser.add_argument(
         "--disable-sam-cen",
@@ -2055,6 +2068,7 @@ def main() -> None:
                 shape_feature_dim=6,
                 enable_matchers=False,
                 astro_preprocess_in_model=False,
+                dynamic_image_size=bool(args.sam_dynamic_image_size),
             ).to(device)
         elif model_variant == "per_band":
             model = MultiBandAstroCELLECT2D(

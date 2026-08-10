@@ -1,7 +1,0 @@
-denoised:4,5@1
-denoised:4,5@0
-denoised:8,4@0
-denoised:8,4@1
-noisy:8,4@1
-coadd:8,4
-coadd:6,1

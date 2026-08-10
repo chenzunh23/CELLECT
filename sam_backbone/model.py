@@ -5,6 +5,7 @@ from typing import Dict, Optional, Sequence, Tuple
 
 import torch
 from torch import Tensor, nn
+import torch.nn.functional as F
 
 from .build import SamPerBandImageEncoder, build_per_band_sam_encoder
 from .decoder import SamCellectDecoder
@@ -26,12 +27,14 @@ class SamCellect2D(nn.Module):
         candidate_count: int = 5,
         shape_feature_dim: int = 6,
         enable_matchers: bool = False,
+        dynamic_image_size: bool = False,
     ) -> None:
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
         self.image_size = int(image_size)
         self.patch_size = int(patch_size)
+        self.dynamic_image_size = bool(dynamic_image_size)
         self.supports_processing_ids = True
         image_embedding_size = self.image_size // self.patch_size
         self.prompt_encoder = PromptEncoder(
@@ -90,17 +93,25 @@ class SamCellect2D(nn.Module):
         *,
         multimask_output: bool = True,
         chunk_size: int = 128,
+        output_size: Optional[Tuple[int, int]] = None,
     ) -> Tuple[Tensor, Tensor]:
         """Run SAM mask decoder for many prompts grouped by source image.
 
         ``image_embeddings`` may be [B, band, 256, h, w] or [B*band, 256, h, w].
-        Prompt coordinates and boxes are in the 512x512 image frame. ``boxes``
-        may be ``None`` for center-only prompting.
+        Prompt coordinates and boxes are in the unpadded input image frame.
+        ``boxes`` may be ``None`` for center-only prompting. When ``output_size``
+        is supplied, low-resolution logits are first resized to the padded image
+        size and then cropped to that unpadded output size.
         """
 
         if prompt_batch_indices.numel() == 0:
-            h = self.image_size // 4
-            empty_masks = image_embeddings.new_zeros((0, 3 if multimask_output else 1, h, h))
+            mask_height = int(image_embeddings.shape[-2]) * 4
+            mask_width = int(image_embeddings.shape[-1]) * 4
+            if output_size is not None:
+                mask_height, mask_width = (int(v) for v in output_size)
+            empty_masks = image_embeddings.new_zeros(
+                (0, 3 if multimask_output else 1, mask_height, mask_width)
+            )
             empty_iou = image_embeddings.new_zeros((0, 3 if multimask_output else 1))
             return empty_masks, empty_iou
         if image_embeddings.ndim == 5:
@@ -119,7 +130,21 @@ class SamCellect2D(nn.Module):
             boxes = boxes.to(device=flat_embeddings.device, dtype=flat_embeddings.dtype)
         mask_chunks: list[Tensor] = []
         iou_chunks: list[Tensor] = []
-        dense_pe = self.prompt_encoder.get_dense_pe().to(device=flat_embeddings.device, dtype=flat_embeddings.dtype)
+        embedding_size = (int(flat_embeddings.shape[-2]), int(flat_embeddings.shape[-1]))
+        padded_image_size = (
+            embedding_size[0] * self.patch_size,
+            embedding_size[1] * self.patch_size,
+        )
+        if output_size is not None:
+            output_size = (int(output_size[0]), int(output_size[1]))
+            if output_size[0] > padded_image_size[0] or output_size[1] > padded_image_size[1]:
+                raise ValueError(
+                    f"requested SAM mask output size {output_size} exceeds padded image size {padded_image_size}"
+                )
+        dense_pe = self.prompt_encoder.get_dense_pe(embedding_size).to(
+            device=flat_embeddings.device,
+            dtype=flat_embeddings.dtype,
+        )
         total = int(prompt_batch_indices.numel())
         for start in range(0, total, int(chunk_size)):
             stop = min(start + int(chunk_size), total)
@@ -131,6 +156,8 @@ class SamCellect2D(nn.Module):
                 points=(coords, labels),
                 boxes=None if boxes is None else boxes[pos],
                 masks=None,
+                image_embedding_size=embedding_size,
+                input_image_size=padded_image_size,
             )
             image_embedding = flat_embeddings[batch_chunk]
             image_pe = dense_pe.expand(image_embedding.shape[0], -1, -1, -1)
@@ -141,6 +168,14 @@ class SamCellect2D(nn.Module):
                 dense_prompt_embeddings=dense_embeddings,
                 multimask_output=multimask_output,
             )
+            if output_size is not None:
+                low_res_masks = F.interpolate(
+                    low_res_masks,
+                    size=padded_image_size,
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                low_res_masks = low_res_masks[..., : output_size[0], : output_size[1]]
             mask_chunks.append(low_res_masks)
             iou_chunks.append(iou_predictions)
         return torch.cat(mask_chunks, dim=0), torch.cat(iou_chunks, dim=0)
@@ -175,6 +210,7 @@ def build_sam_cellect2d(
     astro_preprocess_clip_sigma: float = 3.0,
     astro_preprocess_sigma_iters: int = -1,
     astro_preprocess_z_clip: Optional[Tuple[float, float]] = None,
+    dynamic_image_size: bool = False,
 ) -> SamCellect2D:
     encoder = build_per_band_sam_encoder(
         model_type,
@@ -192,6 +228,7 @@ def build_sam_cellect2d(
         style_prompt_layers=style_prompt_layers,
         style_adapter_dim=style_adapter_dim,
         style_router_temperature=style_router_temperature,
+        dynamic_image_size=dynamic_image_size,
     )
     decoder = SamCellectDecoder(
         in_channels=256,
@@ -213,6 +250,7 @@ def build_sam_cellect2d(
         candidate_count=candidate_count,
         shape_feature_dim=shape_feature_dim,
         enable_matchers=enable_matchers,
+        dynamic_image_size=dynamic_image_size,
     )
     if checkpoint is not None:
         load_sam_prompt_mask_checkpoint(model, checkpoint)

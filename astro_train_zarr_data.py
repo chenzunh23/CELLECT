@@ -30,6 +30,14 @@ def _decode_fixed_utf8(arr: np.ndarray) -> list[str]:
     return out
 
 
+def _infer_group_from_store_name(store: Path) -> str:
+    stem = Path(store).stem
+    if "__" not in stem:
+        return ""
+    suffix = stem.split("__", 1)[1]
+    return suffix if suffix.startswith("group_") else ""
+
+
 @dataclass(frozen=True)
 class _ArrayMeta:
     shape: tuple[int, ...]
@@ -470,17 +478,20 @@ def discover_zarr_image_records(
         tile_x0 = reader.read_full_small("tile_x0").astype(np.int32, copy=False)
         tile_y0 = reader.read_full_small("tile_y0").astype(np.int32, copy=False)
         tile_names = _decode_fixed_utf8(reader.read_full_small("tile_name"))
-        groups = _decode_fixed_utf8(reader.read_full_small("group"))
-        dataset_sources = _decode_fixed_utf8(reader.read_full_small("dataset_source"))
+        groups = _decode_fixed_utf8(reader.read_full_small("group")) if reader.has_array("group") else []
+        dataset_sources = (
+            _decode_fixed_utf8(reader.read_full_small("dataset_source")) if reader.has_array("dataset_source") else []
+        )
         tract = str(attrs.get("tract", ""))
-        patch = str(attrs.get("patch", store.stem))
+        patch = str(attrs.get("patch", store.stem.split("__", 1)[0]))
+        store_group = _infer_group_from_store_name(store)
         try:
             rel_root = str(store.parent.relative_to(root))
         except ValueError:
             rel_root = ""
         for i in range(n):
             dataset_source = dataset_sources[i] if i < len(dataset_sources) else str(attrs.get("dataset_source", "zarr"))
-            group = groups[i] if i < len(groups) else ""
+            group = groups[i] if i < len(groups) and groups[i] else store_group
             tile_name = tile_names[i] if i < len(tile_names) else f"sample_{i:06d}"
             parts = [value for value in (tract, dataset_source, patch, group, band, tile_name) if value]
             records.append(

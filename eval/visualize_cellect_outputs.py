@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/cellect_mplconfig")
@@ -23,15 +24,18 @@ from eval.eval_utils import (
     build_prompt_masks,
     build_scaled_tensor_from_fits,
     confidence_overlay,
+    decode_fixed_utf8,
     detection_rows,
     draw_ellipses,
     infer_cellect,
+    input_channel_display_limits,
     load_cellect_model,
     mask_overlay,
     read_zarr_sample,
     resolve_zarr_sample,
     rows_to_reg,
     save_heatmap,
+    save_pixel_png,
     save_png,
     scaled_rgb_for_display,
     select_band_outputs,
@@ -42,6 +46,7 @@ from eval.eval_utils import (
     zarr_sample_group,
     zscale_rgb,
 )
+from eval.matching import ground_truth_rows_from_zarr, write_matching_diagnostics
 
 
 def parse_args() -> argparse.Namespace:
@@ -82,6 +87,11 @@ def parse_args() -> argparse.Namespace:
         help="Scaling used when --input FITS is provided.",
     )
     p.add_argument("--log-a", type=float, default=300.0)
+    p.add_argument("--clip-threshold", type=float, default=3.0)
+    p.add_argument("--log-high-percentile", type=float, default=99.5)
+    p.add_argument("--lupton-stretch", type=float, default=0.5)
+    p.add_argument("--lupton-q", type=float, default=20.0)
+    p.add_argument("--anscombe-clip", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--anscombe-scale", type=float, default=1000.0)
 
     p.add_argument("--confidence-threshold", type=float, default=2.0)
@@ -94,6 +104,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mask-box-scale", type=float, default=2.0)
     p.add_argument("--mask-chunk-size", type=int, default=512)
     p.add_argument("--mask-multimask", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--skip-existing", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--shape-overlay-centers", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--input-shape-overlay", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--out-dir", type=Path, default=Path("output/eval_visualizations/cellect_outputs"))
     return p.parse_args()
 
@@ -114,10 +127,95 @@ def _score_map(outputs: dict[str, torch.Tensor]) -> np.ndarray:
     return (prob * levels).sum(dim=0).numpy().astype(np.float32)
 
 
+def _slug(text: object) -> str:
+    value = str(text).strip().lower().replace("_", "-").replace("/", "-")
+    while "--" in value:
+        value = value.replace("--", "-")
+    return value.strip("-")
+
+
+def _zarr_scaling_slug(attrs: dict, *, root: Path | None, store: Path | None) -> str:
+    mode = attrs.get("image_scaling_mode") or attrs.get("scaling_mode")
+    if mode:
+        slug = _slug(mode)
+        if slug.endswith("-rgb"):
+            slug = slug[:-4]
+        return slug or "zarr"
+    haystacks = [str(path) for path in (store, root) if path is not None]
+    for text in haystacks:
+        normalized = _slug(text)
+        if "zscore-no-upper" in normalized:
+            return "zscore-no-upper"
+        if "log-lupton" in normalized or "lupton" in normalized:
+            return "zscore-log-lupton"
+        if "anscombe" in normalized:
+            return "anscombe"
+        if "zscore" in normalized:
+            return "zscore"
+    return "zarr"
+
+
+def _checkpoint_epoch_label(path: Path) -> str:
+    stem = Path(path).name.rsplit(".", 1)[0]
+    value = stem.split("_")[-1]
+    return str(int(value)) if value.isdigit() else value
+
+
 def _pred_conf_overlay(image: np.ndarray, outputs: dict[str, torch.Tensor]) -> np.ndarray:
     score = _score_map(outputs)
     levels = np.clip(np.rint(score), 0, 4).astype(np.uint8)
     return confidence_overlay(image, levels)
+
+
+def _input_overlay_channel(scaled: np.ndarray, scaling: str) -> tuple[int, np.ndarray] | None:
+    label = str(scaling).replace("_", "-").lower()
+    arr = np.asarray(scaled, dtype=np.float32)
+    if "log-lupton" in label or "lupton" in label:
+        idx = min(2, arr.shape[0] - 1)
+        return idx, arr[idx]
+    if "anscombe" in label or "zscore" in label:
+        return 0, arr[0]
+    return None
+
+
+def _visual_options(args: argparse.Namespace) -> dict[str, object]:
+    return {
+        "shape_overlay_centers": bool(args.shape_overlay_centers),
+        "input_shape_overlay": bool(args.input_shape_overlay),
+        "make_masks": bool(args.make_masks),
+        "confidence_threshold": float(args.confidence_threshold),
+        "confidence_score": str(args.confidence_score),
+        "nms_radius": int(args.nms_radius),
+        "center_refinement": str(args.center_refinement),
+        "center_refinement_radius": int(args.center_refinement_radius),
+        "scaling_mode": str(args.scaling_mode),
+        "clip_threshold": float(args.clip_threshold),
+        "log_a": float(args.log_a),
+        "log_high_percentile": float(args.log_high_percentile),
+        "lupton_stretch": float(args.lupton_stretch),
+        "lupton_q": float(args.lupton_q),
+        "anscombe_clip": bool(args.anscombe_clip),
+        "anscombe_scale": float(args.anscombe_scale),
+    }
+
+
+def _band_outputs_current(band_dir: Path, band: str, options: dict[str, object]) -> bool:
+    if not (band_dir / "matching" / f"{band}_matching_summary.json").exists():
+        return False
+    if not (band_dir / f"{band}_shape_overlay.png").exists():
+        return False
+    if bool(options.get("input_shape_overlay")) and not (band_dir / f"{band}_input_shape_overlay.png").exists():
+        return False
+    if bool(options.get("make_masks")) and not (band_dir / f"{band}_mask_overlay.png").exists():
+        return False
+    options_path = band_dir / f"{band}_visual_options.json"
+    if not options_path.exists():
+        return False
+    try:
+        previous = json.loads(options_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return previous == options
 
 
 def _prepare_from_zarr(args: argparse.Namespace, dataset_source: str | None = None):
@@ -137,17 +235,60 @@ def _prepare_from_zarr(args: argparse.Namespace, dataset_source: str | None = No
     image = np.asarray(sample["image"], dtype=np.float32)
     if image.ndim == 2:
         image = np.stack([image, image, image], axis=0)
+    zarr_clip_threshold = float(attrs.get("clip_threshold", attrs.get("image_clip_threshold", 3.0)))
+    finite_image = image[np.isfinite(image)]
+    if (
+        finite_image.size
+        and zarr_clip_threshold > 3.0
+        and "no-upper" not in _zarr_scaling_slug(
+            attrs,
+            root=args.root.expanduser().resolve() if args.root else None,
+            store=args.zarr_store.expanduser().resolve() if args.zarr_store else None,
+        )
+        and float(np.max(finite_image)) <= 3.0001
+    ):
+        print(
+            "[warn] zarr attrs report clip_threshold="
+            f"{zarr_clip_threshold:g}, but stored image max={float(np.max(finite_image)):.4g}; "
+            "this store was likely generated before image clip-threshold was wired into scaling.",
+            flush=True,
+        )
     tensor = torch.from_numpy(image[None, None].astype(np.float32, copy=False))
     display = np.asarray(sample["display_image"], dtype=np.float32)
     band = (attrs.get("bands") or [args.zarr_band or "band0"])[band_idx]
     dataset = str(attrs.get("dataset_source", dataset_source or "zarr"))
+    if reader.has_array("dataset_source"):
+        dataset_sources = decode_fixed_utf8(reader.read_full_small("dataset_source"))
+        if int(sample_idx) < len(dataset_sources) and dataset_sources[int(sample_idx)]:
+            dataset = dataset_sources[int(sample_idx)]
     group_name = zarr_sample_group(reader, sample_idx)
-    stem_base = Path(args.zarr_store).stem if args.zarr_store else f"{dataset}_{attrs.get('patch', args.patch or 'patch')}"
-    group_part = f"_{group_name}" if group_name else ""
-    stem = f"{stem_base}{group_part}_sample{sample_idx:05d}_{band}"
+    ckpt_root = str(args.checkpoint.expanduser().resolve().parent).split(os.sep)[-1]
+    epoch_num = _checkpoint_epoch_label(args.checkpoint)
+    if reader.has_array("tile_name"):
+        tile_names = decode_fixed_utf8(reader.read_full_small("tile_name"))
+        tile_name = tile_names[int(sample_idx)] if int(sample_idx) < len(tile_names) else f"sample{sample_idx:05d}"
+    else:
+        tile_name = f"sample{sample_idx:05d}"
+    patch_label = str(attrs.get("patch", args.patch or "patch")).replace(",", "_")
+    scaling_label = _zarr_scaling_slug(
+        attrs,
+        root=args.root.expanduser().resolve() if args.root else None,
+        store=args.zarr_store.expanduser().resolve() if args.zarr_store else None,
+    )
+    stem = f"{patch_label}_{tile_name}_{scaling_label}_{ckpt_root}_epoch{epoch_num}"
     x0 = int(reader.read_full_small("tile_x0")[sample_idx]) if reader.has_array("tile_x0") else 0
     y0 = int(reader.read_full_small("tile_y0")[sample_idx]) if reader.has_array("tile_y0") else 0
-    return tensor, [display], [image], [None], [str(band)], stem, [x0], [y0]
+    context = {
+        "reader": reader,
+        "sample_idx": int(sample_idx),
+        "band_idx": int(band_idx),
+        "dataset_source": dataset,
+        "group": group_name,
+        "tile_name": tile_name,
+        "scaling": scaling_label,
+        "clip_threshold": zarr_clip_threshold,
+    }
+    return tensor, [display], [image], [None], [str(band)], stem, [x0], [y0], context
 
 
 def _prepare_from_fits(args: argparse.Namespace):
@@ -162,24 +303,50 @@ def _prepare_from_fits(args: argparse.Namespace):
         width=width,
         height=height,
         scaling_mode=str(args.scaling_mode),
+        clip_threshold=float(args.clip_threshold),
         log_a=float(args.log_a),
+        log_high_percentile=float(args.log_high_percentile),
+        lupton_stretch=float(args.lupton_stretch),
+        lupton_q=float(args.lupton_q),
+        anscombe_clip=bool(args.anscombe_clip),
         anscombe_scale=float(args.anscombe_scale),
     )
     bands = args.band or [path.stem for path in paths]
     if len(bands) != len(paths):
         raise ValueError("--band must be repeated once per --input")
-    stem = f"x{args.x0}_y{args.y0}_{str(args.scaling_mode).replace('_', '-')}"
-    return tensor, raw_images, scaled_images, headers, bands, stem, [int(args.x0)] * len(paths), [int(args.y0)] * len(paths)
+    ckpt_root = str(args.checkpoint.expanduser().resolve().parent).split(os.sep)[-1]
+    epoch_num = _checkpoint_epoch_label(args.checkpoint)
+    stem = f"x{args.x0}_y{args.y0}_{str(args.scaling_mode).replace('_', '-')}_{ckpt_root}_epoch{epoch_num}"
+    return tensor, raw_images, scaled_images, headers, bands, stem, [int(args.x0)] * len(paths), [int(args.y0)] * len(paths), None
 
 
 def _run_one(args: argparse.Namespace, dataset_source: str | None = None) -> Path:
     width = int(args.width or args.size)
     height = int(args.height or args.size)
     if args.input:
-        tensor, raw_images, scaled_images, headers, bands, stem, image_x0, image_y0 = _prepare_from_fits(args)
+        tensor, raw_images, scaled_images, headers, bands, stem, image_x0, image_y0, zarr_context = _prepare_from_fits(args)
     else:
-        tensor, raw_images, scaled_images, headers, bands, stem, image_x0, image_y0 = _prepare_from_zarr(args, dataset_source)
+        tensor, raw_images, scaled_images, headers, bands, stem, image_x0, image_y0, zarr_context = _prepare_from_zarr(args, dataset_source)
         height, width = int(tensor.shape[-2]), int(tensor.shape[-1])
+
+    date = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()).split(" ")[0]
+    year, month, day = date.split("-")
+    out_dir = args.out_dir.expanduser().resolve() / f"{year}-{month}" / date / stem
+    if zarr_context is not None:
+        variant = str(zarr_context.get("dataset_source", "coadd"))
+        if variant not in {"", "coadd", "zarr"}:
+            out_dir = out_dir / variant
+            group_name = str(zarr_context.get("group", ""))
+            if group_name:
+                out_dir = out_dir / group_name
+    visual_options = _visual_options(args)
+    if bool(args.skip_existing) and all(
+        _band_outputs_current(out_dir / str(band), str(band), visual_options)
+        for band in bands
+    ):
+        print(f"[skip] existing outputs for {bands}: {out_dir}", flush=True)
+        return out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device(args.device)
     model, cfg = load_cellect_model(
@@ -189,8 +356,6 @@ def _run_one(args: argparse.Namespace, dataset_source: str | None = None) -> Pat
         bands,
     )
     outputs = infer_cellect(model=model, image_tensor=tensor, device=device, amp=str(args.amp))
-    out_dir = args.out_dir.expanduser().resolve() / stem
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     summaries = []
     for band_idx, band in enumerate(bands):
@@ -212,14 +377,72 @@ def _run_one(args: argparse.Namespace, dataset_source: str | None = None) -> Pat
         )
         score = _score_map(band_outputs)[:height, :width]
         save_heatmap(band_dir / f"{band}_confidence_score.png", score, title=f"{band} confidence score")
-        save_png(band_dir / f"{band}_confidence_overlay.png", _pred_conf_overlay(image, band_outputs), title=f"{band} confidence")
+        save_pixel_png(band_dir / f"{band}_confidence_overlay.png", _pred_conf_overlay(image, band_outputs))
         save_png(band_dir / f"{band}_input_rgb.png", scaled_rgb_for_display(scaled), title=f"{band} model input")
         for channel in range(min(3, scaled.shape[0])):
-            save_heatmap(band_dir / f"{band}_input_channel{channel}.png", scaled[channel], title=f"{band} input channel {channel}")
+            scaling_for_display = str(zarr_context.get("scaling", args.scaling_mode) if zarr_context is not None else args.scaling_mode)
+            clip_threshold_for_display = float(
+                zarr_context.get("clip_threshold", args.clip_threshold)
+                if zarr_context is not None
+                else args.clip_threshold
+            )
+            vmin, vmax = input_channel_display_limits(
+                scaled[channel],
+                scaling=scaling_for_display,
+                channel_index=channel,
+                clip_threshold=clip_threshold_for_display,
+            )
+            save_heatmap(
+                band_dir / f"{band}_input_channel{channel}.png",
+                scaled[channel],
+                title=f"{band} input channel {channel}",
+                vmin=vmin,
+                vmax=vmax,
+            )
         write_reg(band_dir / f"{band}_centers.reg", rows_to_reg(rows, shape=False, color="yellow"))
         write_reg(band_dir / f"{band}_shapes.reg", rows_to_reg(rows, shape=True, color="cyan"))
         write_sources_csv(band_dir / f"{band}_sources.csv", rows, header=header, x0=int(image_x0[band_idx]), y0=int(image_y0[band_idx]))
-        save_png(band_dir / f"{band}_shape_overlay.png", draw_ellipses(image, rows), title=f"{band} predicted shapes")
+        save_pixel_png(
+            band_dir / f"{band}_shape_overlay.png",
+            draw_ellipses(image, rows, draw_centers=bool(args.shape_overlay_centers)),
+        )
+        if bool(args.input_shape_overlay):
+            scaling_name = str(zarr_context.get("scaling", args.scaling_mode) if zarr_context is not None else args.scaling_mode)
+            clip_threshold_for_display = float(
+                zarr_context.get("clip_threshold", args.clip_threshold)
+                if zarr_context is not None
+                else args.clip_threshold
+            )
+            input_selection = _input_overlay_channel(scaled, scaling_name)
+            if input_selection is not None:
+                input_channel_idx, input_channel = input_selection
+                save_pixel_png(
+                    band_dir / f"{band}_input_shape_overlay.png",
+                    draw_ellipses(
+                        input_channel,
+                        rows,
+                        draw_centers=bool(args.shape_overlay_centers),
+                        input_scaled_background=True,
+                        input_scaling=scaling_name,
+                        input_channel_index=input_channel_idx,
+                        input_clip_threshold=clip_threshold_for_display,
+                    ),
+                )
+        matching_summary = None
+        if zarr_context is not None:
+            gt_rows = ground_truth_rows_from_zarr(
+                zarr_context["reader"],
+                int(zarr_context["sample_idx"]),
+                int(zarr_context["band_idx"]),
+            )
+            matching_summary = write_matching_diagnostics(
+                out_dir=band_dir / "matching",
+                pred_rows=rows,
+                gt_rows=gt_rows,
+                image=image,
+                band=str(band),
+                match_radius=3.0,
+            )
 
         mask_count = 0
         if bool(args.make_masks):
@@ -246,9 +469,16 @@ def _run_one(args: argparse.Namespace, dataset_source: str | None = None) -> Pat
                 overwrite=True,
             )
             write_mask_reg(band_dir / f"{band}_mask_contours.reg", label_map)
-            save_png(band_dir / f"{band}_mask_overlay.png", mask_overlay(image, label_map), title=f"{band} masks")
+            save_pixel_png(band_dir / f"{band}_mask_overlay.png", mask_overlay(image, label_map))
 
-        summaries.append({"band": str(band), "detections": len(rows), "masks": mask_count})
+        summary_row = {"band": str(band), "detections": len(rows), "masks": mask_count}
+        if matching_summary is not None:
+            summary_row["matching"] = matching_summary
+        summaries.append(summary_row)
+        (band_dir / f"{band}_visual_options.json").write_text(
+            json.dumps(visual_options, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
 
     (out_dir / "summary.json").write_text(json.dumps({"summary": summaries, "config": cfg}, indent=2, default=str) + "\n", encoding="utf-8")
     return out_dir

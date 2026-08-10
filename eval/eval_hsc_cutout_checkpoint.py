@@ -61,10 +61,27 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--input", type=Path, action="append", required=True, help="Input FITS file. Repeat for multiple bands.")
     p.add_argument("--band", action="append", default=None, help="Band label for each --input; defaults to FITS stem.")
-    p.add_argument("--checkpoint", type=Path, required=True, help="Trained CELLECT sam_per_band checkpoint.")
+    p.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=None,
+        help="Trained CELLECT sam_per_band checkpoint. Required unless --dump-cutout-only is set.",
+    )
     p.add_argument("--config", type=Path, default=None, help="run_config.json. Defaults to CHECKPOINT_PARENT/run_config.json if present.")
     p.add_argument("--out-dir", type=Path, default=Path("output/data_filter_0723/hsc_cutout_eval"))
-    p.add_argument("--hdu", type=int, default=None, help="Image HDU; default finds first 2D image.")
+    p.add_argument(
+        "--hdu",
+        default=None,
+        help=(
+            "Image HDU index or EXTNAME. Default auto-detects LSST/HSC calexp "
+            "IMAGE when present, otherwise the first 2D image-like HDU."
+        ),
+    )
+    p.add_argument(
+        "--image-ext",
+        default=None,
+        help="Alias for --hdu when selecting by EXTNAME, e.g. IMAGE. Useful for calexp files.",
+    )
     p.add_argument("--x0", type=float, required=True, help="Crop origin x, 0-index image pixels unless --crop-coordinates=physical.")
     p.add_argument("--y0", type=float, required=True, help="Crop origin y, 0-index image pixels unless --crop-coordinates=physical.")
     p.add_argument("--size", type=int, default=512, help="Square crop size. Values below 512 are padded before inference.")
@@ -91,6 +108,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--edge-width", type=float, default=0.45)
     p.add_argument("--png-scale", type=int, default=1, help="Nearest-neighbor PNG scale factor.")
     p.add_argument("--max-contour-vertices", type=int, default=160)
+    p.add_argument("--shape-overlay-centers", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument(
+        "--dump-cutout-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Only read/crop/write cutout FITS files, without loading the model or running inference.",
+    )
     return p.parse_args()
 
 
@@ -103,17 +127,101 @@ def read_config(path: Path | None) -> dict:
     return args
 
 
-def first_image_hdu(path: Path, hdu: int | None) -> tuple[np.ndarray, fits.Header, int]:
+def _hdu_label(index: int, hdu: fits.hdu.base.ExtensionHDU | fits.PrimaryHDU) -> str:
+    name = str(getattr(hdu, "name", "") or hdu.header.get("EXTNAME", "") or "").strip()
+    return f"{index}:{name or hdu.__class__.__name__}"
+
+
+def _parse_hdu_selector(selector: object | None) -> int | str | None:
+    if selector is None:
+        return None
+    text = str(selector).strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return text.upper()
+
+
+def _safe_2d_hdu_data(hdu: fits.hdu.base.ExtensionHDU | fits.PrimaryHDU) -> np.ndarray | None:
+    """Return a 2D float image if this HDU is image-like, otherwise ``None``.
+
+    Some HSC/LSST FITS products do not expose a named ``IMAGE`` extension.  In
+    those cases a calexp image may be the primary HDU or an unnamed
+    ImageHDU/CompImageHDU.  We avoid table HDUs here because touching truncated
+    table data can raise buffer/reshape errors unrelated to the image plane.
+    """
+
+    class_name = hdu.__class__.__name__
+    if class_name not in {"PrimaryHDU", "ImageHDU", "CompImageHDU"}:
+        return None
+    shape = getattr(hdu, "shape", None)
+    if shape is not None and len(tuple(shape)) != 2:
+        return None
+    try:
+        data = hdu.data
+    except Exception:
+        return None
+    if data is None:
+        return None
+    arr = np.asarray(data).squeeze()
+    if arr.ndim != 2:
+        return None
+    return np.asarray(arr, dtype=np.float32)
+
+
+def _candidate_image_indices(hdul: fits.HDUList, selector: int | str | None) -> list[int]:
+    if isinstance(selector, int):
+        return [int(selector)]
+    if isinstance(selector, str):
+        if selector in hdul:
+            return [int(hdul.index_of(selector))]
+        lowered = selector.lower()
+        matches = [
+            idx
+            for idx, hdu in enumerate(hdul)
+            if str(getattr(hdu, "name", "") or hdu.header.get("EXTNAME", "") or "").strip().lower() == lowered
+        ]
+        if matches:
+            return matches
+        raise KeyError(f"Extension {selector!r} not found. Available HDUs: {', '.join(_hdu_label(i, h) for i, h in enumerate(hdul))}")
+
+    preferred: list[int] = []
+    for name in ("IMAGE", "SCI", "PRIMARY"):
+        try:
+            if name == "PRIMARY":
+                preferred.append(0)
+            elif name in hdul:
+                preferred.append(int(hdul.index_of(name)))
+        except Exception:
+            pass
+    seen = set()
+    ordered = []
+    for idx in [*preferred, *range(len(hdul))]:
+        if idx not in seen:
+            ordered.append(int(idx))
+            seen.add(int(idx))
+    return ordered
+
+
+def first_image_hdu(path: Path, hdu: object | None) -> tuple[np.ndarray, fits.Header, int]:
+    selector = _parse_hdu_selector(hdu)
+    errors: list[str] = []
     with fits.open(path, memmap=True, ignore_missing_end=True) as hdul:
-        candidates = range(len(hdul)) if hdu is None else (int(hdu),)
+        candidates = _candidate_image_indices(hdul, selector)
         for index in candidates:
-            data = hdul[index].data
-            if data is None:
+            if index < 0 or index >= len(hdul):
+                errors.append(f"{index}: out of range")
                 continue
-            arr = np.asarray(data).squeeze()
-            if arr.ndim == 2:
-                return np.asarray(arr, dtype=np.float32), hdul[index].header.copy(), int(index)
-    raise ValueError(f"no 2D image HDU found in {path}")
+            arr = _safe_2d_hdu_data(hdul[index])
+            if arr is None:
+                errors.append(f"{_hdu_label(index, hdul[index])}: not a readable 2D image HDU")
+                continue
+            return arr, hdul[index].header.copy(), int(index)
+        available = ", ".join(_hdu_label(i, h) for i, h in enumerate(hdul))
+    detail = "; ".join(errors[:8])
+    raise ValueError(f"no readable 2D image HDU found in {path}; available HDUs: {available}; tried: {detail}")
 
 
 def physical_origin_from_header(header: fits.Header) -> tuple[float, float]:
@@ -285,7 +393,7 @@ def ellipse_line(x: float, y: float, major: float, minor: float, theta: float, c
     return f"ellipse({x:.3f},{y:.3f},{major:.3f},{minor:.3f},{math.degrees(theta):.3f}){suffix}"
 
 
-def draw_shape_overlay(path: Path, image: np.ndarray, rows: Sequence[dict[str, float]]) -> None:
+def draw_shape_overlay(path: Path, image: np.ndarray, rows: Sequence[dict[str, float]], *, draw_centers: bool = True) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -309,7 +417,8 @@ def draw_shape_overlay(path: Path, image: np.ndarray, rows: Sequence[dict[str, f
                 alpha=0.9,
             )
         )
-        ax.plot([float(row["x"])], [float(row["y"])], marker="+", color="yellow", ms=3.5, mew=0.8)
+        if draw_centers:
+            ax.plot([float(row["x"])], [float(row["y"])], marker="+", color="yellow", ms=3.5, mew=0.8)
     ax.set_xlim(0, image.shape[1])
     ax.set_ylim(0, image.shape[0])
     ax.set_axis_off()
@@ -423,14 +532,14 @@ def write_csv(path: Path, rows: Sequence[dict[str, float]], *, crop_x0: int, cro
 
 def infer_one(
     *,
-    model: torch.nn.Module,
+    model: torch.nn.Module | None,
     device: torch.device,
     cfg: dict,
     args: argparse.Namespace,
     fits_path: Path,
     band: str,
 ) -> dict[str, object]:
-    image, header, hdu_index = first_image_hdu(fits_path, args.hdu)
+    image, header, hdu_index = first_image_hdu(fits_path, args.image_ext or args.hdu)
     origin = physical_origin_from_header(header)
     width = int(args.width or args.size)
     height = int(args.height or args.size)
@@ -442,6 +551,30 @@ def infer_one(
         crop_y0 = int(round(float(args.y0)))
     crop, invalid, source_bounds = crop_image(image, x0=crop_x0, y0=crop_y0, width=width, height=height)
     cleaned = np.nan_to_num(crop, nan=0.0, posinf=0.0, neginf=0.0)
+    out_dir = args.out_dir / f"{fits_path.stem}_x{crop_x0}_y{crop_y0}_{band}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    prefix = out_dir / f"{fits_path.stem}_x{crop_x0}_y{crop_y0}_{band}"
+    crop_header = shifted_crop_header(header, crop_x0=crop_x0, crop_y0=crop_y0)
+    fits.PrimaryHDU(cleaned[:height, :width], header=crop_header).writeto(prefix.with_name(prefix.name + "_cutout.fits"), overwrite=True)
+    if args.dump_cutout_only:
+        summary = {
+            "input": str(fits_path),
+            "band": band,
+            "hdu": hdu_index,
+            "crop_x0_image": crop_x0,
+            "crop_y0_image": crop_y0,
+            "physical_origin": list(origin),
+            "source_bounds": list(source_bounds),
+            "detections": 0,
+            "mask_instances": 0,
+            "cutout_only": True,
+            "out_dir": str(out_dir),
+        }
+        (out_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="ascii")
+        print(f"[cutout] {band} {fits_path.name}: hdu={hdu_index} out={out_dir}", flush=True)
+        return summary
+    if model is None:
+        raise ValueError("model is required unless --dump-cutout-only is set")
     work = crop.copy()
     work[invalid] = np.nan
     normalized = astro_zscale_preprocess(work[None]).to(dtype=torch.float32)
@@ -509,10 +642,6 @@ def infer_one(
         for new_label, (_old_label, mask, _iou, _area) in enumerate(sorted(candidates, key=lambda item: item[3], reverse=True), start=1):
             label_map[mask] = new_label
 
-    out_dir = args.out_dir / f"{fits_path.stem}_x{crop_x0}_y{crop_y0}_{band}"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    prefix = out_dir / f"{fits_path.stem}_x{crop_x0}_y{crop_y0}_{band}"
-    crop_header = shifted_crop_header(header, crop_x0=crop_x0, crop_y0=crop_y0)
     fits.PrimaryHDU(label_map[:height, :width], header=crop_header).writeto(prefix.with_name(prefix.name + "_mask_labelmap.fits"), overwrite=True)
     write_mask_reg(
         prefix.with_name(prefix.name + "_mask_contours_image.reg"),
@@ -531,8 +660,12 @@ def infer_one(
         edge_width=float(args.edge_width),
         png_scale=int(args.png_scale),
     )
-    draw_shape_overlay(prefix.with_name(prefix.name + "_kron_shape_overlay.png"), cleaned[:height, :width], rows)
-    fits.PrimaryHDU(cleaned[:height, :width], header=crop_header).writeto(prefix.with_name(prefix.name + "_cutout.fits"), overwrite=True)
+    draw_shape_overlay(
+        prefix.with_name(prefix.name + "_kron_shape_overlay.png"),
+        cleaned[:height, :width],
+        rows,
+        draw_centers=bool(args.shape_overlay_centers),
+    )
     summary = {
         "input": str(fits_path),
         "band": band,
@@ -559,15 +692,22 @@ def main() -> int:
     if args.width > 512 or args.height > 512:
         raise ValueError("This script evaluates one SAM-sized crop; use width/height <= 512.")
     args.input = [path.expanduser().resolve() for path in args.input]
-    args.checkpoint = args.checkpoint.expanduser().resolve()
     args.out_dir = args.out_dir.expanduser().resolve()
-    config = args.config.expanduser().resolve() if args.config else args.checkpoint.parent / "run_config.json"
-    cfg = read_config(config if config.exists() else None)
+    if args.dump_cutout_only:
+        cfg = {}
+        model = None
+        device = torch.device("cpu")
+    else:
+        if args.checkpoint is None:
+            raise ValueError("--checkpoint is required unless --dump-cutout-only is set")
+        args.checkpoint = args.checkpoint.expanduser().resolve()
+        config = args.config.expanduser().resolve() if args.config else args.checkpoint.parent / "run_config.json"
+        cfg = read_config(config if config.exists() else None)
+        device = torch.device(args.device)
+        model = _make_model(cfg, args.checkpoint, device, ("HSC",))
     bands = args.band or [path.stem for path in args.input]
     if len(bands) != len(args.input):
         raise ValueError("--band must be provided once per --input")
-    device = torch.device(args.device)
-    model = _make_model(cfg, args.checkpoint, device, ("HSC",))
     summaries = [infer_one(model=model, device=device, cfg=cfg, args=args, fits_path=path, band=band) for path, band in zip(args.input, bands)]
     args.out_dir.mkdir(parents=True, exist_ok=True)
     (args.out_dir / "manifest.json").write_text(json.dumps({"summaries": summaries}, indent=2) + "\n", encoding="ascii")

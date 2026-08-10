@@ -23,7 +23,9 @@ def finite_values(image: np.ndarray) -> np.ndarray:
     return values.astype(np.float64, copy=False)
 
 
-def standardize_by_self(arr: np.ndarray) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
+
+
+def standardize_by_self(arr: np.ndarray, clip_threshold: float = 3.0) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
     values = finite_values(arr)
     mean = float(np.mean(values))
     std = float(np.std(values))
@@ -31,13 +33,13 @@ def standardize_by_self(arr: np.ndarray) -> tuple[np.ndarray, np.ndarray, dict[s
         std = 1.0
     safe = np.nan_to_num(arr, nan=mean, posinf=mean, neginf=mean).astype(np.float32, copy=False)
     z = ((safe - mean) / std).astype(np.float32)
-    z_clip = np.clip(z, -3.0, 3.0).astype(np.float32)
+    z_clip = np.clip(z, -clip_threshold, clip_threshold).astype(np.float32)
     finite = z[np.isfinite(z)]
     return z, z_clip, {
         "pixel_mean": mean,
         "pixel_std": std,
-        "zmax_pixel_fraction": float(np.count_nonzero(z_clip >= 3.0) / z_clip.size),
-        "zmin_pixel_fraction": float(np.count_nonzero(z_clip <= -3.0) / z_clip.size),
+        "zmax_pixel_fraction": float(np.count_nonzero(z_clip >= clip_threshold) / z_clip.size),
+        "zmin_pixel_fraction": float(np.count_nonzero(z_clip <= -clip_threshold) / z_clip.size),
         "full_z_p99": float(np.percentile(finite, 99.0)),
         "full_z_p99_9": float(np.percentile(finite, 99.9)),
         "full_z_max": float(np.max(finite)),
@@ -172,18 +174,28 @@ def lupton_soft_float(image: np.ndarray, *, minimum: float, stretch: float, q: f
     }
 
 
-def anscombe_single(image: np.ndarray, *, scale: float) -> tuple[np.ndarray, dict[str, float]]:
+def anscombe_single(image: np.ndarray, *, scale: float, clip=False) -> tuple[np.ndarray, dict[str, float]]:
     values = finite_values(image)
     minimum = float(np.min(values))
     scale = float(scale)
+    clip = bool(clip)
     if not np.isfinite(scale) or scale <= 0.0:
         raise ValueError(f"Anscombe scale must be finite and positive, got {scale!r}")
     safe = np.nan_to_num(image, nan=minimum, posinf=minimum, neginf=minimum).astype(np.float64, copy=False)
+    if clip:
+        # Clip the image to raw_mean ± 3 * raw_std before applying the Anscombe transform.
+        mean = float(np.mean(safe))
+        std = float(np.std(safe))
+        clip_min = mean - 3.0 * std
+        minimum = max(minimum, clip_min)
+        values = np.clip(values, clip_min, mean + 3.0 * std)
+        safe = np.clip(safe, clip_min, mean + 3.0 * std)
     shifted_scaled = np.maximum((safe - minimum) * scale, 0.0)
     transformed = 2.0 * np.sqrt(shifted_scaled + 3.0 / 8.0)
     return transformed.astype(np.float32), {
         "minimum": minimum,
         "scale": scale,
+        "clip": bool(clip),
         "mean_minus_minimum": float(np.mean(values) - minimum),
         "scaled_mean_minus_minimum": float((np.mean(values) - minimum) * scale),
     }
@@ -218,11 +230,13 @@ def build_bright_mask(
     *,
     mode: str = "log-lupton",
     threshold: float = 3.0,
+    clip_threshold: float = 3.0,
     dilation: int = 2,
     log_a: float = 300.0,
     log_high_percentile: float = 99.5,
     lupton_stretch: float = 0.5,
     lupton_q: float = 20.0,
+    anscombe_clip: bool = False,
     anscombe_scale: float = 1000.0,
 ) -> np.ndarray:
     """Build a saturated/bright-region mask for PU background suppression."""
@@ -230,7 +244,8 @@ def build_bright_mask(
     normalized_mode = str(mode).strip().lower().replace("_", "-")
     if normalized_mode in {"none", "raw", "zscore-no-upper", "zscore-unbounded"}:
         return np.zeros(np.asarray(image).shape, dtype=bool)
-    current_z, current_stats = current_sam_zscore(image)
+    clip_threshold = float(clip_threshold)
+    current_z, current_stats = current_sam_zscore(image, z_clip=(-clip_threshold, clip_threshold))
     if normalized_mode in {
         "zscore",
         "zscore-noclip",
@@ -238,7 +253,7 @@ def build_bright_mask(
         "raw-zscore",
     }:
         if normalized_mode in {"zscore-noclip", "zscore-no-clip", "raw-zscore"}:
-            z, _stats = no_first_clip_zscore(image, z_clip=(-3.0, float("inf")))
+            z, _stats = no_first_clip_zscore(image, z_clip=(-clip_threshold, float("inf")))
         else:
             z = current_z
         bright = z >= float(threshold)
@@ -255,12 +270,12 @@ def build_bright_mask(
             stretch=float(lupton_stretch),
             q=float(lupton_q),
         )
-        _log_z, log_zclip, _log_zstats = standardize_by_self(log_map)
-        _lupton_z, lupton_zclip, _lupton_zstats = standardize_by_self(lupton_map)
+        _log_z, log_zclip, _log_zstats = standardize_by_self(log_map, clip_threshold=clip_threshold)
+        _lupton_z, lupton_zclip, _lupton_zstats = standardize_by_self(lupton_map, clip_threshold=clip_threshold)
         bright = (log_zclip >= float(threshold)) & (lupton_zclip >= float(threshold))
     elif normalized_mode == "anscombe":
-        anscombe_map, _stats = anscombe_single(image, scale=float(anscombe_scale))
-        _z, zclip, _zstats = standardize_by_self(anscombe_map)
+        anscombe_map, _stats = anscombe_single(image, scale=float(anscombe_scale), clip=bool(anscombe_clip))
+        _z, zclip, _zstats = standardize_by_self(anscombe_map, clip_threshold=clip_threshold)
         bright = zclip >= float(threshold)
     else:
         raise ValueError(f"Unknown bright mask mode: {mode!r}")
@@ -280,10 +295,12 @@ def scale_training_image(
     *,
     mode: str = "astro-zscore",
     z_clip: tuple[float, float] | None = None,
+    clip_threshold: float = 3.0,
     log_a: float = 300.0,
     log_high_percentile: float = 99.5,
     lupton_stretch: float = 0.5,
     lupton_q: float = 20.0,
+    anscombe_clip: bool = False,
     anscombe_scale: float = 1000.0,
 ) -> np.ndarray:
     """Return one preprocessed image plane for direct-Zarr SAM training.
@@ -298,11 +315,15 @@ def scale_training_image(
     if normalized_mode in {"astro-zscore", "legacy", "zscale"}:
         raise ValueError("astro-zscore is implemented by astro_zscale_preprocess in the caller")
 
+    clip_threshold = float(clip_threshold)
     if normalized_mode in {"zscore-no-upper", "zscore-no-upper-rgb", "zscore-unbounded", "zscore-unbounded-rgb"}:
-        z, _stats = no_first_clip_zscore(image, z_clip=(-3.0, float("inf")))
+        z, _stats = no_first_clip_zscore(image, z_clip=(-clip_threshold, float("inf")))
         return np.stack([z, z, z], axis=0).astype(np.float32, copy=False) if normalized_mode.endswith("-rgb") else z
 
-    current_z, current_stats = current_sam_zscore(image, z_clip=z_clip if z_clip is not None else (-3.0, 3.0))
+    current_z, current_stats = current_sam_zscore(
+        image,
+        z_clip=z_clip if z_clip is not None else (-clip_threshold, clip_threshold),
+    )
     if normalized_mode in {"zscore", "zscore-rgb"}:
         return (
             np.stack([current_z, current_z, current_z], axis=0).astype(np.float32, copy=False)
@@ -323,13 +344,16 @@ def scale_training_image(
             stretch=float(lupton_stretch),
             q=float(lupton_q),
         )
-        _log_z, log_zclip, _log_zstats = standardize_by_self(log_map)
-        _lupton_z, lupton_zclip, _lupton_zstats = standardize_by_self(lupton_map)
+        _log_z, log_zclip, _log_zstats = standardize_by_self(log_map, clip_threshold=clip_threshold)
+        _lupton_z, lupton_zclip, _lupton_zstats = standardize_by_self(
+            lupton_map,
+            clip_threshold=clip_threshold,
+        )
         return np.stack([current_z, log_zclip, lupton_zclip], axis=0).astype(np.float32, copy=False)
 
     if normalized_mode in {"anscombe", "anscombe-rgb"}:
-        anscombe_map, _stats = anscombe_single(image, scale=float(anscombe_scale))
-        _z, zclip, _zstats = standardize_by_self(anscombe_map)
+        anscombe_map, _stats = anscombe_single(image, scale=float(anscombe_scale), clip=bool(anscombe_clip))
+        _z, zclip, _zstats = standardize_by_self(anscombe_map, clip_threshold=clip_threshold)
         return np.stack([zclip, zclip, zclip], axis=0).astype(np.float32, copy=False) if normalized_mode.endswith("-rgb") else zclip
 
     raise ValueError(f"Unknown training image scaling mode: {mode!r}")

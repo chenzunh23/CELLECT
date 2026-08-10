@@ -1,5 +1,0 @@
-coadd:4,5
-noisy:4,5@group_01
-coadd:6,1
-noisy:4,5@group_00
-noisy:8,4@group_03

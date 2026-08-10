@@ -487,3 +487,16 @@ mask 微调：
 --mask-prompt-chunk-size 128
 ```
 
+## 小于 512 的动态输入尺寸
+
+默认行为保持不变：`sam_per_band` 会把输入补到固定的 `512x512` SAM
+画布。若数据本身小于等于 512，并希望只补到最近的 16 像素倍数，可启用：
+
+```text
+--sam-dynamic-image-size
+```
+
+动态模式会按实际 token 网格插值 ViT absolute position embedding，动态生成
+PromptEncoder dense PE，并将 SAM low-resolution mask logits 先插值到 patch-aligned
+尺寸，再裁回原始图像尺寸计算 mask loss。一个 batch 内的样本仍需具有相同的
+空间尺寸；混合尺寸数据应使用 batch size 1 或按尺寸分桶。

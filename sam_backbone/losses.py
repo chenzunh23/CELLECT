@@ -381,6 +381,7 @@ def _sam_mask_loss_for_prompts(
         boxes,
         multimask_output=bool(getattr(weights, "mask_multimask")),
         chunk_size=int(getattr(weights, "mask_prompt_chunk_size")),
+        output_size=image_hw if bool(getattr(model, "dynamic_image_size", False)) else None,
     )
     t_phase = _mark_mask_timing(
         debug_timing,

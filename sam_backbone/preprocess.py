@@ -126,6 +126,31 @@ def pad_to_square(x: Tensor, size: int) -> Tensor:
     return F.pad(x, (0, int(size) - w, 0, int(size) - h))
 
 
+def pad_to_patch_multiple(x: Tensor, patch_size: int, *, max_size: Optional[int] = None) -> Tensor:
+    """Pad BCHW/CHW tensors on bottom/right to the nearest patch multiple."""
+
+    if x.ndim not in (3, 4):
+        raise ValueError(f"pad_to_patch_multiple expects CHW or BCHW, got shape {tuple(x.shape)}")
+    patch_size = int(patch_size)
+    if patch_size <= 0:
+        raise ValueError(f"patch_size must be positive, got {patch_size}")
+    h, w = (int(v) for v in x.shape[-2:])
+    if max_size is not None and (h > int(max_size) or w > int(max_size)):
+        raise ValueError(
+            f"input spatial size {(h, w)} exceeds configured SAM maximum image size "
+            f"{(int(max_size), int(max_size))}"
+        )
+    pad_h = (-h) % patch_size
+    pad_w = (-w) % patch_size
+    padded_h, padded_w = h + pad_h, w + pad_w
+    if max_size is not None and (padded_h > int(max_size) or padded_w > int(max_size)):
+        raise ValueError(
+            f"input spatial size {(h, w)} requires patch-aligned size {(padded_h, padded_w)}, "
+            f"which exceeds configured SAM maximum image size {(int(max_size), int(max_size))}"
+        )
+    return F.pad(x, (0, pad_w, 0, pad_h))
+
+
 def per_band_stats(x: Tensor) -> dict[str, Tensor]:
     """Return finite-aware per item/per band summary tensors for BCHW inputs."""
 

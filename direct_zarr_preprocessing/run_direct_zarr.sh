@@ -70,7 +70,11 @@ IMAGE_LOG_A="${IMAGE_LOG_A:-300}"
 IMAGE_LOG_HIGH_PERCENTILE="${IMAGE_LOG_HIGH_PERCENTILE:-99.5}"
 IMAGE_LUPTON_STRETCH="${IMAGE_LUPTON_STRETCH:-0.5}"
 IMAGE_LUPTON_Q="${IMAGE_LUPTON_Q:-20}"
+IMAGE_CLIP_THRESHOLD="${IMAGE_CLIP_THRESHOLD:-3.0}"
+IMAGE_ANSCOMBE_CLIP="${IMAGE_ANSCOMBE_CLIP:-0}"
 IMAGE_ANSCOMBE_SCALE="${IMAGE_ANSCOMBE_SCALE:-1000}"
+PU_BRIGHT_CLIP_THRESHOLD="${PU_BRIGHT_CLIP_THRESHOLD:-${IMAGE_CLIP_THRESHOLD}}"
+PU_BRIGHT_ANSCOMBE_CLIP="${PU_BRIGHT_ANSCOMBE_CLIP:-${IMAGE_ANSCOMBE_CLIP}}"
 
 B_MAG_MIN="${B_MAG_MIN:-15}"
 B_MAG_MAX="${B_MAG_MAX:-35}"
@@ -121,8 +125,13 @@ args=(
   --image-log-high-percentile "${IMAGE_LOG_HIGH_PERCENTILE}"
   --image-lupton-stretch "${IMAGE_LUPTON_STRETCH}"
   --image-lupton-q "${IMAGE_LUPTON_Q}"
+  --image-clip-threshold "${IMAGE_CLIP_THRESHOLD}"
   --image-anscombe-scale "${IMAGE_ANSCOMBE_SCALE}"
 )
+
+if [[ "${IMAGE_ANSCOMBE_CLIP}" == "1" ]]; then
+  args+=(--image-anscombe-clip)
+fi
 
 if [[ -n "${DENOISED_FITS_ROOT}" ]]; then
   args+=(--denoised-fits-root "${DENOISED_FITS_ROOT}")
@@ -147,10 +156,14 @@ if [[ "${ENABLE_BRIGHT_BACKGROUND_MASK}" == "1" ]]; then
     --pu-bright-log-high-percentile "${PU_BRIGHT_LOG_HIGH_PERCENTILE}"
     --pu-bright-lupton-stretch "${PU_BRIGHT_LUPTON_STRETCH}"
     --pu-bright-lupton-q "${PU_BRIGHT_LUPTON_Q}"
+    --pu-bright-clip-threshold "${PU_BRIGHT_CLIP_THRESHOLD}"
     --pu-bright-anscombe-scale "${PU_BRIGHT_ANSCOMBE_SCALE}"
     --pu-bright-z-threshold "${PU_BRIGHT_Z_THRESHOLD}"
     --pu-bright-mask-dilate "${PU_BRIGHT_MASK_DILATE}"
   )
+  if [[ "${PU_BRIGHT_ANSCOMBE_CLIP}" == "1" ]]; then
+    args+=(--pu-bright-anscombe-clip)
+  fi
 fi
 if [[ -n "${EXTERNAL_BRIGHT_LABEL_ROOT}" ]]; then
   args+=(

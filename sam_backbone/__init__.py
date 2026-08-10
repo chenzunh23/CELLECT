@@ -22,7 +22,7 @@ from .mask_decoder import MaskDecoder
 from .matcher import AstroMatchNet2D, ENNet2D, EXNet2D
 from .model import SamCellect2D, build_sam_cellect2d
 from .predictor import SamPredictor
-from .preprocess import astro_preprocess, pad_to_square, per_band_stats
+from .preprocess import astro_preprocess, pad_to_patch_multiple, pad_to_square, per_band_stats
 from .prompt_encoder import PromptEncoder
 from .sam import Sam
 from .transformer import TwoWayTransformer
@@ -56,6 +56,7 @@ __all__ = [
     "build_sam_vit_l",
     "load_sam_encoder_checkpoint",
     "pad_to_square",
+    "pad_to_patch_multiple",
     "per_band_stats",
     "prompt_pred_ratio",
     "sam_prompt_mask_losses",

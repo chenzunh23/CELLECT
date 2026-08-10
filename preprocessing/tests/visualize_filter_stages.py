@@ -85,6 +85,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bright-mask-mode", default="log-lupton")
     parser.add_argument("--bright-threshold", type=float, default=2.99)
     parser.add_argument("--bright-dilate", type=int, default=2)
+    parser.add_argument("--clip-threshold", type=float, default=3.0)
     parser.add_argument("--log-a", type=float, default=None)
     parser.add_argument("--anscombe-scale", type=float, default=1000.0)
     parser.add_argument("--origin", choices=("lower", "upper"), default="lower")
@@ -367,6 +368,7 @@ def main() -> int:
     bright_config = BrightRegionConfig(
         mode=args.bright_mask_mode,
         threshold=args.bright_threshold,
+        clip_threshold=args.clip_threshold,
         dilation=args.bright_dilate,
         log_a=log_a,
         anscombe_scale=args.anscombe_scale,

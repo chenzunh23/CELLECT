@@ -36,12 +36,14 @@ from eval.eval_utils import (
     crop_or_pad,
     draw_ellipses,
     draw_points,
+    input_channel_display_limits,
     label_mask_overlay,
     read_fits_image,
     read_zarr_sample,
     resolve_zarr_sample,
     rows_to_reg,
     save_heatmap,
+    save_pixel_png,
     save_png,
     source_rows_from_zarr,
     strict_centers_from_zarr,
@@ -176,7 +178,6 @@ def _source_shapes_overlay(
                 alpha=0.95,
             )
         )
-        ax.plot(float(row["x"]), float(row["y"]), marker="+", color=color, ms=3.0, mew=0.8)
     _draw_external_centers(ax, external_centers)
     ax.set_xlim(0, image.shape[1])
     ax.set_ylim(0, image.shape[0])
@@ -331,23 +332,20 @@ def _run_one(args: argparse.Namespace, dataset_source: str | None) -> Path:
     strict_centers = strict_centers_from_zarr(reader, sample_idx, band_idx)
     all_centers = [*centers, *strict_centers]
 
-    save_png(out_dir / f"{out_stem}_pu_overlay.png", label_mask_overlay(image, pu), title=f"{out_stem} PU", scale=args.png_scale)
-    save_png(
+    save_pixel_png(out_dir / f"{out_stem}_pu_overlay.png", label_mask_overlay(image, pu), scale=args.png_scale)
+    save_pixel_png(
         out_dir / f"{out_stem}_confidence_overlay.png",
         confidence_overlay(image, conf),
-        title=f"{out_stem} confidence",
         scale=args.png_scale,
     )
-    save_png(
+    save_pixel_png(
         out_dir / f"{out_stem}_source_shapes_overlay.png",
         _source_shapes_overlay(image, sources, strict_centers),
-        title=f"{out_stem} source shapes",
         scale=args.png_scale,
     )
-    save_png(
+    save_pixel_png(
         out_dir / f"{out_stem}_centers_overlay.png",
         draw_points(image, all_centers),
-        title=f"{out_stem} centers",
         scale=args.png_scale,
     )
     _panel(out_dir / f"{out_stem}_panel.png", image, pu, conf, sources, strict_centers)
@@ -374,11 +372,21 @@ def _run_one(args: argparse.Namespace, dataset_source: str | None) -> Path:
 
     image_stack = np.asarray(sample["image"], dtype=np.float32)
     if image_stack.ndim == 3:
+        scaling_mode = str(attrs.get("image_scaling_mode") or attrs.get("scaling_mode") or "zscore")
+        clip_threshold = float(attrs.get("clip_threshold", attrs.get("image_clip_threshold", 3.0)))
         for channel in range(min(3, image_stack.shape[0])):
+            vmin, vmax = input_channel_display_limits(
+                image_stack[channel],
+                scaling=scaling_mode,
+                channel_index=channel,
+                clip_threshold=clip_threshold,
+            )
             save_heatmap(
                 out_dir / f"{out_stem}_input_channel{channel}.png",
                 image_stack[channel],
                 title=f"{out_stem} input channel {channel}",
+                vmin=vmin,
+                vmax=vmax,
             )
     return out_dir
 
