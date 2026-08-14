@@ -21,3 +21,4 @@ zangetsu_demo/data
 vis/
 debug.sh
 patches/
+eval/hsctiles/interactive*/**

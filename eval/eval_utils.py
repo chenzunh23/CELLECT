@@ -415,7 +415,7 @@ def draw_ellipses(
             )
         )
         if draw_centers:
-            ax.plot(float(row["x"]), float(row["y"]), marker="+", color=row_point_color, markersize=3.5, mew=0.8)
+            ax.plot(float(row["x"]), float(row["y"]), marker="+", color=row_point_color, markersize=1.5, mew=0.8)
     ax.set_xlim(0, image.shape[1])
     ax.set_ylim(0, image.shape[0])
     ax.set_axis_off()

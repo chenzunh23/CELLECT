@@ -169,7 +169,7 @@ Single 256x256 frame, using dynamic image-size inference and ViT positional
 embedding interpolation:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python eval/eval_hsctile_pack.py \
+CUDA_VISIBLE_DEVICES=0 python eval/hsctiles/eval_hsctile_pack.py \
   --checkpoint /data/czh23/ckpts/sam_zscore_no_upper/best.pt \
   --sample-index 0 \
   --mode single256 \
@@ -179,7 +179,7 @@ CUDA_VISIBLE_DEVICES=0 python eval/eval_hsctile_pack.py \
 Four neighboring 256x256 frames stitched into a native 512x512 input:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python eval/eval_hsctile_pack.py \
+CUDA_VISIBLE_DEVICES=0 python eval/hsctiles/eval_hsctile_pack.py \
   --checkpoint /data/czh23/ckpts/sam_zscore_no_upper/best.pt \
   --band HSC-I \
   --patch 4,5 \

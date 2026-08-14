@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Multi-Dataset Pack Server</title>
+  <link rel="stylesheet" href="/pages/style.css">
+</head>
+<body>
+  <header id="browserHeader" class="hidden">
+    <div class="bar">
+      <div class="title">
+        <span id="titleDataset">Dataset</span>
+        <span>tract <span id="titleTract"></span></span>
+        <select id="patchSelect" title="Patch"></select>
+      </div>
+      <div class="controls">
+        <button id="back">Back</button>
+        <button id="prev">Prev</button>
+        <span class="pageControl"><span>Page</span><input id="pageInput" type="number" min="1" value="1"><span id="pageText"></span></span>
+        <button id="next">Next</button>
+        <button id="searchButton">Search</button>
+        <button id="detect">Detect</button>
+        <div class="viewMenu">
+          <button id="viewButton">View</button>
+          <div id="viewDropdown" class="viewDropdown hidden">
+            <button class="viewItem" data-view="inputScaling"><span class="viewCheck"></span><span>Input Scaling</span></button>
+            <button class="viewItem" data-view="shape"><span class="viewCheck"></span><span>Shape</span></button>
+            <button class="viewItem" data-view="center"><span class="viewCheck"></span><span>Center</span></button>
+            <button class="viewItem" data-view="smooth"><span class="viewCheck"></span><span>Smooth</span></button>
+          </div>
+        </div>
+        <button id="saveCsv">Save CSV</button>
+        <button class="primary" id="export">Export Selected</button>
+      </div>
+    </div>
+  </header>
+  <main>
+    <section class="menu" id="menu">
+      <h1>Multi-Dataset Pack Server</h1>
+      <p class="intro">Browse astronomy image tiles, select regions online, and run CELLECT/SAM detection overlays on the current page. Each dataset exposes the same tract/patch/band/tile/group interface.</p>
+      <div class="datasetCards" id="datasetCards"></div>
+      <div class="formGrid">
+        <div class="field">
+          <label for="tractInput">Tract</label>
+          <input id="tractInput" value="9813">
+        </div>
+        <div class="field">
+          <label for="patchInput">Patches / Objects</label>
+          <select id="patchInput" multiple></select>
+        </div>
+        <div class="field">
+          <label for="bandInput">Bands</label>
+          <select id="bandInput" multiple></select>
+        </div>
+        <div class="field">
+          <label for="nTilesInput">n-tiles</label>
+          <input id="nTilesInput" type="number" min="1" placeholder="60">
+          <label class="inlineCheck"><input id="maxTilesInput" type="checkbox"> max</label>
+        </div>
+        <div class="field">
+          <label for="framesPerTileInput">groups per tile</label>
+          <input id="framesPerTileInput" type="number" min="1" placeholder="1">
+        </div>
+        <div class="field">
+          <label for="tilesPerPageInput">tiles per page</label>
+          <input id="tilesPerPageInput" type="number" min="1" placeholder="2">
+        </div>
+        <div class="field">
+          <label for="runNameInput">run name</label>
+          <input id="runNameInput" placeholder="optional">
+        </div>
+      </div>
+      <div class="menuActions">
+        <button class="primary" id="startButton">Go</button>
+      </div>
+    </section>
+    <p class="status" id="status"></p>
+    <div class="grid" id="grid"></div>
+  </main>
+  <div id="searchOverlay" class="modalOverlay hidden">
+    <div class="modal">
+      <div class="modalHeader">
+        <h2>Tile Search</h2>
+        <button id="closeSearch" title="Close">Close</button>
+      </div>
+      <div class="searchRows">
+        <div class="searchRow">
+          <label>tile x,y</label>
+          <input id="tileIdInput" placeholder="0,1 or x000_y001">
+          <input id="tileYInput" type="number" placeholder="optional y">
+          <button id="tileSearchGo">Go</button>
+        </div>
+        <div class="searchRow">
+          <label>pixel x,y</label>
+          <input id="pixelXInput" type="number" placeholder="image x">
+          <input id="pixelYInput" type="number" placeholder="image y">
+          <button id="pixelSearchGo">Go</button>
+        </div>
+      </div>
+      <div class="tileMapBox">
+        <img id="tileMapImage" src="/assets/blank.png" alt="Tile map placeholder">
+      </div>
+      <p id="searchStatus" class="modalStatus"></p>
+    </div>
+  </div>
+  <div id="smoothOverlay" class="modalOverlay hidden">
+    <div class="smoothModal">
+      <div class="modalHeader">
+        <h2>Smooth</h2>
+        <button id="closeSmooth" title="Close">Close</button>
+      </div>
+      <div class="smoothFields">
+        <label for="smoothModeSelect">kernel</label>
+        <select id="smoothModeSelect">
+          <option value="gaussian">Gaussian</option>
+          <option value="boxcar">Boxcar</option>
+          <option value="tophat">Tophat</option>
+        </select>
+        <label id="smoothSigmaLabel" for="smoothSigmaInput">sigma</label>
+        <input id="smoothSigmaInput" type="number" min="0.1" step="0.1" value="1.0">
+        <label id="smoothRadiusLabel" for="smoothRadiusInput">radius</label>
+        <input id="smoothRadiusInput" type="number" min="1" step="1" value="2">
+      </div>
+      <p id="smoothKernelText" class="modalStatus"></p>
+      <div class="modalActions">
+        <button id="smoothOffButton">Off</button>
+        <button class="primary" id="applySmoothButton">Apply</button>
+      </div>
+    </div>
+  </div>
+  <script src="/pages/app.js"></script>
+</body>
+</html>
