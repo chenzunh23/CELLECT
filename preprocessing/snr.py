@@ -225,17 +225,46 @@ def predicted_snr_from_variance(
 
 
 def resolve_coadd_weight_csv(root: Path | str, band: str, patch: str) -> Path:
-    return Path(root) / str(band) / str(patch) / "weights.csv"
+    root = Path(root)
+    candidates = [
+        root / str(band) / str(patch) / "weights.csv",
+        root / "9813" / str(band) / str(patch) / "weights.csv",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    if root.exists():
+        for tract_dir in sorted(path for path in root.iterdir() if path.is_dir()):
+            candidate = tract_dir / str(band) / str(patch) / "weights.csv"
+            if candidate.exists():
+                return candidate
+    return candidates[0]
 
 
-def read_coadd_weight_sum(path: Path | str, *, valid_only: bool = False) -> tuple[float, int]:
+def read_coadd_weight_sum(
+    path: Path | str,
+    *,
+    valid_only: bool = False,
+    product_collection: str | None = None,
+    coadd_label: str | None = None,
+) -> tuple[float, int]:
     total = 0.0
     count = 0
+    collection_filter = str(product_collection).strip().lower() if product_collection is not None else None
+    label_filter = str(coadd_label).strip().lower() if coadd_label is not None else None
     with Path(path).open(newline="", encoding="utf-8") as handle:
         for row in csv.DictReader(handle):
             if valid_only:
                 flag = str(row.get("has_valid_hsctile_weight", "")).strip().lower()
                 if flag not in {"true", "1", "yes", "y"}:
+                    continue
+            if collection_filter is not None:
+                collection = str(row.get("product_collection", "")).strip().lower()
+                if collection != collection_filter:
+                    continue
+            if label_filter is not None:
+                label = str(row.get("coadd_label", "")).strip().lower()
+                if label != label_filter:
                     continue
             try:
                 weight = float(row["weight"])
@@ -265,6 +294,67 @@ def resolve_variant_group_dir(root: Path | str, patch: str, group: str | int, ba
     return root / patch_dir / group_text / str(band)
 
 
+def _group_number(group: str | int | None) -> int | None:
+    if group is None:
+        return None
+    text = str(group).strip()
+    if text.startswith("group_"):
+        text = text[6:]
+    try:
+        return int(text)
+    except Exception:
+        return None
+
+
+def _product_collection_name(dataset_source: str) -> str:
+    source = str(dataset_source).strip().lower()
+    if source in {"coadd", "half", "half_coadd"}:
+        return "half_coadd"
+    return source
+
+
+def read_product_group_weight_summary(
+    weight_csv: Path | str,
+    *,
+    dataset_source: str,
+    group: str | int,
+    image_fits: Path | str | None = None,
+) -> dict[str, float]:
+    collection = _product_collection_name(dataset_source)
+    group_num = _group_number(group)
+    image_path = str(Path(image_fits).resolve()) if image_fits is not None else None
+    weights: list[float] = []
+    with Path(weight_csv).open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            if str(row.get("product_collection", "")).strip().lower() != collection:
+                continue
+            if image_path is not None:
+                row_image = row.get("product_image_mask_fits", "")
+                if row_image and str(Path(row_image).resolve()) != image_path:
+                    continue
+            elif group_num is not None:
+                try:
+                    if int(str(row.get("group_num", "")).strip()) != group_num:
+                        continue
+                except Exception:
+                    continue
+            try:
+                weight = float(row["weight"])
+            except Exception:
+                continue
+            if math.isfinite(weight) and weight > 0.0:
+                weights.append(weight)
+    if not weights:
+        raise ValueError(f"no {collection} weights found for group={group} in {weight_csv}")
+    return {
+        "selected_weight_sum": float(sum(weights)),
+        "selected_weight_count": float(len(weights)),
+        "selected_weight_min": float(min(weights)),
+        "selected_weight_max": float(max(weights)),
+        "group_index": float(group_num if group_num is not None else -1),
+    }
+
+
 def read_group_weight_summary(meta_path: Path | str) -> dict[str, float]:
     metadata = json.loads(Path(meta_path).read_text(encoding="utf-8"))
     weights = [float(value) for value in metadata.get("selected_weights", [])]
@@ -276,6 +366,39 @@ def read_group_weight_summary(meta_path: Path | str) -> dict[str, float]:
         "selected_weight_max": float(max(weights)) if weights else float("nan"),
         "group_index": float(metadata.get("group_index", -1)),
     }
+
+
+def resolve_product_effective_count_path(
+    root: Path | str,
+    *,
+    band: str,
+    patch: str,
+    group: str | int,
+    dataset_source: str,
+) -> Path:
+    root = Path(root)
+    group_num = _group_number(group)
+    patch_dir = f"patch_{str(patch).replace(',', '_')}"
+    old_group_dir = resolve_variant_group_dir(root, patch, group, band)
+    old = old_group_dir / "effective_count.fits"
+    if old.exists():
+        return old
+
+    product_dirs = [
+        root / str(band) / str(patch),
+        root / "9813" / str(band) / str(patch),
+        root / _product_collection_name(dataset_source) / "9813" / str(band) / str(patch),
+        root / patch_dir / str(group) / str(band),
+    ]
+    for product_dir in product_dirs:
+        if not product_dir.exists():
+            continue
+        matches = sorted(product_dir.glob(f"effective_count*{band}*{patch}*.fits"))
+        if group_num is not None:
+            matches = [path for path in matches if path.stem.rsplit("-", 1)[-1] == str(group_num)]
+        if matches:
+            return matches[0]
+    return old
 
 
 def predicted_snr_from_weight_ratio(
@@ -316,14 +439,45 @@ def compute_weight_ratio_snr(
     band: str,
     patch: str,
     group: str | int,
+    dataset_source: str = "noisy",
+    image_fits: Path | str | None = None,
     config: SnrConfig = SnrConfig(),
 ) -> SnrResult:
     coadd = ap2_snr(table, config=config)
     weight_csv = resolve_coadd_weight_csv(config.coadd_weight_root, band, patch)
     group_dir = resolve_variant_group_dir(config.denoised_fits_root, patch, group, band)
-    coadd_weight_sum, coadd_weight_count = read_coadd_weight_sum(weight_csv, valid_only=config.valid_coadd_weights_only)
-    group_weights = read_group_weight_summary(group_dir / "meta.json")
-    effective_count, effective_origin = read_fits_plane(group_dir / "effective_count.fits", "IMAGE")
+    half_weight_sum, half_weight_count = read_coadd_weight_sum(
+        weight_csv,
+        valid_only=config.valid_coadd_weights_only,
+        product_collection="half_coadd",
+    )
+    if half_weight_count <= 0:
+        half_weight_sum, half_weight_count = read_coadd_weight_sum(
+            weight_csv,
+            valid_only=config.valid_coadd_weights_only,
+            coadd_label="half",
+        )
+    if half_weight_count <= 0:
+        half_weight_sum, half_weight_count = read_coadd_weight_sum(weight_csv, valid_only=config.valid_coadd_weights_only)
+    meta_path = group_dir / "meta.json"
+    if meta_path.exists():
+        group_weights = read_group_weight_summary(meta_path)
+        effective_path = group_dir / "effective_count.fits"
+    else:
+        group_weights = read_product_group_weight_summary(
+            weight_csv,
+            dataset_source=dataset_source,
+            group=group,
+            image_fits=image_fits,
+        )
+        effective_path = resolve_product_effective_count_path(
+            config.denoised_fits_root,
+            band=band,
+            patch=patch,
+            group=group,
+            dataset_source=dataset_source,
+        )
+    effective_count, effective_origin = read_fits_plane(effective_path, "IMAGE")
     x, y = source_xy(table)
     off_y, off_x = circular_aperture_offsets(float(config.aperture_radius))
     local_effective = np.full(len(table), np.nan, dtype=np.float32)
@@ -332,7 +486,7 @@ def compute_weight_ratio_snr(
             local_effective[idx] = mean_map_value_at(effective_count, effective_origin, float(x[idx]), float(y[idx]), off_y, off_x)
     snr, t_eff = predicted_snr_from_weight_ratio(
         coadd,
-        coadd_weight_sum=coadd_weight_sum,
+        coadd_weight_sum=half_weight_sum,
         selected_weight_sum=float(group_weights["selected_weight_sum"]),
         selected_weight_count=float(group_weights["selected_weight_count"]),
         local_effective_count=local_effective,
@@ -345,9 +499,10 @@ def compute_weight_ratio_snr(
         method="weight",
         details={
             "coadd_weight_csv": str(weight_csv),
-            "coadd_weight_sum": float(coadd_weight_sum),
-            "coadd_weight_count": int(coadd_weight_count),
+            "coadd_weight_sum": float(half_weight_sum),
+            "coadd_weight_count": int(half_weight_count),
             "group_dir": str(group_dir),
+            "effective_count_fits": str(effective_path),
             **group_weights,
         },
     )
@@ -414,7 +569,15 @@ def compute_snr_for_sample(
 
     if config.noncoadd_method in {"auto", "weight"} and band is not None and patch is not None and group is not None:
         try:
-            result = compute_weight_ratio_snr(table, band=band, patch=patch, group=group, config=config)
+            result = compute_weight_ratio_snr(
+                table,
+                band=band,
+                patch=patch,
+                group=group,
+                dataset_source=source,
+                image_fits=image_fits,
+                config=config,
+            )
             result.snr_class = classify_snr(result.snr, is_narrow_band=is_narrow_band, config=config)
             return result
         except Exception as exc:

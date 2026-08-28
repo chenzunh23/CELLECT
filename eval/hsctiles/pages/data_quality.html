@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HSC Data Quality Preview</title>
+  <link rel="stylesheet" href="/pages/style.css">
+</head>
+<body class="qualityPage">
+  <header>
+    <div class="bar">
+      <div class="title">
+        <span>HSC Data Quality</span>
+        <span id="qualitySubtitle"></span>
+      </div>
+      <div class="controls">
+        <button id="backButton">Back</button>
+        <button id="helpButton">Help</button>
+      </div>
+    </div>
+  </header>
+  <main class="qualityMain">
+    <section class="qualityViewer">
+      <div class="qualityToolbar">
+        <label>source <select id="sourceSelect"></select></label>
+        <label>band <select id="bandSelect"></select></label>
+        <label>group <select id="groupSelect"></select></label>
+        <label class="inlineCheck"><input id="tileOverlay" type="checkbox" checked> tile overlay</label>
+        <button id="overviewButton">Full score map</button>
+      </div>
+      <div id="pageButtons" class="qualityPages"></div>
+      <div class="qualityImageWrap"><img id="pageImage" alt="page mosaic"></div>
+      <p id="qualityStatus" class="status"></p>
+    </section>
+    <aside class="qualitySide">
+      <div class="legend">
+        <span><span class="swatch red"></span>patch score >= threshold</span>
+        <span><span class="swatch yellow"></span>tile 13-20%</span>
+        <span><span class="swatch orange"></span>tile 20-50%</span>
+        <span><span class="swatch darkred"></span>tile >50%</span>
+      </div>
+      <p id="qualitySummary" class="modalStatus"></p>
+      <h2>Dropped Patches</h2>
+      <pre id="dropList" class="dropList"></pre>
+    </aside>
+  </main>
+  <div id="overviewOverlay" class="modalOverlay hidden">
+    <div class="modal">
+      <div class="modalHeader">
+        <h2 id="overviewTitle">Full score map</h2>
+        <button id="closeOverview">Close</button>
+      </div>
+      <div class="qualityImageWrap"><img id="overviewImage" alt="overview"></div>
+    </div>
+  </div>
+  <div id="helpOverlay" class="modalOverlay hidden">
+    <div class="smoothModal">
+      <div class="modalHeader">
+        <h2>Bad Score</h2>
+        <button id="closeHelp">Close</button>
+      </div>
+      <p class="modalStatus">Each mask plane contributes a per-pixel badness weight. NO_DATA and UNMASKEDNAN use 1.0, INTRP uses 0.3, BAD uses 0.5, and EDGE uses the configured EDGE weight. The displayed patch score is the mean of the maximum active weight per pixel. Tile overlays use the same score on regular 512 pixel tiles with 368 pixel stride.</p>
+    </div>
+  </div>
+  <script src="/pages/data_quality.js"></script>
+</body>
+</html>

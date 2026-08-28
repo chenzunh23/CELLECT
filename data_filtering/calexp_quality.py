@@ -78,7 +78,7 @@ def find_calexp(patch_dir: Path) -> Path | None:
 
 
 def read_calexp(path: Path) -> tuple[np.ndarray, np.ndarray, dict[str, int]]:
-    with fits.open(path, memmap=True, ignore_missing_end=True) as hdul:
+    with fits.open(path, memmap=False, ignore_missing_end=True) as hdul:
         image = np.asarray(hdul[1].data, dtype=np.float32)
         if "MASK" in hdul:
             mask_hdu = hdul["MASK"]
@@ -90,7 +90,7 @@ def read_calexp(path: Path) -> tuple[np.ndarray, np.ndarray, dict[str, int]]:
 
 
 def read_mask_plane(path: Path) -> tuple[np.ndarray, dict[str, int]]:
-    with fits.open(path, memmap=True, ignore_missing_end=True) as hdul:
+    with fits.open(path, memmap=False, ignore_missing_end=True) as hdul:
         if "MASK" in hdul:
             hdu = hdul["MASK"]
         elif len(hdul) > 2 and getattr(hdul[2], "data", None) is not None:
@@ -100,11 +100,41 @@ def read_mask_plane(path: Path) -> tuple[np.ndarray, dict[str, int]]:
         return np.asarray(hdu.data, dtype=np.int64), mask_planes_from_header(hdu.header)
 
 
-def bad_score_map(mask: np.ndarray, planes: dict[str, int], weights: dict[str, float]) -> np.ndarray:
+def read_mask_plane_for_score(path: Path) -> tuple[np.ndarray, dict[str, int], set[str]]:
+    with fits.open(path, memmap=False, ignore_missing_end=True) as hdul:
+        image = np.asarray(hdul[1].data, dtype=np.float32)
+        if "MASK" in hdul:
+            hdu = hdul["MASK"]
+        elif len(hdul) > 2 and getattr(hdul[2], "data", None) is not None:
+            hdu = hdul[2]
+        else:
+            raise KeyError(f"no LSST MASK plane found in {path}")
+        mask = np.asarray(hdu.data, dtype=np.int64)
+        planes = mask_planes_from_header(hdu.header)
+    ignored: set[str] = set()
+    bad_bit = planes.get("BAD")
+    if bad_bit is not None and mask.shape == image.shape:
+        bad = (mask & (1 << int(bad_bit))) != 0
+        if bool(bad.all()) and bool(np.isfinite(image).all()):
+            ignored.add("BAD")
+    return mask, planes, ignored
+
+
+def bad_score_map(
+    mask: np.ndarray,
+    planes: dict[str, int],
+    weights: dict[str, float],
+    *,
+    ignored_planes: Iterable[str] | None = None,
+) -> np.ndarray:
     score = np.zeros(np.asarray(mask).shape, dtype=np.float32)
     mask_values = np.asarray(mask, dtype=np.int64)
+    ignored = {str(name).upper() for name in (ignored_planes or ())}
     for name, weight in weights.items():
-        bit = planes.get(str(name).upper())
+        plane = str(name).upper()
+        if plane in ignored:
+            continue
+        bit = planes.get(plane)
         if bit is None or float(weight) <= 0.0:
             continue
         plane_mask = (mask_values & (1 << int(bit))) != 0
@@ -113,15 +143,27 @@ def bad_score_map(mask: np.ndarray, planes: dict[str, int], weights: dict[str, f
     return score
 
 
-def bad_score_fraction(mask: np.ndarray, planes: dict[str, int], weights: dict[str, float]) -> float:
-    score = bad_score_map(mask, planes, weights)
+def bad_score_fraction(
+    mask: np.ndarray,
+    planes: dict[str, int],
+    weights: dict[str, float],
+    *,
+    ignored_planes: Iterable[str] | None = None,
+) -> float:
+    score = bad_score_map(mask, planes, weights, ignored_planes=ignored_planes)
     return float(np.nanmean(score)) if score.size else 0.0
 
 
-def tile_bad_score(mask_tile: np.ndarray, planes: dict[str, int], weights: dict[str, float]) -> float:
+def tile_bad_score(
+    mask_tile: np.ndarray,
+    planes: dict[str, int],
+    weights: dict[str, float],
+    *,
+    ignored_planes: Iterable[str] | None = None,
+) -> float:
     if np.asarray(mask_tile).size == 0:
         return 0.0
-    return bad_score_fraction(mask_tile, planes, weights)
+    return bad_score_fraction(mask_tile, planes, weights, ignored_planes=ignored_planes)
 
 
 def tile_score_category(score: float) -> str:
@@ -175,6 +217,7 @@ def score_tile_grid(
     *,
     starts: Sequence[tuple[int, int]],
     tile_size: int,
+    ignored_planes: Iterable[str] | None = None,
 ) -> dict[tuple[int, int], float]:
     out: dict[tuple[int, int], float] = {}
     h, w = np.asarray(mask).shape
@@ -183,7 +226,12 @@ def score_tile_grid(
         y1 = int(y0) + int(tile_size)
         if x0 < 0 or y0 < 0 or x1 > w or y1 > h:
             continue
-        out[(int(x0), int(y0))] = tile_bad_score(mask[y0:y1, x0:x1], planes, weights)
+        out[(int(x0), int(y0))] = tile_bad_score(
+            mask[y0:y1, x0:x1],
+            planes,
+            weights,
+            ignored_planes=ignored_planes,
+        )
     return out
 
 
@@ -194,8 +242,8 @@ def patch_and_tile_scores(
     tile_size: int,
     weights: dict[str, float],
 ) -> tuple[float, dict[tuple[int, int], float]]:
-    mask, planes = read_mask_plane(calexp_path)
+    mask, planes, ignored_planes = read_mask_plane_for_score(calexp_path)
     return (
-        bad_score_fraction(mask, planes, weights),
-        score_tile_grid(mask, planes, weights, starts=starts, tile_size=tile_size),
+        bad_score_fraction(mask, planes, weights, ignored_planes=ignored_planes),
+        score_tile_grid(mask, planes, weights, starts=starts, tile_size=tile_size, ignored_planes=ignored_planes),
     )

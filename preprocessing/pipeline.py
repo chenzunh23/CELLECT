@@ -9,7 +9,11 @@ import numpy as np
 from astropy.table import Table
 
 from .bright_ap2 import BrightAp2Config, classify_bright_ap2
-from .bright_label import BrightLabelConfig, label_bright_sources
+from .bright_label import (
+    BrightLabelConfig,
+    label_bright_sources,
+    unsupervised_seeded_component_centers,
+)
 from .image_processing import BrightRegionConfig, ImageProcessingConfig, build_bright_components, read_background_mask, read_fits_image, read_quality_mask, scale_image_for_training
 from .labels import SourceClass, SourceLabels
 from .meas_processing import MeasProcessingConfig, classify_meas_basics
@@ -195,6 +199,37 @@ class PreprocessingPipeline:
             config=self.config.bright,
             refit_config=self.config.refit,
         )
+        seed_components = bright_ap2.component_id[np.asarray(stage.bright_candidate, dtype=bool)]
+        fallback_x, fallback_y, fallback_ids, fallback_component_ids = unsupervised_seeded_component_centers(
+            table,
+            bright.labels,
+            bright_components,
+            seed_component_ids=seed_components,
+            catalog_component_ids=seed_components,
+            existing_strict_component_ids=bright.strict_center_component_id,
+            min_area=float(self.config.bright.empty_seeded_bright_component_area_min),
+            component_search_radius=int(self.config.bright_ap2.component_search_radius),
+            refit_config=self.config.refit,
+        )
+        if fallback_x.size:
+            bright.strict_center_x = np.concatenate([bright.strict_center_x, fallback_x]).astype(np.float64)
+            bright.strict_center_y = np.concatenate([bright.strict_center_y, fallback_y]).astype(np.float64)
+            bright.strict_center_source_id = np.concatenate([bright.strict_center_source_id, fallback_ids]).astype(np.int64)
+            bright.strict_center_reason = np.concatenate(
+                [
+                    bright.strict_center_reason,
+                    np.full(fallback_x.shape, "seeded_bright_component_no_supervised_center", dtype=object),
+                ]
+            )
+            bright.strict_center_component_id = np.concatenate([bright.strict_center_component_id, fallback_component_ids]).astype(np.int32)
+            bright.restricted_fallback_component_ids = np.unique(
+                np.concatenate([bright.restricted_fallback_component_ids, fallback_component_ids]).astype(np.int32)
+            )
+            bright.ordinary_ignore_component_ids = np.setdiff1d(
+                np.asarray(bright.ordinary_ignore_component_ids, dtype=np.int32),
+                np.asarray(fallback_component_ids, dtype=np.int32),
+                assume_unique=False,
+            ).astype(np.int32)
 
         background = read_background_mask(inputs.background_npz, image.shape)
         restricted_fallback_mask = None
@@ -203,6 +238,18 @@ class PreprocessingPipeline:
             component_ids = component_ids[component_ids > 0]
             if component_ids.size:
                 restricted_fallback_mask = np.isin(np.asarray(bright_components, dtype=np.int32), component_ids)
+        ordinary_ignore_mask = None
+        if bright.ordinary_ignore_component_ids.size and bright_components is not None and np.asarray(bright_components).size:
+            component_ids = np.asarray(bright.ordinary_ignore_component_ids, dtype=np.int32)
+            if bright.restricted_fallback_component_ids.size:
+                component_ids = np.setdiff1d(
+                    component_ids,
+                    np.asarray(bright.restricted_fallback_component_ids, dtype=np.int32),
+                    assume_unique=False,
+                ).astype(np.int32)
+            component_ids = component_ids[component_ids > 0]
+            if component_ids.size:
+                ordinary_ignore_mask = np.isin(np.asarray(bright_components, dtype=np.int32), component_ids)
         dense = fill_dense_regions(
             table,
             bright.labels,
@@ -210,6 +257,8 @@ class PreprocessingPipeline:
             background_mask=background,
             quality_ignore_mask=quality_ignore,
             restricted_fallback_mask=restricted_fallback_mask,
+            ordinary_ignore_mask=ordinary_ignore_mask,
+            ordinary_ignore_source_mask=bright.ordinary_ignore_source_mask,
             refit_config=self.config.refit,
         )
         sample_name = inputs.sample_name or inputs.image_fits.stem

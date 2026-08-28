@@ -6,6 +6,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import re
 import sys
 from contextlib import nullcontext
 from pathlib import Path
@@ -72,6 +73,10 @@ SOURCE_CLASS_COLORS = {
     6: "orange",
     7: "violet",
 }
+
+ELLIPSE_REGION_RE = re.compile(
+    r"ellipse\(\s*([-+0-9.eE]+)\s*,\s*([-+0-9.eE]+)\s*,\s*([-+0-9.eE]+)\s*,\s*([-+0-9.eE]+)\s*,\s*([-+0-9.eE]+)\s*\)"
+)
 
 REG_HEADER_IMAGE = (
     "# Region file format: DS9 version 4.1",
@@ -375,6 +380,8 @@ def draw_ellipses(
     color: str | None = None,
     point_color: str | None = None,
     draw_centers: bool = True,
+    invert_background: bool = False,
+    line_width: float = 1.0,
     input_scaled_background: bool = False,
     input_scaling: str | None = None,
     input_channel_index: int | None = None,
@@ -398,6 +405,8 @@ def draw_ellipses(
         gray = rgb[..., 0]
     else:
         gray = zscale_gray(image)
+    if bool(invert_background):
+        gray = 1.0 - gray
     ax.imshow(gray, origin="lower", cmap="gray", vmin=0.0, vmax=1.0, interpolation="nearest")
     for row in sorted(rows, key=lambda r: abs(float(r["major"]) * float(r["minor"])), reverse=True):
         row_color = color or SOURCE_CLASS_COLORS.get(int(row.get("class_id", 1)), "yellow")
@@ -410,7 +419,7 @@ def draw_ellipses(
                 angle=math.degrees(float(row.get("theta", 0.0))),
                 fill=False,
                 edgecolor=row_color,
-                linewidth=1.0,
+                linewidth=float(line_width),
                 alpha=0.95,
             )
         )
@@ -427,6 +436,46 @@ def draw_ellipses(
     # Agg buffers are top-row first, while downstream save_png uses
     # origin="lower" for image-coordinate displays.
     return np.flipud(rgba[..., :3]).astype(np.float32) / 255.0
+
+
+def read_ds9_ellipse_regions(path: Path) -> list[dict[str, float]]:
+    """Read DS9 image-coordinate ellipse rows into ``draw_ellipses`` format."""
+    rows: list[dict[str, float]] = []
+    for line in Path(path).read_text(encoding="ascii", errors="ignore").splitlines():
+        match = ELLIPSE_REGION_RE.search(line)
+        if match is None:
+            continue
+        x, y, major, minor, theta_deg = (float(value) for value in match.groups())
+        rows.append(
+            {
+                "x": x,
+                "y": y,
+                "major": major,
+                "minor": minor,
+                "theta": math.radians(theta_deg),
+            }
+        )
+    return rows
+
+
+def inverse_ellipse_overlay(
+    image: np.ndarray,
+    rows: Sequence[dict[str, float]],
+    *,
+    color: str = "#0066ff",
+    line_width: float = 1.6,
+    draw_centers: bool = False,
+) -> np.ndarray:
+    """Draw ellipses on an inverted zscale background."""
+    return draw_ellipses(
+        image,
+        rows,
+        color=color,
+        point_color=color,
+        draw_centers=bool(draw_centers),
+        invert_background=True,
+        line_width=float(line_width),
+    )
 
 
 def draw_points(

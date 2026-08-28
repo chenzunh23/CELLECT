@@ -27,7 +27,7 @@ class BrightAp2Config:
     outside_bright_abs_max: float = 1.0
     small_bright_abs_max: float = 2.0
     large_bright_region_area_min: float = 1000.0
-    component_search_radius: int = 5
+    component_search_radius: int = 0
 
 
 @dataclass

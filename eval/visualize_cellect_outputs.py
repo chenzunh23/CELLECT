@@ -28,6 +28,7 @@ from eval.eval_utils import (
     detection_rows,
     draw_ellipses,
     infer_cellect,
+    inverse_ellipse_overlay,
     input_channel_display_limits,
     load_cellect_model,
     mask_overlay,
@@ -107,6 +108,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-existing", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--shape-overlay-centers", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--input-shape-overlay", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--inverse-shape-overlay", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--inverse-shape-overlay-centers", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--inverse-shape-overlay-color", default="#0066ff")
     p.add_argument("--out-dir", type=Path, default=Path("output/eval_visualizations/cellect_outputs"))
     return p.parse_args()
 
@@ -182,6 +186,9 @@ def _visual_options(args: argparse.Namespace) -> dict[str, object]:
     return {
         "shape_overlay_centers": bool(args.shape_overlay_centers),
         "input_shape_overlay": bool(args.input_shape_overlay),
+        "inverse_shape_overlay": bool(args.inverse_shape_overlay),
+        "inverse_shape_overlay_centers": bool(args.inverse_shape_overlay_centers),
+        "inverse_shape_overlay_color": str(args.inverse_shape_overlay_color),
         "make_masks": bool(args.make_masks),
         "confidence_threshold": float(args.confidence_threshold),
         "confidence_score": str(args.confidence_score),
@@ -205,6 +212,8 @@ def _band_outputs_current(band_dir: Path, band: str, options: dict[str, object])
     if not (band_dir / f"{band}_shape_overlay.png").exists():
         return False
     if bool(options.get("input_shape_overlay")) and not (band_dir / f"{band}_input_shape_overlay.png").exists():
+        return False
+    if bool(options.get("inverse_shape_overlay")) and not (band_dir / f"{band}_inverse_shape_overlay.png").exists():
         return False
     if bool(options.get("make_masks")) and not (band_dir / f"{band}_mask_overlay.png").exists():
         return False
@@ -406,6 +415,17 @@ def _run_one(args: argparse.Namespace, dataset_source: str | None = None) -> Pat
             band_dir / f"{band}_shape_overlay.png",
             draw_ellipses(image, rows, draw_centers=bool(args.shape_overlay_centers)),
         )
+        if bool(args.inverse_shape_overlay):
+            save_pixel_png(
+                band_dir / f"{band}_inverse_shape_overlay.png",
+                inverse_ellipse_overlay(
+                    image,
+                    rows,
+                    color=str(args.inverse_shape_overlay_color),
+                    line_width=1.8,
+                    draw_centers=bool(args.inverse_shape_overlay_centers),
+                ),
+            )
         if bool(args.input_shape_overlay):
             scaling_name = str(zarr_context.get("scaling", args.scaling_mode) if zarr_context is not None else args.scaling_mode)
             clip_threshold_for_display = float(

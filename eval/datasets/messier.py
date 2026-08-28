@@ -85,7 +85,7 @@ def _source_density_for_peak_search(image: np.ndarray) -> tuple[np.ndarray, floa
     highpass = np.clip(base - background, 0.0, 1.0)
     finite = highpass[np.isfinite(highpass)]
     if finite.size == 0:
-        return np.zeros_like(highpass, dtype=np.float32)
+        return np.zeros_like(highpass, dtype=np.float32), scale_x, scale_y
     threshold = max(float(np.percentile(finite, 97.5)), float(np.median(finite) + 3.0 * np.std(finite)))
     source_mask = (highpass >= threshold).astype(np.uint8) * 255
     density = np.asarray(

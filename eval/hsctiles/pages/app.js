@@ -7,6 +7,7 @@ let showDetect = false;
 let viewInputScaling = false;
 let viewShape = true;
 let viewCenter = false;
+let viewInvert = false;
 let smoothEnabled = false;
 let smoothMode = 'gaussian';
 let smoothSigma = 1.0;
@@ -72,6 +73,7 @@ function selectDataset(datasetId) {
   renderDatasetCards();
   const cfg = activeDatasetOptions();
   if (!cfg) return;
+  document.getElementById('tractLabel').textContent = datasetId === 'ztf' ? 'Field' : 'Tract';
   document.getElementById('tractInput').value = cfg.tract || 'default';
   fillSelect(document.getElementById('patchInput'), cfg.patches || [], cfg.default_patches || []);
   fillSelect(document.getElementById('bandInput'), cfg.bands || [], cfg.default_bands || []);
@@ -98,6 +100,7 @@ function imageUrl(c) {
     params.push(`smooth_sigma=${encodeURIComponent(String(smoothSigma))}`);
     params.push(`smooth_radius=${encodeURIComponent(String(smoothRadius))}`);
   }
+  if (viewInvert) params.push('invert=1');
   if (showDetect) {
     params.push('detect=1');
     params.push(`shape=${viewShape ? 1 : 0}`);
@@ -108,7 +111,7 @@ function imageUrl(c) {
 }
 
 function updateViewMenu() {
-  const states = {inputScaling: viewInputScaling, shape: viewShape, center: viewCenter, smooth: smoothEnabled};
+  const states = {inputScaling: viewInputScaling, shape: viewShape, center: viewCenter, invert: viewInvert, smooth: smoothEnabled};
   for (const item of document.querySelectorAll('.viewItem')) {
     const key = item.dataset.view;
     item.querySelector('.viewCheck').textContent = states[key] ? '✓' : '';
@@ -119,6 +122,7 @@ function resetViewDefaults() {
   viewInputScaling = false;
   viewShape = true;
   viewCenter = false;
+  viewInvert = false;
   smoothEnabled = false;
   updateViewMenu();
 }
@@ -128,6 +132,7 @@ async function toggleViewItem(key) {
   if (key === 'inputScaling') viewInputScaling = !viewInputScaling;
   if (key === 'shape') viewShape = !viewShape;
   if (key === 'center') viewCenter = !viewCenter;
+  if (key === 'invert') viewInvert = !viewInvert;
   if (key === 'smooth') {
     openSmooth();
     return;
@@ -141,7 +146,7 @@ function viewStatusText() {
   const smoothText = smoothEnabled
     ? `${smoothMode} ${smoothMode === 'gaussian' ? `sigma=${smoothSigma}, r=${Math.ceil(2 * smoothSigma)}` : `r=${smoothRadius}`}`
     : 'off';
-  return `View: input scaling=${viewInputScaling ? 'on' : 'off'}, shape=${viewShape ? 'on' : 'off'}, center=${viewCenter ? 'on' : 'off'}, smooth=${smoothText}.`;
+  return `View: input scaling=${viewInputScaling ? 'on' : 'off'}, shape=${viewShape ? 'on' : 'off'}, center=${viewCenter ? 'on' : 'off'}, invert=${viewInvert ? 'on' : 'off'}, smooth=${smoothText}.`;
 }
 
 function candidateCell(c) {
@@ -242,6 +247,16 @@ async function startBrowser() {
   resetViewDefaults();
   await refreshState();
   await loadPage(0);
+}
+
+function viewData() {
+  const cfg = activeDatasetOptions();
+  const label = cfg && cfg.label ? cfg.label : selectedDataset;
+  if (selectedDataset !== 'hsc_image') {
+    alert(`Data quality preview for ${label}: to be implemented`);
+    return;
+  }
+  window.location.href = '/pages/data_quality.html';
 }
 
 async function changePatch() {
@@ -524,6 +539,7 @@ document.getElementById('patchSelect').onchange = () => changePatch().catch(err 
 document.getElementById('saveCsv').onclick = () => saveCsv().catch(err => setStatus(String(err), true));
 document.getElementById('export').onclick = () => exportSelected().catch(err => setStatus(String(err), true));
 document.getElementById('startButton').onclick = () => startBrowser().catch(err => setStatus(String(err), true));
+document.getElementById('viewDataButton').onclick = () => viewData();
 
 (async () => {
   try {

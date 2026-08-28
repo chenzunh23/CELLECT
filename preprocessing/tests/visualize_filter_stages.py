@@ -35,7 +35,11 @@ from astropy.visualization import ZScaleInterval
 from matplotlib.patches import Ellipse, Patch
 
 from preprocessing.bright_ap2 import BrightAp2Config, classify_bright_ap2
-from preprocessing.bright_label import BrightLabelConfig, label_bright_sources
+from preprocessing.bright_label import (
+    BrightLabelConfig,
+    label_bright_sources,
+    unsupervised_seeded_component_centers,
+)
 from preprocessing.image_processing import (
     BrightRegionConfig,
     build_bright_components,
@@ -74,6 +78,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image", type=Path, required=True)
     parser.add_argument("--gaia-fits", type=Path)
     parser.add_argument("--quality-mask-npz", type=Path)
+    parser.add_argument("--hdu", type=int, default=1)
     parser.add_argument("--out-dir", type=Path, default=Path("output/preprocessing_tests/filter_stages"))
     parser.add_argument("--tract", default="9813")
     parser.add_argument("--patch", default="")
@@ -346,7 +351,7 @@ def main() -> int:
     else:
         raise ValueError("provide --refit-csv or pass --run-refit-if-missing")
 
-    image, header = read_fits_image(args.image)
+    image, header = read_fits_image(args.image, hdu=args.hdu)
     display = zscale_image(image)
     geom = compute_kron_ellipse(table, refit_config)
     meas_config = MeasProcessingConfig(
@@ -397,6 +402,58 @@ def main() -> int:
         config=BrightLabelConfig(),
         refit_config=refit_config,
     )
+    seed_components = bright_ap2.component_id[np.asarray(stage.bright_candidate, dtype=bool)]
+    fallback_x, fallback_y, fallback_ids, fallback_component_ids = unsupervised_seeded_component_centers(
+        table,
+        bright_result.labels,
+        components,
+        seed_component_ids=seed_components,
+        catalog_component_ids=seed_components,
+        existing_strict_component_ids=bright_result.strict_center_component_id,
+        min_area=float(BrightLabelConfig().empty_seeded_bright_component_area_min),
+        component_search_radius=int(BrightAp2Config().component_search_radius),
+        refit_config=refit_config,
+    )
+    if fallback_x.size:
+        bright_result.strict_center_x = np.concatenate([bright_result.strict_center_x, fallback_x]).astype(np.float64)
+        bright_result.strict_center_y = np.concatenate([bright_result.strict_center_y, fallback_y]).astype(np.float64)
+        bright_result.strict_center_source_id = np.concatenate([bright_result.strict_center_source_id, fallback_ids]).astype(np.int64)
+        bright_result.strict_center_reason = np.concatenate(
+            [
+                bright_result.strict_center_reason,
+                np.full(fallback_x.shape, "seeded_bright_component_no_supervised_center", dtype=object),
+            ]
+        )
+        bright_result.strict_center_component_id = np.concatenate([bright_result.strict_center_component_id, fallback_component_ids]).astype(np.int32)
+        bright_result.restricted_fallback_component_ids = np.unique(
+            np.concatenate([bright_result.restricted_fallback_component_ids, fallback_component_ids]).astype(np.int32)
+        )
+        for x, y, sid, comp in zip(fallback_x, fallback_y, fallback_ids, fallback_component_ids):
+            bright_result.source_rows.append(
+                {
+                    "source_id": int(sid),
+                    "table_index": -1,
+                    "row_index": -1,
+                    "x": float(x),
+                    "y": float(y),
+                    "output_x": float(x),
+                    "output_y": float(y),
+                    "major": 3.0,
+                    "minor": 3.0,
+                    "theta_deg": 0.0,
+                    "area": math.pi * 9.0,
+                    "axis_ratio": 1.0,
+                    "mag": "",
+                    "class": "added_bright_component_center",
+                    "final_label": "strict_center_only",
+                    "reason": "seeded_bright_component_no_supervised_center",
+                    "component_id": int(comp),
+                    "component_area": "",
+                    "cluster_id": 0,
+                    "cluster_size": 1,
+                    "gaia_source_id": "",
+                }
+            )
 
     fig, axes = plt.subplots(1, 4, figsize=(24, 6), constrained_layout=True)
     for ax, title in zip(

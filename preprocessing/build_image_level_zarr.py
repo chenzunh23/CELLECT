@@ -38,7 +38,11 @@ from astro_data_preprocessing import (
 )
 
 from preprocessing.bright_ap2 import BrightAp2Config, classify_bright_ap2
-from preprocessing.bright_label import BrightLabelConfig, label_bright_sources
+from preprocessing.bright_label import (
+    BrightLabelConfig,
+    label_bright_sources,
+    unsupervised_seeded_component_centers,
+)
 from preprocessing.image_processing import (
     BrightRegionConfig,
     ImageProcessingConfig,
@@ -64,9 +68,12 @@ MASK_PLANES_FOR_STRICT_IGNORE = ("SAT", "BAD", "EDGE", "NO_DATA", "UNMASKEDNAN")
 @dataclass(frozen=True)
 class StoreTask:
     data_root: Path
+    coadd_fits_root: Path
     output_root: Path
     refit_root: Path
     denoised_fits_root: Path
+    coadd_weight_root: Path
+    coadd_lsst_background_root: Path | None
     variant_lsst_background_root: Path | None
     gaia_fits: Path | None
     tract: int
@@ -144,15 +151,78 @@ def _bright_log_a(task: StoreTask) -> float:
     return value if math.isfinite(value) and value > 0.0 else _band_log_a(task.band)
 
 
-def _variant_groups(root: Path, patch: str) -> list[str]:
+def _group_number(group: str | int | None) -> int | None:
+    if group is None:
+        return None
+    text = str(group).strip()
+    if text.startswith("group_"):
+        text = text[6:]
+    try:
+        return int(text)
+    except Exception:
+        return None
+
+
+def _product_patch_dir(root: Path, dataset_source: str, tract: int, band: str, patch: str) -> Path:
+    candidates = [
+        root / str(tract) / band / patch,
+        root / dataset_source / str(tract) / band / patch,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def _variant_groups(root: Path, patch: str, *, band: str | None = None, tract: int | None = None, dataset_source: str | None = None) -> list[str]:
     patch_dir = root / f"patch_{patch.replace(',', '_')}"
     if not patch_dir.exists():
+        old_groups: list[str] = []
+    else:
+        old_groups = [path.name for path in sorted(patch_dir.glob("group_*")) if path.is_dir()]
+    if old_groups or band is None or tract is None or dataset_source is None:
+        return old_groups
+    product_dir = _product_patch_dir(root, str(dataset_source), int(tract), str(band), patch)
+    if not product_dir.exists():
         return []
-    return [path.name for path in sorted(patch_dir.glob("group_*")) if path.is_dir()]
+    groups: set[int] = set()
+    for path in product_dir.glob(f"warp*{band}*{tract}*{patch}*.fits"):
+        group = _group_number(path.stem.rsplit("-", 1)[-1])
+        if group is not None:
+            groups.add(group)
+    return [str(group) for group in sorted(groups)]
 
 
-def _variant_image_path(root: Path, patch: str, group: str, band: str, dataset_source: str) -> Path:
-    return root / f"patch_{patch.replace(',', '_')}" / group / band / f"{dataset_source}.fits"
+def _variant_image_path(root: Path, patch: str, group: str, band: str, dataset_source: str, tract: int | None = None) -> Path:
+    old = root / f"patch_{patch.replace(',', '_')}" / group / band / f"{dataset_source}.fits"
+    if old.exists() or tract is None:
+        return old
+    product_dir = _product_patch_dir(root, dataset_source, int(tract), band, patch)
+    group_num = _group_number(group)
+    if product_dir.exists():
+        matches = sorted(path for path in product_dir.glob(f"warp*{band}*{tract}*{patch}*.fits") if not path.name.startswith("effective_count"))
+        if group_num is not None:
+            matches = [path for path in matches if path.stem.rsplit("-", 1)[-1] == str(group_num)]
+        if matches:
+            return matches[0]
+    return old
+
+
+def _coadd_image_path(root: Path, band: str, tract: int, patch: str) -> Path:
+    official = _band_fits_path(root, band, tract, patch)
+    if official.exists() and not official.name.startswith("effective_count"):
+        return official
+    product_dirs = [
+        root / str(tract) / band / patch,
+        root / "half_coadd" / str(tract) / band / patch,
+    ]
+    for product_dir in product_dirs:
+        if not product_dir.exists():
+            continue
+        matches = sorted(path for path in product_dir.glob(f"warp_half*{band}*{tract}*{patch}*.fits") if not path.name.startswith("effective_count"))
+        if matches:
+            return matches[0]
+    return official
 
 
 def _store_output_path(output_root: Path, patch: str, band: str, dataset_source: str, group: str) -> Path:
@@ -196,16 +266,18 @@ def _read_fits_quality_mask(path: Path, shape: tuple[int, int]) -> np.ndarray:
     if not path.exists():
         return np.zeros(shape, dtype=bool)
     try:
-        with fits.open(path, memmap=True, ignore_missing_end=True) as hdul:
+        with fits.open(path, memmap=False, ignore_missing_end=True) as hdul:
+            image_idx = _find_image_hdu_index(hdul)
+            image = np.asarray(hdul[image_idx].data)
+            image_all_finite = bool(np.isfinite(image).all()) if image.shape == shape else False
             if "MASK" in hdul:
                 hdu = hdul["MASK"]
             else:
-                image_idx = _find_image_hdu_index(hdul)
                 mask_idx = image_idx + 1
                 if mask_idx >= len(hdul) or getattr(hdul[mask_idx], "data", None) is None:
                     return np.zeros(shape, dtype=bool)
                 hdu = hdul[mask_idx]
-            mask = np.asarray(hdu.data)
+            mask = np.asarray(hdu.data, dtype=np.int64)
             if mask.shape != shape:
                 return np.zeros(shape, dtype=bool)
             bits = _mask_plane_bits(hdu.header)
@@ -213,7 +285,10 @@ def _read_fits_quality_mask(path: Path, shape: tuple[int, int]) -> np.ndarray:
             for plane in MASK_PLANES_FOR_STRICT_IGNORE:
                 bit = bits.get(plane)
                 if bit is not None:
-                    out |= (mask.astype(np.int64) & (1 << int(bit))) != 0
+                    plane_mask = (mask & (1 << int(bit))) != 0
+                    if plane == "BAD" and image_all_finite and bool(plane_mask.all()):
+                        continue
+                    out |= plane_mask
             return out
     except Exception:
         return np.zeros(shape, dtype=bool)
@@ -229,8 +304,25 @@ def _read_background_from_det(data_root: Path, band: str, tract: int, patch: str
         return np.zeros(shape, dtype=bool)
 
 
+def _background_group_candidates(group: str | int) -> list[str]:
+    text = str(group)
+    candidates = [text]
+    number = _group_number(text)
+    if number is not None:
+        candidates.extend([f"group_{number:02d}", f"group_{number}", str(number)])
+    elif text.startswith("group_"):
+        number = _group_number(text)
+        if number is not None:
+            candidates.extend([str(number), f"group_{number:02d}"])
+    return list(dict.fromkeys(candidates))
+
+
+def _variant_background_dirs(root: Path, variant: str, tract: int, patch: str, group: str, band: str) -> list[Path]:
+    return [root / variant / str(tract) / patch / candidate / band for candidate in _background_group_candidates(group)]
+
+
 def _variant_background_dir(root: Path, variant: str, tract: int, patch: str, group: str, band: str) -> Path:
-    return root / variant / str(tract) / patch / group / band
+    return _variant_background_dirs(root, variant, tract, patch, group, band)[0]
 
 
 def _read_variant_background(
@@ -246,24 +338,79 @@ def _read_variant_background(
 ) -> np.ndarray | None:
     if root is None:
         return None
-    base = _variant_background_dir(root, variant, tract, patch, group, band)
-    if not base.exists():
-        return None
-    npz = base / "background_mask.npz"
-    if npz.exists():
-        mask = read_background_mask(npz, shape)
-        return np.asarray(mask, dtype=bool)
-    for det in sorted(base.glob("det-*.fits")):
-        try:
-            return _read_det_background_mask(det, shape, origin)
-        except Exception:
+    for base in _variant_background_dirs(root, variant, tract, patch, group, band):
+        if not base.exists():
             continue
+        npz = base / "background_mask.npz"
+        if npz.exists():
+            mask = read_background_mask(npz, shape)
+            return np.asarray(mask, dtype=bool)
+        for det in sorted(base.glob("det-*.fits")):
+            try:
+                return _read_det_background_mask(det, shape, origin)
+            except Exception:
+                continue
+    return None
+
+
+def _read_coadd_lsst_background(
+    *,
+    root: Path | None,
+    tract: int,
+    patch: str,
+    band: str,
+    shape: tuple[int, int],
+    origin: tuple[int, int],
+) -> np.ndarray | None:
+    if root is None:
+        return None
+    for variant in ("coadd", "half_coadd"):
+        background = _read_variant_background(
+            root=root,
+            variant=variant,
+            tract=tract,
+            patch=patch,
+            group="coadd",
+            band=band,
+            shape=shape,
+            origin=origin,
+        )
+        if background is not None:
+            return background
     return None
 
 
 def _background_for_task(task: StoreTask, shape: tuple[int, int], origin: tuple[int, int]) -> np.ndarray:
     coadd = _read_background_from_det(task.data_root, task.band, task.tract, task.patch, shape, origin)
     if task.dataset_source == "coadd":
+        coadd_lsst = _read_coadd_lsst_background(
+            root=task.coadd_lsst_background_root,
+            tract=task.tract,
+            patch=task.patch,
+            band=task.band,
+            shape=shape,
+            origin=origin,
+        )
+        if coadd_lsst is not None:
+            return coadd_lsst
+        if task.coadd_lsst_background_root is not None:
+            tried = []
+            for variant in ("coadd", "half_coadd"):
+                tried.extend(
+                    str(path / "background_mask.npz")
+                    for path in _variant_background_dirs(
+                        task.coadd_lsst_background_root,
+                        variant,
+                        task.tract,
+                        task.patch,
+                        "coadd",
+                        task.band,
+                    )
+                )
+            raise FileNotFoundError(
+                "coadd LSST background not found; tried: "
+                + ", ".join(tried)
+            )
         return coadd
 
     source = str(task.image_variant_background_source).strip().lower()
@@ -287,8 +434,9 @@ def _background_for_task(task: StoreTask, shape: tuple[int, int], origin: tuple[
     if variant is not None:
         return variant
     if source == "variant-lsst" or str(task.missing_variant_background_policy) == "error":
-        expected = (
-            _variant_background_dir(
+        tried = [
+            str(path / "background_mask.npz")
+            for path in _variant_background_dirs(
                 task.variant_lsst_background_root or Path("<variant-lsst-background-root>"),
                 task.dataset_source,
                 task.tract,
@@ -296,9 +444,11 @@ def _background_for_task(task: StoreTask, shape: tuple[int, int], origin: tuple[
                 task.group,
                 task.band,
             )
-            / "background_mask.npz"
+        ]
+        raise FileNotFoundError(
+            "variant LSST background not found; tried: "
+            + ", ".join(tried)
         )
-        raise FileNotFoundError(f"variant LSST background not found: {expected}")
     if str(task.missing_variant_background_policy) == "none":
         return np.zeros(shape, dtype=bool)
     return coadd
@@ -359,9 +509,9 @@ def _classify_patch(task: StoreTask, image: np.ndarray, image_header: fits.Heade
     )
     bright_region, components = build_bright_components(image, config=bright_config)
     quality = _read_fits_quality_mask(
-        _variant_image_path(task.denoised_fits_root, task.patch, task.group, task.band, task.dataset_source)
+        _variant_image_path(task.denoised_fits_root, task.patch, task.group, task.band, task.dataset_source, task.tract)
         if task.dataset_source != "coadd"
-        else _band_fits_path(task.data_root, task.band, task.tract, task.patch),
+        else coadd_image_fits,
         image.shape,
     )
     if not bool(np.any(quality)) and task.dataset_source != "coadd":
@@ -374,12 +524,13 @@ def _classify_patch(task: StoreTask, image: np.ndarray, image_header: fits.Heade
         band=task.band,
         patch=task.patch,
         group=task.group if task.dataset_source != "coadd" else None,
-        image_fits=(coadd_image_fits if task.dataset_source == "coadd" else _variant_image_path(task.denoised_fits_root, task.patch, task.group, task.band, task.dataset_source)),
+        image_fits=(coadd_image_fits if task.dataset_source == "coadd" else _variant_image_path(task.denoised_fits_root, task.patch, task.group, task.band, task.dataset_source, task.tract)),
         coadd_image_fits=coadd_image_fits,
         config=SnrConfig(
             noncoadd_method=task.snr_method,
             missing_noncoadd_policy=task.missing_noncoadd_policy,  # type: ignore[arg-type]
             denoised_fits_root=task.denoised_fits_root,
+            coadd_weight_root=task.coadd_weight_root,
         ),
     )
     ordinary = label_ordinary_sources(
@@ -419,6 +570,37 @@ def _classify_patch(task: StoreTask, image: np.ndarray, image_header: fits.Heade
         ),
         refit_config=RefitConfig(),
     )
+    seed_components = bright_ap2.component_id[np.asarray(stage.bright_candidate, dtype=bool)]
+    fallback_x, fallback_y, fallback_ids, fallback_component_ids = unsupervised_seeded_component_centers(
+        table,
+        bright.labels,
+        components,
+        seed_component_ids=seed_components,
+        catalog_component_ids=seed_components,
+        existing_strict_component_ids=bright.strict_center_component_id,
+        min_area=float(BrightLabelConfig().empty_seeded_bright_component_area_min),
+        component_search_radius=int(BrightAp2Config().component_search_radius),
+        refit_config=RefitConfig(),
+    )
+    if fallback_x.size:
+        bright.strict_center_x = np.concatenate([bright.strict_center_x, fallback_x]).astype(np.float64)
+        bright.strict_center_y = np.concatenate([bright.strict_center_y, fallback_y]).astype(np.float64)
+        bright.strict_center_source_id = np.concatenate([bright.strict_center_source_id, fallback_ids]).astype(np.int64)
+        bright.strict_center_reason = np.concatenate(
+            [
+                bright.strict_center_reason,
+                np.full(fallback_x.shape, "seeded_bright_component_no_supervised_center", dtype=object),
+            ]
+        )
+        bright.strict_center_component_id = np.concatenate([bright.strict_center_component_id, fallback_component_ids]).astype(np.int32)
+        bright.restricted_fallback_component_ids = np.unique(
+            np.concatenate([bright.restricted_fallback_component_ids, fallback_component_ids]).astype(np.int32)
+        )
+        bright.ordinary_ignore_component_ids = np.setdiff1d(
+            np.asarray(bright.ordinary_ignore_component_ids, dtype=np.int32),
+            np.asarray(fallback_component_ids, dtype=np.int32),
+            assume_unique=False,
+        ).astype(np.int32)
     background = _background_for_task(task, image.shape, origin)
     restricted_fallback_mask = None
     if bright.restricted_fallback_component_ids.size and components is not None and np.asarray(components).size:
@@ -426,6 +608,18 @@ def _classify_patch(task: StoreTask, image: np.ndarray, image_header: fits.Heade
         component_ids = component_ids[component_ids > 0]
         if component_ids.size:
             restricted_fallback_mask = np.isin(np.asarray(components, dtype=np.int32), component_ids)
+    ordinary_ignore_mask = None
+    if bright.ordinary_ignore_component_ids.size and components is not None and np.asarray(components).size:
+        component_ids = np.asarray(bright.ordinary_ignore_component_ids, dtype=np.int32)
+        if bright.restricted_fallback_component_ids.size:
+            component_ids = np.setdiff1d(
+                component_ids,
+                np.asarray(bright.restricted_fallback_component_ids, dtype=np.int32),
+                assume_unique=False,
+            ).astype(np.int32)
+        component_ids = component_ids[component_ids > 0]
+        if component_ids.size:
+            ordinary_ignore_mask = np.isin(np.asarray(components, dtype=np.int32), component_ids)
     dense = fill_dense_regions(
         table,
         bright.labels,
@@ -433,6 +627,8 @@ def _classify_patch(task: StoreTask, image: np.ndarray, image_header: fits.Heade
         background_mask=background,
         quality_ignore_mask=quality,
         restricted_fallback_mask=restricted_fallback_mask,
+        ordinary_ignore_mask=ordinary_ignore_mask,
+        ordinary_ignore_source_mask=bright.ordinary_ignore_source_mask,
         refit_config=RefitConfig(),
     )
     geom = compute_kron_ellipse(table, RefitConfig())
@@ -576,11 +772,11 @@ def _tile_targets(labels: PatchLabels, spec, origin: tuple[int, int]) -> dict[st
 
 
 def _build_store(task: StoreTask) -> dict[str, object]:
-    coadd_image_fits = _band_fits_path(task.data_root, task.band, task.tract, task.patch)
+    coadd_image_fits = _coadd_image_path(task.coadd_fits_root, task.band, task.tract, task.patch)
     if task.dataset_source == "coadd":
         image_fits = coadd_image_fits
     else:
-        image_fits = _variant_image_path(task.denoised_fits_root, task.patch, task.group, task.band, task.dataset_source)
+        image_fits = _variant_image_path(task.denoised_fits_root, task.patch, task.group, task.band, task.dataset_source, task.tract)
     if not image_fits.exists():
         raise FileNotFoundError(f"image FITS not found: {image_fits}")
     image, header, origin = _read_image_header_origin(image_fits)
@@ -729,6 +925,7 @@ def _build_store(task: StoreTask) -> dict[str, object]:
             "cluster_centroid_match_pixels": float(task.cluster_centroid_match_pixels),
             "gaia_bright_mag_threshold": float(task.gaia_bright_mag_threshold),
             "image_variant_background_source": task.image_variant_background_source,
+            "coadd_lsst_background_root": str(task.coadd_lsst_background_root) if task.coadd_lsst_background_root is not None else "",
             "variant_lsst_background_root": str(task.variant_lsst_background_root) if task.variant_lsst_background_root is not None else "",
             "missing_variant_background_policy": task.missing_variant_background_policy,
             "tile_size": int(task.tile_size),
@@ -766,9 +963,16 @@ def _parse_patches(values: Sequence[str]) -> list[str]:
 def _make_tasks(args: argparse.Namespace) -> list[StoreTask]:
     patches = _parse_patches(args.patches)
     data_root = Path(args.data_root).expanduser().resolve()
+    coadd_fits_root = Path(args.coadd_fits_root).expanduser().resolve() if args.coadd_fits_root else data_root
     output_root = Path(args.output_root).expanduser().resolve()
     refit_root = Path(args.refit_root).expanduser().resolve()
     denoised_root = Path(args.denoised_fits_root).expanduser().resolve()
+    coadd_weight_root = Path(args.coadd_weight_root).expanduser().resolve()
+    coadd_background_root = (
+        Path(args.coadd_lsst_background_root).expanduser().resolve()
+        if args.coadd_lsst_background_root
+        else None
+    )
     variant_background_root = (
         Path(args.variant_lsst_background_root).expanduser().resolve()
         if args.variant_lsst_background_root
@@ -785,7 +989,7 @@ def _make_tasks(args: argparse.Namespace) -> list[StoreTask]:
             image_lupton_q = float(args.lupton_q) if args.lupton_q is not None else float(args.image_lupton_q)
             bright_lupton_q = float(args.lupton_q) if args.lupton_q is not None else float(args.bright_lupton_q)
             if "coadd" in args.dataset_sources:
-                coadd_path = _band_fits_path(data_root, band, int(args.tract), patch)
+                coadd_path = _coadd_image_path(coadd_fits_root, band, int(args.tract), patch)
                 if not coadd_path.exists():
                     if args.missing_image_policy == "error":
                         raise FileNotFoundError(f"coadd image missing: {coadd_path}")
@@ -794,9 +998,12 @@ def _make_tasks(args: argparse.Namespace) -> list[StoreTask]:
                     tasks.append(
                         StoreTask(
                             data_root=data_root,
+                            coadd_fits_root=coadd_fits_root,
                             output_root=output_root,
                             refit_root=refit_root,
                             denoised_fits_root=denoised_root,
+                            coadd_weight_root=coadd_weight_root,
+                            coadd_lsst_background_root=coadd_background_root,
                             variant_lsst_background_root=variant_background_root,
                             gaia_fits=gaia,
                             tract=int(args.tract),
@@ -835,14 +1042,14 @@ def _make_tasks(args: argparse.Namespace) -> list[StoreTask]:
                             missing_variant_background_policy=str(args.missing_variant_background_policy),
                         )
                     )
-            variant_groups = list(args.groups)
-            if not variant_groups or variant_groups == ["all"]:
-                variant_groups = _variant_groups(denoised_root, patch)
             for dataset_source in args.dataset_sources:
                 if dataset_source == "coadd":
                     continue
+                variant_groups = list(args.groups)
+                if not variant_groups or variant_groups == ["all"]:
+                    variant_groups = _variant_groups(denoised_root, patch, band=band, tract=int(args.tract), dataset_source=dataset_source)
                 for group in variant_groups:
-                    image_path = _variant_image_path(denoised_root, patch, group, band, dataset_source)
+                    image_path = _variant_image_path(denoised_root, patch, group, band, dataset_source, int(args.tract))
                     if not image_path.exists():
                         if args.missing_image_policy == "error":
                             raise FileNotFoundError(f"variant image missing: {image_path}")
@@ -854,9 +1061,12 @@ def _make_tasks(args: argparse.Namespace) -> list[StoreTask]:
                     tasks.append(
                         StoreTask(
                             data_root=data_root,
+                            coadd_fits_root=coadd_fits_root,
                             output_root=output_root,
                             refit_root=refit_root,
                             denoised_fits_root=denoised_root,
+                            coadd_weight_root=coadd_weight_root,
+                            coadd_lsst_background_root=coadd_background_root,
                             variant_lsst_background_root=variant_background_root,
                             gaia_fits=gaia,
                             tract=int(args.tract),
@@ -901,9 +1111,23 @@ def _make_tasks(args: argparse.Namespace) -> list[StoreTask]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", default="/data/shared/Subaru")
+    parser.add_argument(
+        "--coadd-fits-root",
+        default=None,
+        help="Optional FITS root for coadd images. Catalogs/backgrounds still come from --data-root.",
+    )
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--refit-root", default="/data/czh23/refit")
     parser.add_argument("--denoised-fits-root", default="/data/czh23/denoised_fits")
+    parser.add_argument("--coadd-weight-root", default=str(SnrConfig().coadd_weight_root))
+    parser.add_argument(
+        "--coadd-lsst-background-root",
+        default=None,
+        help=(
+            "Optional root for coadd/half-coadd LSST detection backgrounds. "
+            "Supported layout: <root>/{coadd,half_coadd}/<tract>/<patch>/coadd/<band>/background_mask.npz."
+        ),
+    )
     parser.add_argument(
         "--variant-lsst-background-root",
         default=None,

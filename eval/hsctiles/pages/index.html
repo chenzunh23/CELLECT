@@ -27,6 +27,7 @@
             <button class="viewItem" data-view="inputScaling"><span class="viewCheck"></span><span>Input Scaling</span></button>
             <button class="viewItem" data-view="shape"><span class="viewCheck"></span><span>Shape</span></button>
             <button class="viewItem" data-view="center"><span class="viewCheck"></span><span>Center</span></button>
+            <button class="viewItem" data-view="invert"><span class="viewCheck"></span><span>Invert</span></button>
             <button class="viewItem" data-view="smooth"><span class="viewCheck"></span><span>Smooth</span></button>
           </div>
         </div>
@@ -42,7 +43,7 @@
       <div class="datasetCards" id="datasetCards"></div>
       <div class="formGrid">
         <div class="field">
-          <label for="tractInput">Tract</label>
+          <label id="tractLabel" for="tractInput">Tract</label>
           <input id="tractInput" value="9813">
         </div>
         <div class="field">
@@ -72,6 +73,7 @@
         </div>
       </div>
       <div class="menuActions">
+        <button class="secondary" id="viewDataButton">View data</button>
         <button class="primary" id="startButton">Go</button>
       </div>
     </section>

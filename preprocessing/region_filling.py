@@ -40,6 +40,8 @@ def fill_dense_regions(
     background_mask: np.ndarray | None = None,
     quality_ignore_mask: np.ndarray | None = None,
     restricted_fallback_mask: np.ndarray | None = None,
+    ordinary_ignore_mask: np.ndarray | None = None,
+    ordinary_ignore_source_mask: np.ndarray | None = None,
     config: RegionFillingConfig = RegionFillingConfig(),
     refit_config: RefitConfig = RefitConfig(),
 ) -> np.ndarray:
@@ -67,8 +69,30 @@ def fill_dense_regions(
             | (dense == int(DenseLabel.STRICT_IGNORE))
         )
         dense[fallback & replaceable] = int(DenseLabel.RESTRICTED_BRIGHT_REGION)
-
+    if ordinary_ignore_mask is not None:
+        ignore = np.asarray(ordinary_ignore_mask, dtype=bool)
+        replaceable = (
+            (dense == int(DenseLabel.ORDINARY_IGNORE))
+            | (dense == int(DenseLabel.BACKGROUND))
+            | (dense == int(DenseLabel.RESTRICTED_BRIGHT_REGION))
+        )
+        dense[ignore & replaceable] = int(DenseLabel.ORDINARY_IGNORE)
     geom = compute_kron_ellipse(table, refit_config)
+    if ordinary_ignore_source_mask is not None:
+        source_mask = np.asarray(ordinary_ignore_source_mask, dtype=bool)
+        source_mask &= labels.mask(SourceClass.ORDINARY_IGNORE)
+        for idx in np.flatnonzero(source_mask):
+            if not np.isfinite(geom.major[idx]):
+                continue
+            paint_ellipse(
+                dense,
+                float(geom.x[idx]),
+                float(geom.y[idx]),
+                float(geom.major[idx]),
+                float(geom.minor[idx]),
+                float(geom.theta[idx]),
+                int(DenseLabel.ORDINARY_IGNORE),
+            )
     class_by_label = {dense_label: source_class for source_class, dense_label in SOURCE_TO_DENSE.items()}
     paint_order = [label for label in reversed(config.class_priority) if label not in {DenseLabel.ORDINARY_IGNORE, DenseLabel.BACKGROUND}]
     for dense_label in paint_order:

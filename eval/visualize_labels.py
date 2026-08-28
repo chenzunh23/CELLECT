@@ -38,6 +38,7 @@ from eval.eval_utils import (
     draw_points,
     input_channel_display_limits,
     label_mask_overlay,
+    normalize_group_name,
     read_fits_image,
     read_zarr_sample,
     resolve_zarr_sample,
@@ -47,10 +48,12 @@ from eval.eval_utils import (
     save_png,
     source_rows_from_zarr,
     strict_centers_from_zarr,
+    tile_name_matches,
     write_reg,
     zarr_sample_group,
     zscale_rgb,
 )
+from astro_train_zarr_data import PatchZarrReader, discover_zarr_image_records
 
 
 EXTERNAL_SOURCE_COLOR = "#a020f0"
@@ -85,6 +88,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fits-hdu", type=int, default=None)
     p.add_argument("--out-dir", type=Path, default=Path("output/eval_visualizations/labels"))
     p.add_argument("--png-scale", type=int, default=1)
+    p.add_argument(
+        "--confidence-negative-overlay",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Also visualize pixels used as confidence negatives: confidence == 0 and confidence_weight > 0.",
+    )
+    p.add_argument(
+        "--confidence-negative-clear-overlay",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Visualize confidence negatives by leaving them clear and covering all other pixels.",
+    )
+    p.add_argument(
+        "--all-samples",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="With --confidence-negative-overlay and --root, write one confidence-negative PNG for every matching sample.",
+    )
+    p.add_argument("--negative-alpha", type=float, default=0.70)
     return p.parse_args()
 
 
@@ -188,6 +210,130 @@ def _source_shapes_overlay(
     rgba = np.asarray(canvas.buffer_rgba(), dtype=np.uint8)
     plt.close(fig)
     return np.flipud(rgba[..., :3]).astype(np.float32) / 255.0
+
+
+def _confidence_negative_mask(sample: dict[str, np.ndarray]) -> np.ndarray:
+    confidence = np.asarray(sample["confidence"], dtype=np.uint8)
+    weight = np.asarray(sample["confidence_weight"], dtype=np.float32)
+    return (confidence == 0) & np.isfinite(weight) & (weight > 0.0)
+
+
+def _confidence_negative_overlay(image: np.ndarray, negative: np.ndarray, *, alpha: float) -> np.ndarray:
+    rgb = zscale_rgb(image)
+    mask = np.asarray(negative, dtype=bool)
+    color = np.asarray((1.0, 0.58, 0.0), dtype=np.float32)
+    if bool(mask.any()):
+        rgb[mask] = (1.0 - float(alpha)) * rgb[mask] + float(alpha) * color
+    return rgb
+
+
+def _confidence_negative_clear_overlay(image: np.ndarray, negative: np.ndarray, *, alpha: float) -> np.ndarray:
+    rgb = zscale_rgb(image)
+    cover = ~np.asarray(negative, dtype=bool)
+    color = np.asarray((0.10, 0.36, 0.90), dtype=np.float32)
+    if bool(cover.any()):
+        rgb[cover] = (1.0 - float(alpha)) * rgb[cover] + float(alpha) * color
+    return rgb
+
+
+def _save_confidence_negative_plot(
+    path: Path,
+    image: np.ndarray,
+    sample: dict[str, np.ndarray],
+    *,
+    title: str,
+    alpha: float,
+    clear_negative: bool = False,
+) -> None:
+    negative = _confidence_negative_mask(sample)
+    overlay = (
+        _confidence_negative_clear_overlay(image, negative, alpha=alpha)
+        if bool(clear_negative)
+        else _confidence_negative_overlay(image, negative, alpha=alpha)
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(5.2, 5.2), dpi=150)
+    ax.imshow(overlay, origin="lower", interpolation="nearest")
+    total = int(negative.size)
+    count = int(np.count_nonzero(negative))
+    frac = 100.0 * float(count) / max(total, 1)
+    mode = "negative clear; others covered" if bool(clear_negative) else "negative overlay"
+    ax.set_title(f"{title}\n{mode}: {count}/{total} ({frac:.1f}%)", fontsize=9)
+    patch = mpatches.Patch(
+        color=(0.10, 0.36, 0.90) if bool(clear_negative) else (1.0, 0.58, 0.0),
+        label="non-negative covered" if bool(clear_negative) else "confidence negative",
+    )
+    ax.legend(handles=[patch], loc="lower right", fontsize=7, framealpha=0.75)
+    ax.set_axis_off()
+    fig.savefig(path, bbox_inches="tight", pad_inches=0.03)
+    plt.close(fig)
+
+
+def _parse_zarr_uri(uri: str) -> tuple[Path, int]:
+    if not str(uri).startswith("zarr://") or "#" not in str(uri):
+        raise ValueError(f"invalid zarr URI: {uri}")
+    store_s, idx_s = str(uri)[len("zarr://") :].rsplit("#", 1)
+    return Path(store_s), int(idx_s)
+
+
+def _safe_stem(text: object) -> str:
+    return str(text).replace(",", "_").replace("/", "_").replace(" ", "_")
+
+
+def _run_all_confidence_negative_overlays(args: argparse.Namespace, dataset_source: str | None) -> list[Path]:
+    if args.root is None:
+        raise ValueError("--all-samples requires --root")
+    if not args.band:
+        raise ValueError("--all-samples requires --band")
+    effective_group = None if dataset_source == "coadd" else normalize_group_name(args.group)
+    records = discover_zarr_image_records(args.root.expanduser().resolve(), bands=[args.band])
+    outputs: list[Path] = []
+    readers: dict[Path, PatchZarrReader] = {}
+    for rec in records:
+        rec_patch = str(rec.patch).split("__", 1)[0]
+        if args.patch and rec.patch != args.patch and rec_patch != args.patch:
+            continue
+        if dataset_source and rec.dataset_source != dataset_source:
+            continue
+        if args.tile_name and not tile_name_matches(rec.tile_name, args.tile_name):
+            continue
+        store, sample_idx = _parse_zarr_uri(rec.image_paths[0])
+        reader = readers.get(store)
+        if reader is None:
+            reader = PatchZarrReader(store)
+            readers[store] = reader
+        group_name = zarr_sample_group(reader, sample_idx)
+        if effective_group is not None and group_name != effective_group:
+            continue
+        attrs = dict(reader.attrs)
+        bands = list(attrs.get("bands", []))
+        band_idx = bands.index(args.band) if args.band in bands else 0
+        sample = read_zarr_sample(reader, sample_idx, band_idx)
+        image = np.asarray(sample["display_image"], dtype=np.float32)
+        dataset = str(rec.dataset_source or attrs.get("dataset_source", dataset_source or "zarr"))
+        patch_name = str(rec.patch or attrs.get("patch", args.patch or store.stem)).split("__", 1)[0]
+        group_part = f"_{group_name}" if group_name else ""
+        out_dir = args.out_dir.expanduser().resolve() / "confidence_negative_samples" / patch_name / str(args.band)
+        stem = (
+            f"{_safe_stem(dataset)}{_safe_stem(group_part)}_"
+            f"{_safe_stem(patch_name)}_{_safe_stem(args.band)}_"
+            f"{_safe_stem(rec.tile_name)}_sample{sample_idx:05d}"
+        )
+        suffix = "confidence_negative_clear_overlay" if bool(args.confidence_negative_clear_overlay) else "confidence_negative_overlay"
+        out_path = out_dir / f"{stem}_{suffix}.png"
+        title = f"{dataset}{group_part} {patch_name} {args.band} {rec.tile_name}"
+        _save_confidence_negative_plot(
+            out_path,
+            image,
+            sample,
+            title=title,
+            alpha=float(args.negative_alpha),
+            clear_negative=bool(args.confidence_negative_clear_overlay),
+        )
+        outputs.append(out_path)
+    if not outputs:
+        raise RuntimeError("no matching samples for confidence-negative visualization")
+    return outputs
 
 
 def _panel(
@@ -348,6 +494,23 @@ def _run_one(args: argparse.Namespace, dataset_source: str | None) -> Path:
         draw_points(image, all_centers),
         scale=args.png_scale,
     )
+    if bool(args.confidence_negative_overlay):
+        _save_confidence_negative_plot(
+            out_dir / f"{out_stem}_confidence_negative_overlay.png",
+            image,
+            sample,
+            title=f"{dataset}{group_part} {patch_name} {band_name} sample {sample_idx}",
+            alpha=float(args.negative_alpha),
+        )
+    if bool(args.confidence_negative_clear_overlay):
+        _save_confidence_negative_plot(
+            out_dir / f"{out_stem}_confidence_negative_clear_overlay.png",
+            image,
+            sample,
+            title=f"{dataset}{group_part} {patch_name} {band_name} sample {sample_idx}",
+            alpha=float(args.negative_alpha),
+            clear_negative=True,
+        )
     _panel(out_dir / f"{out_stem}_panel.png", image, pu, conf, sources, strict_centers)
     _write_counts_csv(
         out_dir / f"{out_stem}_label_counts.csv",
@@ -397,8 +560,14 @@ def main() -> int:
     if args.zarr_store is not None and args.dataset_source:
         raise ValueError("--dataset-source selection is only used with --root; direct --zarr-store already selects one dataset")
     for dataset_source in _dataset_sources(args.dataset_source):
-        out_dirs.append(_run_one(args, dataset_source))
-    for out_dir in out_dirs:
+        if bool(args.all_samples):
+            if not (bool(args.confidence_negative_overlay) or bool(args.confidence_negative_clear_overlay)):
+                raise ValueError("--all-samples currently requires --confidence-negative-overlay or --confidence-negative-clear-overlay")
+            paths = _run_all_confidence_negative_overlays(args, dataset_source)
+            out_dirs.extend(path.parent for path in paths)
+        else:
+            out_dirs.append(_run_one(args, dataset_source))
+    for out_dir in sorted(set(out_dirs)):
         print(out_dir)
     return 0
 

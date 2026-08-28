@@ -298,10 +298,96 @@ img {
   justify-content: flex-end;
   gap: 10px;
 }
+.qualityPage {
+  background: #111316;
+  color: #e7e9ec;
+}
+.qualityPage header {
+  background: #16191d;
+  border-bottom-color: #333941;
+}
+.qualityMain {
+  display: grid;
+  grid-template-columns: minmax(720px, 1fr) 330px;
+  gap: 14px;
+}
+.qualityViewer,
+.qualitySide {
+  background: #1a1e22;
+  border: 1px solid #333941;
+  border-radius: 8px;
+  padding: 12px;
+}
+.qualityToolbar,
+.qualityPages,
+.legend {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+  margin-bottom: 10px;
+}
+.qualityToolbar label,
+.legend {
+  color: #9aa4b0;
+  font-size: 13px;
+}
+.qualityToolbar select,
+.qualityToolbar button,
+.qualityPage button {
+  background: #22272e;
+  border-color: #404853;
+  color: #e7e9ec;
+}
+.qualityPages button.active {
+  background: #174c78;
+  border-color: #4ba7ec;
+}
+.qualityImageWrap {
+  width: 100%;
+  overflow: auto;
+}
+.qualityImageWrap img {
+  max-width: 100%;
+  width: auto;
+  height: auto;
+  background: #08090a;
+  border: 1px solid #303640;
+}
+.qualitySide h2 {
+  font-size: 14px;
+  margin: 12px 0 8px;
+}
+.dropList {
+  margin: 0;
+  max-height: 55vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  color: #d9dee5;
+  background: #121416;
+  border: 1px solid #303640;
+  border-radius: 6px;
+  padding: 10px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.swatch {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+  margin-right: 4px;
+  vertical-align: -2px;
+}
+.swatch.red { background: #e53935; }
+.swatch.yellow { background: #f5dc23; }
+.swatch.orange { background: #ff7d14; }
+.swatch.darkred { background: #730a18; }
 .hidden { display: none !important; }
 @media (max-width: 980px) {
   .datasetCards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .formGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .searchRow { grid-template-columns: 1fr 1fr; }
   .searchRow label, .searchRow button { grid-column: span 2; }
+  .qualityMain { grid-template-columns: 1fr; }
 }
