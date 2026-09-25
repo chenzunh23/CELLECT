@@ -63,12 +63,15 @@ class SamCellect2D(nn.Module):
         zscale_cache: Optional[Tensor] = None,
         input_is_preprocessed: bool = False,
         processing_ids: Optional[Tensor] = None,
+        psf_stamps: Optional[Tensor] = None,
+        psf_native_sizes: Optional[Tensor] = None,
     ) -> Dict[str, Tensor]:
         encoded = self.encoder(
             x,
             zscale_cache=zscale_cache,
             input_is_preprocessed=input_is_preprocessed,
             return_input=True,
+            psf_stamps=psf_stamps,
         )
         features = encoded["features"]
         images = encoded["preprocessed_images"]
@@ -77,6 +80,8 @@ class SamCellect2D(nn.Module):
             images=images,
             output_size=tuple(x.shape[-2:]),
             processing_ids=processing_ids,
+            psf_stamps=psf_stamps,
+            psf_native_sizes=psf_native_sizes,
         )
         outputs["image_embeddings"] = features
         if "style_logit" in encoded:
@@ -202,6 +207,12 @@ def build_sam_cellect2d(
     style_prompt_layers: Sequence[int] = (2, 5, 8),
     style_adapter_dim: int = 32,
     style_router_temperature: float = 1.0,
+    psf_encoder_injection: str = "none",
+    psf_hidden_dim: int = 32,
+    psf_num_heads: int = 8,
+    psf_decoder_stages: Sequence[str] = (),
+    psf_depthwise_min_kernel_size: int = 3,
+    psf_depthwise_max_kernel_size: Optional[int] = None,
     candidate_count: int = 5,
     shape_feature_dim: int = 6,
     enable_matchers: bool = False,
@@ -212,6 +223,12 @@ def build_sam_cellect2d(
     astro_preprocess_z_clip: Optional[Tuple[float, float]] = None,
     dynamic_image_size: bool = False,
 ) -> SamCellect2D:
+    psf_encoder_injection = str(psf_encoder_injection)
+    if psf_encoder_injection not in {"none", "pre_neck", "post_neck", "both"}:
+        raise ValueError(
+            "psf_encoder_injection must be one of 'none', 'pre_neck', 'post_neck', or 'both', "
+            f"got {psf_encoder_injection!r}"
+        )
     encoder = build_per_band_sam_encoder(
         model_type,
         checkpoint=checkpoint,
@@ -229,6 +246,10 @@ def build_sam_cellect2d(
         style_adapter_dim=style_adapter_dim,
         style_router_temperature=style_router_temperature,
         dynamic_image_size=dynamic_image_size,
+        psf_pre_neck=psf_encoder_injection in {"pre_neck", "both"},
+        psf_post_neck=psf_encoder_injection in {"post_neck", "both"},
+        psf_hidden_dim=int(psf_hidden_dim),
+        psf_num_heads=int(psf_num_heads),
     )
     decoder = SamCellectDecoder(
         in_channels=256,
@@ -241,6 +262,9 @@ def build_sam_cellect2d(
         cen_input_image=cen_input_image,
         cen_width=cen_width,
         use_denoised_film=decoder_denoised_film,
+        psf_depthwise_stages=tuple(psf_decoder_stages),
+        psf_depthwise_min_kernel_size=int(psf_depthwise_min_kernel_size),
+        psf_depthwise_max_kernel_size=psf_depthwise_max_kernel_size,
     )
     model = SamCellect2D(
         encoder,

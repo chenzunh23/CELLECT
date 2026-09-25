@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "definition_id": "jwst_nominal_fwhm_confidence_v1",
+  "mode": "psf-matched",
+  "definition_date": "2026-09-23",
+  "source": "Historical nominal lookup table from preprocessing/utils/psf.py; not a uniform official-table column and not coadd measurements",
+  "nominal_fwhm_arcsec": {
+    "F070W": 0.024,
+    "F090W": 0.031,
+    "F115W": 0.04,
+    "F140M": 0.048,
+    "F150W": 0.05,
+    "F162M": 0.054,
+    "F182M": 0.06,
+    "F200W": 0.066,
+    "F210M": 0.069,
+    "F250M": 0.082,
+    "F277W": 0.091,
+    "F300M": 0.097,
+    "F335M": 0.109,
+    "F356W": 0.115,
+    "F360M": 0.117,
+    "F410M": 0.133,
+    "F430M": 0.14,
+    "F444W": 0.145,
+    "F460M": 0.15,
+    "F480M": 0.157
+  },
+  "default_clip_pixels": [
+    1.6,
+    8.0
+  ],
+  "level_radius_factors": {
+    "3": 0.5,
+    "2": 0.75,
+    "1": 1.25
+  },
+  "level4": "one nearest pixel",
+  "nearest_xy": "floor(source_xy + 0.5)",
+  "distance": "euclidean",
+  "merge": "pixelwise maximum",
+  "hsc_auto": "original Manhattan; unaffected"
+}

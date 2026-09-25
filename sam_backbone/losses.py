@@ -10,6 +10,8 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from utils.train_ops_utils import flatten_per_band_outputs as _flatten_per_band_outputs
+from .mask_supervision import (instance_prompts, combine_prompts, partial_targets,
+                               partial_bce_dice, area_ratio_penalty)
 
 MaskTimingFn = Callable[[str, float, Dict[str, float]], float]
 
@@ -186,6 +188,7 @@ def _zero_mask_losses(anchor: Tensor) -> Dict[str, Tensor]:
         "prompts": zero,
         "gt_prompts": zero,
         "pred_prompts": zero,
+        "supervised_prompts": zero,
     }
 
 
@@ -220,6 +223,7 @@ def _build_gt_prompt_tensors(
     prompt_batch: List[Tensor] = []
     centers_all: List[Tensor] = []
     shapes_all: List[Tensor] = []
+    ids_all: List[Tensor] = []
     weights_all: List[Tensor] = []
     band_centers = batch["band_centers"]  # type: ignore[index]
     band_shape = batch["band_shape"].to(device=device, dtype=torch.float32)  # type: ignore[union-attr]
@@ -229,12 +233,23 @@ def _build_gt_prompt_tensors(
             centers = band_centers[b][band].to(device=device, dtype=torch.float32)
             if centers.numel() == 0:
                 continue
+            ids = batch.get("band_ids")
+            ids = ids[b][band].to(device=device) if ids is not None else torch.full((len(centers),), -1, device=device)
             keep_count = _prompt_sample_limit(centers.shape[0], int(max_gt_per_sample), float(sample_fraction))
-            centers = _random_subset_rows(centers, keep_count)
+            chosen = _random_subset_rows(torch.arange(len(centers), device=device), keep_count)
+            centers, ids = centers[chosen], ids[chosen]
             if centers.numel() == 0:
                 continue
             flat_idx = b * band_count + band
             shapes = _sample_chw_nearest(band_shape[b, band], centers)
+            # Dense shape pixels can belong to a different overlapping source.
+            if "band_shape_source_ids" in batch:
+                shape_ids = batch["band_shape_source_ids"][b][band].tolist()
+                by_id = {int(sid): j for j, sid in enumerate(shape_ids)}
+                values = batch["band_shape_source_values"][b][band].to(device=device)
+                for j, sid in enumerate(ids.tolist()):
+                    if int(sid) in by_id:
+                        shapes[j] = values[by_id[int(sid)]]
             center_only = _sample_hw_nearest(band_center_only[b, band], centers).to(dtype=torch.float32)
             weights = torch.where(
                 center_only > 0,
@@ -244,6 +259,7 @@ def _build_gt_prompt_tensors(
             prompt_batch.append(torch.full((centers.shape[0],), flat_idx, device=device, dtype=torch.long))
             centers_all.append(centers)
             shapes_all.append(shapes)
+            ids_all.append(ids)
             weights_all.append(weights)
     if not centers_all:
         return None
@@ -255,6 +271,7 @@ def _build_gt_prompt_tensors(
         "prompt_shapes": shapes,
         "target_shapes": shapes,
         "weights": torch.cat(weights_all, dim=0),
+        "source_ids": torch.cat(ids_all, dim=0),
         "mask_target_weights": centers.new_ones((centers.shape[0],)),
     }
 
@@ -355,6 +372,7 @@ def _sam_mask_loss_for_prompts(
     ellipse_sigma: float,
     debug_timing: Optional[MaskTimingFn] = None,
     timing_prefix: str = "mask",
+    batch: Optional[Dict[str, object]] = None,
 ) -> Dict[str, Tensor]:
     if prompts["centers"].numel() == 0:
         return _zero_mask_losses(outputs["confidence"])
@@ -412,7 +430,7 @@ def _sam_mask_loss_for_prompts(
     weight_stability = float(getattr(weights, "mask_stability", 0.1)) > 0.0
 
     needs_prob = weight_dice or weight_centroid or weight_outside or weight_min_area or weight_max_area
-    needs_target = weight_dice or weight_bce or weight_outside
+    needs_target = weight_outside or weight_min_area
     prob = torch.sigmoid(logits) if needs_prob else None
     t_phase = _mark_mask_timing(
         debug_timing,
@@ -424,42 +442,41 @@ def _sam_mask_loss_for_prompts(
         mask_w=float(mw),
     )
     prompt_weights = prompts["weights"].to(dtype=logits.dtype).clamp_min(0.0)
-    mask_target_weights = prompts.get("mask_target_weights")
-    if mask_target_weights is None:
-        mask_target_weights = torch.ones_like(prompt_weights)
-    else:
-        mask_target_weights = mask_target_weights.to(device=logits.device, dtype=logits.dtype).clamp(0.0, 1.0)
     valid_prompt = prompt_weights > 0
-    zero = logits.new_zeros(())
+    zero = logits.sum() * 0.0
+    positive, negative, valid, instance_quality, labelled = partial_targets(
+        prompts, batch, image_hw=image_hw, mask_hw=(mh, mw), device=logits.device)
+    # Probability outside the observed image/valid coverage has no area or moment.
+    if prob is not None:
+        prob = prob * valid[:, None]
+    outside_scale = float(getattr(weights, "mask_outside_kron_scale", 1.5))
+    if outside_scale <= 0:
+        raise ValueError("mask_outside_kron_scale must be positive")
     target = (
         _ellipse_targets_lowres(
             prompts["centers"],
             prompts["target_shapes"].detach(),
             mask_hw=(mh, mw),
             image_hw=image_hw,
-            ellipse_sigma=ellipse_sigma,
+            ellipse_sigma=ellipse_sigma * outside_scale,
         )
         if needs_target
         else None
     )
     t_phase = _mark_mask_timing(debug_timing, f"{timing_prefix}.target", t_phase, needs_target=float(needs_target))
 
-    if weight_bce:
-        assert target is not None
-        bce = F.binary_cross_entropy_with_logits(
-            logits,
-            target[:, None, :, :].expand(-1, int(logits.shape[1]), -1, -1),
-            reduction="none",
-        ).mean(dim=(-1, -2))
+    if weight_bce or weight_dice:
+        bce, dice, bce_eligible = partial_bce_dice(logits, positive, negative, labelled)
     else:
-        bce = logits.new_zeros((n, int(logits.shape[1])))
+        bce = dice = logits.new_zeros((n, int(logits.shape[1])))
+        bce_eligible = torch.zeros(n, device=logits.device, dtype=torch.bool)
     t_phase = _mark_mask_timing(debug_timing, f"{timing_prefix}.bce", t_phase, enabled=float(weight_bce))
 
     prob_sum = prob.sum(dim=(-1, -2)) if needs_prob and prob is not None else None
     t_phase = _mark_mask_timing(debug_timing, f"{timing_prefix}.prob_sum", t_phase, enabled=float(needs_prob))
 
     target_inter = None
-    if target is not None and prob is not None and (weight_dice or weight_outside):
+    if target is not None and prob is not None and weight_outside:
         target_expanded = target[:, None, :, :]
         target_inter = (prob * target_expanded).sum(dim=(-1, -2))
     t_phase = _mark_mask_timing(
@@ -469,13 +486,6 @@ def _sam_mask_loss_for_prompts(
         enabled=float(target is not None and prob is not None and (weight_dice or weight_outside)),
     )
 
-    if weight_dice:
-        assert target is not None and prob is not None and prob_sum is not None and target_inter is not None
-        target_expanded = target[:, None, :, :]
-        denom = prob_sum + target_expanded.sum(dim=(-1, -2))
-        dice = 1.0 - (2.0 * target_inter + 1.0) / (denom + 1.0)
-    else:
-        dice = logits.new_zeros((n, int(logits.shape[1])))
     t_phase = _mark_mask_timing(debug_timing, f"{timing_prefix}.dice", t_phase, enabled=float(weight_dice))
 
     if weight_outside:
@@ -500,16 +510,25 @@ def _sam_mask_loss_for_prompts(
 
     if weight_min_area:
         assert area_full is not None
-        lower = float(getattr(weights, "mask_area_ratio_lower", 0.15))
-        upper = float(getattr(weights, "mask_area_ratio_upper", 1.05))
-        if lower < 0.0 or upper <= lower:
-            raise ValueError("mask_area_ratio_lower must be >= 0 and mask_area_ratio_upper must be greater than lower.")
+        lower = float(getattr(weights, "mask_area_ratio_lower", 0.05))
+        upper = float(getattr(weights, "mask_area_ratio_upper", 2.0))
         target_shapes = prompts["target_shapes"].to(device=logits.device, dtype=logits.dtype).detach()
         shape_major = target_shapes[:, 0].abs().clamp_min(1.0) * float(ellipse_sigma)
         shape_minor = target_shapes[:, 1].abs().clamp_min(1.0) * float(ellipse_sigma)
         shape_area = math.pi * shape_major * shape_minor
+        # At a cutout/coverage boundary constrain only the visible Kron area.
+        kron = _ellipse_targets_lowres(prompts['centers'], target_shapes,
+            mask_hw=(mh, mw), image_hw=image_hw, ellipse_sigma=ellipse_sigma)
+        angle = target_shapes[:, 2]
+        half_w = ((shape_major*angle.cos())**2+(shape_minor*angle.sin())**2).sqrt()
+        half_h = ((shape_major*angle.sin())**2+(shape_minor*angle.cos())**2).sqrt()
+        cx, cy = prompts['centers'].unbind(-1)
+        clipped = (cx-half_w < 0) | (cy-half_h < 0) | (cx+half_w >= image_hw[1]) | (cy+half_h >= image_hw[0])
+        clipped |= ((kron*(1-valid)).sum((-1, -2)) > 0)
+        visible_area = (kron*valid).sum((-1, -2))*full_area_scale
+        shape_area = torch.where(clipped, visible_area.clamp_min(1), shape_area)
         area_ratio = area_full / shape_area[:, None].clamp_min(1.0)
-        area_loss = F.relu(1.0 / torch.clamp_min(area_ratio, 0.1) - 1 / lower) + F.relu(area_ratio - upper)
+        area_loss = area_ratio_penalty(area_ratio, lower, upper)
     else:
         area_loss = logits.new_zeros((n, int(logits.shape[1])))
     t_phase = _mark_mask_timing(debug_timing, f"{timing_prefix}.min_area", t_phase, enabled=float(weight_min_area))
@@ -520,9 +539,11 @@ def _sam_mask_loss_for_prompts(
         y_coords = torch.arange(mh, device=logits.device, dtype=logits.dtype).view(1, 1, mh, 1)
         cx = (prob * x_coords).sum(dim=(-1, -2)) / prob_sum.clamp_min(1e-6)
         cy = (prob * y_coords).sum(dim=(-1, -2)) / prob_sum.clamp_min(1e-6)
-        target_cx = prompts["centers"][:, 0].to(dtype=logits.dtype)[:, None] * (float(mw) / float(image_hw[1]))
-        target_cy = prompts["centers"][:, 1].to(dtype=logits.dtype)[:, None] * (float(mh) / float(image_hw[0]))
-        centroid = (torch.abs(cx - target_cx) + torch.abs(cy - target_cy)) # / max(float(mh + mw) * 0.5, 1.0)
+        dx = cx * (float(image_hw[1])/mw) - prompts['centers'][:, 0, None]
+        dy = cy * (float(image_hw[0])/mh) - prompts['centers'][:, 1, None]
+        axes = prompts['target_shapes'][:, :2].detach().abs().clamp_min(1)
+        radius = (axes[:, 0]*axes[:, 1]).sqrt()
+        centroid = torch.linalg.vector_norm(torch.stack((dx, dy), dim=-1), dim=-1)/radius[:, None]
     else:
         centroid = logits.new_zeros((n, int(logits.shape[1])))
     t_phase = _mark_mask_timing(debug_timing, f"{timing_prefix}.centroid", t_phase, enabled=float(weight_centroid))
@@ -554,12 +575,13 @@ def _sam_mask_loss_for_prompts(
     t_phase = _mark_mask_timing(debug_timing, f"{timing_prefix}.quality_losses", t_phase)
 
     selection = str(getattr(weights, "mask_selection", "pred_iou")).lower()
+    supervision_scale = float(getattr(weights, 'mask_supervision_weight', 0.2))
     if selection == "pred_iou":
         best = torch.argmax(iou_predictions.detach(), dim=1)
     elif selection == "loss":
-        target_factor = mask_target_weights[:, None]
+        target_factor = supervision_scale * instance_quality[:, None]
         selection_score = (
-            (float(getattr(weights, "mask_dice")) * dice * target_factor if weight_dice else 0.0)
+            (float(getattr(weights, "mask_dice")) * dice * target_factor * labelled[:, None] if weight_dice else 0.0)
             + (float(getattr(weights, "mask_bce")) * bce * target_factor if weight_bce else 0.0)
             + (float(getattr(weights, "mask_centroid")) * centroid if weight_centroid else 0.0)
             + (float(getattr(weights, "mask_outside")) * outside if weight_outside else 0.0)
@@ -574,8 +596,6 @@ def _sam_mask_loss_for_prompts(
     t_phase = _mark_mask_timing(debug_timing, f"{timing_prefix}.selection", t_phase, mode=float(selection == "loss"))
 
     row = torch.arange(n, device=logits.device)
-    selected_iou = iou_predictions[row, best]
-
     selected = {
         "dice": dice[row, best],
         "bce": bce[row, best],
@@ -589,12 +609,14 @@ def _sam_mask_loss_for_prompts(
 
     geom_weights = prompt_weights * valid_prompt.to(dtype=prompt_weights.dtype)
     geom_denom = geom_weights.sum().clamp_min(1.0)
-    mask_target_weights = mask_target_weights * valid_prompt.to(dtype=mask_target_weights.dtype)
-    target_loss_weights = prompt_weights * mask_target_weights
-    target_denom = target_loss_weights.sum().clamp_min(1.0)
+    # Retain q=0.25 as absolute reliability; dividing by sum(q) would cancel it.
+    dice_weights = prompt_weights * labelled * instance_quality * supervision_scale
+    bce_weights = prompt_weights * bce_eligible * instance_quality * supervision_scale
+    dice_denom = (prompt_weights * labelled).sum().clamp_min(1.0)
+    bce_denom = (prompt_weights * bce_eligible).sum().clamp_min(1.0)
     out = {
-        "dice": (selected["dice"] * target_loss_weights).sum() / target_denom if weight_dice else zero,
-        "bce": (selected["bce"] * target_loss_weights).sum() / target_denom if weight_bce else zero,
+        "dice": (selected["dice"] * dice_weights).sum() / dice_denom if weight_dice else zero,
+        "bce": (selected["bce"] * bce_weights).sum() / bce_denom if weight_bce else zero,
         "centroid": (selected["centroid"] * geom_weights).sum() / geom_denom if weight_centroid else zero,
         "outside": (selected["outside"] * geom_weights).sum() / geom_denom if weight_outside else zero,
         "area": (selected["area"] * geom_weights).sum() / geom_denom if weight_min_area else zero,
@@ -614,6 +636,18 @@ def _sam_mask_loss_for_prompts(
     )
     out["total"] = total
     out["prompts"] = logits.new_tensor(float(valid_prompt.sum().detach().item()))
+    kinds = prompts.get('source_kind', torch.zeros(n, device=logits.device, dtype=torch.long))
+    out['gt_prompts'] = ((kinds != 1) & valid_prompt).sum().to(logits.dtype)
+    out['pred_prompts'] = ((kinds == 1) & valid_prompt).sum().to(logits.dtype)
+    out['supervised_prompts'] = (labelled & valid_prompt).sum().to(logits.dtype)
+    per_prompt = logits.new_zeros(n)
+    for key, attr in [('dice','mask_dice'), ('bce','mask_bce'), ('centroid','mask_centroid'),
+                      ('outside','mask_outside'), ('area','mask_min_area'), ('max_area','mask_max_area'),
+                      ('pred_iou','mask_pred_iou'), ('stability','mask_stability')]:
+        q, denom = (dice_weights, dice_denom) if key == 'dice' else (bce_weights, bce_denom) if key == 'bce' else (geom_weights, geom_denom)
+        per_prompt = per_prompt + float(getattr(weights, attr, 0.0))*selected[key]*q/denom
+    out['gt_total'] = per_prompt[kinds != 1].sum()
+    out['pred_total'] = per_prompt[kinds == 1].sum()
     _mark_mask_timing(debug_timing, f"{timing_prefix}.reduce", t_phase, valid_prompts=float(valid_prompt.sum().detach().item()))
     return out
 
@@ -646,106 +680,28 @@ def sam_prompt_mask_losses(
         return _zero_mask_losses(outputs["confidence"])
     image_hw = tuple(int(v) for v in outputs["confidence"].shape[-2:])
     pred_ratio = prompt_pred_ratio(epoch_index, weights)
-    pieces: List[Tuple[float, Dict[str, Tensor]]] = []
-    gt_loss: Optional[Dict[str, Tensor]] = None
-    pred_loss: Optional[Dict[str, Tensor]] = None
-    if pred_ratio < 1.0:
-        t_phase = time.perf_counter()
-        gt_prompts = _build_gt_prompt_tensors(
-            outputs,
-            batch,
-            device=device,
-            max_gt_per_sample=int(getattr(weights, "mask_max_gt_per_sample", 0)),
-            sample_fraction=float(1.0 - pred_ratio),
-        )
-        t_phase = _mark_mask_timing(
-            debug_timing,
-            "gt.build_prompts",
-            t_phase,
-            pred_ratio=float(pred_ratio),
-            prompts=float(gt_prompts["centers"].shape[0]) if gt_prompts is not None else 0.0,
-        )
-        if gt_prompts is not None:
-            gt_loss = _sam_mask_loss_for_prompts(
-                model,
-                outputs,
-                gt_prompts,
-                weights=weights,
-                image_hw=image_hw,
-                ellipse_sigma=ellipse_sigma,
-                debug_timing=debug_timing,
-                timing_prefix="gt",
-            )
-            pieces.append((1.0 - pred_ratio, gt_loss))
-    if pred_ratio > 0.0:
-        t_phase = time.perf_counter()
-        pred_internal_start = t_phase
-
-        def _pred_debug_timer(label: str) -> None:
-            nonlocal pred_internal_start
-            pred_internal_start = _mark_mask_timing(debug_timing, label, pred_internal_start)
-
-        pred_prompts = _build_pred_prompt_tensors(
-            outputs,
-            batch,
-            device=device,
-            threshold=threshold,
-            nms_radius=nms_radius,
-            confidence_score=confidence_score,
+    mandatory = instance_prompts(batch, outputs, device)
+    gt = _build_gt_prompt_tensors(outputs, batch, device=device,
+        max_gt_per_sample=0, sample_fraction=1.0) if pred_ratio < 1 else None
+    pred = None
+    if pred_ratio > 0:
+        pred = _build_pred_prompt_tensors(outputs, batch, device=device,
+            threshold=threshold, nms_radius=nms_radius, confidence_score=confidence_score,
             use_ordinal_expectation=use_ordinal_expectation,
             debug_ordinal_expectation=debug_ordinal_expectation,
-            center_refinement=center_refinement,
-            center_refinement_radius=center_refinement_radius,
-            max_pred_per_sample=int(getattr(weights, "mask_max_pred_per_sample")),
-            sample_fraction=float(pred_ratio),
-            unmatched_weight=float(getattr(weights, "mask_unmatched_prompt")),
-            detach_prompt_shapes=bool(getattr(weights, "detach_mask_prompt_shapes", False)),
-            detect_centers_fn=detect_centers_fn,
-            debug_timer=_pred_debug_timer if debug_timing is not None else None,
-        )
-        t_phase = _mark_mask_timing(
-            debug_timing,
-            "pred.build_prompts",
-            t_phase,
-            pred_ratio=float(pred_ratio),
-            prompts=float(pred_prompts["centers"].shape[0]) if pred_prompts is not None else 0.0,
-        )
-        if pred_prompts is not None:
-            pred_loss = _sam_mask_loss_for_prompts(
-                model,
-                outputs,
-                pred_prompts,
-                weights=weights,
-                image_hw=image_hw,
-                ellipse_sigma=ellipse_sigma,
-                debug_timing=debug_timing,
-                timing_prefix="pred",
-            )
-            pieces.append((pred_ratio, pred_loss))
-    if not pieces:
-        return _zero_mask_losses(outputs["confidence"])
-    t_phase = time.perf_counter()
-    keys = ("total", "dice", "bce", "centroid", "outside", "area", "max_area", "pred_iou", "stability", "prompts")
-    result: Dict[str, Tensor] = {}
-    for key in keys:
-        if key == "prompts":
-            result[key] = sum(loss[key] for _scale, loss in pieces)
-        else:
-            result[key] = sum(float(scale) * loss[key] for scale, loss in pieces)
-    zero = result["total"].new_zeros(())
-    result["gt_total"] = gt_loss["total"] if gt_loss is not None else zero
-    result["pred_total"] = pred_loss["total"] if pred_loss is not None else zero
-    result["gt_prompts"] = gt_loss["prompts"] if gt_loss is not None else zero
-    result["pred_prompts"] = pred_loss["prompts"] if pred_loss is not None else zero
-    _mark_mask_timing(
-        debug_timing,
-        "combine",
-        t_phase,
-        pieces=float(len(pieces)),
-        gt_prompts=float(result["gt_prompts"].detach().item()),
-        pred_prompts=float(result["pred_prompts"].detach().item()),
-    )
-    return result
+            center_refinement=center_refinement, center_refinement_radius=center_refinement_radius,
+            max_pred_per_sample=0, sample_fraction=1.0,
+            unmatched_weight=float(getattr(weights, 'mask_unmatched_prompt')),
+            detach_prompt_shapes=bool(getattr(weights, 'detach_mask_prompt_shapes', False)),
+            detect_centers_fn=detect_centers_fn)
+    prompts = combine_prompts(mandatory, gt, pred, pred_ratio=pred_ratio,
+        max_gt=int(getattr(weights, 'mask_max_gt_per_sample', 128)),
+        max_pred=int(getattr(weights, 'mask_max_pred_per_sample', 128)))
+    if prompts is None:
+        return _zero_mask_losses(outputs['confidence'])
+    return _sam_mask_loss_for_prompts(model, outputs, prompts, weights=weights,
+        image_hw=image_hw, ellipse_sigma=ellipse_sigma, batch=batch,
+        debug_timing=debug_timing, timing_prefix='mask')
 
 
 __all__ = ["mask_outer_weight_for_epoch", "prompt_pred_ratio", "sam_prompt_mask_losses"]

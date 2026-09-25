@@ -6,6 +6,13 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
+from .psf_conditioning import (
+    PsfDepthwiseConvBlock,
+    flatten_psf_native_sizes,
+    flatten_psf_stamps,
+    normalize_decoder_psf_stages,
+)
+
 
 def _conv_norm_lrelu(in_ch: int, out_ch: int) -> nn.Sequential:
     return nn.Sequential(
@@ -165,6 +172,9 @@ class SamCellectDecoder(nn.Module):
         cen_input_image: bool = True,
         cen_width: int = 8,
         use_denoised_film: bool = False,
+        psf_depthwise_stages: Sequence[str] = (),
+        psf_depthwise_min_kernel_size: int = 3,
+        psf_depthwise_max_kernel_size: Optional[int] = None,
     ) -> None:
         super().__init__()
         if len(tuple(decoder_channels)) != 4:
@@ -176,6 +186,7 @@ class SamCellectDecoder(nn.Module):
         self.use_cen = bool(use_cen)
         self.cen_input_image = bool(cen_input_image)
         self.use_denoised_film = bool(use_denoised_film)
+        self.psf_depthwise_stages = normalize_decoder_psf_stages(psf_depthwise_stages)
         self.pred_channels = self.shape_channels
 
         c1, c2, c3, c4 = [int(ch) for ch in decoder_channels]
@@ -199,6 +210,25 @@ class SamCellectDecoder(nn.Module):
             if self.use_denoised_film
             else {}
         )
+        stage_strides = {
+            "stem": 16,
+            "up1": 8,
+            "up2": 4,
+            "up3": 2,
+            "up4": 1,
+            "refine": 1,
+        }
+        self.psf_depthwise = nn.ModuleDict(
+            {
+                name: PsfDepthwiseConvBlock(
+                    channels=film_channels[name],
+                    feature_stride=stage_strides[name],
+                    min_kernel_size=int(psf_depthwise_min_kernel_size),
+                    max_kernel_size=psf_depthwise_max_kernel_size,
+                )
+                for name in self.psf_depthwise_stages
+            }
+        )
 
         self.confidence_head = nn.Conv2d(c4, self.confidence_levels, kernel_size=1, bias=False)
         self.shape_refine = _conv_norm_lrelu(c4 + self.confidence_levels, c4)
@@ -211,6 +241,8 @@ class SamCellectDecoder(nn.Module):
         images: Optional[Tensor] = None,
         output_size: Optional[Tuple[int, int]] = None,
         processing_ids: Optional[Tensor] = None,
+        psf_stamps: Optional[Tensor] = None,
+        psf_native_sizes: Optional[Tensor] = None,
     ) -> Dict[str, Tensor]:
         per_band = image_embeddings.ndim == 5
         if per_band:
@@ -233,13 +265,28 @@ class SamCellectDecoder(nn.Module):
             flat_batch=int(flat.shape[0]),
             device=flat.device,
         )
+        flat_psf = flatten_psf_stamps(
+            psf_stamps,
+            batch=batch,
+            bands=bands,
+            flat_batch=int(flat.shape[0]),
+            device=flat.device,
+            dtype=flat.dtype,
+        ) if self.psf_depthwise else None
+        flat_psf_native_sizes = flatten_psf_native_sizes(
+            psf_native_sizes,
+            batch=batch,
+            bands=bands,
+            flat_batch=int(flat.shape[0]),
+            device=flat.device,
+        ) if self.psf_depthwise else None
 
-        out = self._forward_film_stage("stem", self.stem, flat, flat_processing_ids)
-        out = self._forward_film_stage("up1", self.up1, out, flat_processing_ids)
-        ds2 = self._forward_film_stage("up2", self.up2, out, flat_processing_ids)
-        ds3 = self._forward_film_stage("up3", self.up3, ds2, flat_processing_ids)
-        out = self._forward_film_stage("up4", self.up4, ds3, flat_processing_ids)
-        out = self._forward_film_stage("refine", self.refine, out, flat_processing_ids)
+        out = self._forward_conditioned_stage("stem", self.stem, flat, flat_processing_ids, flat_psf, flat_psf_native_sizes)
+        out = self._forward_conditioned_stage("up1", self.up1, out, flat_processing_ids, flat_psf, flat_psf_native_sizes)
+        ds2 = self._forward_conditioned_stage("up2", self.up2, out, flat_processing_ids, flat_psf, flat_psf_native_sizes)
+        ds3 = self._forward_conditioned_stage("up3", self.up3, ds2, flat_processing_ids, flat_psf, flat_psf_native_sizes)
+        out = self._forward_conditioned_stage("up4", self.up4, ds3, flat_processing_ids, flat_psf, flat_psf_native_sizes)
+        out = self._forward_conditioned_stage("refine", self.refine, out, flat_processing_ids, flat_psf, flat_psf_native_sizes)
 
         confidence = self.confidence_head(out)
         target_size = tuple(output_size) if output_size is not None else tuple(confidence.shape[-2:])
@@ -261,6 +308,23 @@ class SamCellectDecoder(nn.Module):
                 for key, value in outputs.items()
             }
         return outputs
+
+    def _forward_conditioned_stage(
+        self,
+        name: str,
+        stage: nn.Sequential,
+        x: Tensor,
+        processing_ids: Tensor,
+        psf_stamps: Optional[Tensor],
+        psf_native_sizes: Optional[Tensor],
+    ) -> Tensor:
+        x = self._forward_film_stage(name, stage, x, processing_ids)
+        if name not in self.psf_depthwise:
+            return x
+        psf_block = self.psf_depthwise[name]
+        if psf_stamps is None:
+            raise ValueError("psf_stamps is required when decoder PSF depthwise conditioning is enabled")
+        return psf_block(x, psf_stamps, psf_native_sizes=psf_native_sizes)
 
     def _forward_film_stage(
         self,

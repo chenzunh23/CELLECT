@@ -1817,6 +1817,11 @@ class AstroCutoutDataset(Dataset):
 
 def collate_cutouts(batch: Sequence[Dict[str, object]]) -> Dict[str, object]:
     return {
+        "band_names": [item.get("band_names") for item in batch],
+        "pixel_scale_arcsec": [item.get("pixel_scale_arcsec") for item in batch],
+        "band_mask_instances": [item.get("band_mask_instances", [[] for _ in item["band_confidence"]]) for item in batch],
+        "band_valid_mask": torch.stack([item.get("band_valid_mask", torch.ones_like(item["band_confidence"], dtype=torch.bool)) for item in batch]),
+        "band_trusted_background": torch.stack([item.get("band_trusted_background", torch.zeros_like(item["band_confidence"], dtype=torch.bool)) for item in batch]),
         "image": torch.stack([item["image"] for item in batch]),  # type: ignore[index]
         "seg": torch.stack([item["seg"] for item in batch]),  # type: ignore[index]
         "confidence": torch.stack([item["confidence"] for item in batch]),  # type: ignore[index]

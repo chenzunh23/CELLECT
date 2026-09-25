@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "definition_id": "hsc_coaddpsf_ee10_35_60_70_v1",
+  "mode": "psf-ee",
+  "fractions": [0.10, 0.35, 0.60, 0.70],
+  "levels": [4, 3, 2, 1],
+  "lsst_setup": "/home/czh23/lsst_stack/loadLSST.bash",
+  "psf_path_pattern": "/data/shared/Subaru/9813/{band}/{patch}/calexp-{band}-9813-{patch}.fits",
+  "psf_model": "persisted CoaddPsf; same full-reference PSF used for half/noisy until variant PSFs are available",
+  "spatial_samples_fraction": [0.2, 0.5, 0.8],
+  "aggregation": "median radius over nine PSF samples per patch and band",
+  "normalization": "nonnegative PSF stamp sum; negative interpolation lobes clipped, fraction recorded per stamp",
+  "aperture": "photutils exact circular pixel integration; geometric kernel center",
+  "fwhm_clipping": null,
+  "fallback": "If r10 contains no output pixel center, assign 4 to nearest floor(x+0.5), floor(y+0.5)."
+}

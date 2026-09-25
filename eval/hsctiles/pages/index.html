@@ -25,8 +25,19 @@
           <button id="viewButton">View</button>
           <div id="viewDropdown" class="viewDropdown hidden">
             <button class="viewItem" data-view="inputScaling"><span class="viewCheck"></span><span>Input Scaling</span></button>
+            <div class="scaleMenuBlock" id="scaleMenuBlock">
+              <button class="scaleItem" data-scale="zscale">ZScale</button>
+              <button class="scaleItem" data-scale="zmax">ZMax</button>
+              <button class="scaleItem" data-scale="asinh">Asinh</button>
+              <button class="scaleItem" data-scale="log">Log</button>
+              <button class="scaleItem" data-scale="lupton">Lupton</button>
+              <button class="scaleItem" data-scale="anscombe">Anscombe</button>
+              <button class="scaleItem" data-scale="square">Square</button>
+              <button class="scaleSettingsButton" id="scaleSettingsButton">Scale Settings</button>
+            </div>
             <button class="viewItem" data-view="shape"><span class="viewCheck"></span><span>Shape</span></button>
             <button class="viewItem" data-view="center"><span class="viewCheck"></span><span>Center</span></button>
+            <button class="viewItem" data-view="snrFilter"><span class="viewCheck"></span><span>SNR Filter</span></button>
             <button class="viewItem" data-view="invert"><span class="viewCheck"></span><span>Invert</span></button>
             <button class="viewItem" data-view="smooth"><span class="viewCheck"></span><span>Smooth</span></button>
           </div>
@@ -55,9 +66,9 @@
           <select id="bandInput" multiple></select>
         </div>
         <div class="field">
-          <label for="nTilesInput">n-tiles</label>
-          <input id="nTilesInput" type="number" min="1" placeholder="60">
-          <label class="inlineCheck"><input id="maxTilesInput" type="checkbox"> max</label>
+          <label for="nmsRadiusInput">NMS radius</label>
+          <input id="nmsRadiusInput" type="number" min="0" step="1" placeholder="3">
+          <span class="fieldHint">HSC 3, ZTF 2, JWST 2</span>
         </div>
         <div class="field">
           <label for="framesPerTileInput">groups per tile</label>
@@ -70,6 +81,11 @@
         <div class="field">
           <label for="runNameInput">run name</label>
           <input id="runNameInput" placeholder="optional">
+        </div>
+        <div class="field">
+          <label for="nTilesInput">n-tiles</label>
+          <input id="nTilesInput" type="number" min="1" placeholder="60">
+          <label class="inlineCheck"><input id="maxTilesInput" type="checkbox"> max</label>
         </div>
       </div>
       <div class="menuActions">
@@ -131,6 +147,67 @@
       </div>
     </div>
   </div>
+  <div id="snrOverlay" class="modalOverlay hidden">
+    <div class="smoothModal">
+      <div class="modalHeader">
+        <h2>SNR Filter</h2>
+        <button id="closeSnr" title="Close">Close</button>
+      </div>
+      <div class="snrModalFields">
+        <label class="snrCheck"><input id="snrKronToggle" type="checkbox"> Kron SNR</label>
+        <div class="snrRow">
+          <span>AP2</span>
+          <input id="ap2SnrRange" type="range" min="0" max="50" step="0.5" value="5">
+          <input id="ap2SnrInput" type="number" min="0" step="0.5" value="5">
+        </div>
+        <div class="snrRow">
+          <span>Kron</span>
+          <input id="kronSnrRange" type="range" min="0" max="50" step="0.5" value="5">
+          <input id="kronSnrInput" type="number" min="0" step="0.5" value="5">
+        </div>
+      </div>
+      <p id="snrStatusText" class="modalStatus"></p>
+      <div class="modalActions">
+        <button id="snrOffButton">Off</button>
+        <button class="primary" id="applySnrButton">Apply</button>
+      </div>
+    </div>
+  </div>
+  <div id="scaleOverlay" class="modalOverlay hidden">
+    <div class="scaleModal">
+      <div class="modalHeader">
+        <h2>Scale Settings</h2>
+        <button id="closeScale" title="Close">Close</button>
+      </div>
+      <div class="scalePresetRow" id="scalePresetRow">
+        <button class="scalePreset" data-high-pct="90">90</button>
+        <button class="scalePreset" data-high-pct="95">95</button>
+        <button class="scalePreset" data-high-pct="99.5">99.5</button>
+        <button class="scalePreset" data-high-pct="99.9">99.9</button>
+        <button class="scalePreset" data-high-pct="99.95">99.95</button>
+        <button class="scalePreset" data-high-pct="99.99">99.99</button>
+        <button class="scalePreset" data-high-pct="100">Min/Max</button>
+      </div>
+      <div class="scaleRows">
+        <div class="scaleRow">
+          <div class="scaleRowTitle">Upper Percentile</div>
+          <div class="singleRange">
+            <input id="scalePctMaxRange" type="range" min="0" max="100" step="0.01" value="100">
+          </div>
+          <div class="scaleInputs">
+            <label>max <input id="scalePctMaxInput" type="number" min="0" max="100" step="0.01" value="100"></label>
+          </div>
+        </div>
+      </div>
+      <p id="scaleStatsText" class="modalStatus"></p>
+      <div class="modalActions">
+        <button id="scaleResetButton">Reset</button>
+        <button class="primary" id="applyScaleButton">Apply</button>
+      </div>
+    </div>
+  </div>
+  <script src="/pages/scale_controls.js"></script>
+  <script src="/pages/snr_controls.js"></script>
   <script src="/pages/app.js"></script>
 </body>
 </html>

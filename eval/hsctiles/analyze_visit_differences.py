@@ -349,9 +349,9 @@ def plot_all_snr(
                 path_effects=[],
             )
         handles = [
-            Circle((0, 0), radius=1, fill=False, edgecolor="lime", linewidth=1.4, label="SNR >= 5"),
-            Circle((0, 0), radius=1, fill=False, edgecolor="red", linewidth=1.7, label="SNR < 5"),
-            Circle((0, 0), radius=1, fill=False, edgecolor="white", linewidth=1.5, label="untrusted"),
+            Circle((0, 0), radius=1, fill=False, edgecolor="lime", linewidth=1.2, label="SNR >= 5"),
+            Circle((0, 0), radius=1, fill=False, edgecolor="red", linewidth=1.2, label="SNR < 5"),
+            Circle((0, 0), radius=1, fill=False, edgecolor="white", linewidth=1.2, label="untrusted"),
         ]
         ax.legend(handles=handles, fontsize=7, loc="upper right")
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -391,7 +391,7 @@ def plot_difference_snr(
             for idx, row in enumerate(rows):
                 x, y = float(row["x"]), float(row["y"])
                 snr = snr_lookup[key][idx]
-                ax.add_patch(Circle((x, y), radius=5.0, fill=False, edgecolor=palette[key], linewidth=1.8))
+                ax.add_patch(Circle((x, y), radius=5.0, fill=False, edgecolor=palette[key], linewidth=1.2))
                 text = "bad" if not snr.trusted or not np.isfinite(snr.snr) else f"{snr.snr:.1f}"
                 ax.text(x + 6.2, y + 5.5, text, color=palette[key], fontsize=11, fontweight="bold")
         handles = [
@@ -457,8 +457,8 @@ def plot_confidence_detections(
             if row_idx == 0:
                 handles = [
                     Circle((0, 0), radius=1, fill=False, edgecolor="cyan", linewidth=1.0, label="all detections"),
-                    Circle((0, 0), radius=1, fill=False, edgecolor="magenta", linewidth=2.0, label=f"only {a.label}"),
-                    Circle((0, 0), radius=1, fill=False, edgecolor="yellow", linewidth=2.0, label=f"only {b.label}"),
+                    Circle((0, 0), radius=1, fill=False, edgecolor="magenta", linewidth=1.0, label=f"only {a.label}"),
+                    Circle((0, 0), radius=1, fill=False, edgecolor="yellow", linewidth=1.0, label=f"only {b.label}"),
                 ]
                 ax.legend(handles=handles, fontsize=7, loc="upper right")
     for ax, im in zip(axes[0, :], conf_images, strict=True):

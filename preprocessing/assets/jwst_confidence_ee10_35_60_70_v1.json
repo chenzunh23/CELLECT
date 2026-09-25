@@ -1,0 +1,1383 @@
+{
+  "schema_version": 1,
+  "definition_id": "jwst_simulated_psf_ee10_35_60_70_v1",
+  "created_date": "2026-09-24",
+  "status": "integrated_preprocessing_jwst_auto_default_training_decoder_pending",
+  "scope": "JWST NIRCam focused direct imaging; not HSC or coronagraphy",
+  "psf": {
+    "root": "/data/czh23/JWST/NIRCam_PSF",
+    "filename_pattern": "PSF_NIRCam_in_flight_opd_filter_{filter}.fits",
+    "extension": "OVERSAMP",
+    "required_normaliz_header": "first",
+    "normalization": {
+      "mode": "original_unit",
+      "denominator": 1.0,
+      "renormalize_by_stamp_sum": false,
+      "aperture_target": "sum(PSF * exact_circular_aperture_weights) = boundary_fraction",
+      "note": "Fractions refer to original model normalization, not finite stamp sum. stamp_sum is recorded separately; no infinite-aperture correction is inferred."
+    }
+  },
+  "boundaries": [
+    {
+      "level": 4,
+      "ee_fraction": 0.1,
+      "radius_key": "r10",
+      "outer_inclusive": true
+    },
+    {
+      "level": 3,
+      "ee_fraction": 0.35,
+      "radius_key": "r35",
+      "outer_inclusive": true
+    },
+    {
+      "level": 2,
+      "ee_fraction": 0.6,
+      "radius_key": "r60",
+      "outer_inclusive": true
+    },
+    {
+      "level": 1,
+      "ee_fraction": 0.7,
+      "radius_key": "r70",
+      "outer_inclusive": true
+    }
+  ],
+  "measurement": {
+    "center": "geometric array center: ((nx-1)/2, (ny-1)/2), zero-based x,y",
+    "pixel_scale": "PIXELSCL in the selected extension, arcsec/pixel",
+    "aperture": "photutils.aperture.CircularAperture.to_mask(method=\"exact\")",
+    "root_solver": "scipy.optimize.brentq",
+    "xtol_arcsec": 1e-11,
+    "upper_radius_arcsec": "min(nx,ny) * PIXELSCL / 2",
+    "background_subtraction": false,
+    "negative_value_clipping": false,
+    "tail_extrapolation": false,
+    "resampling": false,
+    "input_check": "2-D, finite, nonnegative; monotonic aperture flux; all targets reachable within complete circle",
+    "software_versions": {
+      "numpy": "2.5.3",
+      "scipy": "1.18.1",
+      "astropy": "8.0.1",
+      "photutils": "3.0.0"
+    }
+  },
+  "rasterization": {
+    "distance": "Euclidean distance from source center to output pixel center",
+    "coordinates": "zero-based x,y; integer coordinates are pixel centers; boundaries at half-integers",
+    "radius_pixels": "radius_arcsec / output_WCS_pixel_scale_arcsec",
+    "reference_pixel_scale_arcsec": 0.03,
+    "reference_scale_is_not_detector_scale": true,
+    "fwhm_clipping": null,
+    "intervals": {
+      "4": "0 <= r <= r10",
+      "3": "r10 < r <= r35",
+      "2": "r35 < r <= r60",
+      "1": "r60 < r <= r70",
+      "0": "r > r70, except forced nearest-center level 4"
+    },
+    "fallback": {
+      "trigger": "no output pixel center lies inside r10",
+      "action": "assign level 4 to exactly one nearest output pixel center",
+      "nearest_xy": "floor(source_xy + 0.5)",
+      "tie_break": "choose the larger coordinate on each tied axis",
+      "retain_multiple_natural_level4_pixels": true,
+      "allow_other_levels_to_be_empty": true
+    },
+    "validated_domain": "source and its full support inside an unmasked image; image edges and invalid-pixel training weights are handled separately by the caller",
+    "overlapping_sources": "use existing pixelwise maximum of ordinal levels when integrated; not a change to instance identity"
+  },
+  "training_notes": [
+    "Level 4 can contain multiple pixels; a level-4 pixel is not independently a separate object.",
+    "Source centers and instance identities must remain available when updating center supervision/decoding.",
+    "Energy thresholds do not imply equal annular energy or equal pixel counts.",
+    "These are simulated PSF radii, not PSFs measured on the current coadds; converting units does not simulate drizzle.",
+    "Preprocessing auto now uses this EE asset for JWST; training center supervision/decoder updates are separate."
+  ],
+  "provenance": {
+    "preview_directory": "/home/czh23/analysis/2026-09/2026-09-24/jwst_large_psf_encircled_energy",
+    "preview_script": "/home/czh23/analysis/2026-09/2026-09-24/jwst_large_psf_encircled_energy/preview_ee_confidence.py",
+    "preview_script_sha256": "2f7d9182e284d390060632a84eab5707d48a235e32b117615bd26af8d822a502",
+    "radii_csv": "/home/czh23/analysis/2026-09/2026-09-24/jwst_large_psf_encircled_energy/ee_confidence_radii.csv",
+    "radii_csv_sha256": "1bd9ececd12ca18a3f46b5b4f1c4f345da62b881374c579042e049c40924cfdc",
+    "max_aperture_flux_residual": 2.446792768395767e-11
+  },
+  "filters": {
+    "F070W": {
+      "path": "/data/czh23/JWST/NIRCam_PSF/PSF_NIRCam_in_flight_opd_filter_F070W.fits",
+      "sha256": "d77f2dbad16a3ab9a257226e3f577329ce38922a1aedbb2ed2ba2a89490c8135",
+      "extension": "OVERSAMP",
+      "shape_yx": [
+        1288,
+        1288
+      ],
+      "header": {
+        "FILTER": "F070W",
+        "PIXELSCL": 0.007774999999999999,
+        "FOV": 10.0142,
+        "OVERSAMP": 4,
+        "DET_SAMP": 4,
+        "NORMALIZ": "first",
+        "VERSION": "1.1.0",
+        "DATAVERS": "1.1.0",
+        "DATE": "2022-09-27T01:42:05",
+        "DET_NAME": "NRCA1",
+        "DET_X": 1024.5,
+        "DET_Y": 1024.5,
+        "WAVELEN": 7.03407494631321e-07,
+        "PUPILOPD": "JWST_OTE_OPD_cycle1_example_2022-07-30.fits",
+        "DISTORT": null,
+        "CHDFTYPE": null,
+        "CHDFSIGM": null,
+        "IPCINST": null,
+        "IPCFILE": null,
+        "JITRSIGM": 0.0008
+      },
+      "stamp_sum": 0.9977320930675863,
+      "radii_arcsec": {
+        "r10": 0.006771000737540241,
+        "r35": 0.015431489319736157,
+        "r60": 0.04704903212465171,
+        "r70": 0.07900469484787781
+      },
+      "radii_pixels_at_0p03_arcsec": {
+        "r10": 0.2257000245846747,
+        "r35": 0.5143829773245386,
+        "r60": 1.5683010708217238,
+        "r70": 2.6334898282625936
+      }
+    },
+    "F090W": {
+      "path": "/data/czh23/JWST/NIRCam_PSF/PSF_NIRCam_in_flight_opd_filter_F090W.fits",
+      "sha256": "fa5c97d26947ab9a50650da7fa0bf7874bb875f5d3a1469eb80cfdbb3cbc8679",
+      "extension": "OVERSAMP",
+      "shape_yx": [
+        1288,
+        1288
+      ],
+      "header": {
+        "FILTER": "F090W",
+        "PIXELSCL": 0.007774999999999999,
+        "FOV": 10.0142,
+        "OVERSAMP": 4,
+        "DET_SAMP": 4,
+        "NORMALIZ": "first",
+        "VERSION": "1.1.0",
+        "DATAVERS": "1.1.0",
+        "DATE": "2022-09-27T01:42:04",
+        "DET_NAME": "NRCA1",
+        "DET_X": 1024.5,
+        "DET_Y": 1024.5,
+        "WAVELEN": 8.99768360734523e-07,
+        "PUPILOPD": "JWST_OTE_OPD_cycle1_example_2022-07-30.fits",
+        "DISTORT": null,
+        "CHDFTYPE": null,
+        "CHDFSIGM": null,
+        "IPCINST": null,
+        "IPCFILE": null,
+        "JITRSIGM": 0.0008
+      },
+      "stamp_sum": 0.9966049305844815,
+      "radii_arcsec": {
+        "r10": 0.007852054727222463,
+        "r35": 0.01733745159668233,
+        "r60": 0.047906416235669165,
+        "r70": 0.06745789313297657
+      },
+      "radii_pixels_at_0p03_arcsec": {
+        "r10": 0.2617351575740821,
+        "r35": 0.5779150532227443,
+        "r60": 1.5968805411889722,
+        "r70": 2.248596437765886
+      }
+    },
+    "F115W": {
+      "path": "/data/czh23/JWST/NIRCam_PSF/PSF_NIRCam_in_flight_opd_filter_F115W.fits",
+      "sha256": "44450743b0a373283e75da063dad054f330e35a419935f54db174197bfcc9bc5",
+      "extension": "OVERSAMP",
+      "shape_yx": [
+        1288,
+        1288
+      ],
+      "header": {
+        "FILTER": "F115W",
+        "PIXELSCL": 0.007774999999999999,
+        "FOV": 10.0142,
+        "OVERSAMP": 4,
+        "DET_SAMP": 4,
+        "NORMALIZ": "first",
+        "VERSION": "1.1.0",
+        "DATAVERS": "1.1.0",
+        "DATE": "2022-09-27T01:42:27",
+        "DET_NAME": "NRCA1",
+        "DET_X": 1024.5,
+        "DET_Y": 1024.5,
+        "WAVELEN": 1.14970265765923e-06,
+        "PUPILOPD": "JWST_OTE_OPD_cycle1_example_2022-07-30.fits",
+        "DISTORT": null,
+        "CHDFTYPE": null,
+        "CHDFSIGM": null,
+        "IPCINST": null,
+        "IPCFILE": null,
+        "JITRSIGM": 0.0008
+      },
+      "stamp_sum": 0.9953502082291938,
+      "radii_arcsec": {
+        "r10": 0.009198351908781856,
+        "r35": 0.01966468612522078,
+        "r60": 0.03603936240861686,
+        "r70": 0.06835984064123403
+      },
+      "radii_pixels_at_0p03_arcsec": {
+        "r10": 0.30661173029272853,
+        "r35": 0.6554895375073593,
+        "r60": 1.2013120802872288,
+        "r70": 2.278661354707801
+      }
+    },
+    "F140M": {
+      "path": "/data/czh23/JWST/NIRCam_PSF/PSF_NIRCam_in_flight_opd_filter_F140M.fits",
+      "sha256": "1541bd7dcf2a1275183ae492bf21425a0565cb1e2741b715a8551c05f037beab",
+      "extension": "OVERSAMP",
+      "shape_yx": [
+        1288,
+        1288
+      ],
+      "header": {
+        "FILTER": "F140M",
+        "PIXELSCL": 0.007774999999999999,
+        "FOV": 10.0142,
+        "OVERSAMP": 4,
+        "DET_SAMP": 4,
+        "NORMALIZ": "first",
+        "VERSION": "1.1.0",
+        "DATAVERS": "1.1.0",
+        "DATE": "2022-09-27T01:42:24",
+        "DET_NAME": "NRCA1",
+        "DET_X": 1024.5,
+        "DET_Y": 1024.5,
+        "WAVELEN": 1.40396410402787e-06,
+        "PUPILOPD": "JWST_OTE_OPD_cycle1_example_2022-07-30.fits",
+        "DISTORT": null,
+        "CHDFTYPE": null,
+        "CHDFSIGM": null,
+        "IPCINST": null,
+        "IPCFILE": null,
+        "JITRSIGM": 0.0008
+      },
+      "stamp_sum": 0.9941850872330291,
+      "radii_arcsec": {
+        "r10": 0.011073193015075507,
+        "r35": 0.023162162200314623,
+        "r60": 0.03940771216891159,
+        "r70": 0.07787297944966169
+      },
+      "radii_pixels_at_0p03_arcsec": {
+        "r10": 0.36910643383585023,
+        "r35": 0.7720720733438208,
+        "r60": 1.3135904056303864,
+        "r70": 2.59576598165539
+      }
+    },
+    "F150W": {
+      "path": "/data/czh23/JWST/NIRCam_PSF/PSF_NIRCam_in_flight_opd_filter_F150W.fits",
+      "sha256": "7c0c806dc79c395b43c014f70667ffa5853bdb0dfd309534bc5be6fe93cf8772",
+      "extension": "OVERSAMP",
+      "shape_yx": [
+        1288,
+        1288
+      ],
+      "header": {
+        "FILTER": "F150W",
+        "PIXELSCL": 0.007774999999999999,
+        "FOV": 10.0142,
+        "OVERSAMP": 4,
+        "DET_SAMP": 4,
+        "NORMALIZ": "first",
+        "VERSION": "1.1.0",
+        "DATAVERS": "1.1.0",
+        "DATE": "2022-09-27T01:42:42",
+        "DET_NAME": "NRCA1",
+        "DET_X": 1024.5,
+        "DET_Y": 1024.5,
+        "WAVELEN": 1.49383309785458e-06,
+        "PUPILOPD": "JWST_OTE_OPD_cycle1_example_2022-07-30.fits",
+        "DISTORT": null,
+        "CHDFTYPE": null,
+        "CHDFSIGM": null,
+        "IPCINST": null,
+        "IPCFILE": null,
+        "JITRSIGM": 0.0008
+      },
+      "stamp_sum": 0.9938268781438783,
+      "radii_arcsec": {
+        "r10": 0.011673860643307431,
+        "r35": 0.024395955837666468,
+        "r60": 0.04145836130299426,
+        "r70": 0.08111564981433968
+      },
+      "radii_pixels_at_0p03_arcsec": {
+        "r10": 0.3891286881102477,
+        "r35": 0.8131985279222156,
+        "r60": 1.3819453767664753,
+        "r70": 2.7038549938113228
+      }
+    },
+    "F150W2": {
+      "path": "/data/czh23/JWST/NIRCam_PSF/PSF_NIRCam_in_flight_opd_filter_F150W2.fits",
+      "sha256": "25a1809ff76161bde8e3bc11d6bd18b2a93a3d577888543085e32c6d9e3842cc",
+      "extension": "OVERSAMP",
+      "shape_yx": [
+        1288,
+        1288
+      ],
+      "header": {
+        "FILTER": "F150W2",
+        "PIXELSCL": 0.007774999999999999,
+        "FOV": 10.0142,
+        "OVERSAMP": 4,
+        "DET_SAMP": 4,
+        "NORMALIZ": "first",
+        "VERSION": "1.1.0",
+        "DATAVERS": "1.1.0",
+        "DATE": "2022-09-27T01:42:47",
+        "DET_NAME": "NRCA1",
+        "DET_X": 1024.5,
+        "DET_Y": 1024.5,
+        "WAVELEN": 1.5371281140097e-06,
+        "PUPILOPD": "JWST_OTE_OPD_cycle1_example_2022-07-30.fits",
+        "DISTORT": null,
+        "CHDFTYPE": null,
+        "CHDFSIGM": null,
+        "IPCINST": null,
+        "IPCFILE": null,
+        "JITRSIGM": 0.0008
+      },
+      "stamp_sum": 0.9937388922637604,
+      "radii_arcsec": {
+        "r10": 0.01139218823134691,
+        "r35": 0.024451035548174144,
+        "r60": 0.04620407996242199,
+        "r70": 0.07863921104872734
+      },
+      "radii_pixels_at_0p03_arcsec": {
+        "r10": 0.3797396077115637,
+        "r35": 0.8150345182724715,
+        "r60": 1.5401359987473997,
+        "r70": 2.621307034957578
+      }
+    },
+    "F162M": {
+      "path": "/data/czh23/JWST/NIRCam_PSF/PSF_NIRCam_in_flight_opd_filter_F162M.fits",
+      "sha256": "5965b78982fca6e45cf932fa9a6184eb8ab28000e3af51cfabc5d81ee6d64867",
+      "extension": "OVERSAMP",
+      "shape_yx": [
+        1288,
+        1288
+      ],
+      "header": {
+        "FILTER": "F162M",
+        "PIXELSCL": 0.007774999999999999,
+        "FOV": 10.0142,
+        "OVERSAMP": 4,
+        "DET_SAMP": 4,
+        "NORMALIZ": "first",
+        "VERSION": "1.1.0",
+        "DATAVERS": "1.1.0",
+        "DATE": "2022-09-27T01:42:50",
+        "DET_NAME": "NRCA1",
+        "DET_X": 1024.5,
+        "DET_Y": 1024.5,
+        "WAVELEN": 1.62486839650168e-06,
+        "PUPILOPD": "JWST_OTE_OPD_cycle1_example_2022-07-30.fits",
+        "DISTORT": null,
+        "CHDFTYPE": null,
+        "CHDFSIGM": null,
+        "IPCINST": null,
+        "IPCFILE": null,
+        "JITRSIGM": 0.0008
+      },
+      "stamp_sum": 0.9933214982003717,
+      "radii_arcsec": {
+        "r10": 0.01264421018790016,
+        "r35": 0.026411286694829547,
+        "r60": 0.044021390209581346,
+        "r70": 0.08679299884649108
+      },
+      "radii_pixels_at_0p03_arcsec": {
+        "r10": 0.42147367293000537,
+        "r35": 0.880376223160985,
+        "r60": 1.4673796736527116,
+        "r70": 2.893099961549703
+      }
+    },
+    "F164N": {
+      "path": "/data/czh23/JWST/NIRCam_PSF/PSF_NIRCam_in_flight_opd_filter_F164N.fits",
+      "sha256": "d874ebeee0794a7210ab37700d9911910b5de65ae91ab318f8249c0121c8807e",
+      "extension": "OVERSAMP",
+      "shape_yx": [
+        1288,
+        1288
+      ],
+      "header": {
+        "FILTER": "F164N",
+        "PIXELSCL": 0.007774999999999999,
+        "FOV": 10.0142,
+        "OVERSAMP": 4,
+        "DET_SAMP": 4,
+        "NORMALIZ": "first",
+        "VERSION": "1.1.0",
+        "DATAVERS": "1.1.0",
+        "DATE": "2022-09-27T01:42:52",
+        "DET_NAME": "NRCA1",
+        "DET_X": 1024.5,
+        "DET_Y": 1024.5,
+        "WAVELEN": 1.64448894054844e-06,
+        "PUPILOPD": "JWST_OTE_OPD_cycle1_example_2022-07-30.fits",
+        "DISTORT": null,
+        "CHDFTYPE": null,
+        "CHDFSIGM": null,
+        "IPCINST": null,
+        "IPCFILE": null,
+        "JITRSIGM": 0.0008
+      },
+      "stamp_sum": 0.9932446170534016,
+      "radii_arcsec": {
+        "r10": 0.012796149221998848,
+        "r35": 0.02672058761704493,
+        "r60": 0.044374153513818536,
+        "r70": 0.0877455433220473
+      },
+      "radii_pixels_at_0p03_arcsec": {
+        "r10": 0.4265383073999616,
+        "r35": 0.8906862539014977,
+        "r60": 1.479138450460618,
+        "r70": 2.9248514440682434
+      }
+    },
+    "F182M": {
+      "path": "/data/czh23/JWST/NIRCam_PSF/PSF_NIRCam_in_flight_opd_filter_F182M.fits",
+      "sha256": "977cf8e4097f206e31580424bc4e7bf38ef8a1d6a3ae1213459c63c3d64edf47",
+      "extension": "OVERSAMP",
+      "shape_yx": [
+        1288,
+        1288
+      ],
+      "header": {
+        "FILTER": "F182M",
+        "PIXELSCL": 0.007774999999999999,
+        "FOV": 10.0142,
+        "OVERSAMP": 4,
+        "DET_SAMP": 4,
+        "NORMALIZ": "first",
+        "VERSION": "1.1.0",
+        "DATAVERS": "1.1.0",
+        "DATE": "2022-09-27T01:42:57",
+        "DET_NAME": "NRCA1",
+        "DET_X": 1024.5,
+        "DET_Y": 1024.5,
+        "WAVELEN": 1.83914367978956e-06,
+        "PUPILOPD": "JWST_OTE_OPD_cycle1_example_2022-07-30.fits",
+        "DISTORT": null,
+        "CHDFTYPE": null,
+        "CHDFSIGM": null,
+        "IPCINST": null,
+        "IPCFILE": null,
+        "JITRSIGM": 0.0008
+      },
+      "stamp_sum": 0.9925583691627416,
+      "radii_arcsec": {
+        "r10": 0.014157812757147536,
+        "r35": 0.029585731783999165,
+        "r60": 0.04861204051937704,
+        "r70": 0.09554953154352812
+      },
+      "radii_pixels_at_0p03_arcsec": {
+        "r10": 0.4719270919049179,
+        "r35": 0.9861910594666389,
+        "r60": 1.6204013506459012,
+        "r70": 3.1849843847842707
+      }
+    },
+    "F187N": {
+      "path": "/data/czh23/JWST/NIRCam_PSF/PSF_NIRCam_in_flight_opd_filter_F187N.fits",
+      "sha256": "f521a8601ed023cd732d1a64b34a4198f75f25f950218f68911fcc27142c26d8",
+      "extension": "OVERSAMP",
+      "shape_yx": [
+        1288,
+        1288
+      ],
+      "header": {
+        "FILTER": "F187N",
+        "PIXELSCL": 0.007774999999999999,
+        "FOV": 10.0142,
+        "OVERSAMP": 4,
+        "DET_SAMP": 4,
+        "NORMALIZ": "first",
+        "VERSION": "1.1.0",
+        "DATAVERS": "1.1.0",
+        "DATE": "2022-09-27T01:44:58",
+        "DET_NAME": "NRCA1",
+        "DET_X": 1024.5,
+        "DET_Y": 1024.5,
+        "WAVELEN": 1.87380833082618e-06,
+        "PUPILOPD": "JWST_OTE_OPD_cycle1_example_2022-07-30.fits",
+        "DISTORT": null,
+        "CHDFTYPE": null,
+        "CHDFSIGM": null,
+        "IPCINST": null,
+        "IPCFILE": null,
+        "JITRSIGM": 0.0008
+      },
+      "stamp_sum": 0.9924495454489799,
+      "radii_arcsec": {
+        "r10": 0.014428719203792502,
+        "r35": 0.030114477990901438,
+        "r60": 0.0493493990642729,
+        "r70": 0.09733424193141497
+      },
+      "radii_pixels_at_0p03_arcsec": {
+        "r10": 0.4809573067930834,
+        "r35": 1.003815933030048,
+        "r60": 1.6449799688090967,
+        "r70": 3.2444747310471658
+      }
+    },
+    "F200W": {
+      "path": "/data/czh23/JWST/NIRCam_PSF/PSF_NIRCam_in_flight_opd_filter_F200W.fits",
+      "sha256": "3b98266507af8e10157c515ae47ed3b9ec357a5d39d59e004cd780689873b2fb",
+      "extension": "OVERSAMP",
+      "shape_yx": [
+        1288,
+        1288
+      ],
+      "header": {
+        "FILTER": "F200W",
+        "PIXELSCL": 0.007774999999999999,
+        "FOV": 10.0142,
+        "OVERSAMP": 4,
+        "DET_SAMP": 4,
+        "NORMALIZ": "first",
+        "VERSION": "1.1.0",
+        "DATAVERS": "1.1.0",
+        "DATE": "2022-09-27T01:46:12",
+        "DET_NAME": "NRCA1",
+        "DET_X": 1024.5,
+        "DET_Y": 1024.5,
+        "WAVELEN": 1.96916812890706e-06,
+        "PUPILOPD": "JWST_OTE_OPD_cycle1_example_2022-07-30.fits",
+        "DISTORT": null,
+        "CHDFTYPE": null,
+        "CHDFSIGM": null,
+        "IPCINST": null,
+        "IPCFILE": null,
+        "JITRSIGM": 0.0008
+      },
+      "stamp_sum": 0.9920393804876514,
+      "radii_arcsec": {
+        "r10": 0.015041684216189812,
+        "r35": 0.031439203300611604,
+        "r60": 0.05203695391954738,
+        "r70": 0.1004467629301428
+      },
+      "radii_pixels_at_0p03_arcsec": {
+        "r10": 0.5013894738729937,
+        "r35": 1.0479734433537202,
+        "r60": 1.7345651306515795,
+        "r70": 3.34822543100476
+      }
+    },
+    "F210M": {
+      "path": "/data/czh23/JWST/NIRCam_PSF/PSF_NIRCam_in_flight_opd_filter_F210M.fits",
+      "sha256": "1b110ec0a174a714fe58ef09215c3bc29488ac36741d994790bd7427e32acddb",
+      "extension": "OVERSAMP",
+      "shape_yx": [
+        1288,
+        1288
+      ],
+      "header": {
+        "FILTER": "F210M",
+        "PIXELSCL": 0.007774999999999999,
+        "FOV": 10.0142,
+        "OVERSAMP": 4,
+        "DET_SAMP": 4,
+        "NORMALIZ": "first",
+        "VERSION": "1.1.0",
+        "DATAVERS": "1.1.0",
+        "DATE": "2022-09-27T01:50:11",
+        "DET_NAME": "NRCA1",
+        "DET_X": 1024.5,
+        "DET_Y": 1024.5,
+        "WAVELEN": 2.09138770001874e-06,
+        "PUPILOPD": "JWST_OTE_OPD_cycle1_example_2022-07-30.fits",
+        "DISTORT": null,
+        "CHDFTYPE": null,
+        "CHDFSIGM": null,
+        "IPCINST": null,
+        "IPCFILE": null,
+        "JITRSIGM": 0.0008
+      },
+      "stamp_sum": 0.991550298099776,
+      "radii_arcsec": {
+        "r10": 0.016013166571461845,
+        "r35": 0.03346547404128215,
+        "r60": 0.054717311279165314,
+        "r70": 0.10692644975945925
+      },
+      "radii_pixels_at_0p03_arcsec": {
+        "r10": 0.5337722190487282,
+        "r35": 1.1155158013760718,
+        "r60": 1.823910375972177,
+        "r70": 3.564214991981975
+      }
+    },
+    "F212N": {
+      "path": "/data/czh23/JWST/NIRCam_PSF/PSF_NIRCam_in_flight_opd_filter_F212N.fits",
+      "sha256": "8ebdb1b3957071b649f59df4bcc6f28866abe694d96d10fa6b1a523f2c7a9193",
+      "extension": "OVERSAMP",
+      "shape_yx": [
+        1288,
+        1288
+      ],
+      "header": {
+        "FILTER": "F212N",
+        "PIXELSCL": 0.007774999999999999,
+        "FOV": 10.0142,
+        "OVERSAMP": 4,
+        "DET_SAMP": 4,
+        "NORMALIZ": "first",
+        "VERSION": "1.1.0",
+        "DATAVERS": "1.1.0",
+        "DATE": "2022-09-27T01:52:05",
+        "DET_NAME": "NRCA1",
+        "DET_X": 1024.5,
+        "DET_Y": 1024.5,
+        "WAVELEN": 2.12123601530653e-06,
+        "PUPILOPD": "JWST_OTE_OPD_cycle1_example_2022-07-30.fits",
+        "DISTORT": null,
+        "CHDFTYPE": null,
+        "CHDFSIGM": null,
+        "IPCINST": null,
+        "IPCFILE": null,
+        "JITRSIGM": 0.0008
+      },
+      "stamp_sum": 0.991460481288037,
+      "radii_arcsec": {
+        "r10": 0.016260082193004698,
+        "r35": 0.033972683495730266,
+        "r60": 0.05544021518685345,
+        "r70": 0.10856980080027011
+      },
+      "radii_pixels_at_0p03_arcsec": {
+        "r10": 0.5420027397668232,
+        "r35": 1.132422783191009,
+        "r60": 1.848007172895115,
+        "r70": 3.6189933600090036
+      }
+    },
+    "F250M": {
+      "path": "/data/czh23/JWST/NIRCam_PSF/PSF_NIRCam_in_flight_opd_filter_F250M.fits",
+      "sha256": "e5779fef53916c9312f32ab96e2faa2d8b7e96686e20e11fc28e1d052a112007",
+      "extension": "OVERSAMP",
+      "shape_yx": [
+        636,
+        636
+      ],
+      "header": {
+        "FILTER": "F250M",
+        "PIXELSCL": 0.01575,
+        "FOV": 10.017,
+        "OVERSAMP": 4,
+        "DET_SAMP": 4,
+        "NORMALIZ": "first",
+        "VERSION": "1.1.0",
+        "DATAVERS": "1.1.0",
+        "DATE": "2022-09-27T01:52:50",
+        "DET_NAME": "NRCA5",
+        "DET_X": 1024.0,
+        "DET_Y": 1024.0,
+        "WAVELEN": 2.50066622529764e-06,
+        "PUPILOPD": "JWST_OTE_OPD_cycle1_example_2022-07-30.fits",
+        "DISTORT": null,
+        "CHDFTYPE": null,
+        "CHDFSIGM": null,
+        "IPCINST": null,
+        "IPCFILE": null,
+        "JITRSIGM": 0.0008
+      },
+      "stamp_sum": 0.9898803199399688,
+      "radii_arcsec": {
+        "r10": 0.01902304092219558,
+        "r35": 0.03984693092234145,
+        "r60": 0.0639030475488943,
+        "r70": 0.12208855005339132
+      },
+      "radii_pixels_at_0p03_arcsec": {
+        "r10": 0.634101364073186,
+        "r35": 1.328231030744715,
+        "r60": 2.130101584963143,
+        "r70": 4.069618335113044
+      }
+    },
+    "F277W": {
+      "path": "/data/czh23/JWST/NIRCam_PSF/PSF_NIRCam_in_flight_opd_filter_F277W.fits",
+      "sha256": "dd052a1133672cbaab4e245733850e44338186b8a4dfa7af67516f8c4b1dcfb1",
+      "extension": "OVERSAMP",
+      "shape_yx": [
+        636,
+        636
+      ],
+      "header": {
+        "FILTER": "F277W",
+        "PIXELSCL": 0.01575,
+        "FOV": 10.017,
+        "OVERSAMP": 4,
+        "DET_SAMP": 4,
+        "NORMALIZ": "first",
+        "VERSION": "1.1.0",
+        "DATAVERS": "1.1.0",
+        "DATE": "2022-09-27T01:53:48",
+        "DET_NAME": "NRCA5",
+        "DET_X": 1024.0,
+        "DET_Y": 1024.0,
+        "WAVELEN": 2.72857003885151e-06,
+        "PUPILOPD": "JWST_OTE_OPD_cycle1_example_2022-07-30.fits",
+        "DISTORT": null,
+        "CHDFTYPE": null,
+        "CHDFSIGM": null,
+        "IPCINST": null,
+        "IPCFILE": null,
+        "JITRSIGM": 0.0008
+      },
+      "stamp_sum": 0.9891513027065937,
+      "radii_arcsec": {
+        "r10": 0.02068082902784597,
+        "r35": 0.04326011682983515,
+        "r60": 0.07037358055945826,
+        "r70": 0.13064271357956317
+      },
+      "radii_pixels_at_0p03_arcsec": {
+        "r10": 0.6893609675948656,
+        "r35": 1.4420038943278386,
+        "r60": 2.345786018648609,
+        "r70": 4.354757119318773
+      }
+    },
+    "F300M": {
+      "path": "/data/czh23/JWST/NIRCam_PSF/PSF_NIRCam_in_flight_opd_filter_F300M.fits",
+      "sha256": "3cfdaa93d354d00a79b2994d1a8da5000b6d93d455571bb65cfda35c5a9457c9",
+      "extension": "OVERSAMP",
+      "shape_yx": [
+        636,
+        636
+      ],
+      "header": {
+        "FILTER": "F300M",
+        "PIXELSCL": 0.01575,
+        "FOV": 10.017,
+        "OVERSAMP": 4,
+        "DET_SAMP": 4,
+        "NORMALIZ": "first",
+        "VERSION": "1.1.0",
+        "DATAVERS": "1.1.0",
+        "DATE": "2022-09-27T01:55:54",
+        "DET_NAME": "NRCA5",
+        "DET_X": 1024.0,
+        "DET_Y": 1024.0,
+        "WAVELEN": 2.98121677604572e-06,
+        "PUPILOPD": "JWST_OTE_OPD_cycle1_example_2022-07-30.fits",
+        "DISTORT": null,
+        "CHDFTYPE": null,
+        "CHDFSIGM": null,
+        "IPCINST": null,
+        "IPCFILE": null,
+        "JITRSIGM": 0.0008
+      },
+      "stamp_sum": 0.9883824372071226,
+      "radii_arcsec": {
+        "r10": 0.02278054052965486,
+        "r35": 0.04722163253875578,
+        "r60": 0.07675828248128119,
+        "r70": 0.14497281713929303
+      },
+      "radii_pixels_at_0p03_arcsec": {
+        "r10": 0.7593513509884954,
+        "r35": 1.574054417958526,
+        "r60": 2.5586094160427066,
+        "r70": 4.832427237976434
+      }
+    },
+    "F322W2": {
+      "path": "/data/czh23/JWST/NIRCam_PSF/PSF_NIRCam_in_flight_opd_filter_F322W2.fits",
+      "sha256": "ca606cd1ed1da4b88d32f0286266de46ced2150921c30efd7c6f403be194ccf1",
+      "extension": "OVERSAMP",
+      "shape_yx": [
+        636,
+        636
+      ],
+      "header": {
+        "FILTER": "F322W2",
+        "PIXELSCL": 0.01575,
+        "FOV": 10.017,
+        "OVERSAMP": 4,
+        "DET_SAMP": 4,
+        "NORMALIZ": "first",
+        "VERSION": "1.1.0",
+        "DATAVERS": "1.1.0",
+        "DATE": "2022-09-27T01:57:48",
+        "DET_NAME": "NRCA5",
+        "DET_X": 1024.0,
+        "DET_Y": 1024.0,
+        "WAVELEN": 3.07409451054375e-06,
+        "PUPILOPD": "JWST_OTE_OPD_cycle1_example_2022-07-30.fits",
+        "DISTORT": null,
+        "CHDFTYPE": null,
+        "CHDFSIGM": null,
+        "IPCINST": null,
+        "IPCFILE": null,
+        "JITRSIGM": 0.0008
+      },
+      "stamp_sum": 0.9882081435635017,
+      "radii_arcsec": {
+        "r10": 0.02283477299732609,
+        "r35": 0.047748504934715094,
+        "r60": 0.07975548038784758,
+        "r70": 0.1384567923020335
+      },
+      "radii_pixels_at_0p03_arcsec": {
+        "r10": 0.7611590999108697,
+        "r35": 1.59161683115717,
+        "r60": 2.658516012928253,
+        "r70": 4.615226410067784
+      }
+    },
+    "F323N": {
+      "path": "/data/czh23/JWST/NIRCam_PSF/PSF_NIRCam_in_flight_opd_filter_F323N.fits",
+      "sha256": "dff687cb618698431fd0b3e6f7f971802404c58759a69e50f2e18714c48e1b82",
+      "extension": "OVERSAMP",
+      "shape_yx": [
+        636,
+        636
+      ],
+      "header": {
+        "FILTER": "F323N",
+        "PIXELSCL": 0.01575,
+        "FOV": 10.017,
+        "OVERSAMP": 4,
+        "DET_SAMP": 4,
+        "NORMALIZ": "first",
+        "VERSION": "1.1.0",
+        "DATAVERS": "1.1.0",
+        "DATE": "2022-09-27T01:57:41",
+        "DET_NAME": "NRCA5",
+        "DET_X": 1024.0,
+        "DET_Y": 1024.0,
+        "WAVELEN": 3.23669279585538e-06,
+        "PUPILOPD": "JWST_OTE_OPD_cycle1_example_2022-07-30.fits",
+        "DISTORT": null,
+        "CHDFTYPE": null,
+        "CHDFSIGM": null,
+        "IPCINST": null,
+        "IPCFILE": null,
+        "JITRSIGM": 0.0008
+      },
+      "stamp_sum": 0.9877389770552258,
+      "radii_arcsec": {
+        "r10": 0.02519273337484618,
+        "r35": 0.052548406841662766,
+        "r60": 0.08709112116403354,
+        "r70": 0.16391635054124162
+      },
+      "radii_pixels_at_0p03_arcsec": {
+        "r10": 0.8397577791615394,
+        "r35": 1.751613561388759,
+        "r60": 2.9030373721344516,
+        "r70": 5.463878351374721
+      }
+    },
+    "F335M": {
+      "path": "/data/czh23/JWST/NIRCam_PSF/PSF_NIRCam_in_flight_opd_filter_F335M.fits",
+      "sha256": "9073efb28109bdd2ef3e348873d306ca9ce3ec1ddf16d43d14b6a92be4659dc8",
+      "extension": "OVERSAMP",
+      "shape_yx": [
+        636,
+        636
+      ],
+      "header": {
+        "FILTER": "F335M",
+        "PIXELSCL": 0.01575,
+        "FOV": 10.017,
+        "OVERSAMP": 4,
+        "DET_SAMP": 4,
+        "NORMALIZ": "first",
+        "VERSION": "1.1.0",
+        "DATAVERS": "1.1.0",
+        "DATE": "2022-09-27T01:57:47",
+        "DET_NAME": "NRCA5",
+        "DET_X": 1024.0,
+        "DET_Y": 1024.0,
+        "WAVELEN": 3.35325925600108e-06,
+        "PUPILOPD": "JWST_OTE_OPD_cycle1_example_2022-07-30.fits",
+        "DISTORT": null,
+        "CHDFTYPE": null,
+        "CHDFSIGM": null,
+        "IPCINST": null,
+        "IPCFILE": null,
+        "JITRSIGM": 0.0008
+      },
+      "stamp_sum": 0.987429605490235,
+      "radii_arcsec": {
+        "r10": 0.02562566399841414,
+        "r35": 0.0532707968580605,
+        "r60": 0.08642322790815225,
+        "r70": 0.16268917051257886
+      },
+      "radii_pixels_at_0p03_arcsec": {
+        "r10": 0.854188799947138,
+        "r35": 1.7756932286020168,
+        "r60": 2.8807742636050753,
+        "r70": 5.422972350419296
+      }
+    },
+    "F356W": {
+      "path": "/data/czh23/JWST/NIRCam_PSF/PSF_NIRCam_in_flight_opd_filter_F356W.fits",
+      "sha256": "b59220c47265a6310b01b9d0c16f7a64403ffa70472e1faa2ca98790cbdf631b",
+      "extension": "OVERSAMP",
+      "shape_yx": [
+        636,
+        636
+      ],
+      "header": {
+        "FILTER": "F356W",
+        "PIXELSCL": 0.01575,
+        "FOV": 10.017,
+        "OVERSAMP": 4,
+        "DET_SAMP": 4,
+        "NORMALIZ": "first",
+        "VERSION": "1.1.0",
+        "DATAVERS": "1.1.0",
+        "DATE": "2022-09-27T01:59:49",
+        "DET_NAME": "NRCA5",
+        "DET_X": 1024.0,
+        "DET_Y": 1024.0,
+        "WAVELEN": 3.52907236337716e-06,
+        "PUPILOPD": "JWST_OTE_OPD_cycle1_example_2022-07-30.fits",
+        "DISTORT": null,
+        "CHDFTYPE": null,
+        "CHDFSIGM": null,
+        "IPCINST": null,
+        "IPCFILE": null,
+        "JITRSIGM": 0.0008
+      },
+      "stamp_sum": 0.9869661777394403,
+      "radii_arcsec": {
+        "r10": 0.026785740120023716,
+        "r35": 0.055850255961719004,
+        "r60": 0.09088729217383695,
+        "r70": 0.1676745292421188
+      },
+      "radii_pixels_at_0p03_arcsec": {
+        "r10": 0.8928580040007905,
+        "r35": 1.8616751987239668,
+        "r60": 3.029576405794565,
+        "r70": 5.589150974737294
+      }
+    },
+    "F360M": {
+      "path": "/data/czh23/JWST/NIRCam_PSF/PSF_NIRCam_in_flight_opd_filter_F360M.fits",
+      "sha256": "5f7071f6a78da453598af6596f24b8110d2b46f4252a92b13cb6f64f3511832f",
+      "extension": "OVERSAMP",
+      "shape_yx": [
+        636,
+        636
+      ],
+      "header": {
+        "FILTER": "F360M",
+        "PIXELSCL": 0.01575,
+        "FOV": 10.017,
+        "OVERSAMP": 4,
+        "DET_SAMP": 4,
+        "NORMALIZ": "first",
+        "VERSION": "1.1.0",
+        "DATAVERS": "1.1.0",
+        "DATE": "2022-09-27T02:03:47",
+        "DET_NAME": "NRCA5",
+        "DET_X": 1024.0,
+        "DET_Y": 1024.0,
+        "WAVELEN": 3.615748542542e-06,
+        "PUPILOPD": "JWST_OTE_OPD_cycle1_example_2022-07-30.fits",
+        "DISTORT": null,
+        "CHDFTYPE": null,
+        "CHDFSIGM": null,
+        "IPCINST": null,
+        "IPCFILE": null,
+        "JITRSIGM": 0.0008
+      },
+      "stamp_sum": 0.9867481806976247,
+      "radii_arcsec": {
+        "r10": 0.02755837318975897,
+        "r35": 0.05739109749706861,
+        "r60": 0.09277106599198777,
+        "r70": 0.1744269814372147
+      },
+      "radii_pixels_at_0p03_arcsec": {
+        "r10": 0.9186124396586324,
+        "r35": 1.9130365832356204,
+        "r60": 3.0923688663995925,
+        "r70": 5.814232714573823
+      }
+    },
+    "F405N": {
+      "path": "/data/czh23/JWST/NIRCam_PSF/PSF_NIRCam_in_flight_opd_filter_F405N.fits",
+      "sha256": "3b00d131c74a469860734a9763cb115b3a5d57c04ff9e4bb8671c2889419795c",
+      "extension": "OVERSAMP",
+      "shape_yx": [
+        636,
+        636
+      ],
+      "header": {
+        "FILTER": "F405N",
+        "PIXELSCL": 0.01575,
+        "FOV": 10.017,
+        "OVERSAMP": 4,
+        "DET_SAMP": 4,
+        "NORMALIZ": "first",
+        "VERSION": "1.1.0",
+        "DATAVERS": "1.1.0",
+        "DATE": "2022-09-27T02:06:30",
+        "DET_NAME": "NRCA5",
+        "DET_X": 1024.0,
+        "DET_Y": 1024.0,
+        "WAVELEN": 4.05145613940418e-06,
+        "PUPILOPD": "JWST_OTE_OPD_cycle1_example_2022-07-30.fits",
+        "DISTORT": null,
+        "CHDFTYPE": null,
+        "CHDFSIGM": null,
+        "IPCINST": null,
+        "IPCFILE": null,
+        "JITRSIGM": 0.0008
+      },
+      "stamp_sum": 0.9855545568474307,
+      "radii_arcsec": {
+        "r10": 0.030661595070876048,
+        "r35": 0.06369053258281414,
+        "r60": 0.10248616960289147,
+        "r70": 0.19219516412895896
+      },
+      "radii_pixels_at_0p03_arcsec": {
+        "r10": 1.0220531690292016,
+        "r35": 2.123017752760471,
+        "r60": 3.416205653429716,
+        "r70": 6.406505470965299
+      }
+    },
+    "F410M": {
+      "path": "/data/czh23/JWST/NIRCam_PSF/PSF_NIRCam_in_flight_opd_filter_F410M.fits",
+      "sha256": "a92a0de41a3f932a3a9f7ab998017cf9ff89d2a7de3e701e48b579c2dd727c25",
+      "extension": "OVERSAMP",
+      "shape_yx": [
+        636,
+        636
+      ],
+      "header": {
+        "FILTER": "F410M",
+        "PIXELSCL": 0.01575,
+        "FOV": 10.017,
+        "OVERSAMP": 4,
+        "DET_SAMP": 4,
+        "NORMALIZ": "first",
+        "VERSION": "1.1.0",
+        "DATAVERS": "1.1.0",
+        "DATE": "2022-09-27T02:06:31",
+        "DET_NAME": "NRCA5",
+        "DET_X": 1024.0,
+        "DET_Y": 1024.0,
+        "WAVELEN": 4.07215655852712e-06,
+        "PUPILOPD": "JWST_OTE_OPD_cycle1_example_2022-07-30.fits",
+        "DISTORT": null,
+        "CHDFTYPE": null,
+        "CHDFSIGM": null,
+        "IPCINST": null,
+        "IPCFILE": null,
+        "JITRSIGM": 0.0008
+      },
+      "stamp_sum": 0.9854917106104194,
+      "radii_arcsec": {
+        "r10": 0.03076512513666077,
+        "r35": 0.06393540534849078,
+        "r60": 0.10298995001460451,
+        "r70": 0.1918913104225752
+      },
+      "radii_pixels_at_0p03_arcsec": {
+        "r10": 1.0255041712220256,
+        "r35": 2.131180178283026,
+        "r60": 3.4329983338201506,
+        "r70": 6.39637701408584
+      }
+    },
+    "F430M": {
+      "path": "/data/czh23/JWST/NIRCam_PSF/PSF_NIRCam_in_flight_opd_filter_F430M.fits",
+      "sha256": "0da283a5cefd360cf9c31e61e1c87354e87e365425dd4be18f1b1f2305a66c82",
+      "extension": "OVERSAMP",
+      "shape_yx": [
+        636,
+        636
+      ],
+      "header": {
+        "FILTER": "F430M",
+        "PIXELSCL": 0.01575,
+        "FOV": 10.017,
+        "OVERSAMP": 4,
+        "DET_SAMP": 4,
+        "NORMALIZ": "first",
+        "VERSION": "1.1.0",
+        "DATAVERS": "1.1.0",
+        "DATE": "2022-09-27T02:09:23",
+        "DET_NAME": "NRCA5",
+        "DET_X": 1024.0,
+        "DET_Y": 1024.0,
+        "WAVELEN": 4.27822328109192e-06,
+        "PUPILOPD": "JWST_OTE_OPD_cycle1_example_2022-07-30.fits",
+        "DISTORT": null,
+        "CHDFTYPE": null,
+        "CHDFSIGM": null,
+        "IPCINST": null,
+        "IPCFILE": null,
+        "JITRSIGM": 0.0008
+      },
+      "stamp_sum": 0.9848743819555954,
+      "radii_arcsec": {
+        "r10": 0.032217575141619145,
+        "r35": 0.06697975226312129,
+        "r60": 0.10727626365537643,
+        "r70": 0.1992855130475498
+      },
+      "radii_pixels_at_0p03_arcsec": {
+        "r10": 1.0739191713873049,
+        "r35": 2.23265840877071,
+        "r60": 3.5758754551792147,
+        "r70": 6.642850434918326
+      }
+    },
+    "F444W": {
+      "path": "/data/czh23/JWST/NIRCam_PSF/PSF_NIRCam_in_flight_opd_filter_F444W.fits",
+      "sha256": "3fc5d68ac70f93e4aec491cb16f7382978c1b1647a833427e2d4025ab29b9cf1",
+      "extension": "OVERSAMP",
+      "shape_yx": [
+        636,
+        636
+      ],
+      "header": {
+        "FILTER": "F444W",
+        "PIXELSCL": 0.01575,
+        "FOV": 10.017,
+        "OVERSAMP": 4,
+        "DET_SAMP": 4,
+        "NORMALIZ": "first",
+        "VERSION": "1.1.0",
+        "DATAVERS": "1.1.0",
+        "DATE": "2022-09-27T02:11:17",
+        "DET_NAME": "NRCA5",
+        "DET_X": 1024.0,
+        "DET_Y": 1024.0,
+        "WAVELEN": 4.34716460645538e-06,
+        "PUPILOPD": "JWST_OTE_OPD_cycle1_example_2022-07-30.fits",
+        "DISTORT": null,
+        "CHDFTYPE": null,
+        "CHDFSIGM": null,
+        "IPCINST": null,
+        "IPCFILE": null,
+        "JITRSIGM": 0.0008
+      },
+      "stamp_sum": 0.9846052794087201,
+      "radii_arcsec": {
+        "r10": 0.03253765632665081,
+        "r35": 0.0678166321541839,
+        "r60": 0.10919246769750944,
+        "r70": 0.19715677271158383
+      },
+      "radii_pixels_at_0p03_arcsec": {
+        "r10": 1.0845885442216936,
+        "r35": 2.2605544051394637,
+        "r60": 3.639748923250315,
+        "r70": 6.571892423719461
+      }
+    },
+    "F460M": {
+      "path": "/data/czh23/JWST/NIRCam_PSF/PSF_NIRCam_in_flight_opd_filter_F460M.fits",
+      "sha256": "c02160e1679b6b842c9ed1dd9b89e0b1f2e969de658c83163f44efce162faf49",
+      "extension": "OVERSAMP",
+      "shape_yx": [
+        636,
+        636
+      ],
+      "header": {
+        "FILTER": "F460M",
+        "PIXELSCL": 0.01575,
+        "FOV": 10.017,
+        "OVERSAMP": 4,
+        "DET_SAMP": 4,
+        "NORMALIZ": "first",
+        "VERSION": "1.1.0",
+        "DATAVERS": "1.1.0",
+        "DATE": "2022-09-27T02:15:13",
+        "DET_NAME": "NRCA5",
+        "DET_X": 1024.0,
+        "DET_Y": 1024.0,
+        "WAVELEN": 4.62787307369572e-06,
+        "PUPILOPD": "JWST_OTE_OPD_cycle1_example_2022-07-30.fits",
+        "DISTORT": null,
+        "CHDFTYPE": null,
+        "CHDFSIGM": null,
+        "IPCINST": null,
+        "IPCFILE": null,
+        "JITRSIGM": 0.0008
+      },
+      "stamp_sum": 0.9837445906114939,
+      "radii_arcsec": {
+        "r10": 0.034738899344488906,
+        "r35": 0.07216939541650995,
+        "r60": 0.11482312641442403,
+        "r70": 0.210786759092603
+      },
+      "radii_pixels_at_0p03_arcsec": {
+        "r10": 1.1579633114829635,
+        "r35": 2.405646513883665,
+        "r60": 3.827437547147468,
+        "r70": 7.0262253030867665
+      }
+    },
+    "F466N": {
+      "path": "/data/czh23/JWST/NIRCam_PSF/PSF_NIRCam_in_flight_opd_filter_F466N.fits",
+      "sha256": "2095dd9e51b4340fa442a981b5d06a1d4841734950ed6247bc65822ca6f4326c",
+      "extension": "OVERSAMP",
+      "shape_yx": [
+        636,
+        636
+      ],
+      "header": {
+        "FILTER": "F466N",
+        "PIXELSCL": 0.01575,
+        "FOV": 10.017,
+        "OVERSAMP": 4,
+        "DET_SAMP": 4,
+        "NORMALIZ": "first",
+        "VERSION": "1.1.0",
+        "DATAVERS": "1.1.0",
+        "DATE": "2022-09-27T02:17:07",
+        "DET_NAME": "NRCA5",
+        "DET_X": 1024.0,
+        "DET_Y": 1024.0,
+        "WAVELEN": 4.65438362023908e-06,
+        "PUPILOPD": "JWST_OTE_OPD_cycle1_example_2022-07-30.fits",
+        "DISTORT": null,
+        "CHDFTYPE": null,
+        "CHDFSIGM": null,
+        "IPCINST": null,
+        "IPCFILE": null,
+        "JITRSIGM": 0.0008
+      },
+      "stamp_sum": 0.9836530907946833,
+      "radii_arcsec": {
+        "r10": 0.034942043338816106,
+        "r35": 0.07257398724493754,
+        "r60": 0.11542440467906345,
+        "r70": 0.21190734533643116
+      },
+      "radii_pixels_at_0p03_arcsec": {
+        "r10": 1.1647347779605368,
+        "r35": 2.4191329081645847,
+        "r60": 3.847480155968782,
+        "r70": 7.0635781778810385
+      }
+    },
+    "F470N": {
+      "path": "/data/czh23/JWST/NIRCam_PSF/PSF_NIRCam_in_flight_opd_filter_F470N.fits",
+      "sha256": "cca2a4c73d202d6ca7778d84786241e3c856943d27cdd67ee691a87b766196a4",
+      "extension": "OVERSAMP",
+      "shape_yx": [
+        636,
+        636
+      ],
+      "header": {
+        "FILTER": "F470N",
+        "PIXELSCL": 0.01575,
+        "FOV": 10.017,
+        "OVERSAMP": 4,
+        "DET_SAMP": 4,
+        "NORMALIZ": "first",
+        "VERSION": "1.1.0",
+        "DATAVERS": "1.1.0",
+        "DATE": "2022-09-27T02:17:07",
+        "DET_NAME": "NRCA5",
+        "DET_X": 1024.0,
+        "DET_Y": 1024.0,
+        "WAVELEN": 4.70785852312942e-06,
+        "PUPILOPD": "JWST_OTE_OPD_cycle1_example_2022-07-30.fits",
+        "DISTORT": null,
+        "CHDFTYPE": null,
+        "CHDFSIGM": null,
+        "IPCINST": null,
+        "IPCFILE": null,
+        "JITRSIGM": 0.0008
+      },
+      "stamp_sum": 0.983366091503288,
+      "radii_arcsec": {
+        "r10": 0.03534389824019788,
+        "r35": 0.0733917902990978,
+        "r60": 0.11674751613739558,
+        "r70": 0.21404210877660523
+      },
+      "radii_pixels_at_0p03_arcsec": {
+        "r10": 1.1781299413399293,
+        "r35": 2.4463930099699267,
+        "r60": 3.891583871246519,
+        "r70": 7.134736959220175
+      }
+    },
+    "F480M": {
+      "path": "/data/czh23/JWST/NIRCam_PSF/PSF_NIRCam_in_flight_opd_filter_F480M.fits",
+      "sha256": "a6842ae0dc7af9ceb25921f521de0737ba7dd6d4584b8662d58b3681c7e43d19",
+      "extension": "OVERSAMP",
+      "shape_yx": [
+        636,
+        636
+      ],
+      "header": {
+        "FILTER": "F480M",
+        "PIXELSCL": 0.01575,
+        "FOV": 10.017,
+        "OVERSAMP": 4,
+        "DET_SAMP": 4,
+        "NORMALIZ": "first",
+        "VERSION": "1.1.0",
+        "DATAVERS": "1.1.0",
+        "DATE": "2022-09-27T02:17:12",
+        "DET_NAME": "NRCA5",
+        "DET_X": 1024.0,
+        "DET_Y": 1024.0,
+        "WAVELEN": 4.81133887655082e-06,
+        "PUPILOPD": "JWST_OTE_OPD_cycle1_example_2022-07-30.fits",
+        "DISTORT": null,
+        "CHDFTYPE": null,
+        "CHDFSIGM": null,
+        "IPCINST": null,
+        "IPCFILE": null,
+        "JITRSIGM": 0.0008
+      },
+      "stamp_sum": 0.9830000586408144,
+      "radii_arcsec": {
+        "r10": 0.03613096978100285,
+        "r35": 0.0750119631919411,
+        "r60": 0.11952967681228324,
+        "r70": 0.2189930803212687
+      },
+      "radii_pixels_at_0p03_arcsec": {
+        "r10": 1.2043656593667618,
+        "r35": 2.5003987730647035,
+        "r60": 3.9843225604094417,
+        "r70": 7.299769344042291
+      }
+    }
+  }
+}

@@ -173,6 +173,10 @@ def _record_group_name(rec: CutoutRecord) -> str:
         return str(match.group(1))
     for uri in getattr(rec, "image_paths", ()) or ():
         text = str(uri)
+        match = re.search(r"__(group_\d+|\d+|half)\.zarr(?:#|$)", text)
+        if match:
+            group = match.group(1)
+            return f"group_{int(group):02d}" if group.isdigit() else group
         match = re.search(r"__?(group_\d+)(?:\\.zarr|/|#|$)", text)
         if match:
             return str(match.group(1))
@@ -226,15 +230,17 @@ def filter_records_by_patches(
     if not patches:
         return list(records)
     wanted = sorted({patch.strip("/") for patch in patches if patch.strip("/")})
+    # Index only requested aliases once; the old selector-by-record scan was O(S*N).
+    wanted_aliases = {_selector_parts(spec)[0] for spec in wanted}
+    by_alias = {alias: [] for alias in wanted_aliases}
+    for rec in records:
+        for alias in record_patch_aliases(rec, root) & wanted_aliases:
+            by_alias[alias].append(rec)
     selected: list[CutoutRecord] = []
     seen_names: set[str] = set()
     for spec in wanted:
         patch_selector, group_selector = _selector_parts(spec)
-        matched = [
-            rec
-            for rec in records
-            if patch_selector and (record_patch_aliases(rec, root) & {patch_selector})
-        ]
+        matched = by_alias.get(patch_selector, [])
         if not matched:
             continue
         group_selector = str(group_selector).strip()
@@ -312,6 +318,25 @@ def wcs_for_path(path: str, fits_hdu: int, cache: dict[tuple[str, int], object])
         return None
 
     try:
+        if str(path).startswith("zarr://"):
+            # Zarr WCS describes the label parent, while detections use tile pixels.
+            from astro_train_zarr_data import _parse_zarr_uri, _reader
+            store, sample = _parse_zarr_uri(path)
+            reader = _reader(str(store))
+            raw = reader.attrs.get("sky_wcs_header")
+            if raw is None:
+                cache[key] = False
+                return None
+            header = fits.Header.fromstring(raw, sep="\n") if isinstance(raw, str) else fits.Header(raw)
+            wcs = WCS(header).celestial
+            if not wcs.has_celestial:
+                cache[key] = False
+                return None
+            x0 = int(reader.read_full_small("tile_x0")[sample])
+            y0 = int(reader.read_full_small("tile_y0")[sample])
+            wcs = wcs.slice((slice(y0, None), slice(x0, None)))
+            cache[key] = wcs
+            return wcs
         with fits.open(path, memmap=True) as hdul:
             header = hdul[int(fits_hdu)].header
             wcs = WCS(header).celestial

@@ -22,3 +22,4 @@ vis/
 debug.sh
 patches/
 eval/hsctiles/interactive*/**
+*.pyc

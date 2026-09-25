@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Sequence
 
 
-DEFAULT_SOURCES = ("coadd", "denoised", "noisy")
+DEFAULT_SOURCES = ("coadd", "denoised", "noisy", "half_coadd")
 DEFAULT_BANDS = ("HSC-G", "HSC-R", "HSC-I", "HSC-Z", "HSC-Y", "NB0387", "NB0816", "NB0921", "NB1010")
 DEFAULT_NARROW_BANDS = ("NB0387", "NB0816", "NB0921", "NB0924", "NB1010")
 STORE_RE = re.compile(r"^(?P<patch>\d+,\d+)(?:__(?P<group>group_\d+))?\.zarr$")
@@ -55,6 +55,9 @@ class StoreInfo:
     group: str
     path: Path
     num_samples: int = 0
+    physical_patch: str = ''
+    dataset: str = 'hsc'
+    bounds: tuple = ()
 
 
 @dataclass
@@ -67,11 +70,14 @@ class SelectorCandidate:
     narrow_fraction: float = 1.0
     narrow_tile_sum: int = 0
     weight: float = 1.0
+    physical_patch: str = ''
+    dataset: str = 'hsc'
+    bounds: tuple = ()
 
     @property
     def selector(self) -> str:
-        if self.source == "coadd":
-            return f"coadd:{self.patch}"
+        if self.source == "coadd" or (self.source=='half_coadd' and self.group in ('','half')):
+            return f"{self.source}:{self.patch}"
         suffix = f"@{self.group}" if self.group else ""
         return f"{self.source}:{self.patch}{suffix}"
 
@@ -185,35 +191,33 @@ def _normalize_selector(text: str, *, default_source: str = "coadd") -> str:
 
 
 def scan_stores(root: Path, sources: Sequence[str], bands: Sequence[str]) -> list[StoreInfo]:
-    image_root = root / "image_level"
-    if not image_root.exists():
-        raise FileNotFoundError(f"image-level zarr root not found: {image_root}")
+    """Read store metadata recursively; never infer JWST fields from HSC names."""
     wanted_sources = {str(source).lower() for source in sources}
     wanted_bands = {str(band) for band in bands}
     stores: list[StoreInfo] = []
-    for source_dir in sorted(path for path in image_root.iterdir() if path.is_dir()):
-        source = source_dir.name.lower()
-        if source not in wanted_sources:
-            continue
-        for band_dir in sorted(path for path in source_dir.iterdir() if path.is_dir()):
-            band = band_dir.name
-            if wanted_bands and band not in wanted_bands:
-                continue
-            for store in sorted(band_dir.glob("*.zarr")):
-                match = STORE_RE.match(store.name)
-                if not match:
-                    continue
-                group = match.group("group") or ""
-                stores.append(
-                    StoreInfo(
-                        source=source,
-                        band=band,
-                        patch=match.group("patch"),
-                        group=group,
-                        path=store,
-                        num_samples=_read_num_samples(store),
-                    )
-                )
+    for store in sorted(root.rglob('*.zarr')):
+        attrs=store/'.zattrs'
+        if not attrs.exists():continue
+        meta=json.loads(attrs.read_text())
+        if not meta.get('image_level_training',False):continue
+        if meta.get('format')=='cellect_direct_patch_zarr' and not store.with_name(store.name+'_manifest.json').exists():continue
+        source=str(meta.get('dataset_source',store.parent.parent.name)).lower()
+        if wanted_sources and source not in wanted_sources:continue
+        bs=meta.get('bands',[meta.get('band',store.parent.name)])
+        if len(bs)!=1:continue
+        band=bs[0]
+        if wanted_bands and band not in wanted_bands:continue
+        dataset=meta.get('dataset','hsc');patch=str(meta.get('patch',store.stem.split('__')[0]))
+        group=str(meta.get('group',''));physical=patch
+        if dataset!='hsc':
+            # COSMOS proposals and centered views share one pointing split.
+            # Abell keeps parent-level splits; its overlapping windows are guarded below.
+            physical=(f'{dataset}/{meta["split_group"]}' if dataset=='cosmos' and meta.get('split_group')
+                      else f'{dataset}/{meta.get("parent_id",patch)}')
+            tract=str(meta.get('tract',dataset))
+            patch=f'{tract}/{patch}'
+        stores.append(StoreInfo(source,band,patch,group,store,int(meta.get('num_samples',0)),
+            physical,dataset,tuple(meta.get('parent_bounds',()))))
     return stores
 
 
@@ -240,9 +244,10 @@ def build_candidates(
         if store.patch in exclude_patches:
             continue
         key = (store.source, store.patch, store.group)
-        cand = by_key.setdefault(key, SelectorCandidate(source=store.source, patch=store.patch, group=store.group))
+        cand = by_key.setdefault(key, SelectorCandidate(source=store.source, patch=store.patch, group=store.group,
+            physical_patch=store.physical_patch or store.patch,dataset=store.dataset,bounds=store.bounds))
         cand.bands.add(store.band)
-        cand.samples_by_band[store.band] = max(cand.samples_by_band.get(store.band, 0), int(store.num_samples))
+        cand.samples_by_band[store.band] = cand.samples_by_band.get(store.band, 0) + int(store.num_samples)
         if store.source == "coadd":
             by_patch_band_samples[(store.patch, store.band)].append(int(store.num_samples))
 
@@ -268,7 +273,7 @@ def build_candidates(
 
         fraction = 1.0
         tile_sum = int(narrow_tile_sum_by_patch.get(cand.patch, 0))
-        if present_narrow and not disable_narrow_downweight:
+        if present_narrow and not disable_narrow_downweight and cand.dataset=='hsc':
             if str(narrow_weight_mode).replace("_", "-") == "mean-fraction":
                 per_band: list[float] = []
                 for band in present_narrow:
@@ -284,7 +289,7 @@ def build_candidates(
             fraction = max(0.0, min(1.0, fraction))
         cand.narrow_fraction = fraction
         cand.narrow_tile_sum = tile_sum
-        if disable_narrow_downweight:
+        if disable_narrow_downweight or cand.dataset!='hsc':
             cand.weight = 1.0
         else:
             floor = max(0.0, min(1.0, float(narrow_weight_floor)))
@@ -320,6 +325,22 @@ def fixed_selectors_to_candidates(
         more = "" if len(missing) <= 12 else f" ... (+{len(missing) - 12})"
         raise RuntimeError(f"fixed validation selector(s) not found in zarr root: {preview}{more}")
     return selected
+
+
+def validation_exclusions(candidates, selected):
+    """Tie proposals/centered views and guard overlapping Abell parent blocks."""
+    blocked=set()
+    for c in candidates:
+        for v in selected:
+            same=(c.physical_patch or c.patch)==(v.physical_patch or v.patch)
+            overlap=False
+            if c.dataset==v.dataset=='abell' and c.bounds and v.bounds:
+                # Centered 512 stamps can extend outside a 4096 parent.
+                a,b=c.bounds,v.bounds
+                overlap=(a[0]-256<b[2]+256 and a[2]+256>b[0]-256
+                         and a[1]-256<b[3]+256 and a[3]+256>b[1]-256)
+            if same or overlap:blocked.add(c.patch);break
+    return blocked
 
 
 def weighted_sample_without_replacement(
@@ -408,7 +429,7 @@ def _selected_rows(selected: Sequence[SelectorCandidate]) -> list[dict[str, obje
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--root", required=True, type=Path, help="Image-level Zarr root, e.g. /data/czh23/direct_zarr_v3_lupton")
-    parser.add_argument("--bands", nargs="+", default=list(DEFAULT_BANDS))
+    parser.add_argument("--bands", nargs="+", default=None, help='Default: all discovered HSC/JWST bands')
     parser.add_argument("--dataset-sources", nargs="+", default=list(DEFAULT_SOURCES), help="Sources to scan and sample.")
     parser.add_argument("--narrow-bands", nargs="+", default=list(DEFAULT_NARROW_BANDS), help="Bands used to downweight patches with missing/filtered narrow-band stores.")
     parser.add_argument("--train-counts", nargs="*", default=None, metavar="SOURCE=N", help="Number of selectors per source for train.")
@@ -445,7 +466,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     root = args.root.expanduser()
-    bands = [str(band) for band in args.bands]
+    bands = [str(band) for band in (args.bands or [])]
     sources = [str(source).lower() for source in args.dataset_sources]
     train_counts = _parse_count_items(args.train_counts)
     val_counts = _parse_count_items(args.val_counts)
@@ -457,6 +478,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     exclude_patches = _parse_patch_list(args.exclude_patches) | _read_patch_file(args.exclude_patches_file)
 
     stores = scan_stores(root, sources, bands)
+    if not bands:bands=sorted({s.band for s in stores})
     if not stores:
         raise SystemExit(f"no image-level zarr stores found under {root / 'image_level'}")
     candidates = build_candidates(
@@ -501,7 +523,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     allow_short=bool(args.allow_short),
                 )
             )
-    val_physical = {cand.patch for cand in val_selected}
+    val_physical = validation_exclusions(candidates,val_selected)
 
     train_selected: list[SelectorCandidate] = []
     for source, count in sorted(train_counts.items()):

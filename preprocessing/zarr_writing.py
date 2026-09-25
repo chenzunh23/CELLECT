@@ -63,6 +63,10 @@ class ImageLevelTrainingBatch:
     shape_source_classes: np.ndarray
     shape_source_ids: np.ndarray
     shape_source_offsets: np.ndarray
+    band_segmentation_ids: np.ndarray | None = None
+    band_segmentation_weight: np.ndarray | None = None
+    segmentation_overlap: dict | None = None
+    band_valid_mask: np.ndarray | None = None
 
 
 def write_image_level_zarr(
@@ -143,11 +147,43 @@ def write_training_image_level_zarr(
     n = int(images.shape[0])
     bands = int(images.shape[1])
     h, w = int(images.shape[-2]), int(images.shape[-1])
+    if batch.band_valid_mask is not None and np.shape(batch.band_valid_mask)!=(n,bands,h,w):
+        raise ValueError('validity/image shape mismatch')
+    seg_ids = batch.band_segmentation_ids
+    seg_weight = batch.band_segmentation_weight
+    if (seg_ids is None) != (seg_weight is None):
+        raise ValueError("segmentation IDs and weights must be supplied together")
+    if seg_ids is not None:
+        seg_ids = np.asarray(seg_ids)
+        seg_weight = np.asarray(seg_weight)
+        expected = (n, bands, h, w)
+        if seg_ids.shape != expected or seg_weight.shape != expected:
+            raise ValueError(f"segmentation arrays must have shape {expected}")
+        if (not np.issubdtype(seg_ids.dtype, np.integer) or np.any(seg_ids < 0)
+                or np.any(seg_ids > np.iinfo(np.int32).max)):
+            raise ValueError("segmentation IDs must be nonnegative int32-compatible integers")
+        if (not np.isfinite(seg_weight).all() or np.any(seg_weight < 0)
+                or np.any(seg_weight > 1) or np.any(seg_weight[seg_ids == 0] != 0)):
+            raise ValueError("segmentation weights must be finite in [0,1], zero outside instances")
+    overlap = batch.segmentation_overlap
+    if overlap is not None:
+        from .utils.segmentation_storage import validate_overlap_masks
+        if seg_ids is None:
+            raise ValueError('overlap sidecars require the base segmentation ID plane')
+        validate_overlap_masks(overlap, n, bands, h, w)
     attrs = dict(batch.attrs)
     attrs.setdefault("format", "cellect_direct_patch_zarr")
     attrs["schema"] = "preprocessing_v3_image_level"
     attrs["image_level_training"] = True
     attrs["num_samples"] = n
+    attrs["segmentation_supervision"] = "positive_only" if seg_ids is not None else "none"
+    if seg_ids is not None:
+        attrs["segmentation_id_namespace"] = "cosmos_catalog_id"
+    if overlap is not None:
+        from .utils.segmentation_storage import MASK_COLUMNS, MASK_ENCODING
+        attrs['segmentation_overlap_encoding'] = MASK_ENCODING
+        attrs['segmentation_overlap_columns'] = MASK_COLUMNS
+        attrs['segmentation_instance_reader'] = 'preprocessing.utils.segmentation_storage.iter_training_segmentation_masks'
     writer = ZarrGroupWriter(output, overwrite=overwrite, attrs=attrs)
     chunk_tiles = max(1, int(chunk_tiles))
     if images.ndim == 5:
@@ -155,6 +191,9 @@ def write_training_image_level_zarr(
     else:
         image_chunks = (min(chunk_tiles, max(1, n)), bands, h, w)
     writer.array("images", shape=images.shape, chunks=image_chunks, dtype=np.float32).write_full(images)
+    if batch.band_valid_mask is not None:
+        valid=np.asarray(batch.band_valid_mask,bool)
+        writer.array('band_valid_mask',shape=valid.shape,chunks=(1,bands,h,w),dtype=np.uint8).write_full(valid.astype(np.uint8))
 
     def _write_band_array(name: str, values: np.ndarray, dtype, extra: tuple[int, ...] = ()) -> None:
         arr = np.asarray(values, dtype=dtype)
@@ -169,6 +208,9 @@ def write_training_image_level_zarr(
     _write_band_array("band_shape", batch.band_shape, np.float32, extra=(3,))
     _write_band_array("band_shape_weight", batch.band_shape_weight, np.float32)
     _write_band_array("band_pu_class_mask", batch.band_pu_class_mask, np.uint8)
+    if seg_ids is not None:
+        _write_band_array("band_segmentation_ids", seg_ids, np.int32)
+        _write_band_array("band_segmentation_weight", seg_weight, np.float32)
 
     writer.array("tile_x0", shape=(n,), chunks=(max(1, n),), dtype=np.int32).write_full(np.asarray(batch.tile_x0, dtype=np.int32))
     writer.array("tile_y0", shape=(n,), chunks=(max(1, n),), dtype=np.int32).write_full(np.asarray(batch.tile_y0, dtype=np.int32))
@@ -187,6 +229,11 @@ def write_training_image_level_zarr(
             chunks = (max(1, len(arr)),)
         writer.array(name, shape=arr.shape, chunks=chunks, dtype=dtype).write_full(arr)
 
+    if overlap is not None:
+        _write_flat('segmentation_overlap_meta', overlap['meta'], np.int64, width=8)
+        _write_flat('segmentation_overlap_data', overlap['data'], np.uint8)
+        _write_flat('segmentation_overlap_offsets', overlap['offsets'], np.int64)
+        _write_flat('segmentation_overlap_weights', overlap['weights'], np.float32)
     _write_flat("source_centers", batch.source_centers, np.float32, width=2)
     _write_flat("source_ids", batch.source_ids, np.int64)
     writer.array("source_offsets", shape=np.asarray(batch.source_offsets).shape, chunks=(max(1, n), bands + 1), dtype=np.int64).write_full(

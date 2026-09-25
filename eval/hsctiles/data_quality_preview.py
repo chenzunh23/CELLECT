@@ -44,7 +44,7 @@ class DataQualitySource:
     key: str
     label: str
     root: Path
-    pattern: str
+    patterns: tuple[str, ...]
     uses_group: bool
 
 
@@ -113,14 +113,21 @@ def source_path(source: DataQualitySource, tract: str, band: str, patch: str, gr
         group_index = int(str(group).replace("group_", ""))
     except Exception:
         group_index = 0
-    return source.root / source.pattern.format(
-        tract=tract,
-        band=band,
-        patch=patch,
-        patch_us=str(patch).replace(",", "_"),
-        group=group_index,
-        group2=f"{group_index:02d}",
-    )
+    candidates = [
+        source.root / pattern.format(
+            tract=tract,
+            band=band,
+            patch=patch,
+            patch_us=str(patch).replace(",", "_"),
+            group=group_index,
+            group2=f"{group_index:02d}",
+        )
+        for pattern in source.patterns
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
 
 
 def safe_zscale(image: np.ndarray) -> np.ndarray:
@@ -239,9 +246,38 @@ class DataQualityPreview:
         self.tile_stride = int(tile_stride)
         self.groups = [str(group) for group in groups]
         self.sources = {
-            "coadd": DataQualitySource("coadd", "coadd", Path(coadd_root).expanduser(), "{tract}/{band}/{patch}/warp_half-{band}-{tract}-{patch}-0.fits", False),
-            "noisy": DataQualitySource("noisy", "noisy", Path(noisy_root).expanduser(), "{tract}/{band}/{patch}/warp_8-{band}-{tract}-{patch}-{group}.fits", True),
-            "denoised": DataQualitySource("denoised", "denoised", Path(denoised_fits_root).expanduser(), "patch_{patch_us}/group_{group2}/{band}/noisy.fits", True),
+            "coadd": DataQualitySource(
+                "coadd",
+                "coadd",
+                Path(coadd_root).expanduser(),
+                (
+                    "{tract}/{band}/{patch}/warp_half-{band}-{tract}-{patch}-0.fits",
+                    "{tract}/{band}/{patch}/calexp-{band}-{tract}-{patch}.fits",
+                    "{band}/{patch}/warp_half-{band}-{tract}-{patch}-0.fits",
+                    "{band}/{patch}/calexp-{band}-{tract}-{patch}.fits",
+                ),
+                False,
+            ),
+            "noisy": DataQualitySource(
+                "noisy",
+                "noisy",
+                Path(noisy_root).expanduser(),
+                (
+                    "{tract}/{band}/{patch}/warp_8-{band}-{tract}-{patch}-{group}.fits",
+                    "{band}/{patch}/warp_8-{band}-{tract}-{patch}-{group}.fits",
+                ),
+                True,
+            ),
+            "denoised": DataQualitySource(
+                "denoised",
+                "denoised",
+                Path(denoised_fits_root).expanduser(),
+                (
+                    "patch_{patch_us}/group_{group2}/{band}/denoised.fits",
+                    "patch_{patch_us}/group_{group2}/{band}/noisy.fits",
+                ),
+                True,
+            ),
         }
         self.score_cache: dict[tuple[str, str, str], list[PatchScore]] = {}
         self.image_cache: dict[tuple[Any, ...], bytes] = {}

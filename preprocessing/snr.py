@@ -19,6 +19,61 @@ from .utils.catalog import magnitude_from_flux, source_xy
 SnrClass = Literal["clean", "weak_shape", "ignore"]
 
 
+def apply_candidate_snr(result, snr, *, weak_class=None, ignore_inclusive=False):
+    """JWST 3/5 cuts applied to every surviving candidate, never upgrading it."""
+    from .labels import SourceClass as C
+    from .ordinary_common import downgrade, retained
+    snr = np.asarray(snr, dtype=float)
+    if snr.shape != result.candidate.shape:
+        raise ValueError("SNR length mismatch")
+    weak_class = C.WEAK_SHAPE if weak_class is None else weak_class
+    low = (snr <= 3) if ignore_inclusive else (snr < 3)
+    ignored = retained(result) & (~np.isfinite(snr) | low)
+    downgrade(result, ignored, C.ORDINARY_IGNORE, "ordinary_snr_ignore")
+    weak = retained(result) & (snr < 5)
+    downgrade(result, weak, weak_class, "ordinary_snr_candidate")
+    result.diagnostics.update(snr=snr, snr_ignore=ignored, snr_weak=weak)
+    result.snapshot("snr")
+
+
+def remeasure_aperture_snr(image, geometry, *, sky_mask=None, excluded_mask=None,
+                           radius=16.0, background_box=128, min_sky_apertures=8):
+    """Measure linear-flux data using shared per-block background/noise tools."""
+    from utils.source_snr import measure_local_aperture_snr
+    return measure_local_aperture_snr(
+        image, geometry.x, geometry.y, major=geometry.major, minor=geometry.minor,
+        sky_mask=sky_mask, excluded_mask=excluded_mask, radius=radius,
+        box=background_box, min_sky_apertures=min_sky_apertures)
+
+
+def apply_remeasured_aperture_snr(result, mag, measurement, *, mag_min=22.0):
+    """Recheck faint sources including untrusted strict-center candidates.
+
+    For clean/weak candidates retain the conservative trusted-only rule. For
+    strict-center candidates, missing or SNR<3 is rejection, not an exemption.
+    """
+    from .labels import SourceClass as C
+    from .ordinary_common import downgrade, retained
+    snr = np.asarray(measurement["snr"], float)
+    trusted = np.asarray(measurement["trusted"], bool)
+    mag = np.asarray(mag, float)
+    if any(a.shape != result.candidate.shape for a in (snr, trusted, mag)):
+        raise ValueError("remeasured SNR length mismatch")
+    test = retained(result)
+    if mag_min is not None:
+        test &= np.isfinite(mag) & (mag > mag_min)
+    strict = test & result.labels.mask(C.STRICT_CENTER_ONLY)
+    apply = test & (trusted | strict)
+    ignored = apply & (~np.isfinite(snr) | (snr < 3))
+    downgrade(result, ignored, C.ORDINARY_IGNORE, "aperture_snr_ignore")
+    center = apply & ~ignored & (snr < 5)
+    downgrade(result, center, C.STRICT_CENTER_ONLY, "aperture_snr_center")
+    result.diagnostics.update(aperture_snr=snr, aperture_snr_trusted=trusted,
+                              aperture_snr_ignore=ignored, aperture_snr_center=center,
+                              aperture_snr_tested=test)
+    result.snapshot("aperture_snr")
+
+
 @dataclass(frozen=True)
 class SnrConfig:
     """SNR thresholds and metadata roots used by ordinary-source filtering."""

@@ -741,6 +741,8 @@ def _init_detection_totals(
         "linked_tp": 0,
         "linked_fp": 0,
         "linked_fn": 0,
+        "samples": 0,
+        "linking_enabled": False,
         "collect_candidate_stats": bool(collect_candidate_stats),
         "per_band_counts": {},
         "link_metrics_total": {
@@ -786,7 +788,9 @@ def _merge_detection_totals(items: Sequence[Dict[str, object]], band_names: Sequ
     collect_candidate_stats = any(bool(item.get("collect_candidate_stats", False)) for item in items if isinstance(item, dict))
     merged = _init_detection_totals(band_names, collect_candidate_stats=collect_candidate_stats)
     for item in items:
+        merged["linking_enabled"] = bool(merged["linking_enabled"] or item.get("linking_enabled", False))
         for key in (
+            "samples",
             "tp",
             "fp",
             "clean_region_fp",
@@ -826,6 +830,7 @@ def _merge_detection_totals(items: Sequence[Dict[str, object]], band_names: Sequ
                 )
                 assert isinstance(bucket, dict)
                 for count_key in (
+                    "samples",
                     "tp",
                     "fp",
                     "clean_region_fp",
@@ -969,11 +974,14 @@ def _finalize_detection_totals(
             band_candidate_stats = counts.get("candidate_stats")
             if bool(collect_candidate_stats) and isinstance(band_candidate_stats, dict):
                 per_band[str(band_name)]["candidate_stats"] = _finalize_candidate_stats_bucket(band_candidate_stats)
+        for name, bucket in per_band.items():
+            bucket["samples"] = int(per_band_counts[name].get("samples", 0))
+            bucket["evaluated"] = bucket["samples"] > 0
         result["per_band"] = per_band
     link_metrics_total = totals.get("link_metrics_total")
-    if isinstance(link_metrics_total, dict):
+    if totals.get("linking_enabled", False) and isinstance(link_metrics_total, dict):
         result["link_metrics"] = _finalize_link_metrics(link_metrics_total)
-    if use_ex_link_postprocess:
+    if totals.get("linking_enabled", False) and use_ex_link_postprocess:
         linked_tp = int(totals["linked_tp"])
         linked_fp = int(totals["linked_fp"])
         linked_fn = int(totals["linked_fn"])
@@ -989,4 +997,7 @@ def _finalize_detection_totals(
             "completeness": linked_recall,
             "f1": 2.0 * linked_precision * linked_recall / max(linked_precision + linked_recall, 1e-12),
         }
+    result["samples"] = int(totals.get("samples", 0))
+    result["linking_enabled"] = bool(totals.get("linking_enabled", False))
+    result["overall"] = {key: result[key] for key in ("samples", "tp", "fp", "fn", "precision", "recall", "f1")}
     return result

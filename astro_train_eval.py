@@ -9,6 +9,8 @@ model construction, and distributed training orchestration.
 
 from __future__ import annotations
 
+from utils.detection_metadata import sample_band_name, valid_predictions
+
 import argparse
 import csv
 import json
@@ -324,7 +326,7 @@ def _write_eval_sources_csv(
                 "tile_name": batch["tile_name"][item_idx],  # type: ignore[index]
                 "source_type": source_type,
                 "source_index": int(source_index),
-                "band": _band_name(band_idx, band_names) if band_idx >= 0 else "",
+                "band": sample_band_name(batch, item_idx, band_idx, band_names) if band_idx >= 0 else "",
                 "band_index": int(band_idx) if band_idx >= 0 else "",
                 "x_local": _format_float(x, 6),
                 "y_local": _format_float(y, 6),
@@ -402,6 +404,9 @@ def _write_eval_sources_csv(
         pred_xy: np.ndarray,
     ) -> list[dict[str, object]]:
         pred_xy = _as_numpy_centers(pred_xy)
+        scales = batch.get("pixel_scale_arcsec")
+        scale = scales[item_idx] if scales is not None else None
+        scale = float(scale) if scale is not None else float(pixel_scale_arcsec)
         clean_xy = _batch_centers(batch, item_idx, band_idx, "centers", "band_centers")
         ordinary_xy = _batch_centers(batch, item_idx, band_idx, "ignore_centers", "band_ignore_centers")
         strict_center_xy = _batch_centers(
@@ -413,7 +418,7 @@ def _write_eval_sources_csv(
         )
         strict_ignore_xy = _batch_centers(batch, item_idx, band_idx, "strict_ignore_centers", "band_strict_ignore_centers")
         ordinary_xy = np.unique(
-            np.concatenate([ordinary_xy, strict_center_xy, strict_ignore_xy], axis=0),
+            np.concatenate([ordinary_xy, strict_ignore_xy], axis=0),
             axis=0,
         ).astype(np.float32)
         clean_ids = _batch_ids(batch, item_idx, band_idx)
@@ -450,7 +455,7 @@ def _write_eval_sources_csv(
                 if gt_idx < len(clean_ids):
                     info["matched_source_id"] = str(clean_ids[gt_idx])
                 info["match_distance_pix"] = _format_float(clean_dist[pred_idx], 6)
-                info["match_distance_arcsec"] = _format_float(clean_dist[pred_idx] * float(pixel_scale_arcsec), 6)
+                info["match_distance_arcsec"] = _format_float(clean_dist[pred_idx] * scale, 6)
                 info["match_x_local"] = float(clean_xy[gt_idx, 0])
                 info["match_y_local"] = float(clean_xy[gt_idx, 1])
             elif pred_idx in ordinary_map:
@@ -459,7 +464,7 @@ def _write_eval_sources_csv(
                 info["matched_catalog"] = "ordinary_ignore"
                 info["matched_source_index"] = int(gt_idx)
                 info["match_distance_pix"] = _format_float(ordinary_dist[pred_idx], 6)
-                info["match_distance_arcsec"] = _format_float(ordinary_dist[pred_idx] * float(pixel_scale_arcsec), 6)
+                info["match_distance_arcsec"] = _format_float(ordinary_dist[pred_idx] * scale, 6)
                 info["match_x_local"] = float(ordinary_xy[gt_idx, 0])
                 info["match_y_local"] = float(ordinary_xy[gt_idx, 1])
             elif _point_in_mask_np(clean_mask, xy[0], xy[1]) or _point_in_mask_np(background_mask, xy[0], xy[1]):
@@ -569,7 +574,7 @@ def _write_eval_sources_csv(
             item_idx = list_idx // band_count if band_count else list_idx
             band_idx = list_idx % band_count if band_count else 0
             source_type = "band" if band_count else "fused"
-            pred_arr = np.asarray(pred_xy, dtype=np.float32).reshape(-1, 2)
+            pred_arr = valid_predictions(pred_xy, batch, item_idx, band_idx)
             match_infos = _match_infos_for_predictions(batch, item_idx, band_idx, pred_arr)
             for source_index, xy in enumerate(pred_arr):
                 append_row(
@@ -580,7 +585,7 @@ def _write_eval_sources_csv(
                     float(xy[1]),
                     band_idx=band_idx,
                     source_index=source_index,
-                    member_bands=_band_name(band_idx, band_names) if band_count else "",
+                    member_bands=sample_band_name(batch, item_idx, band_idx, band_names) if band_count else "",
                     match_info=match_infos[source_index],
                 )
 
@@ -681,7 +686,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "In Zarr train mode, use single-band image-level stores for SAM detector training. "
+            "In Zarr train/eval modes, use single-band image-level stores. "
             "Batch size then means total images, not multi-band groups."
         ),
     )
@@ -703,7 +708,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional directory containing precomputed <tile>.npz dense targets from astro_data_preprocessing.py.",
     )
-    parser.add_argument("--bands", nargs="+", default=("HSC-G", "HSC-R", "HSC-I"))
+    parser.add_argument("--detection-linking", action=argparse.BooleanOptionalAction, default=False,
+                        help="Enable legacy aligned multiband linking; disabled for independent image-level Zarr.")
+    parser.add_argument("--bands", nargs="+", default=("HSC-G", "HSC-R", "HSC-I"),
+                        help="Requested filters, or all for image-level Zarr metadata discovery.")
     parser.add_argument("--fits-hdu", type=int, default=1)
     parser.add_argument("--out-dir", default="./output/astro_cellect2d")
     parser.add_argument("--checkpoint", default=None)
@@ -1244,8 +1252,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "N=5 disables epochs 0-4 and enables mask loss from epoch 5."
         ),
     )
-    parser.add_argument("--mask-dice-weight", type=float, default=0.0)
-    parser.add_argument("--mask-bce-weight", type=float, default=0.0)
+    parser.add_argument("--mask-dice-weight", type=float, default=1.0,
+                        help="Dice on labelled instances only, restricted to positive mask and trusted sky.")
+    parser.add_argument("--mask-bce-weight", type=float, default=1.0,
+                        help="Balanced positive-mask / trusted SExtractor-sky BCE; unknown pixels excluded.")
+    parser.add_argument("--mask-supervision-weight", type=float, default=0.2,
+                        help="Additional BCE/Dice multiplier; instance reliability (normally 0.25) is retained.")
+    parser.add_argument("--mask-outside-kron-scale", type=float, default=1.5,
+                        help="Kron semi-axis multiplier for outside penalty only; does not resize prompt boxes.")
     parser.add_argument("--mask-centroid-weight", type=float, default=0.2)
     parser.add_argument("--mask-outside-weight", type=float, default=0.5)
     parser.add_argument("--mask-min-area-weight", type=float, default=0.1)
@@ -1258,13 +1272,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mask-area-ratio-lower",
         type=float,
-        default=0.20,
+        default=0.05,
         help="Lower bound for mask_area / prompted_shape_area used by mask area ratio loss.",
     )
     parser.add_argument(
         "--mask-area-ratio-upper",
         type=float,
-        default=1.00,
+        default=2.0,
         help="Upper bound for mask_area / prompted_shape_area used by mask area ratio loss.",
     )
     parser.add_argument("--mask-max-area-ratio", type=float, default=0.5)
@@ -1278,14 +1292,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mask-max-gt-per-sample",
         type=int,
-        default=0,
-        help="Maximum GT prompts per flattened batch/band item for SAM mask loss. <=0 keeps all GT prompts.",
+        default=128,
+        help="Total per-image prompt budget in GT phase; labelled instances are mandatory and may exceed it. <=0 is unlimited.",
     )
     parser.add_argument(
         "--mask-max-pred-per-sample",
         type=int,
-        default=0,
-        help="Maximum predicted prompts per flattened batch/band item for mask loss. <=0 keeps all detections.",
+        default=128,
+        help="Total per-image prompt budget in predicted phase; labelled GT instances remain mandatory. <=0 is unlimited.",
     )
     parser.add_argument("--mask-prompt-chunk-size", type=int, default=128)
     parser.add_argument(
@@ -1489,10 +1503,8 @@ def main() -> None:
     if args.zarr_random_image_batches:
         if args.data_format != "zarr":
             raise ValueError("--zarr-random-image-batches requires --data-format zarr")
-        if args.mode != "train":
-            print("WARNING: --zarr-random-image-batches is train-only; eval uses regular multiband Zarr discovery.")
-            args.zarr_random_image_batches = False
-        elif args.model_variant == "auto":
+        args.detection_linking = False
+        if args.model_variant == "auto":
             args.model_variant = "sam_per_band"
         elif args.model_variant != "sam_per_band":
             raise ValueError("--zarr-random-image-batches is currently implemented only for --model-variant sam_per_band")
@@ -1555,10 +1567,19 @@ def main() -> None:
         val_patch_specs = _parse_patch_specs(args.val_patches, args.val_patches_file)
         explicit_train_val_patches = args.mode == "train" and (bool(train_patch_specs) or bool(val_patch_specs))
         discover_max_records = None if ((args.mode == "eval" and eval_patch_specs) or explicit_train_val_patches) else args.max_records
+        if list(args.bands) == ["all"]:
+            if args.data_format != "zarr" or not args.zarr_random_image_batches:
+                raise ValueError("--bands all requires image-level Zarr")
+            from preprocessing.make_zarr_patch_splits import scan_stores
+            args.bands = sorted({s.band for s in scan_stores(root, [], [])})
+            if not args.bands:
+                raise RuntimeError("No completed image-level stores found")
+            if is_main:
+                print(f"Discovered filters: {args.bands}")
         if args.data_format == "zarr":
             if reference_dir is not None or cutout_dir is not None or band_reference_root is not None:
                 raise ValueError("--reference-dir/--cutout-dir/--band-reference-root are legacy-only options")
-            if args.mode == "train" and bool(args.zarr_random_image_batches):
+            if bool(args.zarr_random_image_batches):
                 records = discover_zarr_image_records(root, bands=args.bands, max_records=discover_max_records)
                 if is_main:
                     print(
@@ -1728,6 +1749,8 @@ def main() -> None:
             mask_loss_warmup_epochs=int(args.mask_loss_warmup_epochs),
             mask_dice=float(args.mask_dice_weight),
             mask_bce=float(args.mask_bce_weight),
+            mask_supervision_weight=float(args.mask_supervision_weight),
+            mask_outside_kron_scale=float(args.mask_outside_kron_scale),
             mask_centroid=float(args.mask_centroid_weight),
             mask_outside=float(args.mask_outside_weight),
             mask_min_area=float(args.mask_min_area_weight),
@@ -1987,8 +2010,8 @@ def main() -> None:
         ex_enabled = matcher_variant and len(args.bands) > 1 and not args.disable_ex_loss
         en_enabled = matcher_variant and bool(args.enable_en_loss)
         en_postprocess_enabled = matcher_variant and (bool(args.use_en_postprocess) or en_enabled)
-        ex_link_postprocess_enabled = matcher_variant and len(args.bands) > 1 and bool(args.use_ex_link_postprocess)
-        train_detect_ex_link_enabled = ex_enabled and bool(args.train_detect_ex_link)
+        ex_link_postprocess_enabled = bool(args.detection_linking) and matcher_variant and len(args.bands) > 1 and bool(args.use_ex_link_postprocess)
+        train_detect_ex_link_enabled = bool(args.detection_linking) and ex_enabled and bool(args.train_detect_ex_link)
         ex_band_pairs = (
             parse_matcher_ex_band_pairs(args.bands, core_band=args.ex_core_band, pair_specs=args.ex_band_pairs)
             if ex_enabled
@@ -2009,8 +2032,7 @@ def main() -> None:
                         )
                     del style_ckpt, style_state
             if (
-                args.mode == "train"
-                and bool(args.zarr_random_image_batches)
+                bool(args.zarr_random_image_batches)
                 and bool(args.sam_encoder_style_prompt)
             ):
                 if is_main:
@@ -2179,6 +2201,7 @@ def main() -> None:
                 use_ex_link_postprocess=ex_link_postprocess_enabled,
                 ex_link_threshold=args.ex_link_threshold,
                 band_names=args.bands,
+                detection_linking=bool(args.detection_linking),
                 collect_candidate_stats=bool(args.debug_detection_metrics),
                 ignore_mask_during_detection=bool(args.ignore_mask_during_detection),
                 epoch_index=0,
@@ -2219,6 +2242,7 @@ def main() -> None:
                 link_json = _expand_path(args.linking_metrics_json) if args.linking_metrics_json else out_dir / "linking_metrics.json"
                 if _write_linking_metrics_json(link_json, det, epoch=None):
                     det["linking_metrics_json"] = str(link_json)
+                (out_dir / "eval_metrics.json").write_text(json.dumps({"dense": dense, "detection": det}, indent=2) + "\n")
                 print(json.dumps({"dense": dense, "detection": det}, indent=2))
             _sync_distributed()
             return
@@ -2339,6 +2363,9 @@ def main() -> None:
                 if sam_iteration_scheduler is not None
                 else None
             ),
+            "detection_linking": bool(args.detection_linking),
+            "zarr_image_level": bool(args.zarr_random_image_batches),
+            "detection_match_radius_pixels": float(center_radius_px),
             "single_band_detector": bool(args.single_band_detector),
             "seg_classes": int(args.seg_classes),
             "distributed": distributed,
@@ -2606,6 +2633,7 @@ def main() -> None:
                 use_ex_link_postprocess=train_detect_ex_link_enabled,
                 ex_link_threshold=args.ex_link_threshold,
                 band_names=args.bands,
+                detection_linking=bool(args.detection_linking),
                 collect_candidate_stats=bool(args.debug_detection_metrics),
                 ignore_mask_during_detection=bool(args.ignore_mask_during_detection),
                 epoch_index=epoch,
@@ -2653,6 +2681,9 @@ def main() -> None:
                 if sam_iteration_scheduler is not None:
                     log_line["lr_schedule"] = sam_iteration_scheduler.state_dict()
                 if run_detect:
+                    detection_json = json.dumps({"epoch": int(epoch) + 1, **det_metrics}, indent=2) + "\n"
+                    (out_dir / f"detection_metrics_epoch_{int(epoch) + 1:04d}.json").write_text(detection_json)
+                    (out_dir / "detection_metrics_latest.json").write_text(detection_json)
                     link_epoch_json = out_dir / f"linking_metrics_epoch_{int(epoch) + 1:04d}.json"
                     if _write_linking_metrics_json(link_epoch_json, det_metrics, epoch=int(epoch)):
                         link_latest_json = out_dir / "linking_metrics_latest.json"
@@ -2710,6 +2741,12 @@ def main() -> None:
                     if sam_iteration_scheduler is not None:
                         sched_state = sam_iteration_scheduler.state_dict()
                         epoch_payload["lr_schedule/step_count"] = int(sched_state.get("step_count", 0))
+                    if run_detect:
+                        buckets = {"overall": det_metrics.get("overall", {}), **det_metrics.get("per_band", {})}
+                        for band, metrics in buckets.items():
+                            for key, value in metrics.items():
+                                if isinstance(value, (int, float)):
+                                    epoch_payload[f"val/detection/{band}/{key}"] = float(value)
                     wandb.log(epoch_payload, step=int(global_step))
                 ckpt = _checkpoint_payload(
                     model,

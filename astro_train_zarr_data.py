@@ -17,6 +17,7 @@ from torch import Tensor
 from torch.utils.data import Dataset, IterableDataset, Sampler, get_worker_info
 
 from astro_train_data import CutoutRecord, collate_cutouts
+from utils.instance_mask_data import read_instance_targets, flip_instance_targets
 
 
 def _read_json(path: Path) -> dict:
@@ -572,6 +573,8 @@ class ZarrCutoutDataset(Dataset):
         band_shape = torch.from_numpy(reader.read_first_axis("band_shape", sample_idx).astype(np.float32, copy=False))
         band_shape_weight = torch.from_numpy(reader.read_first_axis("band_shape_weight", sample_idx).astype(np.float32, copy=False))
         band_pu = torch.from_numpy(reader.read_first_axis("band_pu_class_mask", sample_idx).astype(np.uint8, copy=False))
+        mask_instances, valid_mask, trusted_background = read_instance_targets(
+            reader, sample_idx, band_pu, image)
 
         band_targets = [
             _target_defaults_from_pu(
@@ -661,6 +664,9 @@ class ZarrCutoutDataset(Dataset):
         if self.augment and random.random() < 0.5:
             width = int(image.shape[-1])
             image = torch.flip(image, dims=(-1,))
+            mask_instances = flip_instance_targets(mask_instances, width)
+            valid_mask = torch.flip(valid_mask, dims=(-1,))
+            trusted_background = torch.flip(trusted_background, dims=(-1,))
             flipped_targets = []
             for target in band_targets:
                 target = {key: value.clone() for key, value in target.items()}
@@ -689,6 +695,11 @@ class ZarrCutoutDataset(Dataset):
         shape_source_ids = band_shape_source_ids[0]
         return {
             "image": image,
+            "band_names": list(reader.attrs.get("bands", [])),
+            "pixel_scale_arcsec": reader.attrs.get("confidence_config", {}).get("pixel_scale_arcsec"),
+            "band_mask_instances": mask_instances,
+            "band_valid_mask": valid_mask,
+            "band_trusted_background": trusted_background,
             "seg": primary["seg"],
             "confidence": primary["confidence"],
             "shape": primary["shape"],

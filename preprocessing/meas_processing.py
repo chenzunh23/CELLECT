@@ -8,9 +8,10 @@ import numpy as np
 from astropy.table import Table
 
 from .labels import SourceClass, SourceLabels
+from .utils.area_filter import area_filter_masks
 from .refit import RefitConfig, compute_kron_ellipse
 from .utils.catalog import magnitude_from_flux, source_filter_mask
-from .utils.geometry import close_pair_dimmer_mask
+from .utils.geometry import EllipseGeometry, close_pair_dimmer_mask
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,30 @@ class MeasProcessingResult:
     b_too_faint: np.ndarray
     b_bad_axis: np.ndarray
     b_close_dimmer: np.ndarray
+    nan_center_ignore: np.ndarray | None = None
+
+
+def classify_catalog_basics(geometry, magnitude, *, dataset, pixel_scale_arcsec,
+                            config=None, source_mask=None, image=None, valid_mask=None,
+                            center_invalid=None, origin=(0, 0)):
+    """Shared A filter for already-adapted catalogs, before ordinary rules.
+
+    HSC retains its B magnitude/axis/close cuts. JWST has no added axis or
+    magnitude cut; A2744 close pairs run after its PSF size cut in ordinary.
+    """
+    if dataset not in {"hsc", "cosmos", "a2744"}:
+        raise ValueError(f"unknown dataset: {dataset!r}")
+    if config is None:
+        kwargs = {} if dataset == "hsc" else dict(
+            b_mag_max=float("inf"), b_axis_ratio_max=float("inf"), close_center_arcsec=0.0)
+        config = MeasProcessingConfig(pixel_scale_arcsec=pixel_scale_arcsec, **kwargs)
+    elif config.pixel_scale_arcsec != pixel_scale_arcsec:
+        raise ValueError("config and input pixel scales disagree")
+    n = len(magnitude)
+    table = Table({"row_index": np.arange(n)})
+    return classify_meas_basics(table, config=config, geometry=geometry, magnitude=magnitude,
+                               image=image,valid_mask=valid_mask,center_invalid=center_invalid,origin=origin,
+                               source_mask=np.ones(n, bool) if source_mask is None else source_mask)
 
 
 def classify_meas_basics(
@@ -52,6 +77,10 @@ def classify_meas_basics(
     *,
     config: MeasProcessingConfig = MeasProcessingConfig(),
     refit_config: RefitConfig = RefitConfig(),
+    geometry: EllipseGeometry | None = None,
+    magnitude: np.ndarray | None = None,
+    source_mask: np.ndarray | None = None,
+    image=None, valid_mask=None, center_invalid=None, origin=(0, 0),
 ) -> MeasProcessingResult:
     """Apply refit-dependent A filter and B-filter basics.
 
@@ -61,20 +90,33 @@ def classify_meas_basics(
     """
 
     labels = SourceLabels.empty(len(table), default=SourceClass.DROPPED)
-    geom = compute_kron_ellipse(table, refit_config)
-    mag = magnitude_from_flux(table, column=config.flux_column, zeropoint=config.zeropoint)
+    geom = compute_kron_ellipse(table, refit_config) if geometry is None else geometry
+    mag = magnitude_from_flux(table, column=config.flux_column, zeropoint=config.zeropoint) if magnitude is None else np.asarray(magnitude, dtype=float)
+    if mag.shape != (len(table),) or len(geom.x) != len(table):
+        raise ValueError("catalog/geometry/magnitude length mismatch")
 
     finite = geom.valid() & np.isfinite(mag)
-    source_ok = source_filter_mask(table, config.source_filter)
-    base = finite & source_ok
+    source_ok = source_filter_mask(table, config.source_filter) if source_mask is None else np.asarray(source_mask, dtype=bool)
+    if source_ok.shape != mag.shape:
+        raise ValueError("source_mask length mismatch")
+    from .utils.no_data import center_ignore_mask, apply_center_ignore
+    nan_ignore = center_ignore_mask(geom, image=image, valid_mask=valid_mask,
+                                    center_invalid=center_invalid, origin=origin)
+    base = finite & source_ok & ~nan_ignore
 
     labels.assign(~source_ok, SourceClass.DROPPED, "source_filter")
     labels.assign(source_ok & ~finite, SourceClass.ORDINARY_IGNORE, "invalid_refit_or_mag")
+    apply_center_ignore(labels, nan_ignore)
 
-    a_large = base & (geom.area > config.a_area_max)
-    a_faint_large = base & (geom.area > config.a_faint_area_max) & (mag > config.a_faint_mag_min)
+    a_large, a_faint_large = area_filter_masks(
+        geom.area, mag, pixel_scale_arcsec=config.pixel_scale_arcsec,
+        area_max=config.a_area_max, faint_area_max=config.a_faint_area_max,
+        faint_mag_min=config.a_faint_mag_min,
+    )
+    a_large &= base
+    a_faint_large &= base
     labels.assign(a_large, SourceClass.DROPPED, "A_area_gt_max")
-    labels.assign(a_faint_large & ~a_large, SourceClass.ORDINARY_IGNORE, "A_faint_large")
+    labels.assign(a_faint_large & ~a_large, SourceClass.DROPPED, "A_faint_large")
 
     after_a = base & ~a_large & ~a_faint_large
     too_faint = after_a & (mag > config.b_mag_max)
@@ -110,4 +152,5 @@ def classify_meas_basics(
         b_too_faint=too_faint,
         b_bad_axis=bad_axis,
         b_close_dimmer=close_dimmer,
+        nan_center_ignore=nan_ignore,
     )

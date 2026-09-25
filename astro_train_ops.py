@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from utils.detection_metadata import sample_band_name, valid_predictions
+
 import json
 import math
 import time
@@ -127,8 +129,10 @@ class LossWeights:
     matcher_outer_weight: float = 10.0
     mask_outer_weight: float = 0.0
     mask_loss_warmup_epochs: int = 0
-    mask_dice: float = 0.0
-    mask_bce: float = 0.0
+    mask_dice: float = 1.0
+    mask_bce: float = 1.0
+    mask_supervision_weight: float = 0.2
+    mask_outside_kron_scale: float = 1.5
     mask_centroid: float = 0.2
     mask_outside: float = 0.5
     mask_min_area: float = 0.1
@@ -138,8 +142,8 @@ class LossWeights:
     mask_unmatched_prompt: float = 0.2
     center_only_shape_factor: float = 0.2
     mask_min_area_px: float = 15.0
-    mask_area_ratio_lower: float = 0.15
-    mask_area_ratio_upper: float = 1.05
+    mask_area_ratio_lower: float = 0.05
+    mask_area_ratio_upper: float = 2.0
     mask_max_area_ratio: float = 0.5
     mask_pred_iou_thresh: float = 0.8
     mask_stability_score_thresh: float = 0.95
@@ -147,8 +151,8 @@ class LossWeights:
     mask_stability_temperature: float = 10.0
     mask_prompt_gt_epochs: int = 5
     mask_prompt_pred_epoch: int = 30
-    mask_max_gt_per_sample: int = 0
-    mask_max_pred_per_sample: int = 0
+    mask_max_gt_per_sample: int = 128
+    mask_max_pred_per_sample: int = 128
     mask_prompt_chunk_size: int = 128
     mask_multimask: bool = True
     mask_selection: str = "pred_iou"
@@ -2377,6 +2381,7 @@ def _update_detection_totals(
     ex_link_threshold: float,
     ex_band_pairs: Optional[Sequence[Tuple[int, int]]],
     band_names: Sequence[str],
+    detection_linking: bool = False,
     collect_candidate_stats: bool = False,
     ignore_mask_during_detection: bool = True,
 ) -> None:
@@ -2560,7 +2565,7 @@ def _update_detection_totals(
                 threshold=candidate_effective_threshold,
             )
             if bool(collect_candidate_stats) and band_idx is not None and band_names:
-                band_name = str(band_names[int(band_idx)])
+                band_name = sample_band_name(batch, map_idx // max(band_count, 1), int(band_idx), band_names)
                 band_bucket = per_band_counts.setdefault(
                     band_name,
                     {
@@ -2591,9 +2596,11 @@ def _update_detection_totals(
                         foreground_gate_active=candidate_foreground_gate_active,
                         threshold=candidate_effective_threshold,
                     )
-    for pred_xy, gt_xy, band_idx, clean_mask, background_mask, ordinary_ignore_xy in zip(
+    for map_idx, (pred_xy, gt_xy, band_idx, clean_mask, background_mask, ordinary_ignore_xy) in enumerate(zip(
         pred_list, gt_list, band_indices, clean_masks, background_masks, ordinary_ignore_list
-    ):
+    )):
+        pred_xy = valid_predictions(pred_xy, batch, map_idx // max(band_count, 1), int(band_idx or 0))
+        totals["samples"] = int(totals.get("samples", 0)) + 1
         strict_ignored = 0
         clean_gt_np = gt_xy.numpy().astype(np.float32)
         ordinary_np = ordinary_ignore_xy.numpy().astype(np.float32)
@@ -2613,7 +2620,7 @@ def _update_detection_totals(
         totals["ordinary_ignore_total"] = int(totals["ordinary_ignore_total"]) + int(counts_now["ordinary_ignore_total"])
         totals["strict_ignored_pred"] = int(totals["strict_ignored_pred"]) + int(strict_ignored)
         if band_idx is not None and band_names:
-            band_name = str(band_names[int(band_idx)])
+            band_name = sample_band_name(batch, map_idx // max(band_count, 1), int(band_idx), band_names)
             counts = per_band_counts.setdefault(
                 band_name,
                 {
@@ -2629,6 +2636,7 @@ def _update_detection_totals(
                 },
             )
             assert isinstance(counts, dict)
+            counts["samples"] = int(counts.get("samples", 0)) + 1
             counts["tp"] = int(counts.get("tp", 0)) + int(counts_now["tp"])
             counts["fp"] = int(counts.get("fp", 0)) + int(counts_now["fp"])
             counts["clean_region_fp"] = int(counts.get("clean_region_fp", 0)) + int(counts_now["clean_region_fp"])
@@ -2638,8 +2646,10 @@ def _update_detection_totals(
             counts["ordinary_ignore_total"] = int(counts.get("ordinary_ignore_total", 0)) + int(counts_now["ordinary_ignore_total"])
             counts["strict_ignored_pred"] = int(counts.get("strict_ignored_pred", 0)) + int(strict_ignored)
 
-    ex_link_active = bool(use_ex_link_postprocess and per_band_outputs and hasattr(base_model, "EX"))
-    if per_band_outputs and not ex_link_active:
+    linking_active = bool(detection_linking and per_band_outputs and band_count > 1)
+    totals["linking_enabled"] = bool(totals.get("linking_enabled", False) or linking_active)
+    ex_link_active = bool(linking_active and use_ex_link_postprocess and hasattr(base_model, "EX"))
+    if linking_active and not ex_link_active:
         nested_band_centers: Sequence[Sequence[Tensor]] = batch["band_centers"]  # type: ignore[assignment]
         nested_band_ids: Sequence[Sequence[Tensor]] = batch["band_ids"]  # type: ignore[assignment]
         merged_centers_list: Sequence[Tensor] = batch["centers"]  # type: ignore[assignment]
@@ -2789,6 +2799,7 @@ def run_epoch(
         "mask_prompts": 0.0,
         "mask_gt_prompts": 0.0,
         "mask_pred_prompts": 0.0,
+        "mask_supervised_prompts": 0.0,
         "mask_active": 0.0,
         "mask_weight_scale": 0.0,
     }
@@ -2874,6 +2885,7 @@ def run_epoch(
             "pred_total",
             "gt_prompts",
             "pred_prompts",
+            "supervised_prompts",
         )
         return {key: zero for key in keys}
 
@@ -3072,6 +3084,7 @@ def run_epoch(
         sums["mask_prompts"] += float(mask_losses["prompts"].detach()) * batch_size
         sums["mask_gt_prompts"] += float(mask_losses["gt_prompts"].detach()) * batch_size
         sums["mask_pred_prompts"] += float(mask_losses["pred_prompts"].detach()) * batch_size
+        sums["mask_supervised_prompts"] += float(mask_losses["supervised_prompts"].detach()) * batch_size
         sums["mask_active"] += float(mask_active) * batch_size
         sums["mask_weight_scale"] += float(mask_weight_scale) * batch_size
         should_log_iteration = (
@@ -3117,6 +3130,7 @@ def run_epoch(
                 local_metrics["loss/mask_prompts"] = float(mask_losses["prompts"].detach())
                 local_metrics["loss/mask_gt_prompts"] = float(mask_losses["gt_prompts"].detach())
                 local_metrics["loss/mask_pred_prompts"] = float(mask_losses["pred_prompts"].detach())
+                local_metrics["loss/mask_supervised_prompts"] = float(mask_losses["supervised_prompts"].detach())
                 local_metrics["loss/mask_active"] = float(mask_active)
                 local_metrics["loss/mask_weight_scale"] = float(mask_weight_scale)
             if distributed and dist.is_available() and dist.is_initialized():
@@ -3203,6 +3217,7 @@ def validate_epoch(
     use_ex_link_postprocess: bool,
     ex_link_threshold: float,
     band_names: Sequence[str],
+    detection_linking: bool = False,
     collect_candidate_stats: bool = False,
     ignore_mask_during_detection: bool = True,
     epoch_index: int = 0,
@@ -3238,6 +3253,7 @@ def validate_epoch(
         "mask_prompts": 0.0,
         "mask_gt_prompts": 0.0,
         "mask_pred_prompts": 0.0,
+        "mask_supervised_prompts": 0.0,
     }
     count = 0
     det_totals = _init_detection_totals(band_names, collect_candidate_stats=collect_candidate_stats) if compute_detection else None
@@ -3332,6 +3348,7 @@ def validate_epoch(
                 ex_band_pairs=ex_band_pairs,
                 band_names=band_names,
                 collect_candidate_stats=collect_candidate_stats,
+                detection_linking=detection_linking,
                 ignore_mask_during_detection=ignore_mask_during_detection,
             )
 
@@ -3361,6 +3378,7 @@ def validate_epoch(
         sums["mask_prompts"] += float(mask_losses["prompts"].detach()) * batch_size
         sums["mask_gt_prompts"] += float(mask_losses["gt_prompts"].detach()) * batch_size
         sums["mask_pred_prompts"] += float(mask_losses["pred_prompts"].detach()) * batch_size
+        sums["mask_supervised_prompts"] += float(mask_losses["supervised_prompts"].detach()) * batch_size
 
     if distributed and dist.is_available() and dist.is_initialized():
         keys = list(sums.keys())
@@ -3410,6 +3428,7 @@ def evaluate_detection(
     ex_link_threshold: float = 0.5,
     ex_band_pairs: Optional[Sequence[Tuple[int, int]]] = None,
     band_names: Sequence[str] = (),
+    detection_linking: bool = False,
     collect_candidate_stats: bool = False,
     show_progress: bool = True,
 ) -> Dict[str, object]:
@@ -3440,6 +3459,7 @@ def evaluate_detection(
             ex_band_pairs=ex_band_pairs,
             band_names=band_names,
             collect_candidate_stats=collect_candidate_stats,
+            detection_linking=detection_linking,
         )
     return _finalize_detection_totals(
         totals,

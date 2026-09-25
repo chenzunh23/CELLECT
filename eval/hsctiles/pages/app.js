@@ -4,7 +4,6 @@ let busy = false;
 let optionsCache = null;
 let selectedDataset = 'hsc_raw';
 let showDetect = false;
-let viewInputScaling = false;
 let viewShape = true;
 let viewCenter = false;
 let viewInvert = false;
@@ -13,6 +12,7 @@ let smoothMode = 'gaussian';
 let smoothSigma = 1.0;
 let smoothRadius = 2;
 let pendingSearchPage = null;
+let lastCandidates = [];
 
 async function fetchJson(url, options) {
   const res = await fetch(url, options);
@@ -77,8 +77,14 @@ function selectDataset(datasetId) {
   document.getElementById('tractInput').value = cfg.tract || 'default';
   fillSelect(document.getElementById('patchInput'), cfg.patches || [], cfg.default_patches || []);
   fillSelect(document.getElementById('bandInput'), cfg.bands || [], cfg.default_bands || []);
+  const nmsInput = document.getElementById('nmsRadiusInput');
+  nmsInput.value = String(cfg.default_nms_radius == null ? 3 : cfg.default_nms_radius);
+  nmsInput.placeholder = String(cfg.default_nms_radius == null ? 3 : cfg.default_nms_radius);
   document.getElementById('nTilesInput').placeholder = String(cfg.default_n_tiles || 4);
-  document.getElementById('framesPerTileInput').placeholder = String(cfg.default_frames_per_tile || 1);
+  const framesInput = document.getElementById('framesPerTileInput');
+  framesInput.placeholder = String(cfg.default_frames_per_tile || 1);
+  framesInput.disabled = datasetId === 'jwst';
+  framesInput.value = datasetId === 'jwst' ? '1' : '';
   document.getElementById('tilesPerPageInput').placeholder = String(cfg.default_tiles_per_page || 2);
   document.getElementById('startButton').disabled = !cfg.enabled;
   if (!cfg.enabled) setStatus(`${cfg.label} is a placeholder in this browser.`, true);
@@ -94,7 +100,10 @@ async function loadOptions() {
 
 function imageUrl(c) {
   const params = [];
-  if (viewInputScaling) params.push('input=1');
+  const inputMode = window.ScaleControls && ScaleControls.isInputMode();
+  if (window.ScaleControls) params.push(...ScaleControls.params());
+  if (window.SnrControls) params.push(...SnrControls.params());
+  if (inputMode) params.push('input=1');
   if (smoothEnabled) {
     params.push(`smooth_mode=${encodeURIComponent(smoothMode)}`);
     params.push(`smooth_sigma=${encodeURIComponent(String(smoothSigma))}`);
@@ -105,33 +114,48 @@ function imageUrl(c) {
     params.push('detect=1');
     params.push(`shape=${viewShape ? 1 : 0}`);
     params.push(`center=${viewCenter ? 1 : 0}`);
-    if (viewInputScaling) params.push('input_shape=1');
+    if (inputMode) params.push('input_shape=1');
   }
   return params.length ? `/image/${c.token}.png?${params.join('&')}` : `/image/${c.token}.png`;
 }
 
 function updateViewMenu() {
-  const states = {inputScaling: viewInputScaling, shape: viewShape, center: viewCenter, invert: viewInvert, smooth: smoothEnabled};
+  const inputMode = window.ScaleControls && ScaleControls.isInputMode();
+  const snrEnabled = window.SnrControls && SnrControls.isEnabled();
+  const states = {inputScaling: inputMode, shape: viewShape, center: viewCenter, snrFilter: snrEnabled, invert: viewInvert, smooth: smoothEnabled};
   for (const item of document.querySelectorAll('.viewItem')) {
     const key = item.dataset.view;
     item.querySelector('.viewCheck').textContent = states[key] ? '✓' : '';
   }
+  if (window.ScaleControls) ScaleControls.refreshMenu();
 }
 
 function resetViewDefaults() {
-  viewInputScaling = false;
   viewShape = true;
   viewCenter = false;
   viewInvert = false;
   smoothEnabled = false;
+  if (window.ScaleControls) ScaleControls.reset();
+  if (window.SnrControls) SnrControls.reset();
   updateViewMenu();
 }
 
 async function toggleViewItem(key) {
   if (!state || !state.started) return;
-  if (key === 'inputScaling') viewInputScaling = !viewInputScaling;
+  if (key === 'inputScaling') {
+    if (window.ScaleControls) {
+      await ScaleControls.setMode('input');
+      return;
+    }
+  }
   if (key === 'shape') viewShape = !viewShape;
   if (key === 'center') viewCenter = !viewCenter;
+  if (key === 'snrFilter') {
+    if (window.SnrControls) {
+      SnrControls.open();
+      return;
+    }
+  }
   if (key === 'invert') viewInvert = !viewInvert;
   if (key === 'smooth') {
     openSmooth();
@@ -146,7 +170,9 @@ function viewStatusText() {
   const smoothText = smoothEnabled
     ? `${smoothMode} ${smoothMode === 'gaussian' ? `sigma=${smoothSigma}, r=${Math.ceil(2 * smoothSigma)}` : `r=${smoothRadius}`}`
     : 'off';
-  return `View: input scaling=${viewInputScaling ? 'on' : 'off'}, shape=${viewShape ? 'on' : 'off'}, center=${viewCenter ? 'on' : 'off'}, invert=${viewInvert ? 'on' : 'off'}, smooth=${smoothText}.`;
+  const scaleText = window.ScaleControls ? ScaleControls.statusText() : 'default';
+  const snrText = window.SnrControls ? SnrControls.statusText() : 'snr=off';
+  return `View: scale=${scaleText}, ${snrText}, shape=${viewShape ? 'on' : 'off'}, center=${viewCenter ? 'on' : 'off'}, invert=${viewInvert ? 'on' : 'off'}, smooth=${smoothText}.`;
 }
 
 function candidateCell(c) {
@@ -185,7 +211,9 @@ function candidateCell(c) {
   const weight = Number.isFinite(c.weight) ? c.weight.toPrecision(4) : '';
   const scale = Number.isFinite(c.scale) ? c.scale.toPrecision(4) : '';
   const det = c.detected ? ` detections=${c.n_detections}` : '';
-  meta.innerHTML = `<strong>${c.token} ${c.band}${visit}${det}</strong><span>${c.dataset || ''} ${c.patch} ${c.tile_id} frame ${c.frame_rank + 1}/${c.tile_length}</span><span>local X=[${c.x0},${c.x1}) Y=[${c.y0},${c.y1})</span><span>weight=${weight} scale=${scale}</span>`;
+  const snrMeta = c.detected && window.SnrControls ? SnrControls.labelText(c.token) : '';
+  const snrLine = snrMeta ? `<span class="snrMeta">${snrMeta}</span>` : '';
+  meta.innerHTML = `<strong>${c.token} ${c.band}${visit}${det}</strong><span>${c.dataset || ''} ${c.patch} ${c.tile_id} frame ${c.frame_rank + 1}/${c.tile_length}</span><span>local X=[${c.x0},${c.x1}) Y=[${c.y0},${c.y1})</span><span>weight=${weight} scale=${scale}</span>${snrLine}`;
   label.append(box, meta);
   cell.append(img, label);
   return cell;
@@ -216,7 +244,7 @@ async function refreshState(updateTitle=true) {
   document.getElementById('detect').textContent = showDetect ? 'Hide Detect' : 'Detect';
   updateViewMenu();
   const warningText = state.warnings && state.warnings.length ? ` Warnings: ${state.warnings.join(' | ')}` : '';
-  setStatus(`${state.dataset_label || state.dataset} ${state.patch}: ${state.n_candidates} frames from ${state.n_tiles} spatial tiles; groups/tile=${state.frames_per_tile}; tiles/page=${state.tiles_per_page}; detect batch=${state.detect_batch_size}; selected ${state.n_selected}. Scaling=${state.scaling_mode}; checkpoint=${state.checkpoint_name}.${warningText}`, Boolean(warningText));
+  setStatus(`${state.dataset_label || state.dataset} ${state.patch}: ${state.n_candidates} frames from ${state.n_tiles} spatial tiles; groups/tile=${state.frames_per_tile}; tiles/page=${state.tiles_per_page}; detect batch=${state.detect_batch_size}; nms=${state.nms_radius}; selected ${state.n_selected}. Scaling=${state.scaling_mode}; checkpoint=${state.checkpoint_name}.${warningText}`, Boolean(warningText));
 }
 
 async function startBrowser() {
@@ -228,6 +256,7 @@ async function startBrowser() {
   const nRaw = document.getElementById('nTilesInput').value.trim();
   const framesRaw = document.getElementById('framesPerTileInput').value.trim();
   const tilesPageRaw = document.getElementById('tilesPerPageInput').value.trim();
+  const nmsRaw = document.getElementById('nmsRadiusInput').value.trim();
   const maxTiles = document.getElementById('maxTilesInput').checked;
   const payload = {
     dataset: selectedDataset,
@@ -236,6 +265,7 @@ async function startBrowser() {
     bands: selectedValues(document.getElementById('bandInput')),
     run_name: document.getElementById('runNameInput').value.trim(),
     n_tiles: maxTiles || !nRaw ? null : Number(nRaw),
+    nms_radius: nmsRaw ? Number(nmsRaw) : Number(cfg.default_nms_radius || 3),
     frames_per_tile: framesRaw ? Number(framesRaw) : null,
     tiles_per_page: tilesPageRaw ? Number(tilesPageRaw) : null,
     all_tiles: maxTiles
@@ -285,7 +315,15 @@ async function loadPage(nextPage, preserveDetect=false) {
   const grid = document.getElementById('grid');
   grid.innerHTML = '<div class="empty">Loading</div>';
   try {
+    if (preserveDetect && showDetect && window.SnrControls && SnrControls.isEnabled()) {
+      const snrResult = await SnrControls.prepare();
+      if (snrResult) {
+        const snrLabel = snrResult.method === 'kron' ? 'Kron' : 'AP2';
+        setStatus(`${snrLabel} SNR>${Number(snrResult.threshold).toFixed(1)}: sources=${snrResult.n_sources}, bad=${snrResult.n_bad} on ${snrResult.n_images} images.`);
+      }
+    }
     const payload = await fetchJson(`/api/page?page=${page}`);
+    lastCandidates = payload.candidates || [];
     const nColumns = Math.max(2, payload.bands.length);
     grid.style.gridTemplateColumns = `repeat(${nColumns}, minmax(140px, 1fr))`;
     grid.innerHTML = '';
@@ -295,6 +333,7 @@ async function loadPage(nextPage, preserveDetect=false) {
       for (const c of payload.candidates) grid.appendChild(candidateCell(c));
     }
   } catch (err) {
+    lastCandidates = [];
     grid.innerHTML = `<div class="empty error">${String(err)}</div>`;
   } finally {
     busy = false;
@@ -441,6 +480,9 @@ async function detectPage() {
     });
     showDetect = true;
     setStatus(`Detected current page: ${result.n_images} images, ${result.n_detections} detections.`);
+    if (window.SnrControls && SnrControls.isEnabled()) {
+      await SnrControls.prepare();
+    }
     await refreshState(false);
     await loadPage(page, true);
   } catch (err) {
@@ -540,6 +582,32 @@ document.getElementById('saveCsv').onclick = () => saveCsv().catch(err => setSta
 document.getElementById('export').onclick = () => exportSelected().catch(err => setStatus(String(err), true));
 document.getElementById('startButton').onclick = () => startBrowser().catch(err => setStatus(String(err), true));
 document.getElementById('viewDataButton').onclick = () => viewData();
+if (window.ScaleControls) {
+  ScaleControls.init({
+    fetchJson,
+    setStatus,
+    firstToken: () => (lastCandidates[0] ? lastCandidates[0].token : ''),
+    onChange: async () => {
+      updateViewMenu();
+      setStatus(viewStatusText());
+      await loadPage(page, true);
+    }
+  });
+}
+if (window.SnrControls) {
+  SnrControls.init({
+    fetchJson,
+    setStatus,
+    currentPage: () => page,
+    detectActive: () => showDetect,
+    statusText: viewStatusText,
+    reload: async () => {
+      updateViewMenu();
+      setStatus(viewStatusText());
+      await loadPage(page, true);
+    }
+  });
+}
 
 (async () => {
   try {

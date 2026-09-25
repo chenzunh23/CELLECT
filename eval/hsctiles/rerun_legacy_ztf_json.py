@@ -67,7 +67,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patch", action="append", default=None, help="Only rerun these ZTF q patches.")
     parser.add_argument("--tile-id", action="append", default=None, help="Only rerun these tile ids.")
     parser.add_argument("--visit", action="append", default=None, help="Only rerun these visits/obsids.")
-    parser.add_argument("--scaling-mode", choices=("zscore_clip", "zscore_no_clip", "zscore_no_upper", "log_lupton", "anscombe"), default="log_lupton")
+    parser.add_argument(
+        "--scaling-mode",
+        choices=(
+            "zscore_clip",
+            "zscore_no_clip",
+            "zscore_no_upper",
+            "zscore_rawclip_no_upper",
+            "zscore-rawclip-no-upper-rgb",
+            "log_lupton",
+            "anscombe",
+        ),
+        default="log_lupton",
+    )
     parser.add_argument("--clip-threshold", type=float, default=3.0)
     parser.add_argument("--log-a", type=float, default=300.0)
     parser.add_argument("--log-high-percentile", type=float, default=99.5)

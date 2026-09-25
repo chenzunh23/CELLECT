@@ -34,7 +34,7 @@ import numpy as np
 from astropy.visualization import ZScaleInterval
 from scipy import ndimage
 
-from astro_data_preprocessing import make_tile_specs
+from preprocessing.utils.inputs import make_tile_specs
 from data_filtering.sam_input_scaling import build_bright_mask
 from preprocessing.build_image_level_zarr import _coadd_image_path, _read_image_header_origin, _variant_image_path
 

@@ -104,6 +104,8 @@ astro_preprocess_in_model=False
 
 通过 `--mask-loss-weight > 0` 打开。代码在 `sam_backbone/losses.py`。
 
+2026-09-25实例部分监督的完整定义与参数见 [MASK_SUPERVISION_zh.md](MASK_SUPERVISION_zh.md)。新Zarr中的真实实例mask已接入，Dice不再使用椭圆伪标签。
+
 prompt 只使用：
 
 - positive center point
@@ -113,7 +115,8 @@ prompt curriculum：
 
 - epoch `< --mask-prompt-gt-epochs`：全部使用 GT center/shape。
 - epoch `--mask-prompt-gt-epochs` 到 `--mask-prompt-pred-epoch`：线性增加 predicted prompt 比例。
-- epoch `>= --mask-prompt-pred-epoch`：全部使用 predicted center/shape。
+- epoch `>= --mask-prompt-pred-epoch`：普通点使用 predicted center/shape。
+- 真实mask实例始终保留GT center/shape，不受上述调度与128点上限裁掉；普通点补足剩余预算。
 
 默认是：
 
@@ -124,13 +127,13 @@ prompt curriculum：
 
 mask loss 细分：
 
-- Dice loss
-- BCE loss
-- centroid loss：mask 几何中心接近 prompt/GT center。
-- outside prior：惩罚 mask 超出 shape aperture 的区域。
-- min-area prior：惩罚过小 mask，默认面积阈值 `15 px`。
+- Dice：只用于有实例mask的点，未知像素不进入监督域。
+- BCE：实例正像素与SExtractor可信背景负像素分别归一；无mask时只有可信负监督。
+- centroid：像素质心偏移的欧氏距离除以Kron `sqrt(a*b)`。
+- outside：惩罚超出1.5倍Kron半轴的概率质量。
+- area：mask/Kron可见面积比的对数区间惩罚，默认范围0.05–2。
 
-SAM multimask 输出默认开启。训练时对多个 mask 计算 loss，并使用 best-of-K 监督。若要关闭：
+SAM multimask 输出默认开启。`--mask-selection loss` 按loss选择候选；默认 `pred_iou` 按质量分数选择。若要关闭：
 
 ```bash
 --disable-mask-multimask
@@ -440,11 +443,11 @@ train/iteration/prompt/predicted_ratio
 train/iteration/prompt/gt_ratio
 ```
 
-默认第 0-4 epoch 全 GT，第 5-29 epoch 线性切换，第 30 epoch 后全 predicted。
+普通点默认第0–4 epoch使用GT，第5–29 epoch线性切换，第30 epoch后使用predicted。真实mask实例的GT点始终保留。
 
 ### 小 mask 如何处理？
 
-SAM mask loss 中，小于 `--mask-min-area-px` 的 mask 不参与 Dice/BCE/centroid/outside 监督，但仍保留 min-area prior 惩罚。
+本版不按 `--mask-min-area-px` 删除小mask；该选项仅为旧命令兼容保留。真实mask采用面积覆盖率下采样，避免极小源被直接抹除；几何面积约束使用0.05–2的Kron面积比。
 
 ### strict ignore 现在怎么处理？
 

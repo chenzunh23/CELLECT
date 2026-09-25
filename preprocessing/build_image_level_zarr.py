@@ -13,8 +13,8 @@ import json
 import math
 import os
 import sys
+from dataclasses import replace
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
@@ -27,13 +27,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-cellect")
 
-from astro_data_preprocessing import (
+from preprocessing.utils.inputs import (
     _band_catalog_path,
-    _band_det_path,
-    _band_fits_path,
-    _find_image_hdu_index,
-    _origin_from_ltv,
-    _read_det_background_mask,
     make_tile_specs,
 )
 
@@ -45,449 +40,64 @@ from preprocessing.bright_label import (
 )
 from preprocessing.image_processing import (
     BrightRegionConfig,
-    ImageProcessingConfig,
     build_bright_components,
-    read_background_mask,
-    scale_image_for_training,
 )
-from preprocessing.labels import DenseLabel, LabelWeights, SourceClass
+from preprocessing.labels import SourceClass
+from preprocessing.dataset_inputs import (
+    ImageInput, load_paths, discover_cosmos, discover_abell, hsc_input,
+    header_info, load_image as load_registered_image, bind_task,
+)
 from preprocessing.meas_processing import MeasProcessingConfig, classify_meas_basics
 from preprocessing.ordinary import OrdinaryConfig, label_ordinary_sources
 from preprocessing.refit import RefitConfig, attach_refit_geometry, compute_kron_ellipse
 from preprocessing.region_filling import fill_dense_regions
 from preprocessing.snr import SnrConfig, compute_snr_for_sample
 from preprocessing.utils.catalog import source_ids
-from preprocessing.utils.geometry import paint_ellipse
 from preprocessing.zarr_writing import ImageLevelTrainingBatch, write_training_image_level_zarr
+from preprocessing.utils.image_level import (
+    _scale_image_chw,
+    attach_cosmos_segmentation,
+    StoreTask,
+    PatchLabels,
+    _is_narrow_band,
+    _band_log_a,
+    _image_log_a,
+    _bright_log_a,
+    _group_number,
+    _product_patch_dir,
+    _variant_groups,
+    _variant_image_path,
+    _coadd_image_path,
+    _store_output_path,
+    _refit_csv_path,
+    _read_image_header_origin,
+    _mask_plane_bits,
+    _mask_plane_bit,
+    _read_fits_quality_mask,
+    _read_bright_object_mask,
+    _read_background_from_det,
+    _background_group_candidates,
+    _variant_background_dirs,
+    _variant_background_dir,
+    _read_variant_background,
+    _read_coadd_lsst_background,
+    _subtract_bright_object_background,
+    _background_for_task,
+    _crop,
+    _paint_confidence,
+    _source_indices_in_tile,
+    _strict_centers_in_tile,
+    _tile_targets,
+)
 
 
 DEFAULT_BANDS = ("HSC-G", "HSC-R", "HSC-I", "HSC-Z", "HSC-Y", "NB0387", "NB0816", "NB0921", "NB1010")
 MASK_PLANES_FOR_STRICT_IGNORE = ("SAT", "BAD", "EDGE", "NO_DATA", "UNMASKEDNAN")
 
 
-@dataclass(frozen=True)
-class StoreTask:
-    data_root: Path
-    coadd_fits_root: Path
-    output_root: Path
-    refit_root: Path
-    denoised_fits_root: Path
-    coadd_weight_root: Path
-    coadd_lsst_background_root: Path | None
-    variant_lsst_background_root: Path | None
-    gaia_fits: Path | None
-    tract: int
-    patch: str
-    band: str
-    dataset_source: str
-    group: str
-    tile_size: int
-    stride: int
-    max_tiles: int
-    overwrite: bool
-    chunk_tiles: int
-    image_scaling_mode: str
-    image_scaling_scope: str
-    bright_mask_mode: str
-    bright_threshold: float
-    bright_dilation: int
-    clip_threshold: float
-    image_log_a: float
-    image_log_high_percentile: float
-    image_lupton_stretch: float
-    image_lupton_q: float
-    image_anscombe_clip: bool
-    image_anscombe_scale: float
-    bright_log_a: float
-    bright_log_high_percentile: float
-    bright_lupton_stretch: float
-    bright_lupton_q: float
-    bright_anscombe_scale: float
-    cluster_source_match_pixels: float
-    cluster_centroid_match_pixels: float
-    gaia_bright_mag_threshold: float
-    snr_method: str
-    missing_noncoadd_policy: str
-    image_variant_background_source: str = "auto"
-    missing_variant_background_policy: str = "fallback_coadd"
 
 
-@dataclass
-class PatchLabels:
-    table: Table
-    dense: np.ndarray
-    label_classes: np.ndarray
-    geom_x: np.ndarray
-    geom_y: np.ndarray
-    geom_major: np.ndarray
-    geom_minor: np.ndarray
-    geom_theta: np.ndarray
-    source_ids: np.ndarray
-    strict_x: np.ndarray
-    strict_y: np.ndarray
-    strict_ids: np.ndarray
-
-
-def _is_narrow_band(band: str) -> bool:
-    return str(band).upper().startswith("NB")
-
-
-def _band_log_a(band: str) -> float:
-    band = str(band).upper()
-    if band == "NB1010":
-        return 100.0
-    if band == "NB0387":
-        return 3000.0
-    return 1000.0
-
-
-def _image_log_a(task: StoreTask) -> float:
-    value = float(task.image_log_a)
-    return value if math.isfinite(value) and value > 0.0 else _band_log_a(task.band)
-
-
-def _bright_log_a(task: StoreTask) -> float:
-    value = float(task.bright_log_a)
-    return value if math.isfinite(value) and value > 0.0 else _band_log_a(task.band)
-
-
-def _group_number(group: str | int | None) -> int | None:
-    if group is None:
-        return None
-    text = str(group).strip()
-    if text.startswith("group_"):
-        text = text[6:]
-    try:
-        return int(text)
-    except Exception:
-        return None
-
-
-def _product_patch_dir(root: Path, dataset_source: str, tract: int, band: str, patch: str) -> Path:
-    candidates = [
-        root / str(tract) / band / patch,
-        root / dataset_source / str(tract) / band / patch,
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return candidates[0]
-
-
-def _variant_groups(root: Path, patch: str, *, band: str | None = None, tract: int | None = None, dataset_source: str | None = None) -> list[str]:
-    patch_dir = root / f"patch_{patch.replace(',', '_')}"
-    if not patch_dir.exists():
-        old_groups: list[str] = []
-    else:
-        old_groups = [path.name for path in sorted(patch_dir.glob("group_*")) if path.is_dir()]
-    if old_groups or band is None or tract is None or dataset_source is None:
-        return old_groups
-    product_dir = _product_patch_dir(root, str(dataset_source), int(tract), str(band), patch)
-    if not product_dir.exists():
-        return []
-    groups: set[int] = set()
-    for path in product_dir.glob(f"warp*{band}*{tract}*{patch}*.fits"):
-        group = _group_number(path.stem.rsplit("-", 1)[-1])
-        if group is not None:
-            groups.add(group)
-    return [str(group) for group in sorted(groups)]
-
-
-def _variant_image_path(root: Path, patch: str, group: str, band: str, dataset_source: str, tract: int | None = None) -> Path:
-    old = root / f"patch_{patch.replace(',', '_')}" / group / band / f"{dataset_source}.fits"
-    if old.exists() or tract is None:
-        return old
-    product_dir = _product_patch_dir(root, dataset_source, int(tract), band, patch)
-    group_num = _group_number(group)
-    if product_dir.exists():
-        matches = sorted(path for path in product_dir.glob(f"warp*{band}*{tract}*{patch}*.fits") if not path.name.startswith("effective_count"))
-        if group_num is not None:
-            matches = [path for path in matches if path.stem.rsplit("-", 1)[-1] == str(group_num)]
-        if matches:
-            return matches[0]
-    return old
-
-
-def _coadd_image_path(root: Path, band: str, tract: int, patch: str) -> Path:
-    official = _band_fits_path(root, band, tract, patch)
-    if official.exists() and not official.name.startswith("effective_count"):
-        return official
-    product_dirs = [
-        root / str(tract) / band / patch,
-        root / "half_coadd" / str(tract) / band / patch,
-    ]
-    for product_dir in product_dirs:
-        if not product_dir.exists():
-            continue
-        matches = sorted(path for path in product_dir.glob(f"warp_half*{band}*{tract}*{patch}*.fits") if not path.name.startswith("effective_count"))
-        if matches:
-            return matches[0]
-    return official
-
-
-def _store_output_path(output_root: Path, patch: str, band: str, dataset_source: str, group: str) -> Path:
-    if dataset_source == "coadd":
-        return output_root / "image_level" / "coadd" / band / f"{patch}.zarr"
-    return output_root / "image_level" / dataset_source / band / f"{patch}__{group}.zarr"
-
-
-def _refit_csv_path(refit_root: Path, tract: int, band: str, patch: str) -> Path:
-    return refit_root / str(tract) / band / patch / "batch_heavyfp_kron_refit" / "batch_heavyfp_kron_refit.csv"
-
-
-def _read_image_header_origin(path: Path, hdu: int | str = 1) -> tuple[np.ndarray, fits.Header, tuple[int, int]]:
-    with fits.open(path, memmap=True, ignore_missing_end=True) as hdul:
-        if isinstance(hdu, str):
-            idx = hdul.index_of(hdu)
-        else:
-            idx = int(hdu)
-            if idx >= len(hdul) or getattr(hdul[idx], "data", None) is None:
-                idx = _find_image_hdu_index(hdul)
-        data = np.asarray(hdul[idx].data, dtype=np.float32)
-        header = hdul[idx].header.copy()
-        origin = _origin_from_ltv(header)
-    return data, header, origin
-
-
-def _mask_plane_bits(header: fits.Header) -> dict[str, int]:
-    bits: dict[str, int] = {}
-    for key, value in header.items():
-        if not str(key).startswith("MP_"):
-            continue
-        name = str(key)[3:].upper()
-        try:
-            bits[name] = int(value)
-        except Exception:
-            continue
-    return bits
-
-
-def _read_fits_quality_mask(path: Path, shape: tuple[int, int]) -> np.ndarray:
-    if not path.exists():
-        return np.zeros(shape, dtype=bool)
-    try:
-        with fits.open(path, memmap=False, ignore_missing_end=True) as hdul:
-            image_idx = _find_image_hdu_index(hdul)
-            image = np.asarray(hdul[image_idx].data)
-            image_all_finite = bool(np.isfinite(image).all()) if image.shape == shape else False
-            if "MASK" in hdul:
-                hdu = hdul["MASK"]
-            else:
-                mask_idx = image_idx + 1
-                if mask_idx >= len(hdul) or getattr(hdul[mask_idx], "data", None) is None:
-                    return np.zeros(shape, dtype=bool)
-                hdu = hdul[mask_idx]
-            mask = np.asarray(hdu.data, dtype=np.int64)
-            if mask.shape != shape:
-                return np.zeros(shape, dtype=bool)
-            bits = _mask_plane_bits(hdu.header)
-            out = np.zeros(shape, dtype=bool)
-            for plane in MASK_PLANES_FOR_STRICT_IGNORE:
-                bit = bits.get(plane)
-                if bit is not None:
-                    plane_mask = (mask & (1 << int(bit))) != 0
-                    if plane == "BAD" and image_all_finite and bool(plane_mask.all()):
-                        continue
-                    out |= plane_mask
-            return out
-    except Exception:
-        return np.zeros(shape, dtype=bool)
-
-
-def _read_background_from_det(data_root: Path, band: str, tract: int, patch: str, shape: tuple[int, int], origin: tuple[int, int]) -> np.ndarray:
-    det = _band_det_path(data_root, band, tract, patch)
-    if det is None or not det.exists():
-        return np.zeros(shape, dtype=bool)
-    try:
-        return _read_det_background_mask(det, shape, origin)
-    except Exception:
-        return np.zeros(shape, dtype=bool)
-
-
-def _background_group_candidates(group: str | int) -> list[str]:
-    text = str(group)
-    candidates = [text]
-    number = _group_number(text)
-    if number is not None:
-        candidates.extend([f"group_{number:02d}", f"group_{number}", str(number)])
-    elif text.startswith("group_"):
-        number = _group_number(text)
-        if number is not None:
-            candidates.extend([str(number), f"group_{number:02d}"])
-    return list(dict.fromkeys(candidates))
-
-
-def _variant_background_dirs(root: Path, variant: str, tract: int, patch: str, group: str, band: str) -> list[Path]:
-    return [root / variant / str(tract) / patch / candidate / band for candidate in _background_group_candidates(group)]
-
-
-def _variant_background_dir(root: Path, variant: str, tract: int, patch: str, group: str, band: str) -> Path:
-    return _variant_background_dirs(root, variant, tract, patch, group, band)[0]
-
-
-def _read_variant_background(
-    *,
-    root: Path | None,
-    variant: str,
-    tract: int,
-    patch: str,
-    group: str,
-    band: str,
-    shape: tuple[int, int],
-    origin: tuple[int, int],
-) -> np.ndarray | None:
-    if root is None:
-        return None
-    for base in _variant_background_dirs(root, variant, tract, patch, group, band):
-        if not base.exists():
-            continue
-        npz = base / "background_mask.npz"
-        if npz.exists():
-            mask = read_background_mask(npz, shape)
-            return np.asarray(mask, dtype=bool)
-        for det in sorted(base.glob("det-*.fits")):
-            try:
-                return _read_det_background_mask(det, shape, origin)
-            except Exception:
-                continue
-    return None
-
-
-def _read_coadd_lsst_background(
-    *,
-    root: Path | None,
-    tract: int,
-    patch: str,
-    band: str,
-    shape: tuple[int, int],
-    origin: tuple[int, int],
-) -> np.ndarray | None:
-    if root is None:
-        return None
-    for variant in ("coadd", "half_coadd"):
-        background = _read_variant_background(
-            root=root,
-            variant=variant,
-            tract=tract,
-            patch=patch,
-            group="coadd",
-            band=band,
-            shape=shape,
-            origin=origin,
-        )
-        if background is not None:
-            return background
-    return None
-
-
-def _background_for_task(task: StoreTask, shape: tuple[int, int], origin: tuple[int, int]) -> np.ndarray:
-    coadd = _read_background_from_det(task.data_root, task.band, task.tract, task.patch, shape, origin)
-    if task.dataset_source == "coadd":
-        coadd_lsst = _read_coadd_lsst_background(
-            root=task.coadd_lsst_background_root,
-            tract=task.tract,
-            patch=task.patch,
-            band=task.band,
-            shape=shape,
-            origin=origin,
-        )
-        if coadd_lsst is not None:
-            return coadd_lsst
-        if task.coadd_lsst_background_root is not None:
-            tried = []
-            for variant in ("coadd", "half_coadd"):
-                tried.extend(
-                    str(path / "background_mask.npz")
-                    for path in _variant_background_dirs(
-                        task.coadd_lsst_background_root,
-                        variant,
-                        task.tract,
-                        task.patch,
-                        "coadd",
-                        task.band,
-                    )
-                )
-            raise FileNotFoundError(
-                "coadd LSST background not found; tried: "
-                + ", ".join(tried)
-            )
-        return coadd
-
-    source = str(task.image_variant_background_source).strip().lower()
-    if source not in {"auto", "coadd-target", "variant-lsst", "none"}:
-        raise ValueError(f"unknown image variant background source: {task.image_variant_background_source}")
-    if source == "none":
-        return np.zeros(shape, dtype=bool)
-    if source == "coadd-target":
-        return coadd
-
-    variant = _read_variant_background(
-        root=task.variant_lsst_background_root,
-        variant=task.dataset_source,
-        tract=task.tract,
-        patch=task.patch,
-        group=task.group,
-        band=task.band,
-        shape=shape,
-        origin=origin,
-    )
-    if variant is not None:
-        return variant
-    if source == "variant-lsst" or str(task.missing_variant_background_policy) == "error":
-        tried = [
-            str(path / "background_mask.npz")
-            for path in _variant_background_dirs(
-                task.variant_lsst_background_root or Path("<variant-lsst-background-root>"),
-                task.dataset_source,
-                task.tract,
-                task.patch,
-                task.group,
-                task.band,
-            )
-        ]
-        raise FileNotFoundError(
-            "variant LSST background not found; tried: "
-            + ", ".join(tried)
-        )
-    if str(task.missing_variant_background_policy) == "none":
-        return np.zeros(shape, dtype=bool)
-    return coadd
-
-
-def _crop(arr: np.ndarray, x0: int, y0: int, origin: tuple[int, int], size: int) -> np.ndarray:
-    lx0 = int(x0) - int(origin[0])
-    ly0 = int(y0) - int(origin[1])
-    if arr.ndim == 2:
-        return np.asarray(arr[ly0 : ly0 + size, lx0 : lx0 + size])
-    if arr.ndim == 3:
-        return np.asarray(arr[:, ly0 : ly0 + size, lx0 : lx0 + size])
-    raise ValueError(f"cannot crop array with shape {arr.shape}")
-
-
-def _scale_image_chw(raw_image: np.ndarray, task: StoreTask) -> np.ndarray:
-    scaled = scale_image_for_training(
-        raw_image,
-        config=ImageProcessingConfig(
-            scaling_mode=task.image_scaling_mode,
-            clip_threshold=float(task.clip_threshold),
-            log_a=_image_log_a(task),
-            log_high_percentile=float(task.image_log_high_percentile),
-            lupton_stretch=float(task.image_lupton_stretch),
-            lupton_q=float(task.image_lupton_q),
-            anscombe_clip=bool(task.image_anscombe_clip),
-            anscombe_scale=float(task.image_anscombe_scale),
-        ),
-    )
-    if scaled.ndim == 2:
-        return scaled[None, :, :].astype(np.float32, copy=False)
-    if scaled.ndim == 3 and scaled.shape[-1] in (1, 3):
-        return np.moveaxis(scaled, -1, 0).astype(np.float32, copy=False)
-    if scaled.ndim == 3 and scaled.shape[0] in (1, 3):
-        return scaled.astype(np.float32, copy=False)
-    raise ValueError(f"unsupported scaled image shape: {scaled.shape}")
-
-
-def _classify_patch(task: StoreTask, image: np.ndarray, image_header: fits.Header, origin: tuple[int, int], coadd_image_fits: Path) -> PatchLabels:
+def _classify_patch(task: StoreTask, image: np.ndarray, image_header: fits.Header, origin: tuple[int, int], coadd_image_fits: Path, *, background_override=None) -> PatchLabels:
     meas_path = _band_catalog_path(task.data_root, task.band, task.tract, task.patch)
     refit_csv = _refit_csv_path(task.refit_root, task.tract, task.band, task.patch)
     if not meas_path.exists():
@@ -516,7 +126,11 @@ def _classify_patch(task: StoreTask, image: np.ndarray, image_header: fits.Heade
     )
     if not bool(np.any(quality)) and task.dataset_source != "coadd":
         quality = _read_fits_quality_mask(coadd_image_fits, image.shape)
-    stage = classify_meas_basics(table, config=MeasProcessingConfig(), refit_config=RefitConfig())
+    stage = classify_meas_basics(table, config=MeasProcessingConfig(), refit_config=RefitConfig(),
+                                 # Refitted x_image/y_image are already local.
+                                 # The FITS origin is only used for global tile IDs;
+                                 # subtracting it here marks every refit as no-data.
+                                 image=image, origin=(0, 0))
     snr = compute_snr_for_sample(
         table,
         dataset_source=task.dataset_source,
@@ -601,7 +215,8 @@ def _classify_patch(task: StoreTask, image: np.ndarray, image_header: fits.Heade
             np.asarray(fallback_component_ids, dtype=np.int32),
             assume_unique=False,
         ).astype(np.int32)
-    background = _background_for_task(task, image.shape, origin)
+    background = (_background_for_task(task, image.shape, origin)
+                  if background_override is None else np.asarray(background_override, bool))
     restricted_fallback_mask = None
     if bright.restricted_fallback_component_ids.size and components is not None and np.asarray(components).size:
         component_ids = np.asarray(bright.restricted_fallback_component_ids, dtype=np.int32)
@@ -625,6 +240,7 @@ def _classify_patch(task: StoreTask, image: np.ndarray, image_header: fits.Heade
         bright.labels,
         image.shape,
         background_mask=background,
+        bright_region_mask=bright_region,
         quality_ignore_mask=quality,
         restricted_fallback_mask=restricted_fallback_mask,
         ordinary_ignore_mask=ordinary_ignore_mask,
@@ -645,130 +261,8 @@ def _classify_patch(task: StoreTask, image: np.ndarray, image_header: fits.Heade
         strict_x=bright.strict_center_x.astype(np.float32),
         strict_y=bright.strict_center_y.astype(np.float32),
         strict_ids=bright.strict_center_source_id.astype(np.int64),
+        strict_is_gaia=np.array(["gaia" in str(r) for r in bright.strict_center_reason], bool),
     )
-
-
-def _paint_confidence(conf: np.ndarray, weight: np.ndarray, centers: np.ndarray, *, levels: int = 5, value_weight: float = 1.0) -> None:
-    if centers.size == 0:
-        return
-    h, w = conf.shape
-    yy, xx = np.mgrid[0:h, 0:w]
-    radius = int(levels) - 1
-    for cx, cy in np.asarray(centers, dtype=np.float32).reshape(-1, 2):
-        cx_i = int(round(float(cx)))
-        cy_i = int(round(float(cy)))
-        if not (0 <= cx_i < w and 0 <= cy_i < h):
-            continue
-        y0 = max(0, cy_i - radius)
-        y1 = min(h, cy_i + radius + 1)
-        x0 = max(0, cx_i - radius)
-        x1 = min(w, cx_i + radius + 1)
-        dist = np.abs(xx[y0:y1, x0:x1] - float(cx)) + np.abs(yy[y0:y1, x0:x1] - float(cy))
-        vals = np.ceil(np.clip(radius - dist, 0, None)).astype(np.uint8)
-        keep = vals > 0
-        patch_conf = conf[y0:y1, x0:x1]
-        patch_weight = weight[y0:y1, x0:x1]
-        patch_conf[keep] = np.maximum(patch_conf[keep], vals[keep])
-        patch_weight[keep] = np.maximum(patch_weight[keep], float(value_weight))
-
-
-def _source_indices_in_tile(labels: PatchLabels, mask: np.ndarray, spec, origin: tuple[int, int]) -> np.ndarray:
-    tile_x0 = float(spec.x0) - float(origin[0])
-    tile_y0 = float(spec.y0) - float(origin[1])
-    local_x = labels.geom_x - tile_x0
-    local_y = labels.geom_y - tile_y0
-    return np.flatnonzero(
-        np.asarray(mask, dtype=bool)
-        & np.isfinite(local_x)
-        & np.isfinite(local_y)
-        & (local_x >= 0.0)
-        & (local_x < float(spec.size))
-        & (local_y >= 0.0)
-        & (local_y < float(spec.size))
-    )
-
-
-def _strict_centers_in_tile(labels: PatchLabels, spec, origin: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
-    tile_x0 = float(spec.x0) - float(origin[0])
-    tile_y0 = float(spec.y0) - float(origin[1])
-    centers = np.column_stack([labels.strict_x - tile_x0, labels.strict_y - tile_y0]).astype(np.float32)
-    keep = (
-        np.isfinite(centers[:, 0])
-        & np.isfinite(centers[:, 1])
-        & (centers[:, 0] >= 0.0)
-        & (centers[:, 0] < float(spec.size))
-        & (centers[:, 1] >= 0.0)
-        & (centers[:, 1] < float(spec.size))
-    )
-    return centers[keep], labels.strict_ids[keep]
-
-
-def _tile_targets(labels: PatchLabels, spec, origin: tuple[int, int]) -> dict[str, np.ndarray]:
-    size = int(spec.size)
-    dense = _crop(labels.dense, spec.x0, spec.y0, origin, size).astype(np.uint8, copy=False)
-    tile_x0 = float(spec.x0) - float(origin[0])
-    tile_y0 = float(spec.y0) - float(origin[1])
-    weights = LabelWeights().as_array()
-    conf = np.zeros((size, size), dtype=np.uint8)
-    conf_weight = weights[np.clip(dense, 0, len(weights) - 1)].astype(np.float32, copy=False)
-    shape = np.zeros((3, size, size), dtype=np.float32)
-    shape_weight = np.zeros((size, size), dtype=np.float32)
-
-    clean_or_weak = (labels.label_classes == int(SourceClass.CLEAN)) | (labels.label_classes == int(SourceClass.WEAK_SHAPE))
-    strict_table = labels.label_classes == int(SourceClass.STRICT_CENTER_ONLY)
-    train_center = clean_or_weak | strict_table
-    center_idx = _source_indices_in_tile(labels, train_center, spec, origin)
-    center_xy = np.column_stack([labels.geom_x[center_idx] - tile_x0, labels.geom_y[center_idx] - tile_y0]).astype(np.float32)
-    strict_extra_xy, strict_extra_ids = _strict_centers_in_tile(labels, spec, origin)
-    all_conf_centers = center_xy
-    if len(strict_extra_xy):
-        all_conf_centers = np.concatenate([all_conf_centers, strict_extra_xy], axis=0)
-    _paint_confidence(conf, conf_weight, all_conf_centers, levels=5, value_weight=1.0)
-
-    shape_idx = _source_indices_in_tile(labels, clean_or_weak, spec, origin)
-    for idx in shape_idx:
-        cx = float(labels.geom_x[idx] - tile_x0)
-        cy = float(labels.geom_y[idx] - tile_y0)
-        major = float(labels.geom_major[idx])
-        minor = float(labels.geom_minor[idx])
-        theta = float(labels.geom_theta[idx])
-        if not (math.isfinite(major) and math.isfinite(minor) and major > 0 and minor > 0):
-            continue
-        region = np.zeros((size, size), dtype=np.uint8)
-        paint_ellipse(region, cx, cy, major, minor, theta, 1)
-        inside = region > 0
-        shape[0][inside] = major
-        shape[1][inside] = minor
-        shape[2][inside] = theta
-        shape_weight[inside] = 1.0
-
-    source_idx = _source_indices_in_tile(labels, clean_or_weak, spec, origin)
-    source_centers = np.column_stack([labels.geom_x[source_idx] - tile_x0, labels.geom_y[source_idx] - tile_y0]).astype(np.float32)
-    source_ids_arr = labels.source_ids[source_idx].astype(np.int64, copy=False)
-    strict_table_idx = _source_indices_in_tile(labels, strict_table, spec, origin)
-    strict_table_centers = np.column_stack([labels.geom_x[strict_table_idx] - tile_x0, labels.geom_y[strict_table_idx] - tile_y0]).astype(np.float32)
-    strict_table_ids = labels.source_ids[strict_table_idx].astype(np.int64, copy=False)
-    strict_centers = np.concatenate([strict_table_centers, strict_extra_xy], axis=0).astype(np.float32)
-    strict_ids = np.concatenate([strict_table_ids, strict_extra_ids], axis=0).astype(np.int64)
-    shape_centers = source_centers.astype(np.float32)
-    shape_values = np.column_stack([labels.geom_major[source_idx], labels.geom_minor[source_idx], labels.geom_theta[source_idx]]).astype(np.float32)
-    shape_classes = labels.label_classes[source_idx].astype(np.uint8, copy=False)
-    shape_ids = source_ids_arr
-    return {
-        "confidence": conf,
-        "conf_weight": conf_weight,
-        "shape": shape,
-        "shape_weight": shape_weight,
-        "pu": dense,
-        "source_centers": source_centers,
-        "source_ids": source_ids_arr,
-        "strict_centers": strict_centers,
-        "strict_ids": strict_ids,
-        "shape_centers": shape_centers,
-        "shape_values": shape_values,
-        "shape_classes": shape_classes,
-        "shape_ids": shape_ids,
-    }
 
 
 def _build_store(task: StoreTask) -> dict[str, object]:
@@ -781,24 +275,81 @@ def _build_store(task: StoreTask) -> dict[str, object]:
         raise FileNotFoundError(f"image FITS not found: {image_fits}")
     image, header, origin = _read_image_header_origin(image_fits)
     labels = _classify_patch(task, image, header, origin, coadd_image_fits)
-    specs = make_tile_specs(
+    return write_classified_patch(task, image, labels, origin, provenance={
+        "image_fits": str(image_fits), "coadd_image_fits": str(coadd_image_fits),
+        "refit_csv": str(_refit_csv_path(task.refit_root, task.tract, task.band, task.patch)),
+    })
+
+
+def write_classified_patch(task: StoreTask, image: np.ndarray, labels: PatchLabels,
+                           origin=(0, 0), *, cosmos_catalog=None, image_wcs=None,
+                           provenance=None, input_source: ImageInput | None = None,
+                           tile_specs=None, valid_mask=None, max_invalid_fraction=None,
+                           scaled_image_chw=None, include_large_sources=True) -> dict[str, object]:
+    """Write already classified sources without rerunning HSC source filters.
+
+    COSMOS callers supply the catalog and full-image WCS to generate isolated
+    segmentation targets before tiling. Other datasets leave them unset.
+    Scaling is performed here: image must be linear and already converted to
+    HSC surface-brightness units for JWST, not RGB or previously scaled values.
+    input_source namespaces JWST outputs by dataset/proposal and records both
+    training-image and catalog-selection reference paths. Labels must already
+    be on the training-image grid; this function does not rerun source filters.
+    """
+    if input_source is not None:
+        task = bind_task(task, input_source)
+        provenance = {**(provenance or {}), **input_source.to_dict()}
+        if input_source.dataset in ('abell','cosmos') and max_invalid_fraction is None:
+            max_invalid_fraction=.10
+    if image.shape != labels.dense.shape:
+        raise ValueError("image and dense target shapes must match")
+    if cosmos_catalog is not None:
+        if image_wcs is None:
+            raise ValueError("COSMOS segmentation requires image_wcs")
+        segmentation_valid = np.isfinite(image)
+        if valid_mask is not None:
+            if np.shape(valid_mask) != image.shape:
+                raise ValueError("valid mask/image shape mismatch")
+            segmentation_valid &= np.asarray(valid_mask, bool)
+        attach_cosmos_segmentation(labels, image_wcs, cosmos_catalog,
+                                   origin=origin, valid_mask=segmentation_valid)
+    if (labels.segmentation_ids is None) != (labels.segmentation_weight is None):
+        raise ValueError("segmentation IDs and weights must be supplied together")
+    specs = list(tile_specs) if tile_specs is not None else make_tile_specs(
         parent_origin=origin,
         image_shape=(int(image.shape[1]), int(image.shape[0])),
         tile_size=task.tile_size,
         stride=task.stride,
         compare_origin=None,
     )
+    if tile_specs is None and include_large_sources and input_source is not None and input_source.dataset in ('abell','cosmos'):
+        from preprocessing.utils.large_sources import large_source_specs
+        specs.extend(large_source_specs(labels,input_source.dataset,origin=origin,size=task.tile_size))
+    if valid_mask is not None:
+        valid_mask=np.asarray(valid_mask,bool)
+        if valid_mask.shape != image.shape:raise ValueError('valid mask/image shape mismatch')
+    if max_invalid_fraction is not None:
+        from preprocessing.utils.large_sources import valid_tile_specs
+        valid_mask=np.isfinite(image) if valid_mask is None else valid_mask
+        specs=valid_tile_specs(specs,valid_mask,origin,max_invalid_fraction)
     if task.max_tiles > 0:
         specs = specs[: int(task.max_tiles)]
     n = len(specs)
     if n == 0:
+        if max_invalid_fraction is not None:
+            return {'samples':0,'status':'no_valid_tiles','patch':task.patch,'band':task.band}
         raise RuntimeError(f"no tile specs generated for {task.patch} {task.band} {task.dataset_source} {task.group}")
+    from preprocessing.utils.confidence import resolve_confidence
+    confidence_config = resolve_confidence(
+        task, image_wcs=image_wcs,
+        image_path=(input_source.image_fits if input_source is not None else (provenance or {}).get('image_fits')),
+    )
     h = w = int(task.tile_size)
     scaling_scope = str(task.image_scaling_scope).strip().lower().replace("_", "-")
     if scaling_scope not in {"patch", "tile"}:
         raise ValueError(f"unknown image scaling scope: {task.image_scaling_scope}")
     if scaling_scope == "patch":
-        full_scaled_chw = _scale_image_chw(image, task)
+        full_scaled_chw = _scale_image_chw(image, task) if scaled_image_chw is None else np.asarray(scaled_image_chw)
         c = int(full_scaled_chw.shape[0])
         first_scaled_chw = None
     else:
@@ -811,6 +362,12 @@ def _build_store(task: StoreTask) -> dict[str, object]:
     band_shape = np.zeros((n, 1, 3, h, w), dtype=np.float32)
     band_shape_weight = np.zeros((n, 1, h, w), dtype=np.float32)
     band_pu = np.zeros((n, 1, h, w), dtype=np.uint8)
+    band_valid = np.zeros((n,1,h,w),bool) if valid_mask is not None else None
+    band_seg_ids = band_seg_weight = None
+    overlap_rows = []
+    if labels.segmentation_ids is not None:
+        band_seg_ids = np.zeros((n, 1, h, w), dtype=np.int32)
+        band_seg_weight = np.zeros((n, 1, h, w), dtype=np.float32)
     sample_names: list[str] = []
     tile_names: list[str] = []
     groups: list[str] = []
@@ -841,18 +398,47 @@ def _build_store(task: StoreTask) -> dict[str, object]:
             raw_tile = _crop(image, spec.x0, spec.y0, origin, h)
             scaled_chw = _scale_image_chw(raw_tile, task)
         images[i, 0] = scaled_chw
-        target = _tile_targets(labels, spec, origin)
+        target = _tile_targets(labels, spec, origin, confidence=confidence_config)
+        if valid_mask is not None:
+            v=_crop(valid_mask,spec.x0,spec.y0,origin,h)
+            band_valid[i,0]=v
+            images[i,0,...,~v]=0
+            target['confidence'][~v]=0
+            target['conf_weight'][~v]=0
+            target['shape_weight'][~v]=0
+            from preprocessing.labels import DenseLabel
+            target['pu'][~v]=int(DenseLabel.STRICT_IGNORE)
+            if 'segmentation_weight' in target:target['segmentation_weight'][~v]=0
+            for center_key,others in [('source_centers',['source_ids']),('strict_centers',['strict_ids']),
+                                      ('shape_centers',['shape_values','shape_classes','shape_ids'])]:
+                centers=target[center_key]
+                xy=np.clip(np.floor(centers+.5).astype(int),0,h-1)
+                keep=v[xy[:,1],xy[:,0]]
+                if center_key == 'strict_centers':
+                    keep |= target['strict_is_gaia']
+                for key in [center_key]+others:target[key]=target[key][keep]
         band_conf[i, 0] = target["confidence"]
         band_conf_weight[i, 0] = target["conf_weight"]
         band_shape[i, 0] = target["shape"]
         band_shape_weight[i, 0] = target["shape_weight"]
         band_pu[i, 0] = target["pu"]
+        if band_seg_ids is not None:
+            band_seg_ids[i, 0] = target["segmentation_ids"]
+            band_seg_weight[i, 0] = target["segmentation_weight"]
+        for row in target.get('segmentation_overlap_masks', []):
+            if valid_mask is not None:
+                y, x = row['y0'], row['x0']; mh, mw = row['mask'].shape
+                row['mask'] &= v[y:y+mh, x:x+mw]
+            if row['mask'].any():
+                overlap_rows.append(dict(row, sample=i, band=0))
         tile_x0[i] = int(spec.x0)
         tile_y0[i] = int(spec.y0)
         tile_names.append(spec.name)
         groups.append("" if task.dataset_source == "coadd" else task.group)
         sources.append(task.dataset_source)
         prefix = task.band if task.dataset_source == "coadd" else f"{task.group}_{task.band}"
+        if input_source is not None:
+            prefix = input_source.sample_name
         sample_names.append(f"{prefix}_{spec.name}")
 
         offsets[i, 0] = source_cursor
@@ -884,6 +470,7 @@ def _build_store(task: StoreTask) -> dict[str, object]:
         return np.concatenate(nonempty, axis=0).astype(dtype, copy=False)
 
     output = _store_output_path(task.output_root, task.patch, task.band, task.dataset_source, task.group)
+    from preprocessing.utils.segmentation_storage import pack_overlap_masks
     batch = ImageLevelTrainingBatch(
         images=images,
         band_confidence=band_conf,
@@ -891,6 +478,11 @@ def _build_store(task: StoreTask) -> dict[str, object]:
         band_shape=band_shape,
         band_shape_weight=band_shape_weight,
         band_pu_class_mask=band_pu,
+        band_valid_mask=band_valid,
+        band_segmentation_ids=band_seg_ids,
+        band_segmentation_weight=band_seg_weight,
+        segmentation_overlap=(pack_overlap_masks(overlap_rows)
+                              if labels.segmentation_overlap_masks is not None else None),
         sample_names=sample_names,
         tile_x0=tile_x0,
         tile_y0=tile_y0,
@@ -928,12 +520,15 @@ def _build_store(task: StoreTask) -> dict[str, object]:
             "coadd_lsst_background_root": str(task.coadd_lsst_background_root) if task.coadd_lsst_background_root is not None else "",
             "variant_lsst_background_root": str(task.variant_lsst_background_root) if task.variant_lsst_background_root is not None else "",
             "missing_variant_background_policy": task.missing_variant_background_policy,
+            "subtract_bright_object_from_background": bool(task.subtract_bright_object_from_background),
+            "bright_object_mask_root": str(task.bright_object_mask_root) if task.bright_object_mask_root is not None else "",
             "tile_size": int(task.tile_size),
+            "max_invalid_fraction": max_invalid_fraction,
             "stride": int(task.stride),
             "source_export_mode": "preprocessing_v3",
-            "image_fits": str(image_fits),
-            "coadd_image_fits": str(coadd_image_fits),
-            "refit_csv": str(_refit_csv_path(task.refit_root, task.tract, task.band, task.patch)),
+            **(provenance or {}),
+            "confidence_config": confidence_config,
+            "segmentation_policy": labels.segmentation_policy,
         },
         source_centers=_cat(centers_flat, 2, np.float32),
         source_ids=_cat(ids_flat, None, np.int64),
@@ -978,6 +573,11 @@ def _make_tasks(args: argparse.Namespace) -> list[StoreTask]:
         if args.variant_lsst_background_root
         else None
     )
+    bright_object_mask_root = (
+        Path(args.bright_object_mask_root).expanduser().resolve()
+        if args.bright_object_mask_root
+        else data_root
+    )
     gaia = Path(args.gaia_fits).expanduser().resolve() if args.gaia_fits else None
     tasks: list[StoreTask] = []
     for patch in patches:
@@ -1005,6 +605,7 @@ def _make_tasks(args: argparse.Namespace) -> list[StoreTask]:
                             coadd_weight_root=coadd_weight_root,
                             coadd_lsst_background_root=coadd_background_root,
                             variant_lsst_background_root=variant_background_root,
+                            bright_object_mask_root=bright_object_mask_root,
                             gaia_fits=gaia,
                             tract=int(args.tract),
                             patch=patch,
@@ -1038,6 +639,7 @@ def _make_tasks(args: argparse.Namespace) -> list[StoreTask]:
                             gaia_bright_mag_threshold=float(args.gaia_bright_mag_threshold),
                             snr_method=str(args.snr_method),
                             missing_noncoadd_policy=str(args.missing_noncoadd_policy),
+                            subtract_bright_object_from_background=bool(args.subtract_bright_object_from_background),
                             image_variant_background_source=str(args.image_variant_background_source),
                             missing_variant_background_policy=str(args.missing_variant_background_policy),
                         )
@@ -1068,6 +670,7 @@ def _make_tasks(args: argparse.Namespace) -> list[StoreTask]:
                             coadd_weight_root=coadd_weight_root,
                             coadd_lsst_background_root=coadd_background_root,
                             variant_lsst_background_root=variant_background_root,
+                            bright_object_mask_root=bright_object_mask_root,
                             gaia_fits=gaia,
                             tract=int(args.tract),
                             patch=patch,
@@ -1101,25 +704,73 @@ def _make_tasks(args: argparse.Namespace) -> list[StoreTask]:
                             gaia_bright_mag_threshold=float(args.gaia_bright_mag_threshold),
                             snr_method=str(args.snr_method),
                             missing_noncoadd_policy=str(args.missing_noncoadd_policy),
+                            subtract_bright_object_from_background=bool(args.subtract_bright_object_from_background),
                             image_variant_background_source=str(args.image_variant_background_source),
                             missing_variant_background_policy=str(args.missing_variant_background_policy),
                         )
                     )
-    return tasks
+    return [replace(task, confidence_mode=args.confidence_mode,
+                    confidence_config_path=args.confidence_config_path,
+                    confidence_fwhm_min=args.confidence_fwhm_min,
+                    confidence_fwhm_max=args.confidence_fwhm_max,
+                    confidence_fwhm_pixels=args.confidence_fwhm_pixels) for task in tasks]
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
+    bootstrap = argparse.ArgumentParser(add_help=False)
+    bootstrap.add_argument('--paths-config')
+    preliminary, _ = bootstrap.parse_known_args(argv)
+    paths = load_paths(preliminary.paths_config)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-root", default="/data/shared/Subaru")
+    parser.add_argument('--paths-config', help='Partial overrides of preprocessing/dataset_paths.json')
+    parser.add_argument('--datasets', nargs='+', choices=['hsc','cosmos','abell'], default=['hsc'])
+    parser.add_argument('--training-batch', action='store_true', help='Four-family production runner with precomputed SExtractor masks and independent centered labels')
+    parser.add_argument('--plan-only', action='store_true')
+    parser.add_argument('--background-root', default='/data/czh23/analysis/2026-09/2026-09-25/batch_aggressive_background')
+    parser.add_argument('--hsc-products-root', default='/data/czh23/Subaru_products')
+    parser.add_argument('--training-kinds', nargs='+', choices=['hsc_half','hsc_noisy','cosmos','abell'], default=['hsc_half','hsc_noisy','cosmos','abell'])
+    parser.add_argument('--job-limit', type=int, default=0, help='Pilot job limit; 0 means all')
+    parser.add_argument('--large-only', action='store_true', help='Pilot: write centered large sources without ordinary grid')
+    parser.add_argument('--cross-boundary-only', action='store_true', help='Pilot: retain large stamps crossing a parent boundary')
+    parser.add_argument('--large-limit', type=int, default=0, help='Pilot centered-stamp limit per parent; 0 means all')
+    parser.add_argument('--parent-xy', nargs=2, type=int, help='COSMOS pilot parent lower-left x y')
+    parser.add_argument('--diagnostic-dir', help='Optional two-panel centered-stamp diagnostics')
+    parser.add_argument('--list-inputs', action='store_true', help='Discover/check images and references; write inventory only, no labels/Zarr')
+    parser.add_argument('--input-manifest-out', help='Inventory JSON path (default: output-root/input_inventory.json)')
+    parser.add_argument('--jwst-bands', nargs='+', help='Effective JWST bands; default all available')
+    parser.add_argument('--cosmos-proposals', type=int, nargs='+', choices=[1727,5893])
+    parser.add_argument('--cosmos-pointings', type=int, nargs='+')
+    parser.add_argument('--abell-stage', choices=['cutouts','zarr','all'], default='all')
+    parser.add_argument('--abell-plan-only', action='store_true')
+    parser.add_argument('--abell-parent', nargs='+', help='Optional aligned parent IDs for pilots, e.g. x+00_y+00')
+    parser.add_argument('--abell-anchor', type=int, nargs=2, default=[8064,19102], metavar=('X0','Y0'))
+    parser.add_argument('--parent-size', type=int, default=4096)
+    parser.add_argument('--parent-overlap', type=int, default=128)
+    parser.add_argument('--jwst-max-invalid-fraction', type=float, default=0.10)
+    parser.add_argument('--confidence-mode', choices=['auto', 'manhattan', 'psf-matched', 'psf-ee'], default='auto',
+                        help='auto: JWST asset EE rings; HSC original Manhattan. psf-matched selects legacy FWHM rings.')
+    parser.add_argument('--confidence-config-path', help='Optional EE or legacy FWHM asset JSON; default bundled asset for selected mode')
+    parser.add_argument('--confidence-fwhm-min', type=float, default=1.6, help='PSF confidence FWHM lower limit in output pixels')
+    parser.add_argument('--confidence-fwhm-max', type=float, default=8.0, help='PSF confidence FWHM upper limit in output pixels')
+    parser.add_argument('--confidence-fwhm-pixels', type=float, default=None,
+                        help='Optional measured FWHM override in output pixels; otherwise use nominal JWST FWHM / WCS scale')
+    parser.add_argument('--sex-detect-thresh', type=float, default=1.5)
+    parser.add_argument('--sex-minarea', type=int, default=5)
+    parser.add_argument('--sex-back-size', type=int, default=64)
+    parser.add_argument('--sex-grow', type=int, default=0)
+    parser.add_argument('--abell-catalog', default='/data/shared/jwst_foundation/catalog/detect/field_ra3p573_dec-30p376_det_cat.fits')
+    parser.add_argument('--abell-gaia', default='/home/czh23/CELLECT/output/gaia_dr3_abell2744.fits')
+    parser.add_argument('--abell-background-root', default='/data/czh23/JWST/lsst_background_masks/jwst/default/Abell2744/group_00')
+    parser.add_argument("--data-root", default=paths['hsc']['data_root'])
     parser.add_argument(
         "--coadd-fits-root",
-        default=None,
+        default=paths['hsc']['coadd_fits_root'],
         help="Optional FITS root for coadd images. Catalogs/backgrounds still come from --data-root.",
     )
     parser.add_argument("--output-root", required=True)
-    parser.add_argument("--refit-root", default="/data/czh23/refit")
-    parser.add_argument("--denoised-fits-root", default="/data/czh23/denoised_fits")
-    parser.add_argument("--coadd-weight-root", default=str(SnrConfig().coadd_weight_root))
+    parser.add_argument("--refit-root", default=paths['hsc']['refit_root'])
+    parser.add_argument("--denoised-fits-root", default=paths['hsc']['denoised_fits_root'])
+    parser.add_argument("--coadd-weight-root", default=paths['hsc']['coadd_weight_root'])
     parser.add_argument(
         "--coadd-lsst-background-root",
         default=None,
@@ -1136,7 +787,23 @@ def parse_args() -> argparse.Namespace:
             "Expected layout: <root>/<variant>/<tract>/<patch>/<group>/<band>/background_mask.npz."
         ),
     )
-    parser.add_argument("--gaia-fits", default="output/gaia_dr3_cosmos.fits")
+    parser.add_argument(
+        "--subtract-bright-object-from-background",
+        action="store_true",
+        help=(
+            "Remove official coadd BRIGHT_OBJECT pixels from any selected background mask. "
+            "This is off by default."
+        ),
+    )
+    parser.add_argument(
+        "--bright-object-mask-root",
+        default=None,
+        help=(
+            "Root of the official coadd FITS files used for BRIGHT_OBJECT subtraction. "
+            "Defaults to --data-root."
+        ),
+    )
+    parser.add_argument("--gaia-fits", default=paths['hsc']['gaia_fits'])
     parser.add_argument("--tract", type=int, default=9813)
     parser.add_argument("--patches", nargs="+", default=["all"])
     parser.add_argument("--bands", nargs="+", default=list(DEFAULT_BANDS))
@@ -1194,13 +861,75 @@ def parse_args() -> argparse.Namespace:
         help="Fallback when a noisy/denoised background is missing in auto mode.",
     )
     parser.add_argument("--missing-image-policy", default="skip", choices=["skip", "error"])
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    from preprocessing.utils.confidence import validate_confidence
+    try:
+        validate_confidence(args.confidence_mode, args.confidence_fwhm_min,
+                            args.confidence_fwhm_max, args.confidence_fwhm_pixels)
+    except ValueError as exc:
+        parser.error(str(exc))
+    args.paths = paths
+    return args
+
+
+def discover_inputs(args) -> list[ImageInput]:
+    """One registry for HSC variants, curated COSMOS and Abell half/full pairs."""
+    sources = []
+    if 'hsc' in args.datasets:
+        sources.extend(hsc_input(task) for task in _make_tasks(args))
+    if 'cosmos' in args.datasets:
+        sources.extend(discover_cosmos(args.paths['cosmos'], proposals=args.cosmos_proposals,
+            bands=args.jwst_bands, pointings=args.cosmos_pointings))
+    if 'abell' in args.datasets:
+        sources.extend(discover_abell(args.paths['abell'], bands=args.jwst_bands))
+    if not sources:
+        raise ValueError('No images matched the selected datasets/filters')
+    names = [s.sample_name for s in sources]
+    if len(set(names)) != len(names):
+        raise ValueError('Duplicate input sample identifiers')
+    return sources
+
+
+def write_input_inventory(args):
+    sources = discover_inputs(args)
+    rows = []
+    for source in sources:
+        header, shape, idx = header_info(source.image_fits)
+        rh, rshape, ridx = header_info(source.reference_fits)
+        rows.append({**source.to_dict(), 'shape': list(shape), 'image_hdu': idx,
+                     'bunit': header.get('BUNIT'), 'reference_shape': list(rshape),
+                     'reference_hdu': ridx, 'reference_bunit': rh.get('BUNIT')})
+    output = Path(args.input_manifest_out or Path(args.output_root)/'input_inventory.json').expanduser()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    result = dict(schema=1, paths=args.paths, items=rows,
+                  counts={name:sum(s.dataset==name for s in sources) for name in args.datasets})
+    output.write_text(json.dumps(result,indent=2)+'\n')
+    print(f'[preprocessing-v3] inputs only: {result["counts"]}; inventory={output}',flush=True)
+    return result
 
 
 def main() -> int:
     args = parse_args()
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
+    if args.training_batch:
+        from preprocessing.training_batch import run
+        return run(args)
+    if args.list_inputs:
+        write_input_inventory(args)
+        return 0
+    if args.datasets == ['abell']:
+        from preprocessing.abell_cutouts import run_cutouts
+        if args.abell_stage in ('cutouts','all') or args.abell_plan_only:
+            run_cutouts(args)
+        if args.abell_stage in ('zarr','all') and not args.abell_plan_only:
+            from preprocessing.abell_zarr import run_abell_zarr
+            run_abell_zarr(args)
+        return 0
+    if args.datasets != ['hsc']:
+        raise ValueError('JWST input loading is available via --list-inputs and load_registered_image. '
+                         'For Zarr, supply final dataset-specific PatchLabels to write_classified_patch(input_source=...). '
+                         'HSC catalog filtering must not be applied to JWST images.')
     tasks = _make_tasks(args)
     print(f"[preprocessing-v3] writing {len(tasks)} image-level store(s) to {args.output_root}", flush=True)
     results = []

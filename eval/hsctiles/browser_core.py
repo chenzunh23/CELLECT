@@ -23,6 +23,11 @@ from astropy.visualization import ZScaleInterval
 from PIL import Image, ImageDraw, ImageFont
 import torch
 
+from data_filtering.sam_input_scaling import (
+    anscombe_single as display_anscombe_single,
+    current_sam_zscore as display_sam_zscore,
+    lupton_single as display_lupton_single,
+)
 
 DEFAULT_CELLECT_ROOT = Path(__file__).resolve().parents[2]
 CELLECT_ROOT = Path(os.environ.get("CELLECT_ROOT", str(DEFAULT_CELLECT_ROOT))).expanduser().resolve()
@@ -31,7 +36,12 @@ if str(CELLECT_ROOT) not in sys.path:
 
 from eval.datasets import (  # noqa: E402
     DEFAULT_HSC_RAW_BANDS,
+    DEFAULT_HSC_COADD_FITS_ROOT,
+    DEFAULT_HSC_DENOISED_FITS_ROOT,
+    DEFAULT_HSC_NOISY_FITS_ROOT,
+    DEFAULT_HSC_WEIGHT_ROOT,
     DEFAULT_HSC_RAW_ROOT,
+    DEFAULT_JWST_NIRCAM_ROOT,
     DEFAULT_MESSIER_ROOT,
     DEFAULT_ZTF_BANDS,
     DEFAULT_ZTF_CUT_ORIGIN_DIR,
@@ -41,6 +51,7 @@ from eval.datasets import (  # noqa: E402
     FrameRef,
     HscImageAccess,
     HscRawAccess,
+    JwstNircamAccess,
     MessierAccess,
     ZtfAccess,
 )
@@ -52,7 +63,9 @@ from eval.eval_utils import (  # noqa: E402
     load_cellect_model,
     make_training_rgb,
     select_band_outputs,
+    zscale_gray,
 )
+from utils.source_snr import SourceSnrConfig, filter_snr_rows, measure_source_snrs  # noqa: E402
 
 
 DEFAULT_ROOT = DEFAULT_HSC_RAW_ROOT
@@ -142,6 +155,165 @@ def display_gray(image: np.ndarray) -> np.ndarray:
         return np.zeros(arr.shape, dtype=np.uint8)
     scaled = np.clip((np.nan_to_num(arr, nan=lo) - lo) / (hi - lo), 0.0, 1.0)
     return np.flipud(np.rint(255.0 * scaled).astype(np.uint8))
+
+
+def _finite_stats(image: np.ndarray) -> tuple[np.ndarray, float, float]:
+    arr = np.asarray(image, dtype=np.float32)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return finite, 0.0, 1.0
+    lo = float(np.min(finite))
+    hi = float(np.max(finite))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        hi = lo + 1.0
+    return finite, lo, hi
+
+
+def _percentile_or_default(values: np.ndarray, pct: float, default: float) -> float:
+    if values.size == 0:
+        return float(default)
+    pct = min(100.0, max(0.0, float(pct)))
+    value = float(np.percentile(values, pct))
+    return value if np.isfinite(value) else float(default)
+
+
+def _display_limits(
+    image: np.ndarray,
+    *,
+    custom: bool,
+    low_pct: float,
+    high_pct: float,
+    low_value: float | None,
+    high_value: float | None,
+    default_low: float | None = None,
+    default_high: float | None = None,
+) -> tuple[float, float]:
+    finite, image_min, image_max = _finite_stats(image)
+    if custom:
+        lo = float(low_value) if low_value is not None and np.isfinite(low_value) else _percentile_or_default(finite, low_pct, image_min)
+        hi = float(high_value) if high_value is not None and np.isfinite(high_value) else _percentile_or_default(finite, high_pct, image_max)
+    else:
+        lo = image_min if default_low is None else float(default_low)
+        hi = image_max if default_high is None else float(default_high)
+    if not np.isfinite(lo):
+        lo = image_min
+    if not np.isfinite(hi):
+        hi = image_max
+    if hi <= lo:
+        hi = lo + 1.0
+    return lo, hi
+
+
+def _normalize_between(image: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    safe = np.nan_to_num(np.asarray(image, dtype=np.float32), nan=float(lo), posinf=float(hi), neginf=float(lo))
+    return np.clip((safe - float(lo)) / max(float(hi) - float(lo), 1e-6), 0.0, 1.0).astype(np.float32)
+
+
+def _display_scaled_plane(
+    image: np.ndarray,
+    *,
+    display_scaling: str,
+    scale_custom: bool = False,
+    scale_low_pct: float = 0.0,
+    scale_high_pct: float = 100.0,
+    scale_low_value: float | None = None,
+    scale_high_value: float | None = None,
+    log_a: float = 1000.0,
+    lupton_stretch: float = 0.5,
+    lupton_q: float = 20.0,
+    anscombe_scale: float = 1000.0,
+) -> np.ndarray:
+    mode = str(display_scaling or "zscale").strip().lower().replace("_", "-")
+    arr = np.asarray(image, dtype=np.float32)
+    finite, image_min, image_max = _finite_stats(arr)
+    if mode == "zscale":
+        try:
+            lo, hi = ZScaleInterval().get_limits(finite)
+        except Exception:
+            lo, hi = image_min, image_max
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            lo, hi = image_min, image_max
+        return _normalize_between(arr, lo, hi)
+    if mode == "zmax":
+        lo, hi = _display_limits(
+            arr,
+            custom=scale_custom,
+            low_pct=scale_low_pct,
+            high_pct=scale_high_pct,
+            low_value=scale_low_value,
+            high_value=scale_high_value,
+        )
+        return _normalize_between(arr, lo, hi)
+    if mode == "asinh":
+        _z, stats = display_sam_zscore(arr)
+        default_low = float(stats.get("zscore_median", stats.get("median", image_min)))
+        lo, hi = _display_limits(
+            arr,
+            custom=scale_custom,
+            low_pct=scale_low_pct,
+            high_pct=scale_high_pct,
+            low_value=scale_low_value,
+            high_value=scale_high_value,
+            default_low=default_low,
+            default_high=image_max,
+        )
+        x = _normalize_between(arr, lo, hi)
+        return np.clip(np.arcsinh(10.0 * x) / 3.0, 0.0, 1.0).astype(np.float32)
+    if mode == "log":
+        lo, hi = _display_limits(
+            arr,
+            custom=scale_custom,
+            low_pct=scale_low_pct,
+            high_pct=scale_high_pct,
+            low_value=scale_low_value,
+            high_value=scale_high_value,
+            default_low=image_min,
+            default_high=image_max,
+        )
+        x = _normalize_between(arr, lo, hi)
+        a = float(log_a) if np.isfinite(float(log_a)) and float(log_a) > 0.0 else 1000.0
+        return np.clip(np.log1p(a * x) / np.log1p(a), 0.0, 1.0).astype(np.float32)
+    if mode == "lupton":
+        _z, stats = display_sam_zscore(arr)
+        default_low = float(stats.get("zscore_median", stats.get("median", image_min)))
+        lo, hi = _display_limits(
+            arr,
+            custom=scale_custom,
+            low_pct=scale_low_pct,
+            high_pct=scale_high_pct,
+            low_value=scale_low_value,
+            high_value=scale_high_value,
+            default_low=default_low,
+            default_high=image_max,
+        )
+        clipped = np.clip(np.nan_to_num(arr, nan=lo, posinf=hi, neginf=lo), lo, hi)
+        plane, _stats = display_lupton_single(clipped, minimum=lo, stretch=lupton_stretch, q=lupton_q)
+        return np.clip(np.nan_to_num(plane, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0).astype(np.float32)
+    if mode == "anscombe":
+        base = np.clip(np.nan_to_num(arr, nan=image_min, posinf=image_max, neginf=image_min), image_min, image_max)
+        plane, _stats = display_anscombe_single(base, scale=anscombe_scale, clip=False)
+        lo, hi = _display_limits(
+            plane,
+            custom=scale_custom,
+            low_pct=scale_low_pct,
+            high_pct=scale_high_pct,
+            low_value=None,
+            high_value=None,
+        )
+        return _normalize_between(plane, lo, hi)
+    if mode == "square":
+        lo, hi = _display_limits(
+            arr,
+            custom=scale_custom,
+            low_pct=scale_low_pct,
+            high_pct=scale_high_pct,
+            low_value=scale_low_value,
+            high_value=scale_high_value,
+        )
+        x = np.maximum(np.nan_to_num(arr, nan=lo, posinf=hi, neginf=lo) - lo, 0.0)
+        y = x * x
+        return np.clip(y / max((hi - lo) * (hi - lo), 1e-6), 0.0, 1.0).astype(np.float32)
+    raise ValueError(f"unknown display scaling: {display_scaling}")
 
 
 def _smooth_float_image(image: np.ndarray, sigma: float) -> np.ndarray:
@@ -280,6 +452,7 @@ def _input_shape_overlay_png_bytes(
     clip_threshold: float,
     draw_centers: bool,
     invert_background: bool = False,
+    use_row_colors: bool = False,
 ) -> bytes:
     selection = _input_overlay_channel(scaled, scaling)
     if selection is None:
@@ -291,9 +464,9 @@ def _input_shape_overlay_png_bytes(
     rgb = draw_ellipses(
         channel,
         rows,
-        color="cyan",
+        color=None if use_row_colors else "cyan",
         draw_centers=draw_centers,
-        point_color="blue",
+        point_color=None if use_row_colors else "blue",
         invert_background=invert_background,
         input_scaled_background=True,
         input_scaling=scaling,
@@ -332,6 +505,7 @@ def _input_shape_overlay_uint8(
     smooth_sigma: float = 1.0,
     smooth_radius: int = 1,
     invert_background: bool = False,
+    use_row_colors: bool = False,
 ) -> np.ndarray:
     selection = _input_overlay_channel(scaled, scaling)
     if selection is None:
@@ -349,9 +523,9 @@ def _input_shape_overlay_uint8(
     rgb = draw_ellipses(
         channel,
         rows,
-        color="cyan",
+        color=None if use_row_colors else "cyan",
         draw_centers=draw_centers,
-        point_color="blue",
+        point_color=None if use_row_colors else "blue",
         invert_background=invert_background,
         input_scaled_background=True,
         input_scaling=scaling,
@@ -382,6 +556,88 @@ def _input_display_uint8(
         smooth_radius=smooth_radius,
         invert_background=invert_background,
     )
+
+
+def _display_input_uint8(
+    image: np.ndarray,
+    *,
+    display_scaling: str,
+    scale_custom: bool = False,
+    scale_low_pct: float = 0.0,
+    scale_high_pct: float = 100.0,
+    scale_low_value: float | None = None,
+    scale_high_value: float | None = None,
+    smooth_mode: str = "none",
+    smooth_sigma: float = 1.0,
+    smooth_radius: int = 1,
+    invert_background: bool = False,
+) -> np.ndarray:
+    plane = _display_scaled_plane(
+        image,
+        display_scaling=display_scaling,
+        scale_custom=scale_custom,
+        scale_low_pct=scale_low_pct,
+        scale_high_pct=scale_high_pct,
+        scale_low_value=scale_low_value,
+        scale_high_value=scale_high_value,
+    )
+    plane = _display_filter_image(
+        plane,
+        smooth_mode=smooth_mode,
+        smooth_sigma=smooth_sigma,
+        smooth_radius=smooth_radius,
+    )
+    gray = np.clip(np.rint(np.nan_to_num(plane, nan=0.0, posinf=1.0, neginf=0.0) * 255.0), 0, 255).astype(np.uint8)
+    if invert_background:
+        gray = 255 - gray
+    return np.repeat(np.flipud(gray)[..., None], 3, axis=2)
+
+
+def _display_input_shape_overlay_uint8(
+    image: np.ndarray,
+    rows: list[dict[str, float]],
+    *,
+    display_scaling: str,
+    scale_custom: bool = False,
+    scale_low_pct: float = 0.0,
+    scale_high_pct: float = 100.0,
+    scale_low_value: float | None = None,
+    scale_high_value: float | None = None,
+    draw_centers: bool,
+    smooth_mode: str = "none",
+    smooth_sigma: float = 1.0,
+    smooth_radius: int = 1,
+    invert_background: bool = False,
+    use_row_colors: bool = False,
+) -> np.ndarray:
+    plane = _display_scaled_plane(
+        image,
+        display_scaling=display_scaling,
+        scale_custom=scale_custom,
+        scale_low_pct=scale_low_pct,
+        scale_high_pct=scale_high_pct,
+        scale_low_value=scale_low_value,
+        scale_high_value=scale_high_value,
+    )
+    plane = _display_filter_image(
+        plane,
+        smooth_mode=smooth_mode,
+        smooth_sigma=smooth_sigma,
+        smooth_radius=smooth_radius,
+    )
+    rgb = draw_ellipses(
+        plane,
+        rows,
+        color=None if use_row_colors else "cyan",
+        draw_centers=draw_centers,
+        point_color=None if use_row_colors else "blue",
+        invert_background=invert_background,
+        input_scaled_background=True,
+        input_scaling="zscore-no-upper",
+        input_channel_index=0,
+        input_clip_threshold=1.0,
+    )
+    return np.clip(np.rint(np.flipud(rgb) * 255.0), 0, 255).astype(np.uint8)
 
 
 def _draw_centers_on_uint8(image_rgb: np.ndarray, rows: list[dict[str, float]], *, radius: int = 5) -> np.ndarray:
@@ -423,21 +679,97 @@ def _save_titled_png(path: Path, image_rgb: np.ndarray, title: str, *, min_image
     canvas.save(path)
 
 
+def _save_snr_overlay_png(
+    path: Path,
+    image: np.ndarray,
+    rows: list[dict[str, Any]],
+    *,
+    title: str,
+    threshold: float = 5.0,
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.patheffects as patheffects
+    from matplotlib.patches import Ellipse
+
+    arr = np.asarray(image, dtype=np.float32)
+    height, width = arr.shape
+    fig, ax = plt.subplots(figsize=(width / 100.0, height / 100.0), dpi=100)
+    ax.imshow(zscale_gray(arr), origin="lower", cmap="gray", vmin=0.0, vmax=1.0, interpolation="nearest")
+    for row in sorted(rows, key=lambda item: abs(float(item.get("major", 1.0)) * float(item.get("minor", 1.0))), reverse=True):
+        snr = float(row.get("snr", float("nan")))
+        bad = bool(int(row.get("snr_bad", 0))) or not np.isfinite(snr)
+        color = "0.65" if bad else ("lime" if snr > float(threshold) else "red")
+        x = float(row.get("x", 0.0))
+        y = float(row.get("y", 0.0))
+        major = max(abs(float(row.get("major", 1.0))), 1.0)
+        minor = max(abs(float(row.get("minor", 1.0))), 1.0)
+        theta = float(row.get("theta", 0.0))
+        if abs(theta) > 2.0 * np.pi:
+            theta = np.deg2rad(theta)
+        ax.add_patch(
+            Ellipse(
+                (x, y),
+                width=2.0 * major,
+                height=2.0 * minor,
+                angle=float(np.rad2deg(theta)),
+                fill=False,
+                edgecolor=color,
+                linewidth=1.1,
+                alpha=0.95,
+            )
+        )
+        label = "bad" if bad else f"{snr:.1f}"
+        ax.text(
+            x + 4.0,
+            y + 4.0,
+            label,
+            color=color,
+            fontsize=7,
+            fontweight="bold",
+            path_effects=[patheffects.withStroke(linewidth=1.6, foreground="black")],
+        )
+    ax.set_title(title, fontsize=10)
+    ax.set_xlim(0, width)
+    ax.set_ylim(0, height)
+    ax.set_axis_off()
+    fig.subplots_adjust(0, 0, 1, 0.94)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, bbox_inches="tight", pad_inches=0.02)
+    plt.close(fig)
+
+
 def dataset_label(dataset_id: str) -> str:
     return {
         "hsc_raw": "HSC raw tiles",
         "sitian": "Sitian",
         "hsc_image": "HSC coadd/noisy/denoised",
         "ztf": "ZTF",
+        "jwst": "JWST NIRCam",
     }.get(str(dataset_id), str(dataset_id))
 
 
 def make_access(dataset_id: str, args: argparse.Namespace, tract: str):
+    def path_arg(name: str, default: Path) -> Path:
+        value = getattr(args, name, None)
+        return Path(default if value is None else value)
+
     dataset_id = str(dataset_id)
     if dataset_id == "hsc_raw":
         return HscRawAccess(Path(args.root), tract)
     if dataset_id == "hsc_image":
-        return HscImageAccess(Path(args.hsc_image_root), tract)
+        return HscImageAccess(
+            Path(args.hsc_image_root),
+            tract,
+            weight_root=path_arg("hsc_weight_root", DEFAULT_HSC_WEIGHT_ROOT),
+            coadd_weight_root=path_arg("hsc_coadd_weight_root", DEFAULT_HSC_WEIGHT_ROOT),
+            variant_weight_root=path_arg("hsc_variant_weight_root", DEFAULT_HSC_WEIGHT_ROOT),
+            coadd_fits_root=path_arg("hsc_coadd_fits_root", DEFAULT_HSC_COADD_FITS_ROOT),
+            noisy_fits_root=path_arg("hsc_noisy_fits_root", DEFAULT_HSC_NOISY_FITS_ROOT),
+            denoised_fits_root=path_arg("hsc_denoised_fits_root", DEFAULT_HSC_DENOISED_FITS_ROOT),
+        )
     if dataset_id == "sitian":
         return MessierAccess(Path(args.messier_root), tract, selection_mode=str(args.messier_tile_mode))
     if dataset_id == "ztf":
@@ -447,6 +779,12 @@ def make_access(dataset_id: str, args: argparse.Namespace, tract: str):
             ccd=str(args.ztf_ccd),
             tile_size=int(args.ztf_tile_size),
             cut_origin_dir=Path(args.ztf_cut_origin_dir) if args.ztf_cut_origin_dir else None,
+        )
+    if dataset_id == "jwst":
+        return JwstNircamAccess(
+            Path(getattr(args, "jwst_root", DEFAULT_JWST_NIRCAM_ROOT)),
+            "default",
+            tile_size=int(getattr(args, "jwst_tile_size", 512)),
         )
     raise KeyError(f"unknown dataset: {dataset_id}")
 
@@ -483,12 +821,17 @@ class BrowserState:
         elif self.dataset_id == "ztf":
             default_n_tiles = int(args.ztf_n_tiles)
             default_frames_per_tile = int(args.ztf_frames_per_tile)
+        elif self.dataset_id == "jwst":
+            default_n_tiles = int(args.jwst_n_tiles)
+            default_frames_per_tile = 1
         else:
             default_n_tiles = int(args.n_tiles)
             default_frames_per_tile = int(args.frames_per_tile)
         self.n_tiles_requested = None if all_tiles else int(n_tiles if n_tiles is not None else default_n_tiles)
         self.all_tiles = bool(all_tiles)
         self.frames_per_tile = max(1, int(frames_per_tile if frames_per_tile is not None else default_frames_per_tile))
+        if self.dataset_id == "jwst":
+            self.frames_per_tile = 1
         self.tiles_per_page = max(1, int(tiles_per_page if tiles_per_page is not None else args.tiles_per_page))
         self.detect_batch_size = max(1, int(args.detect_batch_size))
         self.seed = int(args.seed)
@@ -509,7 +852,7 @@ class BrowserState:
         self.anscombe_scale = float(args.anscombe_scale)
         self.confidence_threshold = float(args.confidence_threshold)
         self.confidence_score = str(args.confidence_score)
-        self.nms_radius = int(args.ztf_nms_radius if self.dataset_id == "ztf" else args.nms_radius)
+        self.nms_radius = int(getattr(args, "active_nms_radius", args.nms_radius))
         self.center_refinement = str(args.center_refinement)
         self.center_refinement_radius = int(args.center_refinement_radius)
         self.shape_overlay_centers = bool(args.shape_overlay_centers)
@@ -526,6 +869,8 @@ class BrowserState:
         self.detect_png_by_token: dict[str, bytes] = {}
         self.input_shape_png_by_token: dict[str, bytes] = {}
         self.detect_rows_by_token: dict[str, list[dict[str, float]]] = {}
+        self.snr_rows_by_token_method: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        self.snr_config = SourceSnrConfig()
         self.tile_map_png_by_patch: dict[str, bytes] = {}
         self._model_by_bands: dict[tuple[str, ...], tuple[torch.nn.Module, dict[str, Any]]] = {}
         self._model_lock = threading.Lock()
@@ -560,6 +905,17 @@ class BrowserState:
         return tiles
 
     def _usable_bands_for_patch(self, patch: str) -> list[str]:
+        if self.dataset_id == "jwst" and hasattr(self.access, "image_file"):
+            usable = []
+            for band in self.bands:
+                try:
+                    self.access.image_file(band, patch)
+                except Exception as exc:
+                    self.warnings.append(f"{patch}: skip unavailable {band}: {exc}")
+                    print(f"WARNING: {patch}: skip unavailable {band}: {exc}", flush=True)
+                    continue
+                usable.append(band)
+            return usable
         if self.dataset_id in {"hsc_raw", "ztf"} and hasattr(self.access, "valid_tiles_for_band"):
             usable = []
             for band in self.bands:
@@ -623,7 +979,9 @@ class BrowserState:
             self.refs_by_patch[patch] = refs
 
     def _all_map_tile_ids(self, patch: str) -> list[str]:
-        if self.dataset_id in {"hsc_raw", "ztf"} and hasattr(self.access, "valid_tiles_for_band"):
+        if self.dataset_id == "jwst":
+            return list(self.selected_tiles_by_patch.get(patch, []))
+        if self.dataset_id in {"hsc_raw", "ztf", "jwst"} and hasattr(self.access, "valid_tiles_for_band"):
             try:
                 sets = [self.access.valid_tiles_for_band(band, patch) for band in self._bands_for_patch(patch)]
                 if sets:
@@ -755,7 +1113,11 @@ class BrowserState:
             "checkpoint": str(self.checkpoint),
             "scaling_mode": self.scaling_mode,
             "visit": self.visit,
-            "note": f"{dataset_label(self.dataset_id)} frames; detection uses browser scaling={self.scaling_mode}.",
+            "note": (
+                f"{dataset_label(self.dataset_id)} frames; HSC image detection uses FITS crops with scaling={self.scaling_mode}."
+                if self.dataset_id == "hsc_image"
+                else f"{dataset_label(self.dataset_id)} frames; detection uses browser scaling={self.scaling_mode}."
+            ),
         }
         (self.session_dir / "browser_manifest.json").write_text(
             json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
@@ -779,6 +1141,7 @@ class BrowserState:
             "frames_per_tile": self.frames_per_tile,
             "tiles_per_page": self.tiles_per_page,
             "detect_batch_size": self.detect_batch_size,
+            "nms_radius": self.nms_radius,
             "n_candidates": len(self.refs),
             "n_selected": len(self.selected),
             "n_pages": self.n_pages,
@@ -873,8 +1236,81 @@ class BrowserState:
     def selected_refs(self) -> list[FrameRef]:
         return [ref for ref in self.refs if ref.token in self.selected]
 
-    def _scaled_input_for_token(self, token: str) -> np.ndarray:
-        image = self.access.read_frame(self.ref_by_token[token])
+    @staticmethod
+    def _normalize_snr_method(method: str) -> str:
+        normalized = str(method or "ap2").strip().lower().replace("_", "-")
+        return "kron" if normalized in {"kron", "kron-snr"} else "ap2"
+
+    def _snr_rows_for_token(self, token: str, method: str) -> list[dict[str, Any]]:
+        method = self._normalize_snr_method(method)
+        key = (str(token), method)
+        cached = self.snr_rows_by_token_method.get(key)
+        if cached is not None:
+            return cached
+        if token not in self.detect_rows_by_token:
+            return []
+        ref = self.ref_by_token[token]
+        image = self._detection_image_for_ref(ref)
+        rows, _summary = measure_source_snrs(
+            image,
+            self.detect_rows_by_token[token],
+            method=method,
+            config=self.snr_config,
+        )
+        self.snr_rows_by_token_method[key] = rows
+        return rows
+
+    def _snr_filtered_rows(self, token: str, method: str, threshold: float) -> list[dict[str, Any]]:
+        return filter_snr_rows(self._snr_rows_for_token(token, method), threshold=float(threshold))
+
+    def prepare_snr_page(self, page_index: int, method: str, threshold: float = 5.0) -> dict[str, Any]:
+        method = self._normalize_snr_method(method)
+        threshold = float(threshold)
+        refs_by_key = self._refs_by_tile_slot()
+        tokens: list[str] = []
+        for tile_id, frame_slot in self._page_tile_slots(page_index):
+            per_band = refs_by_key.get((tile_id, frame_slot), {})
+            for band in self._bands_for_patch(self.patch):
+                ref = per_band.get(band)
+                if ref is not None and ref.token in self.detect_rows_by_token:
+                    tokens.append(ref.token)
+        n_sources = 0
+        n_bad = 0
+        by_token: dict[str, dict[str, Any]] = {}
+        for token in tokens:
+            rows = self._snr_rows_for_token(token, method)
+            good_rows = [
+                row for row in rows
+                if int(row.get("snr_bad", 0)) == 0 and np.isfinite(float(row.get("snr", float("nan")))) and float(row.get("snr", float("nan"))) >= threshold
+            ]
+            bad_rows = [row for row in rows if int(row.get("snr_bad", 0)) != 0 or not np.isfinite(float(row.get("snr", float("nan"))))]
+            n_sources += len(good_rows)
+            n_bad += len(bad_rows)
+            by_token[token] = {
+                "method": method,
+                "threshold": threshold,
+                "sources": int(len(good_rows)),
+                "bad": int(len(bad_rows)),
+                "total": int(len(rows)),
+            }
+        return {
+            "stage": "done",
+            "method": method,
+            "threshold": threshold,
+            "n_images": len(tokens),
+            "n_sources": int(n_sources),
+            "n_bad": int(n_bad),
+            "by_token": by_token,
+        }
+
+    def _detection_image_for_ref(self, ref: FrameRef) -> np.ndarray:
+        reader = getattr(self.access, "read_detection_frame", None)
+        if callable(reader):
+            return np.asarray(reader(ref), dtype=np.float32)
+        return np.asarray(self.access.read_frame(ref), dtype=np.float32)
+
+    def _scaled_input_for_ref(self, ref: FrameRef) -> np.ndarray:
+        image = self._detection_image_for_ref(ref)
         return make_training_rgb(
             image,
             mode=self.scaling_mode,
@@ -886,6 +1322,32 @@ class BrowserState:
             anscombe_clip=self.anscombe_clip,
             anscombe_scale=self.anscombe_scale,
         )
+
+    def _scaled_input_for_token(self, token: str) -> np.ndarray:
+        return self._scaled_input_for_ref(self.ref_by_token[token])
+
+    def scale_stats(self, token: str) -> dict[str, Any]:
+        if token not in self.ref_by_token:
+            raise KeyError(f"unknown token: {token}")
+        image = self._detection_image_for_ref(self.ref_by_token[token])
+        finite, image_min, image_max = _finite_stats(image)
+        percentiles = [0.0, 50.0, 90.0, 95.0, 99.5, 99.9, 99.95, 99.99, 100.0]
+        values = {str(p): _percentile_or_default(finite, p, image_min if p <= 50 else image_max) for p in percentiles}
+        try:
+            zlo, zhi = ZScaleInterval().get_limits(finite)
+        except Exception:
+            zlo, zhi = image_min, image_max
+        if not np.isfinite(zlo) or not np.isfinite(zhi) or zhi <= zlo:
+            zlo, zhi = image_min, image_max
+        return {
+            "token": token,
+            "min": image_min,
+            "max": image_max,
+            "zscale_min": float(zlo),
+            "zscale_max": float(zhi),
+            "percentiles": values,
+            "finite_fraction": float(finite.size / np.asarray(image).size) if np.asarray(image).size else 0.0,
+        }
 
     def image_png(
         self,
@@ -900,10 +1362,19 @@ class BrowserState:
         smooth_sigma: float = 1.0,
         smooth_radius: int = 1,
         invert_background: bool = False,
+        display_scaling: str = "zscale",
+        scale_custom: bool = False,
+        scale_low_pct: float = 0.0,
+        scale_high_pct: float = 100.0,
+        scale_low_value: float | None = None,
+        scale_high_value: float | None = None,
+        snr_filter: bool = False,
+        snr_method: str = "ap2",
+        snr_threshold: float = 5.0,
     ) -> bytes:
         use_input = bool(input_image or input_shape)
         if detect and token in self.detect_rows_by_token:
-            rows = self.detect_rows_by_token[token]
+            rows = self._snr_filtered_rows(token, snr_method, snr_threshold) if bool(snr_filter) else self.detect_rows_by_token[token]
             if use_input:
                 scaled = self._scaled_input_for_token(token)
                 if show_shape:
@@ -917,6 +1388,7 @@ class BrowserState:
                         smooth_sigma=smooth_sigma,
                         smooth_radius=smooth_radius,
                         invert_background=invert_background,
+                        use_row_colors=bool(snr_filter),
                     )
                 else:
                     arr = _input_display_uint8(
@@ -932,31 +1404,40 @@ class BrowserState:
                         arr = _draw_centers_on_uint8(arr, rows)
                 return _png_bytes(arr)
             image = _display_filter_image(
-                self.access.read_frame(self.ref_by_token[token]),
+                self._detection_image_for_ref(self.ref_by_token[token]),
                 smooth_mode=smooth_mode,
                 smooth_sigma=smooth_sigma,
                 smooth_radius=smooth_radius,
             )
             if show_shape:
-                arr = _overlay_uint8(image, rows, draw_centers=show_center, invert_background=invert_background)
+                arr = _display_input_shape_overlay_uint8(
+                    image,
+                    rows,
+                    display_scaling=display_scaling,
+                    scale_custom=scale_custom,
+                    scale_low_pct=scale_low_pct,
+                    scale_high_pct=scale_high_pct,
+                    scale_low_value=scale_low_value,
+                    scale_high_value=scale_high_value,
+                    draw_centers=show_center,
+                    invert_background=invert_background,
+                    use_row_colors=bool(snr_filter),
+                )
             else:
-                gray = display_gray(image)
-                if invert_background:
-                    gray = 255 - gray
-                arr = Image.fromarray(gray, mode="L").convert("RGB")
-                arr = np.asarray(arr, dtype=np.uint8)
+                arr = _display_input_uint8(
+                    image,
+                    display_scaling=display_scaling,
+                    scale_custom=scale_custom,
+                    scale_low_pct=scale_low_pct,
+                    scale_high_pct=scale_high_pct,
+                    scale_low_value=scale_low_value,
+                    scale_high_value=scale_high_value,
+                    invert_background=invert_background,
+                )
                 if show_center:
                     arr = _draw_centers_on_uint8(arr, rows)
             return _png_bytes(arr)
         if input_image or input_shape:
-            if smooth_mode in {"", "none", "off"} and not invert_background and token not in self.input_png_by_token:
-                self.input_png_by_token[token] = _input_display_png_bytes(
-                    self._scaled_input_for_token(token),
-                    scaling=self.scaling_mode,
-                    clip_threshold=self.clip_threshold,
-                )
-            if smooth_mode in {"", "none", "off"} and not invert_background:
-                return self.input_png_by_token[token]
             return _png_bytes(
                 _input_display_uint8(
                     self._scaled_input_for_token(token),
@@ -974,10 +1455,18 @@ class BrowserState:
             smooth_sigma=smooth_sigma,
             smooth_radius=smooth_radius,
         )
-        gray = display_gray(image)
-        if invert_background:
-            gray = 255 - gray
-        return _png_bytes(gray)
+        return _png_bytes(
+            _display_input_uint8(
+                image,
+                display_scaling=display_scaling,
+                scale_custom=scale_custom,
+                scale_low_pct=scale_low_pct,
+                scale_high_pct=scale_high_pct,
+                scale_low_value=scale_low_value,
+                scale_high_value=scale_high_value,
+                invert_background=invert_background,
+            )
+        )
 
     def raw_image_png(self, token: str) -> bytes:
         image = self.access.read_frame(self.ref_by_token[token])
@@ -1036,7 +1525,7 @@ class BrowserState:
             print(f"WARNING: {message}", flush=True)
             return {"n_images": 0, "n_detections": 0}
         device = torch.device(self.device_name)
-        raw_images = [self.access.read_frame(per_band[band]) for band in bands]
+        raw_images = [self._detection_image_for_ref(per_band[band]) for band in bands]
         scaled = [
             make_training_rgb(
                 image,
@@ -1068,6 +1557,8 @@ class BrowserState:
                 height=per_band[band].height,
             )
             self.detect_rows_by_token[ref.token] = rows
+            for method in ("ap2", "kron"):
+                self.snr_rows_by_token_method.pop((ref.token, method), None)
             self.detect_png_by_token[ref.token] = _overlay_png_bytes(
                 raw_images[band_idx],
                 rows,
@@ -1128,7 +1619,7 @@ class BrowserState:
                     raw_by_sample: list[list[np.ndarray]] = []
                     scaled_by_sample = []
                     for _tile_id, _frame_slot, per_band in chunk:
-                        raw_images = [self.access.read_frame(per_band[band]) for band in bands]
+                        raw_images = [self._detection_image_for_ref(per_band[band]) for band in bands]
                         raw_by_sample.append(raw_images)
                         scaled_by_sample.append(
                             [
@@ -1163,6 +1654,8 @@ class BrowserState:
                                 height=ref.height,
                             )
                             self.detect_rows_by_token[ref.token] = rows
+                            for method in ("ap2", "kron"):
+                                self.snr_rows_by_token_method.pop((ref.token, method), None)
                             self.detect_png_by_token[ref.token] = _overlay_png_bytes(
                                 raw_by_sample[sample_idx][band_idx],
                                 rows,
@@ -1216,6 +1709,7 @@ class BrowserState:
         manifest = []
         for ref in refs:
             image = self.access.read_frame(ref)
+            detection_image = self._detection_image_for_ref(ref)
             out_dir = self.export_dir / ref.tract / ref.patch / ref.band / ref.tile_id
             out_dir.mkdir(parents=True, exist_ok=True)
             stem = ref.candidate_id
@@ -1224,6 +1718,8 @@ class BrowserState:
             png_path = out_dir / f"{stem}.png"
             detect_png_path = out_dir / f"{stem}_detect_overlay.png"
             input_shape_png_path = out_dir / f"{stem}_input_shape_overlay.png"
+            ap2_snr_png_path = out_dir / f"{stem}_ap2_snr_overlay.png"
+            kron_snr_png_path = out_dir / f"{stem}_kron_snr_overlay.png"
             detect_csv_path = out_dir / f"{stem}_detections.csv"
             if write_png:
                 Image.fromarray(display_gray(image), mode="L").convert("RGB").save(png_path)
@@ -1241,24 +1737,14 @@ class BrowserState:
                 writer.writeheader()
                 writer.writerows(detect_rows)
             if write_png:
-                overlay = _overlay_uint8(image, detect_rows, draw_centers=self.shape_overlay_centers)
+                overlay = _overlay_uint8(detection_image, detect_rows, draw_centers=self.shape_overlay_centers)
                 _save_titled_png(
                     detect_png_path,
                     overlay,
                     f"{ref.candidate_id} detections={len(detect_rows)}",
                     min_image_size=512,
                 )
-                scaled = make_training_rgb(
-                    image,
-                    mode=self.scaling_mode,
-                    clip_threshold=self.clip_threshold,
-                    log_a=self.log_a,
-                    log_high_percentile=self.log_high_percentile,
-                    lupton_stretch=self.lupton_stretch,
-                    lupton_q=self.lupton_q,
-                    anscombe_clip=self.anscombe_clip,
-                    anscombe_scale=self.anscombe_scale,
-                )
+                scaled = self._scaled_input_for_ref(ref)
                 input_overlay = _input_shape_overlay_uint8(
                     scaled,
                     detect_rows,
@@ -1272,12 +1758,26 @@ class BrowserState:
                     f"{ref.candidate_id} input shape detections={len(detect_rows)}",
                     min_image_size=512,
                 )
+                for method, snr_png_path, label in (
+                    ("ap2", ap2_snr_png_path, "AP2"),
+                    ("kron", kron_snr_png_path, "Kron"),
+                ):
+                    snr_rows = self._snr_rows_for_token(ref.token, method)
+                    _save_snr_overlay_png(
+                        snr_png_path,
+                        detection_image,
+                        snr_rows,
+                        title=f"{ref.candidate_id} {label} SNR, red<5 green>5 gray=bad",
+                        threshold=5.0,
+                    )
             row = {
                 **ref.to_dict(),
                 "npz_path": str(npz_path),
                 "png_path": str(png_path) if write_png else "",
                 "detect_png_path": str(detect_png_path) if write_png else "",
                 "input_shape_png_path": str(input_shape_png_path) if write_png else "",
+                "ap2_snr_png_path": str(ap2_snr_png_path) if write_png else "",
+                "kron_snr_png_path": str(kron_snr_png_path) if write_png else "",
                 "detect_csv_path": str(detect_csv_path),
                 "export_subdir": str(out_dir),
                 "n_detections": len(detect_rows),

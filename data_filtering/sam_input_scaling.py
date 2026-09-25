@@ -119,6 +119,46 @@ def no_first_clip_zscore(
     }
 
 
+def rawclip_no_upper_zscore(
+    image: np.ndarray,
+    *,
+    clip_sigma: float = 3.0,
+) -> tuple[np.ndarray, dict[str, float]]:
+    values = finite_values(image)
+    raw_min = float(np.min(values))
+    raw_median = float(np.median(values))
+    raw_sigma = float(np.std(values))
+    if not np.isfinite(raw_sigma) or raw_sigma <= 0.0:
+        raw_sigma = 1.0
+    clip_hi = raw_median + float(clip_sigma) * raw_sigma
+    clipped_values = np.minimum(values, clip_hi)
+    mean, median, std = sigma_clipped_stats(clipped_values, sigma=float(clip_sigma), maxiters=None)
+    sigma_mean = float(mean) if np.isfinite(mean) else float(np.mean(clipped_values))
+    median = float(median) if np.isfinite(median) else float(np.median(clipped_values))
+    std = float(std) if np.isfinite(std) and std > 0 else float(np.std(clipped_values))
+    if not np.isfinite(std) or std <= 0.0:
+        std = 1.0
+    safe = np.where(np.isfinite(image), image, median).astype(np.float32, copy=False)
+    capped = np.minimum(safe, clip_hi)
+    z = ((capped - median) / std).astype(np.float32)
+    finite_z = z[np.isfinite(z)]
+    return z, {
+        "raw_median": raw_median,
+        "raw_min": raw_min,
+        "raw_sigma": raw_sigma,
+        "clip_hi": clip_hi,
+        "zscore_mean": sigma_mean,
+        "zscore_median": median,
+        "sigma_mean": sigma_mean,
+        "mean": median,
+        "median": median,
+        "std": std,
+        "clip_hi_pixel_fraction": float(np.count_nonzero(values >= clip_hi) / values.size),
+        "full_z_min": float(np.min(finite_z)) if finite_z.size else float("nan"),
+        "full_z_max": float(np.max(finite_z)) if finite_z.size else float("nan"),
+    }
+
+
 def log_single(image: np.ndarray, *, minimum: float, high_pct: float, a: float) -> tuple[np.ndarray, dict[str, float]]:
     values = finite_values(image)
     hi = float(np.percentile(values, float(high_pct)))
@@ -238,6 +278,7 @@ def build_bright_mask(
     lupton_q: float = 20.0,
     anscombe_clip: bool = False,
     anscombe_scale: float = 1000.0,
+    statistics_clip_sigma: float | None = None,
 ) -> np.ndarray:
     """Build a saturated/bright-region mask for PU background suppression."""
 
@@ -245,40 +286,51 @@ def build_bright_mask(
     if normalized_mode in {"none", "raw", "zscore-no-upper", "zscore-unbounded"}:
         return np.zeros(np.asarray(image).shape, dtype=bool)
     clip_threshold = float(clip_threshold)
-    current_z, current_stats = current_sam_zscore(image, z_clip=(-clip_threshold, clip_threshold))
-    if normalized_mode in {
-        "zscore",
-        "zscore-noclip",
-        "zscore-no-clip",
-        "raw-zscore",
-    }:
-        if normalized_mode in {"zscore-noclip", "zscore-no-clip", "raw-zscore"}:
-            z, _stats = no_first_clip_zscore(image, z_clip=(-clip_threshold, float("inf")))
+    stats_sigma = 3.0 if statistics_clip_sigma is None else float(statistics_clip_sigma)
+    if not np.isfinite(stats_sigma) or stats_sigma <= 0:
+        raise ValueError("statistics_clip_sigma must be finite and positive")
+    if normalized_mode in {"zscore-rawclip-no-upper", "zscore-rawclip-no-upper-rgb"}:
+        z, _stats = rawclip_no_upper_zscore(image, clip_sigma=clip_threshold)
+        finite = np.isfinite(z)
+        if not np.any(finite):
+            bright = np.zeros(np.asarray(image).shape, dtype=bool)
         else:
-            z = current_z
-        bright = z >= float(threshold)
-    elif normalized_mode in {"log-lupton", "zscore-lupton-log", "lupton-log"}:
-        log_map, _log_stats = log_single(
-            image,
-            minimum=float(current_stats["raw_min"]),
-            high_pct=float(log_high_percentile),
-            a=float(log_a),
-        )
-        lupton_map, _lupton_stats = lupton_single(
-            image,
-            minimum=float(current_stats["zscore_median"]),
-            stretch=float(lupton_stretch),
-            q=float(lupton_q),
-        )
-        _log_z, log_zclip, _log_zstats = standardize_by_self(log_map, clip_threshold=clip_threshold)
-        _lupton_z, lupton_zclip, _lupton_zstats = standardize_by_self(lupton_map, clip_threshold=clip_threshold)
-        bright = (log_zclip >= float(threshold)) & (lupton_zclip >= float(threshold))
-    elif normalized_mode == "anscombe":
-        anscombe_map, _stats = anscombe_single(image, scale=float(anscombe_scale), clip=bool(anscombe_clip))
-        _z, zclip, _zstats = standardize_by_self(anscombe_map, clip_threshold=clip_threshold)
-        bright = zclip >= float(threshold)
+            bright = finite & (z == float(np.max(z[finite])))
     else:
-        raise ValueError(f"Unknown bright mask mode: {mode!r}")
+        current_z, current_stats = current_sam_zscore(image, clip_sigma=stats_sigma, z_clip=(-clip_threshold, clip_threshold))
+        if normalized_mode in {
+            "zscore",
+            "zscore-noclip",
+            "zscore-no-clip",
+            "raw-zscore",
+        }:
+            if normalized_mode in {"zscore-noclip", "zscore-no-clip", "raw-zscore"}:
+                z, _stats = no_first_clip_zscore(image, clip_sigma=stats_sigma, z_clip=(-clip_threshold, float("inf")))
+            else:
+                z = current_z
+            bright = z >= float(threshold)
+        elif normalized_mode in {"log-lupton", "zscore-lupton-log", "lupton-log"}:
+            log_map, _log_stats = log_single(
+                image,
+                minimum=float(current_stats["raw_min"]),
+                high_pct=float(log_high_percentile),
+                a=float(log_a),
+            )
+            lupton_map, _lupton_stats = lupton_single(
+                image,
+                minimum=float(current_stats["zscore_median"]),
+                stretch=float(lupton_stretch),
+                q=float(lupton_q),
+            )
+            _log_z, log_zclip, _log_zstats = standardize_by_self(log_map, clip_threshold=clip_threshold)
+            _lupton_z, lupton_zclip, _lupton_zstats = standardize_by_self(lupton_map, clip_threshold=clip_threshold)
+            bright = (log_zclip >= float(threshold)) & (lupton_zclip >= float(threshold))
+        elif normalized_mode == "anscombe":
+            anscombe_map, _stats = anscombe_single(image, scale=float(anscombe_scale), clip=bool(anscombe_clip))
+            _z, zclip, _zstats = standardize_by_self(anscombe_map, clip_threshold=clip_threshold)
+            bright = zclip >= float(threshold)
+        else:
+            raise ValueError(f"Unknown bright mask mode: {mode!r}")
 
     if int(dilation) > 0 and np.any(bright):
         try:
@@ -302,6 +354,7 @@ def scale_training_image(
     lupton_q: float = 20.0,
     anscombe_clip: bool = False,
     anscombe_scale: float = 1000.0,
+    statistics_clip_sigma: float | None = None,
 ) -> np.ndarray:
     """Return one preprocessed image plane for direct-Zarr SAM training.
 
@@ -316,12 +369,20 @@ def scale_training_image(
         raise ValueError("astro-zscore is implemented by astro_zscale_preprocess in the caller")
 
     clip_threshold = float(clip_threshold)
+    stats_sigma = 3.0 if statistics_clip_sigma is None else float(statistics_clip_sigma)
+    if not np.isfinite(stats_sigma) or stats_sigma <= 0:
+        raise ValueError("statistics_clip_sigma must be finite and positive")
+    if normalized_mode in {"zscore-rawclip-no-upper", "zscore-rawclip-no-upper-rgb"}:
+        z, _stats = rawclip_no_upper_zscore(image, clip_sigma=clip_threshold)
+        return np.stack([z, z, z], axis=0).astype(np.float32, copy=False) if normalized_mode.endswith("-rgb") else z
+
     if normalized_mode in {"zscore-no-upper", "zscore-no-upper-rgb", "zscore-unbounded", "zscore-unbounded-rgb"}:
-        z, _stats = no_first_clip_zscore(image, z_clip=(-clip_threshold, float("inf")))
+        z, _stats = no_first_clip_zscore(image, clip_sigma=stats_sigma, z_clip=(-clip_threshold, float("inf")))
         return np.stack([z, z, z], axis=0).astype(np.float32, copy=False) if normalized_mode.endswith("-rgb") else z
 
     current_z, current_stats = current_sam_zscore(
         image,
+        clip_sigma=stats_sigma,
         z_clip=z_clip if z_clip is not None else (-clip_threshold, clip_threshold),
     )
     if normalized_mode in {"zscore", "zscore-rgb"}:

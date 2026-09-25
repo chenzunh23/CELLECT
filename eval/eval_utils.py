@@ -808,6 +808,8 @@ def make_training_rgb(
         return np.stack([z, z, z], axis=0).astype(np.float32)
     if normalized in {"zscore-no-upper", "zscore-unbounded"}:
         return scale_training_image(image, mode="zscore-no-upper-rgb", clip_threshold=float(clip_threshold))
+    if normalized in {"zscore-rawclip-no-upper", "zscore-rawclip-no-upper-rgb"}:
+        return scale_training_image(image, mode="zscore-rawclip-no-upper-rgb", clip_threshold=float(clip_threshold))
     if normalized in {"log-lupton", "lupton-log", "zscore-log-lupton"}:
         return scale_training_image(
             image,

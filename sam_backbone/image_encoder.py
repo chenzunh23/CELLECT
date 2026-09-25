@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from typing import Optional, Sequence, Tuple, Type
 
 from .common import LayerNorm2d, MLPBlock
+from .psf_conditioning import PsfChannelCrossAttentionBlock
 from .style_conditioning import ConditionalStyleAdapter
 
 
@@ -37,6 +38,8 @@ class ImageEncoderViT(nn.Module):
         style_prompt_dim: int = 0,
         style_prompt_layers: Sequence[int] = (),
         style_adapter_dim: int = 32,
+        psf_pre_neck: bool = False,
+        psf_hidden_dim: int = 32,
     ) -> None:
         """
         Args:
@@ -59,6 +62,7 @@ class ImageEncoderViT(nn.Module):
         super().__init__()
         self.img_size = img_size
         self.patch_size = patch_size
+        self.psf_pre_neck_enabled = bool(psf_pre_neck)
 
         self.patch_embed = PatchEmbed(
             kernel_size=(patch_size, patch_size),
@@ -104,6 +108,15 @@ class ImageEncoderViT(nn.Module):
                 for index in self.style_prompt_layers
             }
         )
+        self.psf_pre_neck = (
+            PsfChannelCrossAttentionBlock(
+                channels=embed_dim,
+                num_heads=num_heads,
+                hidden_dim=int(psf_hidden_dim),
+            )
+            if self.psf_pre_neck_enabled
+            else None
+        )
 
         self.neck = nn.Sequential(
             nn.Conv2d(
@@ -123,7 +136,12 @@ class ImageEncoderViT(nn.Module):
             LayerNorm2d(out_chans),
         )
 
-    def forward(self, x: torch.Tensor, style_prompt: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        style_prompt: Optional[torch.Tensor] = None,
+        psf_stamps: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         x = self.patch_embed(x)
         if self.pos_embed is not None:
             pos_embed = self.pos_embed
@@ -143,6 +161,12 @@ class ImageEncoderViT(nn.Module):
             x = blk(x)
             if str(index) in self.style_adapters:
                 x = self.style_adapters[str(index)](x, style_prompt)
+
+        if self.psf_pre_neck is not None:
+            if psf_stamps is None:
+                raise ValueError("psf_stamps is required when pre-neck PSF conditioning is enabled")
+            x_nchw = x.permute(0, 3, 1, 2)
+            x = self.psf_pre_neck(x_nchw, psf_stamps).permute(0, 2, 3, 1)
 
         x = self.neck(x.permute(0, 3, 1, 2))
 

@@ -18,9 +18,18 @@ if str(CELLECT_ROOT) not in sys.path:
 
 from eval.datasets import (
     DEFAULT_HSC_IMAGE_BANDS,
+    DEFAULT_HSC_COADD_FITS_ROOT,
+    DEFAULT_HSC_DENOISED_FITS_ROOT,
     DEFAULT_HSC_IMAGE_ROOT,
+    DEFAULT_HSC_NOISY_FITS_ROOT,
+    DEFAULT_HSC_OFFICIAL_COADD_FITS_ROOT,
+    DEFAULT_HSC_OFFICIAL_WEIGHT_ROOT,
+    DEFAULT_HSC_WEIGHT_ROOT,
     DEFAULT_HSC_RAW_BANDS,
     DEFAULT_HSC_RAW_ROOT,
+    DEFAULT_JWST_NIRCAM_BANDS,
+    DEFAULT_JWST_NIRCAM_ROOT,
+    DEFAULT_JWST_NIRCAM_TILE_SIZE,
     DEFAULT_MESSIER_ROOT,
     DEFAULT_ZTF_BANDS,
     DEFAULT_ZTF_CUT_ORIGIN_DIR,
@@ -29,6 +38,7 @@ from eval.datasets import (
     DEFAULT_ZTF_TILE_SIZE,
     HscImageAccess,
     HscRawAccess,
+    JwstNircamAccess,
     MessierAccess,
     ZtfAccess,
 )
@@ -133,6 +143,13 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/page":
                 page = int(parse_qs(parsed.query).get("page", ["0"])[0])
                 self._send_json(self.state.page_payload(page))
+            elif parsed.path == "/api/scale_stats":
+                query = parse_qs(parsed.query)
+                token = query.get("token", [""])[0]
+                if not token:
+                    self._send_json({"error": "missing token"}, HTTPStatus.BAD_REQUEST)
+                    return
+                self._send_json(self.state.scale_stats(token))
             elif parsed.path.startswith("/api/data_quality/"):
                 query = parse_qs(parsed.query)
                 source = query.get("source", ["coadd"])[0]
@@ -183,6 +200,18 @@ class Handler(BaseHTTPRequestHandler):
                     smooth_radius = int(float(query.get("smooth_radius", ["1"])[0]))
                 except Exception:
                     smooth_radius = 1
+                try:
+                    snr_threshold = float(query.get("snr_threshold", ["5.0"])[0])
+                except Exception:
+                    snr_threshold = 5.0
+                def opt_float(name: str) -> float | None:
+                    raw = query.get(name, [""])[0]
+                    if raw in {"", "null", "None"}:
+                        return None
+                    try:
+                        return float(raw)
+                    except Exception:
+                        return None
                 body = self.state.image_png(
                     token,
                     detect=detect,
@@ -194,6 +223,15 @@ class Handler(BaseHTTPRequestHandler):
                     smooth_sigma=smooth_sigma,
                     smooth_radius=smooth_radius,
                     invert_background=invert_background,
+                    display_scaling=query.get("display_scaling", ["zscale"])[0],
+                    scale_custom=query.get("scale_custom", ["0"])[0] in {"1", "true", "yes"},
+                    scale_low_pct=float(query.get("scale_low_pct", ["0"])[0]),
+                    scale_high_pct=float(query.get("scale_high_pct", ["100"])[0]),
+                    scale_low_value=opt_float("scale_low_value"),
+                    scale_high_value=opt_float("scale_high_value"),
+                    snr_filter=query.get("snr_filter", ["0"])[0] in {"1", "true", "yes"},
+                    snr_method=query.get("snr_method", ["ap2"])[0],
+                    snr_threshold=snr_threshold,
                 )
                 self._send_bytes(body, "image/png")
             elif parsed.path.startswith("/tile_map/") and parsed.path.endswith(".png"):
@@ -229,6 +267,11 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/detect_page":
                 page = int(payload.get("page", 0))
                 self._send_json(self.state.detect_page(page))
+            elif parsed.path == "/api/prepare_snr":
+                page = int(payload.get("page", 0))
+                method = str(payload.get("method", "ap2"))
+                threshold = float(payload.get("threshold", 5.0))
+                self._send_json(self.state.prepare_snr_page(page, method, threshold))
             elif parsed.path == "/api/find_tile":
                 mode = str(payload.get("mode", ""))
                 self._send_json(
@@ -255,19 +298,25 @@ class Server(ThreadingHTTPServer):
         super().__init__(addr, Handler)
         self.args = args
         self.browser_state: BrowserState | None = None
-        self.data_quality_preview = DataQualityPreview(
-            tract=str(args.tract),
-            bands=list(DEFAULT_DATA_QUALITY_BANDS),
-            threshold=float(args.data_quality_threshold),
-            edge_weight=float(args.data_quality_edge_weight),
-            panel_size=int(args.data_quality_panel_size),
-            tile_size=int(args.data_quality_tile_size),
-            tile_stride=int(args.data_quality_tile_stride),
-            coadd_root=Path(args.data_quality_coadd_root),
-            noisy_root=Path(args.data_quality_noisy_root),
-            denoised_fits_root=Path(args.data_quality_denoised_fits_root),
-            groups=[str(value) for value in args.data_quality_groups],
-        )
+        self._data_quality_preview: DataQualityPreview | None = None
+
+    @property
+    def data_quality_preview(self) -> DataQualityPreview:
+        if self._data_quality_preview is None:
+            self._data_quality_preview = DataQualityPreview(
+                tract=str(self.args.tract),
+                bands=list(DEFAULT_DATA_QUALITY_BANDS),
+                threshold=float(self.args.data_quality_threshold),
+                edge_weight=float(self.args.data_quality_edge_weight),
+                panel_size=int(self.args.data_quality_panel_size),
+                tile_size=int(self.args.data_quality_tile_size),
+                tile_stride=int(self.args.data_quality_tile_stride),
+                coadd_root=Path(self.args.data_quality_coadd_root),
+                noisy_root=Path(self.args.data_quality_noisy_root),
+                denoised_fits_root=Path(self.args.data_quality_denoised_fits_root),
+                groups=[str(value) for value in self.args.data_quality_groups],
+            )
+        return self._data_quality_preview
 
     def options_payload(self) -> dict[str, Any]:
         by_dataset: dict[str, dict[str, Any]] = {}
@@ -291,6 +340,8 @@ class Server(ThreadingHTTPServer):
             "default_frames_per_tile": int(self.args.frames_per_tile),
             "default_tiles_per_page": int(self.args.tiles_per_page),
             "tile_size": 256,
+            "default_nms_radius": int(self.args.nms_radius),
+            "nms_recommendation": "HSC 3, ZTF 2, JWST 2",
         }
         messier_access = MessierAccess(Path(self.args.messier_root), "default", selection_mode=str(self.args.messier_tile_mode))
         messier_patches = messier_access.available_patches()
@@ -308,10 +359,21 @@ class Server(ThreadingHTTPServer):
             "default_frames_per_tile": 1,
             "default_tiles_per_page": int(self.args.tiles_per_page),
             "tile_size": 512,
+            "default_nms_radius": int(self.args.nms_radius),
+            "nms_recommendation": "HSC 3, ZTF 2, JWST 2",
         }
-        hsc_image_access = HscImageAccess(Path(self.args.hsc_image_root), str(self.args.tract))
+        hsc_image_access = HscImageAccess(
+            Path(self.args.hsc_image_root),
+            str(self.args.tract),
+            weight_root=Path(self.args.hsc_weight_root),
+            coadd_weight_root=Path(self.args.hsc_coadd_weight_root),
+            variant_weight_root=Path(self.args.hsc_variant_weight_root),
+            coadd_fits_root=Path(self.args.hsc_coadd_fits_root),
+            noisy_fits_root=Path(self.args.hsc_noisy_fits_root),
+            denoised_fits_root=Path(self.args.hsc_denoised_fits_root),
+        )
         hsc_image_bands = hsc_image_access.available_bands() or list(DEFAULT_HSC_IMAGE_BANDS)
-        hsc_image_default_bands = [band for band in DEFAULT_HSC_IMAGE_BANDS if band in hsc_image_bands]
+        hsc_image_default_bands = ["HSC-G", "HSC-I", "HSC-Y"] # [band for band in DEFAULT_HSC_IMAGE_BANDS if band in hsc_image_bands]
         hsc_image_patches = hsc_image_access.available_patches(hsc_image_default_bands or hsc_image_bands)
         hsc_image_variant_patches = hsc_image_access.available_variant_patches(hsc_image_default_bands or hsc_image_bands)
         hsc_image_default_patches = [patch for patch in self.args.patches if patch in hsc_image_patches] or (
@@ -333,6 +395,8 @@ class Server(ThreadingHTTPServer):
             "default_frames_per_tile": 1,
             "default_tiles_per_page": int(self.args.tiles_per_page),
             "tile_size": 512,
+            "default_nms_radius": int(self.args.nms_radius),
+            "nms_recommendation": "HSC 3, ZTF 2, JWST 2",
         }
         ztf_access = ZtfAccess(
             Path(self.args.ztf_root),
@@ -359,6 +423,34 @@ class Server(ThreadingHTTPServer):
             "default_frames_per_tile": int(self.args.ztf_frames_per_tile),
             "default_tiles_per_page": int(self.args.tiles_per_page),
             "tile_size": int(self.args.ztf_tile_size),
+            "default_nms_radius": int(self.args.ztf_nms_radius),
+            "nms_recommendation": "HSC 3, ZTF 2, JWST 2",
+        }
+        jwst_access = JwstNircamAccess(
+            Path(self.args.jwst_root),
+            "default",
+            tile_size=int(self.args.jwst_tile_size),
+        )
+        jwst_bands = jwst_access.available_bands() or list(DEFAULT_JWST_NIRCAM_BANDS)
+        jwst_default_bands = [band for band in self.args.jwst_bands if band in jwst_bands] or [band for band in DEFAULT_JWST_NIRCAM_BANDS if band in jwst_bands]
+        jwst_patches = jwst_access.available_patches(jwst_default_bands or jwst_bands)
+        jwst_default_patches = [patch for patch in self.args.jwst_patches if patch in jwst_patches] or jwst_patches[:1]
+        by_dataset["jwst"] = {
+            "id": "jwst",
+            "label": "JWST NIRCam",
+            "enabled": bool(jwst_patches and jwst_bands),
+            "reason": "" if bool(jwst_patches and jwst_bands) else "not found",
+            "tract": "default",
+            "bands": jwst_bands,
+            "patches": jwst_patches,
+            "default_bands": jwst_default_bands,
+            "default_patches": jwst_default_patches,
+            "default_n_tiles": int(self.args.jwst_n_tiles),
+            "default_frames_per_tile": 1,
+            "default_tiles_per_page": int(self.args.tiles_per_page),
+            "tile_size": int(self.args.jwst_tile_size),
+            "default_nms_radius": int(self.args.jwst_nms_radius),
+            "nms_recommendation": "HSC 3, ZTF 2, JWST 2",
         }
         return {
             "dataset": str(self.args.dataset),
@@ -367,16 +459,17 @@ class Server(ThreadingHTTPServer):
                 {"id": "sitian", "label": "Sitian", "enabled": bool(messier_patches)},
                 {"id": "hsc_image", "label": "HSC coadd/noisy/denoised", "enabled": bool(hsc_image_patches and hsc_image_bands), "reason": "" if bool(hsc_image_patches and hsc_image_bands) else "not found"},
                 {"id": "ztf", "label": "ZTF", "enabled": bool(ztf_patches and ztf_bands), "reason": "" if bool(ztf_patches and ztf_bands) else "not found"},
+                {"id": "jwst", "label": "JWST NIRCam", "enabled": bool(jwst_patches and jwst_bands), "reason": "" if bool(jwst_patches and jwst_bands) else "not found"},
             ],
             "by_dataset": by_dataset,
         }
 
     def start_browser(self, payload: dict[str, Any]) -> None:
         dataset = str(payload.get("dataset") or self.args.dataset)
-        if dataset not in {"hsc_raw", "sitian", "hsc_image", "ztf"}:
+        if dataset not in {"hsc_raw", "sitian", "hsc_image", "ztf", "jwst"}:
             raise NotImplementedError(f"{dataset_label(dataset)} is a placeholder")
         self.args.dataset = dataset
-        default_tract = self.args.ztf_field if dataset == "ztf" else self.args.tract
+        default_tract = self.args.ztf_field if dataset == "ztf" else ("default" if dataset == "jwst" else self.args.tract)
         tract = str(payload.get("tract") or default_tract)
         patches = [str(v) for v in payload.get("patches", []) if str(v)]
         bands = [str(v) for v in payload.get("bands", []) if str(v)]
@@ -385,8 +478,25 @@ class Server(ThreadingHTTPServer):
                 patches = [str(v) for v in self.args.messier_patches]
             elif dataset == "ztf":
                 patches = [str(v) for v in self.args.ztf_patches]
+            elif dataset == "jwst":
+                patches = [str(v) for v in self.args.jwst_patches]
+                if not patches:
+                    patches = JwstNircamAccess(
+                        Path(self.args.jwst_root),
+                        "default",
+                        tile_size=int(self.args.jwst_tile_size),
+                    ).available_patches([str(v) for v in self.args.jwst_bands])[:1]
             elif dataset == "hsc_image":
-                patches = HscImageAccess(Path(self.args.hsc_image_root), tract).available_patches([str(v) for v in self.args.bands])[:1]
+                patches = HscImageAccess(
+                    Path(self.args.hsc_image_root),
+                    tract,
+                    weight_root=Path(self.args.hsc_weight_root),
+                    coadd_weight_root=Path(self.args.hsc_coadd_weight_root),
+                    variant_weight_root=Path(self.args.hsc_variant_weight_root),
+                    coadd_fits_root=Path(self.args.hsc_coadd_fits_root),
+                    noisy_fits_root=Path(self.args.hsc_noisy_fits_root),
+                    denoised_fits_root=Path(self.args.hsc_denoised_fits_root),
+                ).available_patches([str(v) for v in self.args.bands])[:1]
             else:
                 patches = [str(v) for v in self.args.patches]
         if not bands:
@@ -394,11 +504,13 @@ class Server(ThreadingHTTPServer):
                 bands = ["default"]
             elif dataset == "ztf":
                 bands = [str(v) for v in self.args.ztf_bands]
+            elif dataset == "jwst":
+                bands = [str(v) for v in self.args.jwst_bands]
             elif dataset == "hsc_image":
                 bands = [str(v) for v in DEFAULT_HSC_IMAGE_BANDS]
             else:
                 bands = [str(v) for v in self.args.bands]
-        tract = "default" if dataset == "sitian" else tract
+        tract = "default" if dataset in {"sitian", "jwst"} else tract
         all_tiles = bool(payload.get("all_tiles", False))
         n_tiles_raw = payload.get("n_tiles", None)
         n_tiles = None if n_tiles_raw in (None, "", 0) else int(n_tiles_raw)
@@ -406,6 +518,9 @@ class Server(ThreadingHTTPServer):
         tiles_page_raw = payload.get("tiles_per_page", None)
         frames_per_tile = None if frames_raw in (None, "", 0) else int(frames_raw)
         tiles_per_page = None if tiles_page_raw in (None, "", 0) else int(tiles_page_raw)
+        nms_radius_raw = payload.get("nms_radius", None)
+        if nms_radius_raw not in (None, ""):
+            self.args.active_nms_radius = max(0, int(float(nms_radius_raw)))
         run_name = str(payload.get("run_name") or self.args.run_name or "")
         stamp = time.strftime("%Y%m%d_%H%M%S")
         session_name = _session_name(run_name, stamp)
@@ -430,12 +545,19 @@ def main() -> None:
     base = Path(__file__).resolve().parent
     stamp = time.strftime("%Y%m%d_%H%M%S")
     parser = argparse.ArgumentParser(description="Serve interactive CELLECT/SAM QC browser for multiple astronomy image datasets.")
-    parser.add_argument("--dataset", choices=("hsc_raw", "sitian", "hsc_image", "ztf"), default="hsc_raw")
+    parser.add_argument("--dataset", choices=("hsc_raw", "sitian", "hsc_image", "ztf", "jwst"), default="hsc_raw")
     parser.add_argument("--root", "--data-root", dest="root", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--hsc-image-root", type=Path, default=DEFAULT_HSC_IMAGE_ROOT)
-    parser.add_argument("--data-quality-coadd-root", type=Path, default=Path("/data/czh23/Subaru_products/half_coadd"))
-    parser.add_argument("--data-quality-noisy-root", type=Path, default=Path("/data/czh23/Subaru_products/noisy"))
-    parser.add_argument("--data-quality-denoised-fits-root", type=Path, default=Path("/data/czh23/denoised_fits"))
+    parser.add_argument("--hsc-coadd-profile", choices=("half", "official", "custom"), default="half")
+    parser.add_argument("--hsc-weight-root", type=Path, default=None, help="Legacy HSC weight root used for both coadd and variants unless more specific roots are set.")
+    parser.add_argument("--hsc-coadd-weight-root", type=Path, default=None)
+    parser.add_argument("--hsc-variant-weight-root", type=Path, default=None)
+    parser.add_argument("--hsc-coadd-fits-root", type=Path, default=None)
+    parser.add_argument("--hsc-noisy-fits-root", type=Path, default=DEFAULT_HSC_NOISY_FITS_ROOT)
+    parser.add_argument("--hsc-denoised-fits-root", type=Path, default=DEFAULT_HSC_DENOISED_FITS_ROOT)
+    parser.add_argument("--data-quality-coadd-root", type=Path, default=None)
+    parser.add_argument("--data-quality-noisy-root", type=Path, default=None)
+    parser.add_argument("--data-quality-denoised-fits-root", type=Path, default=None)
     parser.add_argument("--data-quality-groups", nargs="+", default=["0", "1", "2", "3"])
     parser.add_argument("--data-quality-threshold", type=float, default=0.13)
     parser.add_argument("--data-quality-edge-weight", type=float, default=0.1)
@@ -448,16 +570,21 @@ def main() -> None:
     parser.add_argument("--ztf-ccd", default="c03")
     parser.add_argument("--ztf-cut-origin-dir", type=Path, default=DEFAULT_ZTF_CUT_ORIGIN_DIR)
     parser.add_argument("--ztf-tile-size", type=int, choices=(256, 512), default=DEFAULT_ZTF_TILE_SIZE)
+    parser.add_argument("--jwst-root", type=Path, default=DEFAULT_JWST_NIRCAM_ROOT)
+    parser.add_argument("--jwst-tile-size", type=int, default=DEFAULT_JWST_NIRCAM_TILE_SIZE)
     parser.add_argument("--tract", default="9813")
     parser.add_argument("--patch", default="4,5", help="Backward-compatible single default patch.")
     parser.add_argument("--patches", nargs="+", default=None, help="Default selected patches for the menu.")
     parser.add_argument("--messier-patches", nargs="+", default=None, help="Default selected Messier/Sitian objects for the menu.")
     parser.add_argument("--ztf-patches", nargs="+", default=None, help="Default selected ZTF quadrants.")
+    parser.add_argument("--jwst-patches", nargs="+", default=None, help="Default selected JWST NIRCam fields.")
     parser.add_argument("--bands", nargs="+", default=list(DEFAULT_BANDS))
     parser.add_argument("--ztf-bands", nargs="+", default=list(DEFAULT_ZTF_BANDS))
+    parser.add_argument("--jwst-bands", nargs="+", default=list(DEFAULT_JWST_NIRCAM_BANDS))
     parser.add_argument("--n-tiles", type=int, default=60)
     parser.add_argument("--messier-n-tiles", type=int, default=4)
     parser.add_argument("--ztf-n-tiles", type=int, default=12)
+    parser.add_argument("--jwst-n-tiles", type=int, default=12)
     parser.add_argument("--messier-tile-mode", choices=("brightest", "random_grid"), default="brightest")
     parser.add_argument("--frames-per-tile", type=int, default=1)
     parser.add_argument("--ztf-frames-per-tile", type=int, default=1)
@@ -471,7 +598,19 @@ def main() -> None:
     parser.add_argument("--visit", type=int, default=None)
     parser.add_argument("--frame-rank", type=int, default=0)
     parser.add_argument("--strict-visit", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--scaling-mode", choices=("zscore_clip", "zscore_no_clip", "zscore_no_upper", "log_lupton", "anscombe"), default="anscombe")
+    parser.add_argument(
+        "--scaling-mode",
+        choices=(
+            "zscore_clip",
+            "zscore_no_clip",
+            "zscore_no_upper",
+            "zscore_rawclip_no_upper_rgb",
+            "zscore-rawclip-no-upper-rgb",
+            "log_lupton",
+            "anscombe",
+        ),
+        default="anscombe",
+    )
     parser.add_argument("--clip-threshold", type=float, default=3.0)
     parser.add_argument("--log-a", type=float, default=300.0)
     parser.add_argument("--log-high-percentile", type=float, default=99.5)
@@ -483,6 +622,7 @@ def main() -> None:
     parser.add_argument("--confidence-score", default="ordinal_expectation")
     parser.add_argument("--nms-radius", type=int, default=3)
     parser.add_argument("--ztf-nms-radius", type=int, default=2)
+    parser.add_argument("--jwst-nms-radius", type=int, default=2)
     parser.add_argument("--center-refinement", choices=("integer", "weighted_centroid", "softargmax"), default="softargmax")
     parser.add_argument("--center-refinement-radius", type=int, default=1)
     parser.add_argument("--shape-overlay-centers", action=argparse.BooleanOptionalAction, default=False)
@@ -498,6 +638,28 @@ def main() -> None:
         args.messier_patches = []
     if args.ztf_patches is None:
         args.ztf_patches = ["q1", "q2"]
+    if args.jwst_patches is None:
+        args.jwst_patches = []
+    if args.hsc_coadd_profile == "official":
+        default_coadd_fits_root = DEFAULT_HSC_OFFICIAL_COADD_FITS_ROOT
+        default_coadd_weight_root = DEFAULT_HSC_OFFICIAL_WEIGHT_ROOT
+    else:
+        default_coadd_fits_root = DEFAULT_HSC_COADD_FITS_ROOT
+        default_coadd_weight_root = DEFAULT_HSC_WEIGHT_ROOT
+    if args.hsc_weight_root is None:
+        args.hsc_weight_root = DEFAULT_HSC_WEIGHT_ROOT
+    if args.hsc_coadd_fits_root is None:
+        args.hsc_coadd_fits_root = default_coadd_fits_root
+    if args.hsc_coadd_weight_root is None:
+        args.hsc_coadd_weight_root = default_coadd_weight_root if args.hsc_coadd_profile != "custom" else args.hsc_weight_root
+    if args.hsc_variant_weight_root is None:
+        args.hsc_variant_weight_root = DEFAULT_HSC_WEIGHT_ROOT
+    if args.data_quality_coadd_root is None:
+        args.data_quality_coadd_root = args.hsc_coadd_fits_root
+    if args.data_quality_noisy_root is None:
+        args.data_quality_noisy_root = args.hsc_noisy_fits_root
+    if args.data_quality_denoised_fits_root is None:
+        args.data_quality_denoised_fits_root = args.hsc_denoised_fits_root
 
     server = Server((args.host, args.port), args)
     host, port = server.server_address[:2]
@@ -508,8 +670,16 @@ def main() -> None:
                 "dataset": str(args.dataset),
                 "data_root": str(Path(args.root).expanduser().resolve()),
                 "hsc_image_root": str(Path(args.hsc_image_root).expanduser().resolve()),
+                "hsc_coadd_profile": str(args.hsc_coadd_profile),
+                "hsc_weight_root": str(Path(args.hsc_weight_root).expanduser().resolve()),
+                "hsc_coadd_weight_root": str(Path(args.hsc_coadd_weight_root).expanduser().resolve()),
+                "hsc_variant_weight_root": str(Path(args.hsc_variant_weight_root).expanduser().resolve()),
+                "hsc_coadd_fits_root": str(Path(args.hsc_coadd_fits_root).expanduser().resolve()),
+                "hsc_noisy_fits_root": str(Path(args.hsc_noisy_fits_root).expanduser().resolve()),
+                "hsc_denoised_fits_root": str(Path(args.hsc_denoised_fits_root).expanduser().resolve()),
                 "messier_root": str(Path(args.messier_root).expanduser().resolve()),
                 "ztf_root": str(Path(args.ztf_root).expanduser().resolve()),
+                "jwst_root": str(Path(args.jwst_root).expanduser().resolve()),
                 "checkpoint": str(Path(args.checkpoint).expanduser().resolve()),
                 "session_dir": str(Path(args.session_dir).expanduser().resolve()),
                 "export_dir": str(Path(args.export_dir).expanduser().resolve()),

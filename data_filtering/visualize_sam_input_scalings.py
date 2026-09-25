@@ -676,14 +676,18 @@ def main() -> int:
     if not specs:
         raise FileNotFoundError("no input FITS matched the requested datasets/groups/bands/tiles")
     for spec in specs:
+        print(f'[DEBUG] processing {spec.name} {spec.band} from {spec.path}')
         image, header = read_spec_image(spec, args.hdu)
         current_zclip, current_stats = current_sam_zscore(image)
         nofirst_zclip, nofirst_stats = no_first_clip_zscore(image)
+        print(f'[DEBUG] raw median={current_stats["raw_median"]:.4g} std={current_stats["raw_sigma"]:.4g}')
+        print(f'[DEBUG] zscore mean={current_stats["mean"]:.4g} median={current_stats["median"]:.4g} std={current_stats["std"]:.4g} scale={1 / current_stats["std"]:.4g}')
         asinh_map, asinh_stats = ds9_asinh(
             image,
             low_pct=args.asinh_low_percentile,
             high_pct=args.asinh_high_percentile,
         )
+        print(f'[DEBUG] asinh lo={asinh_stats["lo"]:.4g} hi={asinh_stats["hi"]:.4g} high_clip_fraction={asinh_stats["high_clip_fraction"]:.4g}')
         lupton_minimum = resolve_minimum(args.lupton_minimum_mode, args.lupton_minimum, current_stats)
         lupton_map, lupton_stats = lupton_single(
             image,
@@ -691,6 +695,7 @@ def main() -> int:
             stretch=args.lupton_stretch,
             q=args.lupton_q,
         )
+        print(f'[DEBUG] lupton minimum={lupton_stats["minimum"]:.4g} stretch={lupton_stats["stretch"]:.4g} Q={lupton_stats["q"]:.4g}')
         asinh_z, asinh_zclip, asinh_zstats = standardize_by_self(asinh_map)
         lupton_z, lupton_zclip, lupton_zstats = standardize_by_self(lupton_map)
         asinh_zstats.update({f"source_{k}": v for k, v in asinh_stats.items()})
@@ -722,6 +727,7 @@ def main() -> int:
         log_map = log_z = log_zclip = None
         log_zstats: dict[str, float] = {}
         if args.include_log_scale:
+            print(f'[DEBUG] applying log scale with a={args.log_a:.4g} and high percentile={args.log_high_percentile:.4g}')
             log_a = float(spec.log_a) if spec.log_a is not None else float(args.log_a)
             if args.log_minimum_mode == "same-as-lupton":
                 log_minimum = lupton_minimum
@@ -773,6 +779,7 @@ def main() -> int:
         safe_patch = spec.patch if spec.patch else args.patch
         safe_name = f"{spec.dataset}_{safe_group}_{safe_patch}_{spec.name}_{spec.band}".replace(",", "_").replace("-", "_")
         title_name = display_name(spec)
+        print(f'[DEBUG] plotting {title_name}')
         plot_clipped_comparison(
             title_name,
             [(title, arr, stats) for title, (arr, stats) in scalings],
@@ -820,6 +827,7 @@ def main() -> int:
             standardized,
             args.out_dir / f"{safe_name}_self_standardized_full_vs_clipped_heatmaps.png",
         )
+        print(f'[DEBUG] writing fits files for {title_name}')
         for title, (arr, stats) in scalings:
             out_fits = args.out_dir / "fits" / f"{safe_name}_{title.replace('[', '').replace(']', '').replace(',', '_')}.fits"
             write_float_fits(out_fits, arr, header)

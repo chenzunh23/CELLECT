@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Sequence
 
 import numpy as np
@@ -20,6 +20,7 @@ from astropy.table import Table
 from astropy.wcs import WCS
 
 from .image_processing import component_area_map, component_centroid_map
+from .utils.gaia import matching_radius_pixels, observation_time, propagated_gaia_radec
 from .labels import SourceClass, SourceLabels
 from .refit import RefitConfig, compute_kron_ellipse
 from .utils.catalog import source_ids
@@ -40,6 +41,8 @@ class BrightLabelConfig:
     cluster_centroid_match_pixels: float = 10.0
     gaia_bright_mag_threshold: float = 18.0
     pixel_scale_arcsec: float = 0.168
+    gaia_source_match_arcsec: float | None = None
+    gaia_centroid_match_arcsec: float | None = None
     use_bad_mask_first_step: bool = False
     add_empty_large_bright_component_centers: bool = True
     empty_large_bright_component_area_min: float = 1000.0
@@ -226,6 +229,7 @@ def project_gaia_rows(
     *,
     image_shape: tuple[int, int] | None,
     image_header: fits.Header | None,
+    pixel_origin: int = 1,
 ) -> list[dict[str, object]]:
     if gaia_table is None or len(gaia_table) == 0:
         return []
@@ -234,7 +238,8 @@ def project_gaia_rows(
         y = np.asarray(gaia_table["y"], dtype=np.float64)
     elif "ra" in gaia_table.colnames and "dec" in gaia_table.colnames and image_header is not None:
         wcs = WCS(image_header)
-        x, y = wcs.all_world2pix(np.asarray(gaia_table["ra"], dtype=np.float64), np.asarray(gaia_table["dec"], dtype=np.float64), 1)
+        ra, dec, _moved = propagated_gaia_radec(gaia_table, observation_time(image_header))
+        x, y = wcs.all_world2pix(ra, dec, pixel_origin)
     else:
         return []
     if "source_id" in gaia_table.colnames:
@@ -333,7 +338,7 @@ def synthetic_gaia_source(
     match_pixels: float,
     reason: str = "gaia_direct_strict_center_only",
 ) -> dict[str, object]:
-    gsid = int(round(finite_float(gaia.get("source_id"), 0.0)))
+    gsid = int(gaia.get("source_id", 0))
     gmag = finite_float(gaia.get("phot_g_mean_mag"), float("nan"))
     x = float(gaia["x"])
     y = float(gaia["y"])
@@ -838,6 +843,15 @@ def classify_component_bright(
                 meta["component_area"] = int(area)
                 meta["empty_small_component_ignore"] = True
                 continue
+            added = add_unmatched_gaia_centers_for_component(
+                comp, cluster_id=next_cluster_id, cluster_size=0,
+                used_gaia_keys=set(), reason="empty_component_gaia_strict_center_only",
+                match_mode="component_membership",
+            )
+            if added:
+                next_cluster_id += 1
+                component_meta.setdefault(comp, {})["empty_component_gaia_added"] = added
+                continue
             x, y = component_centroids[comp]
             if comp not in synthetic_center_components:
                 sources.append(synthetic_component_center_source(comp=comp, component_area=int(area), x=x, y=y))
@@ -996,6 +1010,18 @@ def label_bright_sources(
 ) -> BrightLabelResult:
     """Classify bright candidates with the v2 Gaia/component logic."""
 
+    if not np.isfinite(config.pixel_scale_arcsec) or config.pixel_scale_arcsec <= 0:
+        raise ValueError("pixel_scale_arcsec must be finite and positive")
+    # Legacy pixel options denote distances on the HSC reference grid.
+    config = replace(
+        config,
+        cluster_source_match_pixels=matching_radius_pixels(
+            config.pixel_scale_arcsec, arcsec=config.gaia_source_match_arcsec,
+            hsc_pixels=config.cluster_source_match_pixels),
+        cluster_centroid_match_pixels=matching_radius_pixels(
+            config.pixel_scale_arcsec, arcsec=config.gaia_centroid_match_arcsec,
+            hsc_pixels=config.cluster_centroid_match_pixels),
+    )
     candidate = np.asarray(candidate, dtype=bool)
     if mag is None:
         mag = np.full(len(table), np.nan, dtype=np.float64)

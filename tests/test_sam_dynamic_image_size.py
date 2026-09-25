@@ -16,9 +16,10 @@ from sam_backbone.prompt_encoder import PromptEncoder
 class _ShapeOnlyImageEncoder(nn.Module):
     img_size = 512
     patch_size = 16
+    psf_pre_neck_enabled = False
 
-    def forward(self, x: torch.Tensor, style_prompt=None) -> torch.Tensor:
-        del style_prompt
+    def forward(self, x: torch.Tensor, style_prompt=None, psf_stamps=None) -> torch.Tensor:
+        del style_prompt, psf_stamps
         return x.new_zeros((x.shape[0], 256, x.shape[-2] // 16, x.shape[-1] // 16))
 
 

@@ -29,7 +29,7 @@ import numpy as np
 from astropy.visualization import ZScaleInterval
 from matplotlib.patches import Ellipse, Patch
 
-from astro_data_preprocessing import _band_fits_path
+from preprocessing.utils.inputs import _band_fits_path
 from preprocessing.build_image_level_zarr import StoreTask, _classify_patch, _read_image_header_origin
 from preprocessing.labels import SourceClass
 from preprocessing.refit import RefitConfig, compute_kron_ellipse

@@ -81,7 +81,70 @@ select[multiple] { min-height: 180px; width: 180px; }
   text-align: left;
 }
 .viewItem:hover { background: rgba(29,111,100,0.10); }
+.viewItem.active {
+  background: rgba(29,111,100,0.16);
+  color: var(--accent-dark);
+  font-weight: 650;
+}
 .viewCheck { color: var(--accent); font-weight: 700; text-align: center; }
+.scaleMenuBlock {
+  margin: 4px 0 6px 26px;
+  padding: 4px 0 6px;
+  border-bottom: 1px solid var(--line);
+  display: grid;
+  gap: 2px;
+}
+.scaleItem,
+.scaleSettingsButton {
+  width: 100%;
+  min-height: 28px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  padding: 0 8px;
+  text-align: left;
+  font-size: 13px;
+}
+.scaleItem:hover,
+.scaleSettingsButton:hover { background: rgba(29,111,100,0.10); }
+.scaleItem.active {
+  background: rgba(29,111,100,0.16);
+  color: var(--accent-dark);
+  font-weight: 650;
+}
+.snrModalFields { display: grid; gap: 12px; }
+.snrCheck {
+  min-height: 28px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  color: var(--text);
+  font-size: 13px;
+}
+.snrCheck input { min-height: auto; }
+.snrRow {
+  display: grid;
+  grid-template-columns: 42px minmax(140px, 1fr) 62px;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.snrRow input[type="range"] {
+  width: 100%;
+  min-height: 24px;
+}
+.snrRow input[type="number"] {
+  width: 62px;
+  min-height: 28px;
+  padding: 0 5px;
+}
+.snrModalFields.enabled .snrRow:first-of-type,
+.snrModalFields.enabled.kronActive .snrRow:last-of-type {
+  color: var(--text);
+}
 main { padding: 16px; }
 .status { margin: 0 0 12px; color: var(--muted); font-size: 13px; }
 .grid { display: grid; gap: 10px; align-items: start; }
@@ -122,6 +185,10 @@ img {
   text-overflow: ellipsis;
 }
 .meta span { color: var(--muted); }
+.meta .snrMeta {
+  color: var(--accent-dark);
+  font-weight: 650;
+}
 .empty {
   border: 1px dashed var(--line);
   border-radius: 8px;
@@ -155,7 +222,7 @@ img {
 }
 .datasetCards {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 12px;
   margin: 4px 0 20px;
 }
@@ -188,6 +255,13 @@ img {
   margin-bottom: 6px;
 }
 .field input, .field select { width: 100%; }
+.fieldHint {
+  display: block;
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.25;
+}
 .inlineCheck { margin-top: 8px; display: block; }
 .menuActions {
   margin-top: 18px;
@@ -217,6 +291,16 @@ img {
 .smoothModal {
   width: min(440px, 94vw);
   max-height: min(420px, 92vh);
+  overflow: auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 18px 54px rgba(0,0,0,0.28);
+  padding: 18px;
+}
+.scaleModal {
+  width: min(640px, 94vw);
+  max-height: min(620px, 92vh);
   overflow: auto;
   background: var(--panel);
   border: 1px solid var(--line);
@@ -293,6 +377,60 @@ img {
   width: 100%;
   padding: 0 8px;
 }
+.scalePresetRow {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+.scalePreset {
+  min-height: 30px;
+  padding: 0 10px;
+}
+.scalePreset.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.scaleRows {
+  display: grid;
+  gap: 14px;
+}
+.scaleRow {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+}
+.scaleRowTitle {
+  font-size: 13px;
+  font-weight: 650;
+  margin-bottom: 10px;
+}
+.dualRanges,
+.singleRange {
+  display: grid;
+  gap: 6px;
+}
+.dualRanges input[type="range"],
+.singleRange input[type="range"] {
+  width: 100%;
+  min-height: 24px;
+}
+.scaleInputs {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+  margin-top: 8px;
+}
+.scaleInputs label {
+  color: var(--muted);
+  font-size: 12px;
+}
+.scaleInputs input {
+  width: 100%;
+  margin-top: 4px;
+  padding: 0 8px;
+}
 .modalActions {
   display: flex;
   justify-content: flex-end;
@@ -338,6 +476,16 @@ img {
   background: #22272e;
   border-color: #404853;
   color: #e7e9ec;
+}
+.qualityPage .modal,
+.qualityPage .smoothModal {
+  color: var(--text);
+}
+.qualityPage .modalHeader h2 {
+  color: var(--text);
+}
+.qualityPage .modalStatus {
+  color: var(--muted);
 }
 .qualityPages button.active {
   background: #174c78;

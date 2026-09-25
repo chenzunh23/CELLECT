@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from .image_encoder import ImageEncoderViT
 from .preprocess import astro_preprocess, pad_to_patch_multiple, pad_to_square, per_band_stats
+from .psf_conditioning import PsfChannelCrossAttentionBlock, flatten_psf_stamps
 from .style_conditioning import ImageStyleRouter
 
 
@@ -46,6 +47,8 @@ def build_sam_image_encoder(
     style_prompt_dim: int = 0,
     style_prompt_layers: Sequence[int] = (),
     style_adapter_dim: int = 32,
+    psf_pre_neck: bool = False,
+    psf_hidden_dim: int = 32,
 ) -> ImageEncoderViT:
     """Build a 512-native SAM image encoder and optionally load SAM weights."""
 
@@ -72,6 +75,8 @@ def build_sam_image_encoder(
         style_prompt_dim=int(style_prompt_dim),
         style_prompt_layers=tuple(style_prompt_layers),
         style_adapter_dim=int(style_adapter_dim),
+        psf_pre_neck=bool(psf_pre_neck),
+        psf_hidden_dim=int(psf_hidden_dim),
     )
     if checkpoint is not None:
         load_sam_encoder_checkpoint(encoder, checkpoint, strict=strict)
@@ -141,6 +146,9 @@ class SamPerBandImageEncoder(nn.Module):
         style_prompt_dim: int = 32,
         style_router_temperature: float = 1.0,
         dynamic_image_size: bool = False,
+        psf_post_neck: bool = False,
+        psf_hidden_dim: int = 32,
+        psf_num_heads: int = 8,
     ) -> None:
         super().__init__()
         self.image_encoder = image_encoder
@@ -152,6 +160,7 @@ class SamPerBandImageEncoder(nn.Module):
         self.style_prompt_enabled = bool(style_prompt_enabled)
         self.style_router_temperature = float(style_router_temperature)
         self.dynamic_image_size = bool(dynamic_image_size)
+        self.psf_post_neck = bool(psf_post_neck)
         if self.style_router_temperature <= 0.0:
             raise ValueError("style_router_temperature must be positive")
         if self.style_prompt_enabled:
@@ -164,6 +173,15 @@ class SamPerBandImageEncoder(nn.Module):
             self.style_router = None
             self.register_parameter("style_prompt_raw", None)
             self.register_parameter("style_prompt_processed", None)
+        self.psf_post_neck_block = (
+            PsfChannelCrossAttentionBlock(
+                channels=256,
+                num_heads=int(psf_num_heads),
+                hidden_dim=int(psf_hidden_dim),
+            )
+            if self.psf_post_neck
+            else None
+        )
 
     @property
     def img_size(self) -> int:
@@ -182,6 +200,7 @@ class SamPerBandImageEncoder(nn.Module):
         return_flat: bool = False,
         return_stats: bool = False,
         return_input: bool = False,
+        psf_stamps: Optional[Tensor] = None,
     ) -> Tensor | dict[str, Tensor | dict[str, Tensor] | int]:
         if x.ndim == 4:
             has_rgb_axis = False
@@ -250,7 +269,21 @@ class SamPerBandImageEncoder(nn.Module):
             flat = padded.reshape(batch * bands, 1, padded_height, padded_width)
             flat_rgb = flat.expand(-1, 3, -1, -1).contiguous()
         padded_height, padded_width = (int(v) for v in flat_rgb.shape[-2:])
-        flat_features = self.image_encoder(flat_rgb, style_prompt=flat_style_prompt)
+        flat_psf = None
+        if self.image_encoder.psf_pre_neck_enabled or self.psf_post_neck_block is not None:
+            flat_psf = flatten_psf_stamps(
+                psf_stamps,
+                batch=batch,
+                bands=bands,
+                flat_batch=batch * bands,
+                device=flat_rgb.device,
+                dtype=flat_rgb.dtype,
+            )
+        flat_features = self.image_encoder(flat_rgb, style_prompt=flat_style_prompt, psf_stamps=flat_psf)
+        if self.psf_post_neck_block is not None:
+            if flat_psf is None:
+                raise ValueError("psf_stamps is required when post-neck PSF conditioning is enabled")
+            flat_features = self.psf_post_neck_block(flat_features, flat_psf)
         features = flat_features.reshape(batch, bands, *flat_features.shape[1:])
 
         if not return_flat and not return_stats and not return_input:
@@ -297,6 +330,10 @@ def build_per_band_sam_encoder(
     style_adapter_dim: int = 32,
     style_router_temperature: float = 1.0,
     dynamic_image_size: bool = False,
+    psf_pre_neck: bool = False,
+    psf_post_neck: bool = False,
+    psf_hidden_dim: int = 32,
+    psf_num_heads: int = 8,
 ) -> SamPerBandImageEncoder:
     encoder = build_sam_image_encoder(
         model_type,
@@ -307,6 +344,8 @@ def build_per_band_sam_encoder(
         style_prompt_dim=int(style_prompt_dim) if style_prompt_enabled else 0,
         style_prompt_layers=tuple(style_prompt_layers) if style_prompt_enabled else (),
         style_adapter_dim=int(style_adapter_dim),
+        psf_pre_neck=bool(psf_pre_neck),
+        psf_hidden_dim=int(psf_hidden_dim),
     )
     return SamPerBandImageEncoder(
         encoder,
@@ -319,6 +358,9 @@ def build_per_band_sam_encoder(
         style_prompt_dim=style_prompt_dim,
         style_router_temperature=style_router_temperature,
         dynamic_image_size=dynamic_image_size,
+        psf_post_neck=bool(psf_post_neck),
+        psf_hidden_dim=int(psf_hidden_dim),
+        psf_num_heads=int(psf_num_heads),
     )
 
 

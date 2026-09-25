@@ -15,6 +15,7 @@ from .bright_label import (
     unsupervised_seeded_component_centers,
 )
 from .image_processing import BrightRegionConfig, ImageProcessingConfig, build_bright_components, read_background_mask, read_fits_image, read_quality_mask, scale_image_for_training
+from .image_processing import ImagePreparationConfig, prepare_image
 from .labels import SourceClass, SourceLabels
 from .meas_processing import MeasProcessingConfig, classify_meas_basics
 from .ordinary import OrdinaryConfig, label_ordinary_sources
@@ -40,6 +41,7 @@ class PipelineConfig:
     overwrite: bool = False
     write_training_source_arrays: bool = True
     write_diagnostic_source_rows: bool = False
+    image_preparation: ImagePreparationConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -146,14 +148,17 @@ class PreprocessingPipeline:
             table = attach_refit_geometry(table, None, self.config.refit)
 
         image, image_header = read_fits_image(inputs.image_fits, hdu=self.config.image.hdu)
-        scaled = scale_image_for_training(image, config=self.config.image)
+        prepared = prepare_image(image, header=image_header, config=self.config.image_preparation) if self.config.image_preparation is not None else image
+        scaled = scale_image_for_training(prepared, config=self.config.image)
         if scaled.ndim == 2:
             scaled = scaled[None, ...]
         elif scaled.ndim == 3 and scaled.shape[-1] in (1, 3):
             scaled = np.moveaxis(scaled, -1, 0)
 
-        stage = classify_meas_basics(table, config=self.config.meas, refit_config=self.config.refit)
-        bright_mask, bright_components = build_bright_components(image, config=self.config.bright_region)
+        from .utils.inputs import _origin_from_ltv
+        stage = classify_meas_basics(table, config=self.config.meas, refit_config=self.config.refit,
+                                     image=image, origin=_origin_from_ltv(image_header))
+        bright_mask, bright_components = build_bright_components(prepared, config=self.config.bright_region)
         quality_ignore = read_quality_mask(inputs.quality_mask_npz, image.shape)
         snr_result = compute_snr_for_sample(
             table,
@@ -255,6 +260,7 @@ class PreprocessingPipeline:
             bright.labels,
             image.shape,
             background_mask=background,
+            bright_region_mask=bright_mask,
             quality_ignore_mask=quality_ignore,
             restricted_fallback_mask=restricted_fallback_mask,
             ordinary_ignore_mask=ordinary_ignore_mask,

@@ -1,0 +1,20 @@
+{
+  "hsc": {
+    "data_root": "/data/shared/Subaru",
+    "coadd_fits_root": null,
+    "refit_root": "/data/czh23/refit",
+    "denoised_fits_root": "/data/czh23/denoised_fits",
+    "coadd_weight_root": "/data/czh23/2026-06-21_171607_hsc_metadata_warp_n2n_epoch006_full-all-warp-weights",
+    "gaia_fits": "/home/czh23/CELLECT/output/gaia_dr3_cosmos.fits"
+  },
+  "cosmos": {
+    "manifest": "/data/czh23/JWST/COSMOS_1727_5893/manifest.json",
+    "catalog_root": "/data/shared/jwst_foundation/catalog/COSMOS_1727_1837_5893",
+    "gaia_fits": "/home/czh23/CELLECT/output/gaia_dr3_cosmos_full.fits"
+  },
+  "abell": {
+    "image_root": "/data/shared/JWST/abell2744/stage3_fmodel/mosaic_v2_half/field_ra3p573_dec-30p376",
+    "reference_root": "/data/shared/jwst_foundation/raw/Abell2744",
+    "catalog_root": "/data/shared/jwst_foundation/catalog/A2744"
+  }
+}
