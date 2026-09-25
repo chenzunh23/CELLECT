@@ -82,11 +82,17 @@ root: `/data/czh23/analysis/2026-09/2026-09-25/training_zarr_psfee_v1/zarr`
 
 审计文件位于 `/home/czh23/analysis/2026-09/2026-09-25/mixed_zarr_training/`：inventory_comparison.json、half_coverage_audit.json、legacy_regions_on_new_zarr.json。之前随机方案的 train.txt/val.txt 留作记录，启动脚本不再默认读取。
 
-脚本使用 cellect 环境、SAM ViT-B 官方权重，默认 100 epochs。PSF-EE 标签直接从 Zarr 读取；confidence=ce_hard，保留 shape loss；mask 外层权重 1，BCE/Dice 额外系数 0.2 和各实例可靠度相乘，前 5 epoch 关闭 mask loss；prompt 预算 128，有标签实例必选且不受此上限限制，decoder 每次 32 prompts。outside=1.5 Kron，area=[0.05,2]，centroid 按 sqrt(ab) 归一化。DDP static graph 关闭以支持有/无 mask 的动态分支。
+2026-09-26：`scripts/train_mixed_zarr.sh` 的训练基线改为 `/data/czh23/ckpts/sam_lupton_half_control_0828/run_config.json`，在 Bash 中显式固定参数。使用 cellect 环境、SAM ViT-B 官方初始权重（不自动恢复 0828 的 best.pt），100 epochs，batch size=20/进程，workers=4，pin/persistent workers，bf16，torch.compile；学习率 head/decoder=7.07e-5、encoder=1.414e-5，weight decay=0.1，无学习率 warmup，70%/90% 步数乘 0.1。epoch index 35 起 encoder/检测头 LR=0，decoder 继续训练。默认每 5 epoch 检测、每 2 epoch 保存 checkpoint。W&B 恢复历史 online 默认，可用 `WANDB_MODE=disabled` 关闭。
 
-明确使用 `--match-radius 3`，即同为 3 个输出像素（HSC≈0.504″，JWST≈0.09″），避免套用统一 HSC 像素尺度。该命令没有改变原有 detection score/threshold。`--center-tolerance-arcsec` 在显式 match-radius 下不生效。
+PSF-EE 标签直接从 Zarr 读取；confidence=ce_hard、等级权重=[1,4,8,16,32]；shape 权重=0.5、source_center、log_spd。mask 外层权重恢复为 5，前 15 epoch 关闭 mask loss；centroid/outside/min-area/max-area/pred-iou/stability 权重分别为 0.4/1/1/0.1/0.1/0。prompt 课程恢复为 GT=15、pred=35，选择 loss 最小的 multimask；预算 128、有标签实例必选且不受此上限限制，decoder 每次 256 prompts，可用 `MASK_PROMPT_CHUNK_SIZE=32` 覆盖。新监督规则保留：BCE/Dice 各 1、额外系数 0.2 和各实例可靠度相乘，outside=1.5 Kron，area=[0.05,2]，centroid 按 sqrt(ab) 归一化。由于 mask 外层权重从 1 恢复到 5，可靠度 0.25 的实例其 BCE/Dice 名义乘数为 5×0.2×0.25=0.25，之后仍按代码聚合。DDP static graph 保持关闭以支持有/无 mask 的动态分支。
 
-每 epoch 执行 val+detect。默认输出：`/data/czh23/analysis/2026-09/2026-09-25/cellect_mixed_psfee_v1`；`OUT=...` 可覆盖。检测指标保存 `detection_metrics_epoch_XXXX.json` 和 `detection_metrics_latest.json`；启用 W&B 时另记录 `val/detection/{filter|overall}/...`，默认 W&B disabled。没有 linking 结果文件。best.pt 是最佳验证损失模型。
+明确使用 `--match-radius 3`，即同为 3 个输出像素（HSC≈0.504″，JWST≈0.09″），避免套用统一 HSC 像素尺度；0828 原来按 0.5/0.168≈2.976 像素计算，这是按最新约定保留的差别。`--center-tolerance-arcsec` 在显式 match-radius 下不生效。检测恢复历史 `--confidence-score ordinal_expectation --confidence-threshold 2 --no-use-ordinal-expectation`；不要换成 `--use-ordinal-expectation`，后者在当前代码中强制阈值 3。
+
+2026-09-26 中心后处理：按最终确认保留原有 NMS 默认值，`--nms-radius 1` 表示 **3×3 窗口**，不是半径 3。Python 默认的 `cellect` 无额外 3 像素距离合并；本脚本恢复使用的 `ordinal_expectation` 原有距离合并仍为严格 `<3` 像素，按邻接关系形成连通组、每组保留最高分点（链式组的总跨度可能超过 3）；mask 训练预测提示点仍沿用原来关闭此额外合并的设置。评测匹配仍为 `≤3` 像素。不引入 PSF 可变半径。
+
+新增处理仅为连续 4 级区域取质心：使用**原始 confidence logits 的 argmax==4**、8 邻接连通域；已有阈值/局部极大值筛选通过的候选若属于同一连通域，统一为该区域所有 4 级像素的几何质心，保留浮点坐标，分数取已通过候选的最高分。无合格候选的区域不新增检测；区域外候选维持原坐标细化方法。此处理同时用于训练预测提示点、val/detect 和带分数导出，不改变 Zarr 中 PSF-EE 标签与 GT 提示点。
+
+每 epoch 执行验证损失，每 5 epoch 执行 val+detect（`DETECT_EVERY=1` 可恢复每轮检测）。默认输出：`/data/czh23/analysis/2026-09/2026-09-25/cellect_mixed_psfee_v1`；`OUT=...` 可覆盖。检测指标保存 `detection_metrics_epoch_XXXX.json` 和 `detection_metrics_latest.json`；启用 W&B 时另记录 `val/detection/{filter|overall}/...`。没有 linking 结果文件。best.pt 是最佳验证损失模型。配置核对与 dry-run 命令保存在 `/home/czh23/analysis/2026-09/2026-09-26/mixed_zarr_0828_profile/`；未启动训练。
 
 只打印命令：在上述明确指定清单的命令前添加 `DRY_RUN=1`。
 独立评测（默认 best.pt）：

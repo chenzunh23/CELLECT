@@ -827,6 +827,60 @@ ORDINAL_EXPECTATION_THRESHOLD = 3.0
 ORDINAL_EXPECTATION_MERGE_RADIUS = 3.0
 
 
+def _centroid_level4_peaks(
+    logits: Tensor,
+    score: Tensor,
+    peaks: Tensor,
+    *,
+    center_refinement: str,
+    center_refinement_radius: int,
+) -> Tuple[Tensor, Tensor]:
+    """Collapse seeded 8-connected raw argmax==4 regions to geometric centroids.
+
+    Keep the existing score/threshold/local-maximum candidate selection. A
+    component needs at least one accepted peak, but its centroid uses ALL its
+    level-4 pixels, not only the local maxima. Peaks outside these components
+    retain the requested coordinate refinement. Component scores are the
+    maximum accepted peak scores, for the subsequent distance deduplication.
+    """
+    from scipy import ndimage
+
+    y, x = torch.where(peaks)
+    coords = _refine_peak_coordinates(
+        score, y, x, method=center_refinement, radius=center_refinement_radius)
+    peak_scores = score[y, x]
+    if not x.numel():
+        return coords, peak_scores
+    level4 = (logits.argmax(dim=0) == 4).detach().cpu().numpy()
+    labels, count = ndimage.label(level4, structure=np.ones((3, 3), dtype=bool))
+    if count == 0:
+        return coords, peak_scores
+    py, px = y.cpu().numpy(), x.cpu().numpy()
+    peak_labels = labels[py, px]
+    # Vectorized sums avoid rescanning the image once for every component.
+    rows, cols = np.nonzero(level4)
+    ids = labels[rows, cols]
+    areas = np.bincount(ids, minlength=count + 1)
+    sum_x = np.bincount(ids, weights=cols, minlength=count + 1)
+    sum_y = np.bincount(ids, weights=rows, minlength=count + 1)
+    xy = coords.detach().cpu().numpy().copy()
+    scores = peak_scores.detach().float().cpu().numpy()
+    keep = []
+    first = {}
+    for i, label in enumerate(peak_labels):
+        if label == 0:
+            keep.append(i)
+        elif label not in first:
+            first[label] = i
+            keep.append(i)
+            xy[i] = (sum_x[label] / areas[label], sum_y[label] / areas[label])
+        else:
+            j = first[label]
+            scores[j] = max(scores[j], scores[i])
+    return (torch.as_tensor(xy[keep], device=score.device, dtype=torch.float32),
+            torch.as_tensor(scores[keep], device=score.device, dtype=peak_scores.dtype))
+
+
 def _merge_close_centers_by_score(
     coords: Tensor,
     scores: Tensor,
@@ -1790,7 +1844,12 @@ def detect_centers_tensors(
     center_refinement_radius: int = 1,
     merge_close_centers: Optional[bool] = None,
 ) -> List[Tensor]:
-    """Detect center candidates from confidence maps and keep coordinates on-device."""
+    """Detect level-4 centroids with the existing mode-specific NMS defaults.
+
+    ``nms_radius=1`` is the legacy 3x3 local-max window. Distance merging remains
+    enabled by default only for ordinal expectation. Explicitly disabling that
+    merge still leaves one centroid per seeded, connected level-4 region.
+    """
 
     conf, peaks, _ = _compute_detection_peak_maps(
         outputs,
@@ -1807,16 +1866,12 @@ def detect_centers_tensors(
     else:
         merge_close = bool(merge_close_centers)
     for b in range(conf.shape[0]):
-        y, x = torch.where(peaks[b])
-        coords = _refine_peak_coordinates(
-            conf[b],
-            y,
-            x,
-            method=center_refinement,
-            radius=center_refinement_radius,
+        coords, peak_scores = _centroid_level4_peaks(
+            outputs["confidence"][b], conf[b], peaks[b],
+            center_refinement=center_refinement,
+            center_refinement_radius=center_refinement_radius,
         )
         if bool(merge_close) and coords.numel() > 0:
-            peak_scores = conf[b, y, x]
             coords, _peak_scores = _merge_close_centers_by_score(
                 coords,
                 peak_scores,
@@ -1884,26 +1939,16 @@ def detect_centers_with_scores(
     result: List[Dict[str, np.ndarray]] = []
     merge_close = bool(use_ordinal_expectation or str(confidence_score) == "ordinal_expectation")
     for b in range(conf.shape[0]):
-        y, x = torch.where(peaks[b])
-        if x.numel() == 0:
-            result.append({"xy": np.zeros((0, 2), dtype=np.float32), "score": np.zeros((0,), dtype=np.float32)})
-            continue
-        xy_t = _refine_peak_coordinates(
-            conf[b],
-            y,
-            x,
-            method=center_refinement,
-            radius=center_refinement_radius,
+        xy_t, peak_scores = _centroid_level4_peaks(
+            outputs["confidence"][b], conf[b], peaks[b],
+            center_refinement=center_refinement,
+            center_refinement_radius=center_refinement_radius,
         )
-        peak_scores = conf[b, y, x]
-        if bool(merge_close):
+        if merge_close:
             xy_t, peak_scores = _merge_close_centers_by_score(
-                xy_t,
-                peak_scores,
-                min_distance=float(ORDINAL_EXPECTATION_MERGE_RADIUS),
-            )
+                xy_t, peak_scores, min_distance=float(ORDINAL_EXPECTATION_MERGE_RADIUS))
         xy = xy_t.detach().cpu().numpy().astype(np.float32)
-        score = peak_scores.detach().cpu().numpy().astype(np.float32)
+        score = peak_scores.detach().float().cpu().numpy()
         result.append({"xy": xy, "score": score})
     return result
 
