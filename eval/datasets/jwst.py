@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import re
+import threading
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from .base import FrameRef, TileRow, patch_sort_key
+from .intensity import hsc_intensity_frame
+from .array_cache import ArrayCache
 
 
 DEFAULT_JWST_NIRCAM_ROOT = Path("/data/czh23/JWST/NIRCam")
@@ -53,6 +56,10 @@ class JwstNircamAccess:
         self.root = Path(root).expanduser().resolve()
         self.tract = "default" if str(tract or "default") == "default" else str(tract)
         self.tile_size = int(tile_size or self.tile_size)
+        self._tile_pixels = ArrayCache(128 * 1024**2)
+        self._grid_relation = {}
+        self._path_locks = {}
+        self._path_registry_lock = threading.Lock()
         self._files_by_patch: dict[str, dict[str, Path]] | None = None
         self._shape_cache: dict[Path, tuple[int, int]] = {}
         self._wcs_cache: dict[Path, Any] = {}
@@ -64,6 +71,18 @@ class JwstNircamAccess:
         self._common_mask_cache: dict[tuple[str, str, tuple[str, ...]], np.ndarray] = {}
         self._active_bands_by_patch: dict[str, tuple[str, ...]] = {}
         self._ref_band_by_patch: dict[tuple[str, tuple[str, ...]], str] = {}
+
+    def close(self):
+        for hdul in getattr(self, '_hdul_cache', {}).values():
+            hdul.close()
+        self._hdul_cache.clear()
+        self._data_cache.clear()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _discover(self) -> dict[str, dict[str, Path]]:
         if self._files_by_patch is not None:
@@ -105,28 +124,26 @@ class JwstNircamAccess:
         return path
 
     def _image_hdu_index(self, hdul: Any) -> int:
-        for idx, hdu in enumerate(hdul):
-            name = str(getattr(hdu, "name", "") or "").upper()
-            if hdu.data is not None and (name == "SCI" or idx == 0):
-                return idx
-        for idx, hdu in enumerate(hdul):
-            if hdu.data is not None:
-                return idx
-        raise ValueError("no image HDU found")
+        from preprocessing.dataset_inputs import image_hdu
+        return image_hdu(hdul)
+
+    def _file_lock(self, path):
+        with self._path_registry_lock:
+            return self._path_locks.setdefault(Path(path), threading.RLock())
 
     def _shape_wcs_header(self, path: Path) -> tuple[tuple[int, int], Any, Any]:
-        path = Path(path)
-        if path not in self._shape_cache:
-            fits, WCS = _require_astropy()
-            with fits.open(path, memmap=True) as hdul:
-                idx = self._image_hdu_index(hdul)
-                data = hdul[idx].data
-                if data is None:
-                    raise ValueError(f"no image HDU found in {path}")
-                self._shape_cache[path] = (int(data.shape[-2]), int(data.shape[-1]))
-                self._headers[path] = hdul[idx].header.copy()
-                self._wcs_cache[path] = WCS(self._headers[path]).celestial
-        return self._shape_cache[path], self._wcs_cache[path], self._headers[path]
+        with self._file_lock(path):
+            path = Path(path)
+            if path not in self._shape_cache:
+                fits, WCS = _require_astropy()
+                with fits.open(path, memmap=True) as hdul:
+                    idx = self._image_hdu_index(hdul)
+                    self._shape_cache[path] = tuple(hdul[idx].shape[-2:])
+                    header = hdul[0].header.copy()
+                    header.update(hdul[idx].header)
+                    self._headers[path] = header
+                    self._wcs_cache[path] = WCS(self._headers[path]).celestial
+            return self._shape_cache[path], self._wcs_cache[path], self._headers[path]
 
     def _shape(self, band: str, patch: str) -> tuple[int, int]:
         shape, _wcs, _header = self._shape_wcs_header(self.image_file(band, patch))
@@ -166,32 +183,120 @@ class JwstNircamAccess:
                 raise FileNotFoundError(f"no requested JWST bands are present for patch {patch}")
         return self._ref_band_by_patch[key]
 
-    def _same_grid(self, ref_band: str, band: str, patch: str) -> bool:
-        if ref_band == band:
-            return True
-        try:
-            ref_shape, _ref_wcs, ref_header = self._shape_wcs_header(self.image_file(ref_band, patch))
-            shape, _wcs, header = self._shape_wcs_header(self.image_file(band, patch))
-        except Exception:
-            return False
-        if ref_shape != shape:
-            return False
-        keys = ("CTYPE1", "CTYPE2", "CRPIX1", "CRPIX2", "CRVAL1", "CRVAL2", "CD1_1", "CD1_2", "CD2_1", "CD2_2", "CDELT1", "CDELT2")
-        for key in keys:
-            if key in ref_header or key in header:
-                if str(ref_header.get(key, "")) != str(header.get(key, "")):
-                    return False
-        return True
+    def _affine_grid_transform(self, ref_band, band, patch):
+        """Exact linear pixel transform only when celestial projections coincide."""
+        key = (ref_band, band, patch)
+        if key not in self._grid_relation:
+            a, b = self._wcs_for(ref_band, patch), self._wcs_for(band, patch)
+            same_projection = (not a.has_distortion and not b.has_distortion
+                and list(a.wcs.ctype) == list(b.wcs.ctype)
+                and list(a.wcs.cunit) == list(b.wcs.cunit)
+                and np.array_equal(a.wcs.crval, b.wcs.crval)
+                and a.wcs.lonpole == b.wcs.lonpole and a.wcs.latpole == b.wcs.latpole
+                and a.wcs.radesys == b.wcs.radesys
+                and np.allclose(a.wcs.equinox, b.wcs.equinox, equal_nan=True)
+                and a.wcs.get_pv() == b.wcs.get_pv() and a.wcs.get_ps() == b.wcs.get_ps())
+            if same_projection:
+                matrix = np.linalg.solve(b.pixel_scale_matrix, a.pixel_scale_matrix)
+                offset = b.wcs.crpix - 1 + matrix @ (1 - a.wcs.crpix)
+                self._grid_relation[key] = (matrix, offset)
+            else:
+                self._grid_relation[key] = None
+        return self._grid_relation[key]
 
-    def _world_to_band_pixels(self, ref_band: str, band: str, patch: str, tile: TileRow) -> tuple[np.ndarray, np.ndarray]:
-        yy, xx = np.indices((int(tile.y1 - tile.y0), int(tile.x1 - tile.x0)), dtype=np.float64)
-        ref_x = xx + float(tile.x0)
-        ref_y = yy + float(tile.y0)
-        ref_wcs = self._wcs_for(ref_band, patch)
-        band_wcs = self._wcs_for(band, patch)
-        ra, dec = ref_wcs.pixel_to_world_values(ref_x, ref_y)
-        sx, sy = band_wcs.world_to_pixel_values(ra, dec)
-        return np.asarray(sx, dtype=np.float64), np.asarray(sy, dtype=np.float64)
+    def _tan_grid_transform(self, ref_band, band, patch):
+        # TAN-to-TAN is an exact projective transform. Restrict to ordinary
+        # equatorial TAN without distortion/PV; other WCS use Astropy below.
+        key = ("tan", ref_band, band, patch)
+        if key not in self._grid_relation:
+            a, b = self._wcs_for(ref_band, patch), self._wcs_for(band, patch)
+            eligible = (not a.has_distortion and not b.has_distortion
+                and list(a.wcs.ctype) == list(b.wcs.ctype) == ['RA---TAN', 'DEC--TAN']
+                and all(str(u) == 'deg' for u in list(a.wcs.cunit) + list(b.wcs.cunit))
+                and a.wcs.lonpole == b.wcs.lonpole == 180.
+                and a.wcs.radesys == b.wcs.radesys
+                and np.allclose(a.wcs.equinox, b.wcs.equinox, equal_nan=True)
+                and not a.wcs.get_pv() and not b.wcs.get_pv()
+                and not a.wcs.get_ps() and not b.wcs.get_ps())
+            result = None
+            if eligible:
+                def basis(w):
+                    ra, dec = np.deg2rad(w.wcs.crval)
+                    return np.array([[-np.sin(ra), -np.sin(dec)*np.cos(ra), np.cos(dec)*np.cos(ra)],
+                        [np.cos(ra), -np.sin(dec)*np.sin(ra), np.cos(dec)*np.sin(ra)],
+                        [0, np.cos(dec), np.sin(dec)]])
+                src = np.eye(3)
+                src[:2,:2] = np.deg2rad(a.pixel_scale_matrix)
+                src[:2,2] = src[:2,:2] @ (1-a.wcs.crpix)
+                dst = np.eye(3)
+                dst[:2,:2] = np.linalg.inv(np.deg2rad(b.pixel_scale_matrix))
+                dst[:2,2] = b.wcs.crpix-1
+                result = dst @ basis(b).T @ basis(a) @ src
+            self._grid_relation[key] = result
+        return self._grid_relation[key]
+
+    def _same_grid(self, ref_band: str, band: str, patch: str) -> bool:
+        transform = self._affine_grid_transform(ref_band, band, patch)
+        return (transform is not None and self._shape(ref_band, patch) == self._shape(band, patch)
+                and np.allclose(transform[0], np.eye(2), rtol=0, atol=1e-12)
+                and np.allclose(transform[1], 0, rtol=0, atol=1e-7))
+
+    def _world_to_band_pixels(self, ref_band: str, band: str, patch: str, tile: TileRow):
+        yy, xx = np.indices((tile.height, tile.width), dtype=np.float64)
+        xx += tile.x0
+        yy += tile.y0
+        affine = self._affine_grid_transform(ref_band, band, patch)
+        if affine is not None:
+            m, t = affine
+            return m[0,0]*xx+m[0,1]*yy+t[0], m[1,0]*xx+m[1,1]*yy+t[1]
+        matrix = self._tan_grid_transform(ref_band, band, patch)
+        if matrix is not None:
+            den = matrix[2,0]*xx + matrix[2,1]*yy + matrix[2,2]
+            with np.errstate(divide='ignore', invalid='ignore'):
+                sx = (matrix[0,0]*xx + matrix[0,1]*yy + matrix[0,2]) / den
+                sy = (matrix[1,0]*xx + matrix[1,1]*yy + matrix[1,2]) / den
+            return np.where(den > 0, sx, np.nan), np.where(den > 0, sy, np.nan)
+        ra, dec = self._wcs_for(ref_band, patch).pixel_to_world_values(xx, yy)
+        return self._wcs_for(band, patch).world_to_pixel_values(ra, dec)
+
+    def _read_section(self, path, rows, columns):
+        with self._file_lock(path):
+            # Unscaled FITS SCI uses a zero-copy mmap: only the requested rectangle
+            # is copied/read. Astropy.section otherwise performs hundreds of Python
+            # row reads. Scaled integer/compressed HDUs retain safe section access.
+            fits, _ = _require_astropy()
+            if path not in self._hdul_cache:
+                self._hdul_cache[path] = fits.open(path, memmap=True)
+            hdu = self._hdul_cache[path][self._image_hdu_index(self._hdul_cache[path])]
+            scaled = any(k in hdu.header for k in ('BZERO', 'BSCALE', 'BLANK'))
+            if scaled or isinstance(hdu, fits.CompImageHDU):
+                with fits.open(path, memmap=False) as hd:
+                    data = hd[self._image_hdu_index(hd)].section[rows, columns]
+                    return np.array(data, dtype=np.float32, copy=True)
+            return np.array(hdu.data[rows, columns], dtype=np.float32, copy=True)
+
+    def _sample_tile(self, band, patch, ref_band, tile):
+        key = (band, patch, ref_band, tile.x0, tile.y0, tile.x1, tile.y1)
+        cached = self._tile_pixels.get(key)
+        if cached is not None:
+            return cached
+        path = self.image_file(band, patch)
+        fits, _ = _require_astropy()
+        ny, nx = self._shape(band, patch)
+        if self._same_grid(ref_band, band, patch):
+            out = self._read_section(path, slice(tile.y0,tile.y1), slice(tile.x0,tile.x1))
+        else:
+            sx, sy = self._world_to_band_pixels(ref_band, band, patch, tile)
+            finite = np.isfinite(sx) & np.isfinite(sy)
+            out = np.full((tile.height, tile.width), np.nan, np.float32)
+            if finite.any():
+                xa, ya = max(0, int(np.floor(sx[finite].min()))), max(0, int(np.floor(sy[finite].min())))
+                xb, yb = min(nx, int(np.floor(sx[finite].max()))+2), min(ny, int(np.floor(sy[finite].max()))+2)
+                if xb > xa and yb > ya:
+                    cut = self._read_section(path, slice(ya,yb), slice(xa,xb))
+                    out = self._bilinear_sample(cut, np.where(finite, sx-xa, -1), np.where(finite, sy-ya, -1))
+                    out[~finite] = np.nan
+        return self._tile_pixels.put(key, out)
 
     @staticmethod
     def _bilinear_sample(data: np.ndarray, x: np.ndarray, y: np.ndarray) -> np.ndarray:
@@ -222,13 +327,7 @@ class JwstNircamAccess:
         return out
 
     def _valid_mask_for_band(self, band: str, patch: str, ref_band: str, tile: TileRow) -> np.ndarray:
-        data = self._image_data(self.image_file(band, patch))
-        if self._same_grid(ref_band, band, patch):
-            crop = data[int(tile.y0) : int(tile.y1), int(tile.x0) : int(tile.x1)]
-            return np.isfinite(crop)
-        sx, sy = self._world_to_band_pixels(ref_band, band, patch, tile)
-        sampled = self._bilinear_sample(data, sx, sy)
-        return np.isfinite(sampled)
+        return np.isfinite(self._sample_tile(band, patch, ref_band, tile))
 
     def _tile_valid_fraction(self, patch: str, bands: tuple[str, ...], tile: TileRow) -> float:
         ref_band = self._reference_band(patch, bands)
@@ -306,7 +405,7 @@ class JwstNircamAccess:
     def tiles(self, band: str, patch: str) -> list[TileRow]:
         active = self._active_bands_by_patch.get(str(patch), self._present_bands(patch, [band]))
         key = (str(patch), tuple(active))
-        return self._selected_tiles_by_key.get(key) or self._tiles_for_bands(patch, active)
+        return self._selected_tiles_by_key[key] if key in self._selected_tiles_by_key else self._tiles_for_bands(patch, active)
 
     def tile_by_id(self, band: str, patch: str) -> dict[str, TileRow]:
         return {row.tile_id: row for row in self.tiles(band, patch)}
@@ -363,12 +462,8 @@ class JwstNircamAccess:
         active = self._active_bands_by_patch.get(patch, self._present_bands(patch, [band]))
         ref_band = self._reference_band(patch, active)
         tile = self.tile_by_id(band, patch)[ref.tile_id]
-        data = self._image_data(self.image_file(band, patch))
-        if self._same_grid(ref_band, band, patch):
-            out = np.array(data[int(tile.y0) : int(tile.y1), int(tile.x0) : int(tile.x1)], dtype=np.float32, copy=True)
-        else:
-            sx, sy = self._world_to_band_pixels(ref_band, band, patch, tile)
-            out = self._bilinear_sample(data, sx, sy)
+        path = self.image_file(band, patch)
+        out = self._sample_tile(band, patch, ref_band, tile).copy()
         common_key = (patch, tile.tile_id, tuple(active))
         common = self._common_mask_cache.get(common_key)
         if common is None:
@@ -380,7 +475,8 @@ class JwstNircamAccess:
         if common is not None:
             out = np.asarray(out, dtype=np.float32)
             out[~common] = np.nan
-        return out
+        _shape, _wcs, header = self._shape_wcs_header(path)
+        return hsc_intensity_frame(out, header, input_unit="auto", nan_policy="hybrid")
 
     def manifest(self, patch: str) -> dict[str, Any]:
         return {

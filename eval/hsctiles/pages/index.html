@@ -36,6 +36,7 @@
               <button class="scaleSettingsButton" id="scaleSettingsButton">Scale Settings</button>
             </div>
             <button class="viewItem" data-view="shape"><span class="viewCheck"></span><span>Shape</span></button>
+            <button class="viewItem" data-view="masks"><span class="viewCheck"></span><span>Show Masks</span></button>
             <button class="viewItem" data-view="center"><span class="viewCheck"></span><span>Center</span></button>
             <button class="viewItem" data-view="snrFilter"><span class="viewCheck"></span><span>SNR Filter</span></button>
             <button class="viewItem" data-view="invert"><span class="viewCheck"></span><span>Invert</span></button>
@@ -47,6 +48,13 @@
       </div>
     </div>
   </header>
+  <dialog id="datasetDialog" aria-labelledby="datasetDialogTitle">
+    <div class="datasetDialogHeader">
+      <h2 id="datasetDialogTitle">Choose dataset</h2>
+      <button id="datasetDialogClose" type="button" aria-label="Close dataset selection">Close</button>
+    </div>
+    <div id="datasetChoices" class="datasetChoices"></div>
+  </dialog>
   <main>
     <section class="menu" id="menu">
       <h1>Multi-Dataset Pack Server</h1>

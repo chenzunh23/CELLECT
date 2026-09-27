@@ -57,7 +57,7 @@ def build_parent(args, row):
         reference_mtime_ns=Path(row['reference_fits']).stat().st_mtime_ns,
         catalog_mtime_ns=Path(args.abell_catalog).stat().st_mtime_ns,gaia_mtime_ns=Path(args.abell_gaia).stat().st_mtime_ns,
         confidence_mode=args.confidence_mode,confidence_fwhm_min=args.confidence_fwhm_min,
-        confidence_fwhm_max=args.confidence_fwhm_max,confidence_fwhm_pixels=args.confidence_fwhm_pixels,policy_version=6,reference_background_method=AGGRESSIVE_BACKGROUND_METHOD)
+        confidence_fwhm_max=args.confidence_fwhm_max,confidence_fwhm_pixels=args.confidence_fwhm_pixels,policy_version=7,chunk_tiles=args.chunk_tiles,parent_packed_stamps=True,reference_background_method=AGGRESSIVE_BACKGROUND_METHOD)
     if receipt.exists() and not args.overwrite:
         previous=json.loads(receipt.read_text())
         if previous.get('max_invalid_fraction')!=args.jwst_max_invalid_fraction:
@@ -66,6 +66,9 @@ def build_parent(args, row):
             outputs=previous.get('outputs',[])
             if all(Path(p).exists() and Path(p+'_manifest.json').exists() for p in outputs):return previous
     t=time.monotonic();task=store_task(args,row)
+    from .utils.parent_zarr import ParentStoreAssembly
+    assembly=ParentStoreAssembly(task,audit/"_parts")
+    part_task=assembly.task(task)
     raw,header=fits.getdata(row['training_fits'],header=True)
     valid=np.isfinite(raw);shape=raw.shape
     grid=make_tile_specs(parent_origin=(0,0),image_shape=(shape[1],shape[0]),tile_size=512,stride=368,compare_origin=None)
@@ -101,9 +104,10 @@ def build_parent(args, row):
         training_background='sextractor',reference_snr_background=AGGRESSIVE_BACKGROUND_METHOD,
         scaling_statistics='4096 half-coadd parent',sample_kind='grid')
     # Source classes remain those measured from the FULL reference image.
-    result=write_classified_patch(task,prepared.image,labels,tile_specs=[] if getattr(args,'large_only',False) else grid,valid_mask=valid,
+    result=write_classified_patch(part_task,prepared.image,labels,tile_specs=[] if getattr(args,'large_only',False) else grid,valid_mask=valid,
         max_invalid_fraction=args.jwst_max_invalid_fraction,scaled_image_chw=scaled,provenance=provenance,
         image_wcs=WCS(header).celestial)
+    assembly.add(result)
     del scaled,prepared,raw
     # One owner per source/band: nearest parent center on the anchored lattice.
     step=row['size']-row['parent_overlap'];anchor=row['grid_anchor']
@@ -136,7 +140,7 @@ def build_parent(args, row):
             refsky=ensure_background(Path(row['original_reference']),audit/(source_id+'_reference_sky.npz'),
                                     image=refcontext,header=rch)
             lab,_=classify_reference(refcontext,rch,catalog,gaia,refsky,row['band'],training_background=sky)
-            extra_task=replace(task,patch=row['patch']+'_'+source_id)
+            extra_task=replace(part_task,patch=row['patch']+'_'+source_id)
             prep=prepare_image(context,header=ch)
             one=TileSpec(spec.name,1792,1792,512,kind='large_source')
             extra_result=write_classified_patch(extra_task,prep.image,lab,tile_specs=[one],valid_mask=ok,
@@ -148,14 +152,20 @@ def build_parent(args, row):
                     'background_tiles':abell_region(args.background_root,row['band'],row['original_training'],meta['x0'],meta['y0'],512,512)[1],
                     'stamp_bounds':[meta['x0'],meta['y0'],meta['x0']+512,meta['y0']+512],
                     'sky_wcs_header':ch.tostring(sep='\n')})
+            assembly.add(extra_result,shift=(spec.x0-1792,spec.y0-1792))
             meta.update(status='kept',output=extra_result.get('output'));extra_rows.append(meta)
             del context,refcontext,lab,prep,sky,refsky;gc.collect()
+    output=assembly.finish()
+    sample_cursor=result.get('samples',0)
+    for item in extra_rows:
+        if item['status']=='kept':
+            item.update(output=output,sample_index=sample_cursor);sample_cursor+=1
     (audit/'large_sources.json').write_text(json.dumps(extra_rows,indent=2)+'\n')
     done=dict(band=row['band'],patch=row['patch'],status='complete',grid_samples=result['samples'],
               training_background='sextractor',
               large_samples=sum(r['status']=='kept' for r in extra_rows),labels=summary,
               max_invalid_fraction=args.jwst_max_invalid_fraction,seconds=time.monotonic()-t,signature=signature,
-              outputs=([result['output']] if result.get('output') else [])+[r['output'] for r in extra_rows if r['status']=='kept'])
+              outputs=[output] if output else [])
     receipt.write_text(json.dumps(done,indent=2)+'\n');gc.collect()
     print(f'[abell-zarr] complete {done}',flush=True)
     return done

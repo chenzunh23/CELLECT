@@ -4,8 +4,11 @@ let busy = false;
 let optionsCache = null;
 let selectedDataset = 'hsc_raw';
 let showDetect = false;
+let detectBusy = false;
+let imageVersion = 0;
 let viewShape = true;
 let viewCenter = false;
+let viewMasks = false;
 let viewInvert = false;
 let smoothEnabled = false;
 let smoothMode = 'gaussian';
@@ -54,17 +57,50 @@ function activeDatasetOptions() {
   return optionsCache && optionsCache.by_dataset ? optionsCache.by_dataset[selectedDataset] : null;
 }
 
+function datasetButton(label, detail, selected, enabled, onClick) {
+  const button = document.createElement('button');
+  button.className = selected ? 'datasetCard selected' : 'datasetCard';
+  button.disabled = !enabled;
+  const title = document.createElement('strong');
+  title.textContent = label;
+  const subtitle = document.createElement('span');
+  subtitle.textContent = detail;
+  button.append(title, subtitle);
+  button.onclick = onClick;
+  return button;
+}
+
+function openDatasetGroup(group) {
+  const dialog = document.getElementById('datasetDialog');
+  document.getElementById('datasetDialogTitle').textContent = group.label;
+  const choices = document.getElementById('datasetChoices');
+  choices.replaceChildren();
+  for (const id of group.members) {
+    const ds = optionsCache.by_dataset[id];
+    if (!ds) continue;
+    choices.appendChild(datasetButton(ds.label,
+      ds.enabled ? `${(ds.patches || []).length} regions` : (ds.reason || 'not found'),
+      id === selectedDataset, ds.enabled, () => {
+        selectDataset(id);
+        dialog.close();
+      }));
+  }
+  dialog.showModal();
+}
+
 function renderDatasetCards() {
   const container = document.getElementById('datasetCards');
-  container.innerHTML = '';
-  for (const ds of optionsCache.datasets || []) {
-    const btn = document.createElement('button');
-    btn.className = ds.id === selectedDataset ? 'datasetCard selected' : 'datasetCard';
-    btn.disabled = !ds.enabled;
-    const status = ds.enabled ? 'available' : (ds.reason || 'placeholder');
-    btn.innerHTML = `<strong>${ds.label}</strong><span>${status}</span>`;
-    btn.onclick = () => selectDataset(ds.id);
-    container.appendChild(btn);
+  container.replaceChildren();
+  const groups = optionsCache.dataset_groups || (optionsCache.datasets || []).map(ds => ({label: ds.label, members: [ds.id]}));
+  for (const group of groups) {
+    const members = group.members.map(id => optionsCache.by_dataset[id]).filter(Boolean);
+    const active = members.find(ds => ds.id === selectedDataset);
+    const enabled = members.some(ds => ds.enabled);
+    const detail = active ? active.label : (enabled ? (members.length > 1 ? 'Choose dataset…' : 'available') : 'not found');
+    container.appendChild(datasetButton(group.label, detail, Boolean(active), enabled, () => {
+      if (group.members.length > 1) openDatasetGroup(group);
+      else selectDataset(group.members[0]);
+    }));
   }
 }
 
@@ -83,12 +119,12 @@ function selectDataset(datasetId) {
   document.getElementById('nTilesInput').placeholder = String(cfg.default_n_tiles || 4);
   const framesInput = document.getElementById('framesPerTileInput');
   framesInput.placeholder = String(cfg.default_frames_per_tile || 1);
-  framesInput.disabled = datasetId === 'jwst';
-  framesInput.value = datasetId === 'jwst' ? '1' : '';
+  framesInput.disabled = datasetId.startsWith('jwst');
+  framesInput.value = datasetId.startsWith('jwst') ? '1' : '';
   document.getElementById('tilesPerPageInput').placeholder = String(cfg.default_tiles_per_page || 2);
   document.getElementById('startButton').disabled = !cfg.enabled;
   if (!cfg.enabled) setStatus(`${cfg.label} is a placeholder in this browser.`, true);
-  else setStatus('');
+  else setStatus(cfg.scaling ? `Input scaling: ${cfg.scaling}.` : '');
 }
 
 async function loadOptions() {
@@ -114,15 +150,17 @@ function imageUrl(c) {
     params.push('detect=1');
     params.push(`shape=${viewShape ? 1 : 0}`);
     params.push(`center=${viewCenter ? 1 : 0}`);
+    params.push(`masks=${viewMasks ? 1 : 0}`);
     if (inputMode) params.push('input_shape=1');
   }
+  params.push(`v=${imageVersion}`);
   return params.length ? `/image/${c.token}.png?${params.join('&')}` : `/image/${c.token}.png`;
 }
 
 function updateViewMenu() {
   const inputMode = window.ScaleControls && ScaleControls.isInputMode();
   const snrEnabled = window.SnrControls && SnrControls.isEnabled();
-  const states = {inputScaling: inputMode, shape: viewShape, center: viewCenter, snrFilter: snrEnabled, invert: viewInvert, smooth: smoothEnabled};
+  const states = {inputScaling: inputMode, shape: viewShape, center: viewCenter, masks: viewMasks, snrFilter: snrEnabled, invert: viewInvert, smooth: smoothEnabled};
   for (const item of document.querySelectorAll('.viewItem')) {
     const key = item.dataset.view;
     item.querySelector('.viewCheck').textContent = states[key] ? '✓' : '';
@@ -133,6 +171,7 @@ function updateViewMenu() {
 function resetViewDefaults() {
   viewShape = true;
   viewCenter = false;
+  viewMasks = false;
   viewInvert = false;
   smoothEnabled = false;
   if (window.ScaleControls) ScaleControls.reset();
@@ -150,6 +189,11 @@ async function toggleViewItem(key) {
   }
   if (key === 'shape') viewShape = !viewShape;
   if (key === 'center') viewCenter = !viewCenter;
+  if (key === 'masks') {
+    if (state.make_masks === false) { setStatus('Mask decoding is disabled on this server.'); return; }
+    if (!showDetect) { setStatus('Run Detect to view masks.'); return; }
+    viewMasks = !viewMasks;
+  }
   if (key === 'snrFilter') {
     if (window.SnrControls) {
       SnrControls.open();
@@ -172,7 +216,7 @@ function viewStatusText() {
     : 'off';
   const scaleText = window.ScaleControls ? ScaleControls.statusText() : 'default';
   const snrText = window.SnrControls ? SnrControls.statusText() : 'snr=off';
-  return `View: scale=${scaleText}, ${snrText}, shape=${viewShape ? 'on' : 'off'}, center=${viewCenter ? 'on' : 'off'}, invert=${viewInvert ? 'on' : 'off'}, smooth=${smoothText}.`;
+  return `View: scale=${scaleText}, ${snrText}, shape=${viewShape ? 'on' : 'off'}, center=${viewCenter ? 'on' : 'off'}, masks=${viewMasks ? 'on' : 'off'}, invert=${viewInvert ? 'on' : 'off'}, smooth=${smoothText}.`;
 }
 
 function candidateCell(c) {
@@ -242,6 +286,7 @@ async function refreshState(updateTitle=true) {
   const patchSelect = document.getElementById('patchSelect');
   if (updateTitle) fillSelect(patchSelect, state.patches, [state.patch]);
   document.getElementById('detect').textContent = showDetect ? 'Hide Detect' : 'Detect';
+  document.getElementById('detect').disabled = detectBusy;
   updateViewMenu();
   const warningText = state.warnings && state.warnings.length ? ` Warnings: ${state.warnings.join(' | ')}` : '';
   setStatus(`${state.dataset_label || state.dataset} ${state.patch}: ${state.n_candidates} frames from ${state.n_tiles} spatial tiles; groups/tile=${state.frames_per_tile}; tiles/page=${state.tiles_per_page}; detect batch=${state.detect_batch_size}; nms=${state.nms_radius}; selected ${state.n_selected}. Scaling=${state.scaling_mode}; checkpoint=${state.checkpoint_name}.${warningText}`, Boolean(warningText));
@@ -300,7 +345,15 @@ async function changePatch() {
 }
 
 async function loadPage(nextPage, preserveDetect=false) {
-  if (busy || !state || !state.started) return;
+  if (!state || !state.started) return;
+  if (busy) {
+    if (preserveDetect) {
+      window.setTimeout(() => {
+        loadPage(nextPage, preserveDetect).catch(err => setStatus(String(err), true));
+      }, 100);
+    }
+    return;
+  }
   busy = true;
   if (!preserveDetect) {
     showDetect = false;
@@ -463,13 +516,19 @@ async function runTileSearch(mode, jump=true) {
 
 async function detectPage() {
   if (!state || !state.started) return;
+  if (detectBusy) {
+    setStatus('Detection is already running on the current page...');
+    return;
+  }
   if (showDetect) {
     showDetect = false;
     document.getElementById('detect').textContent = 'Detect';
     await loadPage(page, true);
     return;
   }
+  detectBusy = true;
   document.getElementById('detect').disabled = true;
+  document.getElementById('detect').textContent = 'Detecting...';
   document.getElementById('viewButton').disabled = true;
   setStatus('Running CELLECT detection on the current page...');
   try {
@@ -479,6 +538,7 @@ async function detectPage() {
       body: JSON.stringify({page})
     });
     showDetect = true;
+    imageVersion += 1;
     setStatus(`Detected current page: ${result.n_images} images, ${result.n_detections} detections.`);
     if (window.SnrControls && SnrControls.isEnabled()) {
       await SnrControls.prepare();
@@ -488,14 +548,16 @@ async function detectPage() {
   } catch (err) {
     setStatus(String(err), true);
   } finally {
+    detectBusy = false;
     document.getElementById('detect').disabled = false;
+    document.getElementById('detect').textContent = showDetect ? 'Hide Detect' : 'Detect';
     document.getElementById('viewButton').disabled = false;
   }
 }
 
 async function saveCsv() {
   const result = await fetchJson('/api/save_selection_csv', {method: 'POST'});
-  setStatus(`Saved ${result.n_selected} selected rows to ${result.selection_csv}.`);
+  setStatus(`Saved ${result.n_selected} selected rows to ${result.selection_csv}; ${result.n_mask_images || 0} mask images saved (normal ZScale).`);
 }
 
 async function exportSelected() {
@@ -504,7 +566,7 @@ async function exportSelected() {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({write_png: true})
   });
-  setStatus(`Exported ${result.n_exported} raw frames and ${result.n_detections} detections to ${result.out_dir}.`);
+  setStatus(`Exported ${result.n_exported} raw frames and ${result.n_detections} detections to ${result.out_dir}; mask PNGs use normal ZScale.`);
 }
 
 document.getElementById('prev').onclick = () => loadPage(page - 1);
@@ -617,3 +679,11 @@ if (window.SnrControls) {
     setStatus(String(err), true);
   }
 })();
+
+const datasetDialog = document.getElementById('datasetDialog');
+document.getElementById('datasetDialogClose').addEventListener('click', () => datasetDialog.close());
+datasetDialog.addEventListener('click', event => {
+  if (event.target !== datasetDialog) return;
+  const r = datasetDialog.getBoundingClientRect();
+  if (event.clientX < r.left || event.clientX > r.right || event.clientY < r.top || event.clientY > r.bottom) datasetDialog.close();
+});

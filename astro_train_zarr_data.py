@@ -145,6 +145,32 @@ def _build_zarr_record_chunks(records: Sequence[CutoutRecord]) -> list[list[int]
     return [sorted(values) for _key, values in sorted(buckets.items())]
 
 
+def _pool_parent_chunk_tails(chunks, batch_size):
+    """Keep full local chunks; combine short tails, pad only the final batch.
+
+    Used only for newly generated stores explicitly requesting pool_pad_train.
+    Padding repeats real samples (never adds fake images/labels).
+    """
+    full, tail = [], []
+    for chunk in chunks:
+        count = len(chunk) // batch_size * batch_size
+        if count:
+            full.append(chunk[:count])
+        tail.extend(chunk[count:])
+    for start in range(0, len(tail), batch_size):
+        part = tail[start:start + batch_size]
+        if len(part) < batch_size:
+            donor = tail if tail else full[0]
+            part = part + [donor[i % len(donor)] for i in range(batch_size - len(part))]
+        full.append(part)
+    return full
+
+
+def _new_parent_tail_policy(records):
+    stores = {_parse_zarr_uri(r.image_paths[0])[0] for r in records}
+    return bool(stores) and all(_reader(str(p)).attrs.get('chunk_tail_policy') == 'pool_pad_train' for p in stores)
+
+
 def zarr_passthrough_batch(batch: dict[str, object]) -> dict[str, object]:
     return batch
 
@@ -180,6 +206,7 @@ class ZarrChunkLocalBatchSampler(Sampler[list[int]]):
         self.equalize_replicas = bool(equalize_replicas)
         self.epoch = 0
         self._chunks = _build_zarr_record_chunks(self.records)
+        self._preserve_parent_tails = self.drop_last and _new_parent_tail_policy(self.records)
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
@@ -189,6 +216,12 @@ class ZarrChunkLocalBatchSampler(Sampler[list[int]]):
         rng = random.Random(self.seed + self.epoch)
         if self.shuffle:
             rng.shuffle(chunks)
+        if self._preserve_parent_tails:
+            if self.shuffle and self.shuffle_within_chunk:
+                for chunk in chunks:
+                    rng.shuffle(chunk)
+            chunks = _pool_parent_chunk_tails(chunks, self.batch_size)
+            return chunks[int(rank) :: self.num_replicas]
         chunks = chunks[int(rank) :: self.num_replicas]
         if self.shuffle and self.shuffle_within_chunk:
             for chunk in chunks:
@@ -224,11 +257,17 @@ class ZarrChunkLocalBatchSampler(Sampler[list[int]]):
     def _rank_chunks(self) -> list[list[int]]:
         chunks = self._rank_chunks_for_rank(self.rank)
         if self.equalize_replicas and self.num_replicas > 1:
-            target_batches = min(
+            target_batches = (max if self._preserve_parent_tails else min)(
                 self._batch_count(self._rank_chunks_for_rank(replica_rank))
                 for replica_rank in range(self.num_replicas)
             )
-            chunks = self._truncate_to_batches(chunks, target_batches)
+            if self._preserve_parent_tails:
+                missing = target_batches - self._batch_count(chunks)
+                donor = next((list(c) for c in self._chunks if c), [])
+                for _ in range(missing):
+                    chunks.append([donor[i % len(donor)] for i in range(self.batch_size)])
+            else:
+                chunks = self._truncate_to_batches(chunks, target_batches)
         return chunks
 
     def __iter__(self) -> Iterator[list[int]]:
@@ -283,6 +322,7 @@ class ZarrChunkBatchIterableDataset(IterableDataset):
         self.equalize_replicas = bool(equalize_replicas)
         self.sample_dataset = ZarrCutoutDataset(self.records, augment=augment, **dataset_kwargs)
         self._chunks = _build_zarr_record_chunks(self.records)
+        self._preserve_parent_tails = self.drop_last and _new_parent_tail_policy(self.records)
         self._epoch = mp.Value("i", 0)
 
     def set_epoch(self, epoch: int) -> None:
@@ -298,6 +338,12 @@ class ZarrChunkBatchIterableDataset(IterableDataset):
         rng = random.Random(self.seed + int(epoch))
         if self.shuffle:
             rng.shuffle(chunks)
+        if self._preserve_parent_tails:
+            if self.shuffle and self.shuffle_within_chunk:
+                for chunk in chunks:
+                    rng.shuffle(chunk)
+            chunks = _pool_parent_chunk_tails(chunks, self.batch_size)
+            return chunks[int(rank) :: self.num_replicas]
         chunks = chunks[int(rank) :: self.num_replicas]
         if self.shuffle and self.shuffle_within_chunk:
             for chunk in chunks:
@@ -333,11 +379,17 @@ class ZarrChunkBatchIterableDataset(IterableDataset):
     def _rank_chunks(self, *, epoch: int) -> list[list[int]]:
         chunks = self._rank_chunks_for_rank(epoch=epoch, rank=self.rank)
         if self.equalize_replicas and self.num_replicas > 1:
-            target_batches = min(
+            target_batches = (max if self._preserve_parent_tails else min)(
                 self._batch_count(self._rank_chunks_for_rank(epoch=epoch, rank=replica_rank))
                 for replica_rank in range(self.num_replicas)
             )
-            chunks = self._truncate_to_batches(chunks, target_batches)
+            if self._preserve_parent_tails:
+                missing = target_batches - self._batch_count(chunks)
+                donor = next((list(c) for c in self._chunks if c), [])
+                for _ in range(missing):
+                    chunks.append([donor[i % len(donor)] for i in range(self.batch_size)])
+            else:
+                chunks = self._truncate_to_batches(chunks, target_batches)
         return chunks
 
     def _worker_chunks(self, *, epoch: int) -> list[list[int]]:
@@ -354,7 +406,17 @@ class ZarrChunkBatchIterableDataset(IterableDataset):
                 indices = chunk[start : start + self.batch_size]
                 if len(indices) < self.batch_size and self.drop_last:
                     continue
-                yield collate_cutouts([self.sample_dataset[int(idx)] for idx in indices])
+                samples = []
+                previous_store = None
+                for idx in indices:
+                    store, _ = _parse_zarr_uri(self.records[int(idx)].image_paths[0])
+                    if self._preserve_parent_tails and previous_store is not None and store != previous_store:
+                        # Pooled tails can touch many parents: do not retain a
+                        # full decoded chunk for each parent in the worker.
+                        _clear_all_zarr_chunk_caches()
+                    samples.append(self.sample_dataset[int(idx)])
+                    previous_store = store
+                yield collate_cutouts(samples)
 
     def __len__(self) -> int:
         total = 0

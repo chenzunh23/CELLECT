@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import csv
 import io
 import json
@@ -9,6 +10,7 @@ import re
 import sys
 import threading
 import time
+import traceback
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -55,6 +57,9 @@ from eval.datasets import (  # noqa: E402
     MessierAccess,
     ZtfAccess,
 )
+from eval.datasets.parallel_load import ParallelLoad
+from eval.datasets.array_cache import ArrayCache
+from eval.hsctiles.browser_masks import decode_masks, overlay_masks
 from eval.datasets.base import patch_sort_key  # noqa: E402
 from eval.eval_utils import (  # noqa: E402
     detection_rows,
@@ -741,13 +746,18 @@ def _save_snr_overlay_png(
     plt.close(fig)
 
 
+from eval.datasets.jwst_fields import (CosmosAccess, AbellAccess, DEFAULT_COSMOS_ROOT, DEFAULT_ABELL_PLAN, JWST_DATASETS)
+
+
 def dataset_label(dataset_id: str) -> str:
     return {
         "hsc_raw": "HSC raw tiles",
         "sitian": "Sitian",
         "hsc_image": "HSC coadd/noisy/denoised",
         "ztf": "ZTF",
-        "jwst": "JWST NIRCam",
+        "jwst": "JWST NIRCam fields",
+        "jwst_cosmos": "COSMOS 1727 / 5893",
+        "jwst_abell": "Abell 2744 half coadd",
     }.get(str(dataset_id), str(dataset_id))
 
 
@@ -780,6 +790,10 @@ def make_access(dataset_id: str, args: argparse.Namespace, tract: str):
             tile_size=int(args.ztf_tile_size),
             cut_origin_dir=Path(args.ztf_cut_origin_dir) if args.ztf_cut_origin_dir else None,
         )
+    if dataset_id == "jwst_cosmos":
+        return CosmosAccess(path_arg("cosmos_root", DEFAULT_COSMOS_ROOT), tile_size=int(getattr(args, "jwst_tile_size", 512)))
+    if dataset_id == "jwst_abell":
+        return AbellAccess(path_arg("abell_plan", DEFAULT_ABELL_PLAN), tile_size=int(getattr(args, "jwst_tile_size", 512)))
     if dataset_id == "jwst":
         return JwstNircamAccess(
             Path(getattr(args, "jwst_root", DEFAULT_JWST_NIRCAM_ROOT)),
@@ -821,7 +835,7 @@ class BrowserState:
         elif self.dataset_id == "ztf":
             default_n_tiles = int(args.ztf_n_tiles)
             default_frames_per_tile = int(args.ztf_frames_per_tile)
-        elif self.dataset_id == "jwst":
+        elif self.dataset_id in JWST_DATASETS:
             default_n_tiles = int(args.jwst_n_tiles)
             default_frames_per_tile = 1
         else:
@@ -830,7 +844,7 @@ class BrowserState:
         self.n_tiles_requested = None if all_tiles else int(n_tiles if n_tiles is not None else default_n_tiles)
         self.all_tiles = bool(all_tiles)
         self.frames_per_tile = max(1, int(frames_per_tile if frames_per_tile is not None else default_frames_per_tile))
-        if self.dataset_id == "jwst":
+        if self.dataset_id in JWST_DATASETS:
             self.frames_per_tile = 1
         self.tiles_per_page = max(1, int(tiles_per_page if tiles_per_page is not None else args.tiles_per_page))
         self.detect_batch_size = max(1, int(args.detect_batch_size))
@@ -850,6 +864,10 @@ class BrowserState:
         self.lupton_q = float(args.lupton_q)
         self.anscombe_clip = bool(args.anscombe_clip)
         self.anscombe_scale = float(args.anscombe_scale)
+        if hasattr(self.access, "read_scaled_frame") and getattr(args, "jwst_input_scaling", "training_parent") == "training_parent":
+            self.scaling_mode = "zscore-log-lupton-rgb"
+            self.clip_threshold = 5.0
+            self.log_a = 1000.0
         self.confidence_threshold = float(args.confidence_threshold)
         self.confidence_score = str(args.confidence_score)
         self.nms_radius = int(getattr(args, "active_nms_radius", args.nms_radius))
@@ -874,6 +892,19 @@ class BrowserState:
         self.tile_map_png_by_patch: dict[str, bytes] = {}
         self._model_by_bands: dict[tuple[str, ...], tuple[torch.nn.Module, dict[str, Any]]] = {}
         self._model_lock = threading.Lock()
+        self._frame_cache = ArrayCache(int(getattr(args, "browser_cache_mb", 128)) * 1024**2)
+        self._mask_cache = ArrayCache(128 * 1024**2)
+        self.image_workers = max(1, int(getattr(args, "image_workers", 4)))
+        self._image_load = ParallelLoad(self.image_workers, "image-read")
+        self._scale_load = ParallelLoad(getattr(args, "scaling_workers", 2), "image-scale")
+        if hasattr(self.access, "_parent_load"):
+            self.access._parent_load = ParallelLoad(self._scale_load.workers, "parent-scaling")
+        self._mask_lock = threading.RLock()
+        self.make_masks = bool(getattr(args, "make_masks", True))
+        self.mask_chunk_size = int(getattr(args, "mask_chunk_size", 32))
+        self.mask_threshold = float(getattr(args, "mask_threshold", 0.0))
+        self.mask_box_scale = float(getattr(args, "mask_box_scale", 2.0))
+        self.jwst_input_scaling = str(getattr(args, "jwst_input_scaling", "training_parent"))
         for patch in self.patches:
             self.selected_tiles_by_patch[patch] = self._choose_tiles(patch, self.seed + 1009 * len(self.selected_tiles_by_patch))
         self._build_refs()
@@ -905,7 +936,7 @@ class BrowserState:
         return tiles
 
     def _usable_bands_for_patch(self, patch: str) -> list[str]:
-        if self.dataset_id == "jwst" and hasattr(self.access, "image_file"):
+        if self.dataset_id in JWST_DATASETS and hasattr(self.access, "image_file"):
             usable = []
             for band in self.bands:
                 try:
@@ -979,9 +1010,9 @@ class BrowserState:
             self.refs_by_patch[patch] = refs
 
     def _all_map_tile_ids(self, patch: str) -> list[str]:
-        if self.dataset_id == "jwst":
+        if self.dataset_id in JWST_DATASETS:
             return list(self.selected_tiles_by_patch.get(patch, []))
-        if self.dataset_id in {"hsc_raw", "ztf", "jwst"} and hasattr(self.access, "valid_tiles_for_band"):
+        if self.dataset_id in ({"hsc_raw", "ztf"} | JWST_DATASETS) and hasattr(self.access, "valid_tiles_for_band"):
             try:
                 sets = [self.access.valid_tiles_for_band(band, patch) for band in self._bands_for_patch(patch)]
                 if sets:
@@ -1111,12 +1142,15 @@ class BrowserState:
             "n_candidates_by_patch": {patch: len(values) for patch, values in self.refs_by_patch.items()},
             "selected_tile_ids_by_patch": self.selected_tiles_by_patch,
             "checkpoint": str(self.checkpoint),
+            "image_workers": self.image_workers,
+            "scaling_workers": self._scale_load.workers,
+            "make_masks": self.make_masks,
             "scaling_mode": self.scaling_mode,
             "visit": self.visit,
             "note": (
                 f"{dataset_label(self.dataset_id)} frames; HSC image detection uses FITS crops with scaling={self.scaling_mode}."
                 if self.dataset_id == "hsc_image"
-                else f"{dataset_label(self.dataset_id)} frames; detection uses browser scaling={self.scaling_mode}."
+                else f"{dataset_label(self.dataset_id)} frames; detection scaling={'training parent RGB (4096)' if hasattr(self.access, 'read_scaled_frame') and self.jwst_input_scaling == 'training_parent' else self.scaling_mode}."
             ),
         }
         (self.session_dir / "browser_manifest.json").write_text(
@@ -1146,6 +1180,9 @@ class BrowserState:
             "n_selected": len(self.selected),
             "n_pages": self.n_pages,
             "checkpoint_name": self.checkpoint.name,
+            "image_workers": self.image_workers,
+            "scaling_workers": self._scale_load.workers,
+            "make_masks": self.make_masks,
             "scaling_mode": self.scaling_mode,
             "visit": self.visit,
             "session_dir": str(self.session_dir),
@@ -1303,25 +1340,101 @@ class BrowserState:
             "by_token": by_token,
         }
 
+    def _raw_image_for_ref(self, ref):
+        return self._image_load.cached(self._frame_cache, ("raw", ref.token),
+            lambda: np.asarray(self.access.read_frame(ref), dtype=np.float32))
+
     def _detection_image_for_ref(self, ref: FrameRef) -> np.ndarray:
         reader = getattr(self.access, "read_detection_frame", None)
-        if callable(reader):
-            return np.asarray(reader(ref), dtype=np.float32)
-        return np.asarray(self.access.read_frame(ref), dtype=np.float32)
+        if not callable(reader):
+            return self._raw_image_for_ref(ref)
+        return self._image_load.cached(self._frame_cache, ("detection", ref.token),
+            lambda: np.asarray(reader(ref), dtype=np.float32))
 
-    def _scaled_input_for_ref(self, ref: FrameRef) -> np.ndarray:
-        image = self._detection_image_for_ref(ref)
-        return make_training_rgb(
-            image,
-            mode=self.scaling_mode,
-            clip_threshold=self.clip_threshold,
-            log_a=self.log_a,
-            log_high_percentile=self.log_high_percentile,
-            lupton_stretch=self.lupton_stretch,
-            lupton_q=self.lupton_q,
-            anscombe_clip=self.anscombe_clip,
-            anscombe_scale=self.anscombe_scale,
-        )
+    def _scaled_input_for_ref(self, ref: FrameRef, image=None) -> np.ndarray:
+        key = ("scaled", ref.token, self.scaling_mode, self.clip_threshold, self.log_a,
+               self.log_high_percentile, self.lupton_stretch, self.lupton_q,
+               self.anscombe_clip, self.anscombe_scale, self.jwst_input_scaling)
+        cached = self._frame_cache.get(key)
+        if cached is not None:
+            return cached
+        reader = getattr(self.access, "read_scaled_frame", None)
+        if callable(reader) and self.jwst_input_scaling == "training_parent":
+            factory = lambda: np.asarray(reader(ref), dtype=np.float32)
+        else:
+            # Resolve dependencies before acquiring a scaling slot. Raw requests
+            # never wait behind the expensive 4096-parent scaling computation.
+            if image is None:
+                image = self._detection_image_for_ref(ref)
+            factory = lambda: make_training_rgb(
+                image, mode=self.scaling_mode, clip_threshold=self.clip_threshold,
+                log_a=self.log_a, log_high_percentile=self.log_high_percentile,
+                lupton_stretch=self.lupton_stretch, lupton_q=self.lupton_q,
+                anscombe_clip=self.anscombe_clip, anscombe_scale=self.anscombe_scale)
+        return self._scale_load.cached(self._frame_cache, key, factory)
+
+    def _prepare_detection_inputs(self, refs):
+        # At most one detection batch is queued. Only CPU reading/scaling is
+        # parallelized; encoder and mask decoder keep their existing execution.
+        def prepare(ref):
+            raw = self._detection_image_for_ref(ref)
+            return raw, self._scaled_input_for_ref(ref, raw)
+        with ThreadPoolExecutor(max_workers=self.image_workers, thread_name_prefix="fits-input") as pool:
+            return list(pool.map(prepare, refs))
+
+    def _store_masks(self, model, band_outputs, rows, ref):
+        if not self.make_masks:
+            return
+        masks = decode_masks(model, band_outputs, rows, device=torch.device(self.device_name),
+            amp=self.amp, width=ref.width, height=ref.height, chunk_size=self.mask_chunk_size,
+            threshold=self.mask_threshold, box_scale=self.mask_box_scale)
+        self._mask_cache.put(ref.token, masks)
+
+    def _masks_for_token(self, token):
+        if not self.make_masks:
+            raise RuntimeError("Mask decoding disabled; restart without --no-make-masks")
+        with self._mask_lock:
+            masks = self._mask_cache.get(token)
+            if masks is None:
+                # Only needed after bounded CPU mask-cache eviction. No embeddings
+                # are kept on the GPU between requests.
+                if token not in self.detect_rows_by_token:
+                    raise RuntimeError("Run Detect before Show Masks")
+                ref = self.ref_by_token[token]
+                model, _ = self._load_model([ref.band])
+                tensor = torch.from_numpy(self._scaled_input_for_ref(ref)[None,None])
+                outputs = infer_cellect(model=model, image_tensor=tensor, device=torch.device(self.device_name), amp=self.amp)
+                self._store_masks(model, select_band_outputs(outputs, 0), self.detect_rows_by_token[token], ref)
+                masks = self._mask_cache.get(token)
+            if masks is None:
+                raise RuntimeError("Mask result exceeds cache capacity")
+            return masks
+
+    def _mask_overlay(self, arr, token, rows=None):
+        selected = None
+        if rows is not None:
+            centers = {(r['x'], r['y']) for r in rows}
+            selected = [i for i,r in enumerate(self.detect_rows_by_token[token]) if (r['x'],r['y']) in centers]
+        return overlay_masks(arr, self._masks_for_token(token), selected)
+
+    def mask_png(self, token):
+        # Export is deliberately independent of the active View controls.
+        base = _display_input_uint8(self._detection_image_for_ref(self.ref_by_token[token]), display_scaling="zscale")
+        return _png_bytes(self._mask_overlay(base, token))
+
+    def save_selected_masks(self, out_dir=None):
+        target = Path(out_dir or self.session_dir)
+        paths = []
+        if not self.make_masks:
+            return paths
+        for ref in self.selected_refs():
+            if ref.token not in self.detect_rows_by_token:
+                continue
+            target.mkdir(parents=True, exist_ok=True)
+            path = target / f"{ref.candidate_id}_mask_overlay.png"
+            path.write_bytes(self.mask_png(ref.token))
+            paths.append(str(path))
+        return paths
 
     def _scaled_input_for_token(self, token: str) -> np.ndarray:
         return self._scaled_input_for_ref(self.ref_by_token[token])
@@ -1358,6 +1471,7 @@ class BrowserState:
         input_shape: bool = False,
         show_shape: bool = True,
         show_center: bool = False,
+        show_masks: bool = False,
         smooth_mode: str = "none",
         smooth_sigma: float = 1.0,
         smooth_radius: int = 1,
@@ -1402,6 +1516,8 @@ class BrowserState:
                     )
                     if show_center:
                         arr = _draw_centers_on_uint8(arr, rows)
+                if show_masks:
+                    arr = self._mask_overlay(arr, token, rows if snr_filter else None)
                 return _png_bytes(arr)
             image = _display_filter_image(
                 self._detection_image_for_ref(self.ref_by_token[token]),
@@ -1436,6 +1552,8 @@ class BrowserState:
                 )
                 if show_center:
                     arr = _draw_centers_on_uint8(arr, rows)
+            if show_masks:
+                arr = self._mask_overlay(arr, token, rows if snr_filter else None)
             return _png_bytes(arr)
         if input_image or input_shape:
             return _png_bytes(
@@ -1450,7 +1568,7 @@ class BrowserState:
                 )
             )
         image = _display_filter_image(
-            self.access.read_frame(self.ref_by_token[token]),
+            self._raw_image_for_ref(self.ref_by_token[token]),
             smooth_mode=smooth_mode,
             smooth_sigma=smooth_sigma,
             smooth_radius=smooth_radius,
@@ -1469,7 +1587,7 @@ class BrowserState:
         )
 
     def raw_image_png(self, token: str) -> bytes:
-        image = self.access.read_frame(self.ref_by_token[token])
+        image = self._raw_image_for_ref(self.ref_by_token[token])
         return _png_bytes(display_gray(image))
 
     def _load_model(self, bands: list[str] | None = None) -> tuple[torch.nn.Module, dict[str, Any]]:
@@ -1525,21 +1643,9 @@ class BrowserState:
             print(f"WARNING: {message}", flush=True)
             return {"n_images": 0, "n_detections": 0}
         device = torch.device(self.device_name)
-        raw_images = [self._detection_image_for_ref(per_band[band]) for band in bands]
-        scaled = [
-            make_training_rgb(
-                image,
-                mode=self.scaling_mode,
-                clip_threshold=self.clip_threshold,
-                log_a=self.log_a,
-                log_high_percentile=self.log_high_percentile,
-                lupton_stretch=self.lupton_stretch,
-                lupton_q=self.lupton_q,
-                anscombe_clip=self.anscombe_clip,
-                anscombe_scale=self.anscombe_scale,
-            )
-            for image in raw_images
-        ]
+        prepared = self._prepare_detection_inputs([per_band[band] for band in bands])
+        raw_images = [item[0] for item in prepared]
+        scaled = [item[1] for item in prepared]
         tensor = torch.from_numpy(np.stack(scaled, axis=0).astype(np.float32, copy=False))[None]
         outputs = infer_cellect(model=model, image_tensor=tensor, device=device, amp=self.amp)
         total_images = 0
@@ -1556,6 +1662,7 @@ class BrowserState:
                 width=per_band[band].width,
                 height=per_band[band].height,
             )
+            self._store_masks(model, select_band_outputs(outputs, band_idx), rows, ref)
             self.detect_rows_by_token[ref.token] = rows
             for method in ("ap2", "kron"):
                 self.snr_rows_by_token_method.pop((ref.token, method), None)
@@ -1616,58 +1723,53 @@ class BrowserState:
                     continue
                 for start in range(0, len(group_items), self.detect_batch_size):
                     chunk = group_items[start : start + self.detect_batch_size]
-                    raw_by_sample: list[list[np.ndarray]] = []
-                    scaled_by_sample = []
-                    for _tile_id, _frame_slot, per_band in chunk:
-                        raw_images = [self._detection_image_for_ref(per_band[band]) for band in bands]
-                        raw_by_sample.append(raw_images)
-                        scaled_by_sample.append(
-                            [
-                                make_training_rgb(
-                                    image,
-                                    mode=self.scaling_mode,
-                                    clip_threshold=self.clip_threshold,
-                                    log_a=self.log_a,
-                                    log_high_percentile=self.log_high_percentile,
-                                    lupton_stretch=self.lupton_stretch,
-                                    lupton_q=self.lupton_q,
-                                    anscombe_clip=self.anscombe_clip,
-                                    anscombe_scale=self.anscombe_scale,
+                    try:
+                        raw_by_sample: list[list[np.ndarray]] = []
+                        scaled_by_sample = []
+                        refs = [per_band[band] for _, _, per_band in chunk for band in bands]
+                        prepared = self._prepare_detection_inputs(refs)
+                        for offset in range(0, len(prepared), len(bands)):
+                            sample = prepared[offset:offset + len(bands)]
+                            raw_by_sample.append([value[0] for value in sample])
+                            scaled_by_sample.append([value[1] for value in sample])
+                        tensor = torch.from_numpy(np.stack(scaled_by_sample, axis=0).astype(np.float32, copy=False))
+                        outputs = infer_cellect(model=model, image_tensor=tensor, device=device, amp=self.amp)
+                        for sample_idx, (_tile_id, _frame_slot, per_band) in enumerate(chunk):
+                            sample_outputs = self._select_sample_outputs(outputs, sample_idx)
+                            for band_idx, band in enumerate(bands):
+                                ref = per_band[band]
+                                rows = detection_rows(
+                                    select_band_outputs(sample_outputs, band_idx),
+                                    threshold=self.confidence_threshold,
+                                    nms_radius=self.nms_radius,
+                                    confidence_score=self.confidence_score,
+                                    center_refinement=self.center_refinement,
+                                    center_refinement_radius=self.center_refinement_radius,
+                                    width=ref.width,
+                                    height=ref.height,
                                 )
-                                for image in raw_images
-                            ]
-                        )
-                    tensor = torch.from_numpy(np.stack(scaled_by_sample, axis=0).astype(np.float32, copy=False))
-                    outputs = infer_cellect(model=model, image_tensor=tensor, device=device, amp=self.amp)
-                    for sample_idx, (_tile_id, _frame_slot, per_band) in enumerate(chunk):
-                        sample_outputs = self._select_sample_outputs(outputs, sample_idx)
-                        for band_idx, band in enumerate(bands):
-                            ref = per_band[band]
-                            rows = detection_rows(
-                                select_band_outputs(sample_outputs, band_idx),
-                                threshold=self.confidence_threshold,
-                                nms_radius=self.nms_radius,
-                                confidence_score=self.confidence_score,
-                                center_refinement=self.center_refinement,
-                                center_refinement_radius=self.center_refinement_radius,
-                                width=ref.width,
-                                height=ref.height,
-                            )
-                            self.detect_rows_by_token[ref.token] = rows
-                            for method in ("ap2", "kron"):
-                                self.snr_rows_by_token_method.pop((ref.token, method), None)
-                            self.detect_png_by_token[ref.token] = _overlay_png_bytes(
-                                raw_by_sample[sample_idx][band_idx],
-                                rows,
-                                draw_centers=self.shape_overlay_centers,
-                            )
-                            self.input_shape_png_by_token[ref.token] = _input_shape_overlay_png_bytes(
-                                scaled_by_sample[sample_idx][band_idx],
-                                rows,
-                                scaling=self.scaling_mode,
-                                clip_threshold=self.clip_threshold,
-                                draw_centers=self.shape_overlay_centers,
-                            )
+                                self._store_masks(model, select_band_outputs(sample_outputs, band_idx), rows, ref)
+                                self.detect_rows_by_token[ref.token] = rows
+                                for method in ("ap2", "kron"):
+                                    self.snr_rows_by_token_method.pop((ref.token, method), None)
+                                self.detect_png_by_token[ref.token] = _overlay_png_bytes(
+                                    raw_by_sample[sample_idx][band_idx],
+                                    rows,
+                                    draw_centers=self.shape_overlay_centers,
+                                )
+                                self.input_shape_png_by_token[ref.token] = _input_shape_overlay_png_bytes(
+                                    scaled_by_sample[sample_idx][band_idx],
+                                    rows,
+                                    scaling=self.scaling_mode,
+                                    clip_threshold=self.clip_threshold,
+                                    draw_centers=self.shape_overlay_centers,
+                                )
+                    except Exception as exc:
+                        chunk_ids = ", ".join(f"{tile_id}/slot{slot + 1}" for tile_id, slot, _ in chunk)
+                        message = f"detection failed for bands {bands} on {chunk_ids}: {type(exc).__name__}: {exc}"
+                        self.warnings.append(message)
+                        print(f"WARNING: {message}", flush=True)
+                        traceback.print_exc()
         total_images = 0
         total_detections = 0
         for tile_id, frame_slot in slots:
@@ -1708,7 +1810,7 @@ class BrowserState:
         self._detect_tile_slots(selected_slots, refs_by_key)
         manifest = []
         for ref in refs:
-            image = self.access.read_frame(ref)
+            image = self._raw_image_for_ref(ref)
             detection_image = self._detection_image_for_ref(ref)
             out_dir = self.export_dir / ref.tract / ref.patch / ref.band / ref.tile_id
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -1721,6 +1823,7 @@ class BrowserState:
             ap2_snr_png_path = out_dir / f"{stem}_ap2_snr_overlay.png"
             kron_snr_png_path = out_dir / f"{stem}_kron_snr_overlay.png"
             detect_csv_path = out_dir / f"{stem}_detections.csv"
+            mask_png_path = out_dir / f"{stem}_mask_overlay.png"
             if write_png:
                 Image.fromarray(display_gray(image), mode="L").convert("RGB").save(png_path)
             detect_rows = self.detect_rows_by_token.get(ref.token, [])
@@ -1736,6 +1839,8 @@ class BrowserState:
                 writer = csv.DictWriter(handle, fieldnames=fieldnames)
                 writer.writeheader()
                 writer.writerows(detect_rows)
+            if write_png and self.make_masks and ref.token in self.detect_rows_by_token:
+                mask_png_path.write_bytes(self.mask_png(ref.token))
             if write_png:
                 overlay = _overlay_uint8(detection_image, detect_rows, draw_centers=self.shape_overlay_centers)
                 _save_titled_png(
@@ -1779,6 +1884,7 @@ class BrowserState:
                 "ap2_snr_png_path": str(ap2_snr_png_path) if write_png else "",
                 "kron_snr_png_path": str(kron_snr_png_path) if write_png else "",
                 "detect_csv_path": str(detect_csv_path),
+                "mask_png_path": str(mask_png_path) if write_png and self.make_masks and ref.token in self.detect_rows_by_token else "",
                 "export_subdir": str(out_dir),
                 "n_detections": len(detect_rows),
             }

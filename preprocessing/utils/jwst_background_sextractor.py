@@ -30,7 +30,7 @@ class AggressiveSkyConfig:
     smoothing_sigma_pixels: tuple[float, ...] = (2., 10., 28.)
     thresholds_sigma: tuple[float, ...] = (1.8, 2.2, 2.7)
     minarea_native_pixels: tuple[int, ...] = (16, 32, 128)
-    grow_native_pixels: tuple[int, ...] = (12, 32, 64)
+    grow_native_pixels: tuple[int, ...] = (6, 16, 32) # (12, 32, 64) too aggressive
     min_valid_fraction: float = 0.5
     # SExtractor sees each already smoothed image and must not fit its broad
     # source wings away through a local background mesh.

@@ -136,7 +136,7 @@ def write_training_image_level_zarr(
     batch: ImageLevelTrainingBatch,
     *,
     overwrite: bool,
-    chunk_tiles: int = 16,
+    chunk_tiles: int = 20,
 ) -> Path:
     """Write zarr arrays consumed by ``discover_zarr_image_records``."""
 
@@ -176,6 +176,8 @@ def write_training_image_level_zarr(
     attrs["schema"] = "preprocessing_v3_image_level"
     attrs["image_level_training"] = True
     attrs["num_samples"] = n
+    attrs["chunk_tail_policy"] = "pool_pad_train"
+    attrs["chunk_tiles"] = int(chunk_tiles)
     attrs["segmentation_supervision"] = "positive_only" if seg_ids is not None else "none"
     if seg_ids is not None:
         attrs["segmentation_id_namespace"] = "cosmos_catalog_id"

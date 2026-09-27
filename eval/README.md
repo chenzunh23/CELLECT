@@ -297,3 +297,68 @@ script can be reused before noisy/denoised products are complete.
 
 For FITS input, scaling is built on the fly from the crop. For zarr input, the
 script reads the stored image tensor and visualizes exactly what training used.
+
+## COSMOS / Abell inference (2026-09-26)
+
+`visualize_cellect_outputs.py` accepts the registered final COSMOS products
+(1727 and 5893 separately) and Abell **half** coadds. No catalog-selection full
+coadd is used as inference pixels. Existing HSC/generic FITS arguments still work.
+Run from the CELLECT repository with the `cellect` environment.
+
+```bash
+PYTHON=/home/czh23/miniconda3/envs/cellect/bin/python
+CKPT=/path/to/epoch_011.pt  # run_config.json in the same directory, or pass --config
+
+# Cut a 512-square window from COSMOS; coordinates are zero-based lower-left origin.
+"$PYTHON" eval/visualize_cellect_outputs.py --checkpoint "$CKPT" \
+  --field cosmos --proposal 1727 --patch P0019 --band F444W \
+  --x0 8192 --y0 8192 --size 512
+
+# Abell coordinates are LOCAL to the named aligned 4096 parent.
+"$PYTHON" eval/visualize_cellect_outputs.py --checkpoint "$CKPT" \
+  --field abell --patch x+00_y+00 --band F115W --band F444W \
+  --x0 1792 --y0 1792
+
+# Instead of x0/y0, --sky-center RA DEC centers a FITS crop (ICRS degrees).
+# For DS9 image coordinates subtract one before passing zero-based coordinates.
+
+# Stored training inputs: no additional normalization or resampling.
+"$PYTHON" eval/visualize_cellect_outputs.py --checkpoint "$CKPT" \
+  --root /data/czh23/analysis/2026-09/2026-09-26/training_zarr_psfee_parent20_v2/zarr \
+  --dataset cosmos --proposal 1727 --patch P0019 --zarr-band F444W \
+  --zarr-xy 9000 9000
+
+# Direct store index works for old separate stamps and new packed parent stores.
+"$PYTHON" eval/visualize_cellect_outputs.py --checkpoint "$CKPT" \
+  --zarr-store /path/to/parent.zarr --sample-index 3 --zarr-band F444W
+```
+
+Zarr `--patch` accepts an exact parent name or COSMOS `P0019` to search all its
+parents. `--dataset abell --patch x+00_y+00` selects Abell; `--proposal 5893`
+selects the separate COSMOS exposure set. `--zarr-xy X Y` selects stored tiles
+containing that pixel; `--sky-center RA DEC` selects by WCS. Within a store,
+containing tiles are ordered by distance to their center, with stable ties;
+stores are traversed in sorted order. `--sample-index` selects among those
+matches; with a direct store and no filters it is the original stored index.
+Coordinates follow each store's `sky_wcs_header` and `tile_x0/y0`: full pointing
+pixels for ordinary COSMOS parents, parent-local for Abell. Older standalone
+centered stamps may have their own local WCS. Use sky coordinates to avoid this
+ambiguity. Failed selectors report an error instead of silently changing survey
+or proposal. Saved CSV/region/mask-FITS coordinates use that same WCS.
+
+FITS `--field` uses preprocessing's MJy/sr conversion and three-channel
+zscore/log/Lupton normalization, fitted on a 4096 parent (`clip=5`, `log_a=1000`).
+COSMOS assigns a window to the parent containing its center. Abell uses the
+selected aligned parent. Parameters are cached; the first crop of each parent
+requires fitting statistics. NaN filling of a standalone FITS crop can differ
+near invalid boundaries from a saved training window: use Zarr for exact
+training-input reproduction. A multi-band browser sample requires at least 90%
+common valid pixels, matching the existing NIRCam browser policy.
+
+Paths can be overridden with `--cosmos-root` (directory containing manifest.json)
+and `--abell-plan` (directory containing grid_plan.json and manifests/).
+Abell reads existing aligned `training_fits` first; if absent, it reads a bounded
+section of `original_training` and reprojects with preprocessing's common WCS.
+The original full-coadd file provides only the reference header in this fallback.
+Generic `--input` retains its original per-crop scaling; use `--field` for the
+training-compatible COSMOS/Abell route.

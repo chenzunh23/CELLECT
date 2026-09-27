@@ -539,3 +539,10 @@ img {
   .searchRow label, .searchRow button { grid-column: span 2; }
   .qualityMain { grid-template-columns: 1fr; }
 }
+
+#datasetDialog { width: min(560px, calc(100vw - 48px)); padding: 22px; border: 1px solid var(--line); border-radius: 12px; color: var(--text); background: var(--panel, white); }
+#datasetDialog::backdrop { background: rgba(0, 0, 0, .45); }
+.datasetDialogHeader { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 16px; }
+.datasetDialogHeader h2 { margin: 0; font-size: 20px; }
+.datasetChoices { display: grid; gap: 12px; }
+.datasetChoices .datasetCard { width: 100%; }

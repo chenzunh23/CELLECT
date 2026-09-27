@@ -42,6 +42,7 @@ from eval.datasets import (
     MessierAccess,
     ZtfAccess,
 )
+from eval.datasets.jwst_fields import CosmosAccess, AbellAccess, DEFAULT_COSMOS_ROOT, DEFAULT_ABELL_PLAN, JWST_DATASETS
 from eval.datasets.base import patch_sort_key
 from eval.hsctiles.browser_core import (
     ASSETS_DIR,
@@ -52,9 +53,24 @@ from eval.hsctiles.browser_core import (
     PAGES_DIR,
     _session_name,
     dataset_label,
+    make_access,
     load_html,
 )
 from eval.hsctiles.data_quality_preview import DataQualityPreview, DEFAULT_DATA_QUALITY_BANDS
+
+
+def _resolve_checkpoint_path(path: Path) -> Path:
+    path = Path(path).expanduser()
+    if not path.is_dir():
+        return path
+    best = path / "best.pt"
+    if best.exists():
+        return best
+    epochs = sorted(path.glob("epoch_*.pt"))
+    if epochs:
+        return epochs[-1]
+    return path
+
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "HscPackBrowser/1.0"
@@ -115,6 +131,7 @@ class Handler(BaseHTTPRequestHandler):
                     content_type = "text/html; charset=utf-8"
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", content_type)
+                self.send_header("Cache-Control", "no-store")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -212,6 +229,7 @@ class Handler(BaseHTTPRequestHandler):
                         return float(raw)
                     except Exception:
                         return None
+                image_started = time.perf_counter()
                 body = self.state.image_png(
                     token,
                     detect=detect,
@@ -219,6 +237,7 @@ class Handler(BaseHTTPRequestHandler):
                     input_shape=input_shape,
                     show_shape=show_shape,
                     show_center=show_center,
+                    show_masks=query.get("masks", ["0"])[0] in {"1", "true", "yes"},
                     smooth_mode=smooth_mode,
                     smooth_sigma=smooth_sigma,
                     smooth_radius=smooth_radius,
@@ -233,6 +252,9 @@ class Handler(BaseHTTPRequestHandler):
                     snr_method=query.get("snr_method", ["ap2"])[0],
                     snr_threshold=snr_threshold,
                 )
+                elapsed = time.perf_counter() - image_started
+                if elapsed >= 1:
+                    print(f"[image-png] token={token} total={elapsed:.2f}s input={input_image} masks={query.get('masks', ['0'])[0]}", flush=True)
                 self._send_bytes(body, "image/png")
             elif parsed.path.startswith("/tile_map/") and parsed.path.endswith(".png"):
                 patch = Path(parsed.path).name.removesuffix(".png")
@@ -283,7 +305,8 @@ class Handler(BaseHTTPRequestHandler):
                 )
             elif parsed.path == "/api/save_selection_csv":
                 path = self.state.write_selection_csv()
-                self._send_json({"selection_csv": str(path), "n_selected": len(self.state.selected)})
+                mask_paths = self.state.save_selected_masks()
+                self._send_json({"selection_csv": str(path), "n_selected": len(self.state.selected), "n_mask_images": len(mask_paths), "mask_paths": mask_paths})
             elif parsed.path == "/api/export":
                 result = self.state.export_selected(write_png=bool(payload.get("write_png", True)))
                 self._send_json(result)
@@ -452,24 +475,42 @@ class Server(ThreadingHTTPServer):
             "default_nms_radius": int(self.args.jwst_nms_radius),
             "nms_recommendation": "HSC 3, ZTF 2, JWST 2",
         }
+        for dataset_id in ("jwst_cosmos", "jwst_abell"):
+            reason = ""
+            try:
+                access = make_access(dataset_id, self.args, "default")
+                bands = access.available_bands()
+                patches = access.available_patches(bands)
+            except (OSError, ValueError, KeyError) as exc:
+                bands, patches, reason = [], [], str(exc)
+            defaults = [b for b in ("F115W", "F150W", "F277W", "F444W") if b in bands]
+            by_dataset[dataset_id] = dict(
+                id=dataset_id, label=dataset_label(dataset_id), enabled=bool(patches and bands),
+                reason=reason or ("" if patches else "not found"), tract="default",
+                bands=bands, patches=patches, default_bands=defaults or bands[:1],
+                default_patches=(["x+00_y+00"] if "x+00_y+00" in patches else patches[:1]),
+                default_n_tiles=int(self.args.jwst_n_tiles), default_frames_per_tile=1,
+                default_tiles_per_page=int(self.args.tiles_per_page), tile_size=int(self.args.jwst_tile_size),
+                default_nms_radius=int(self.args.jwst_nms_radius),
+                scaling="training parent RGB (4096)" if self.args.jwst_input_scaling == "training_parent" else self.args.scaling_mode)
         return {
             "dataset": str(self.args.dataset),
-            "datasets": [
-                {"id": "hsc_raw", "label": "HSC raw tiles", "enabled": True},
-                {"id": "sitian", "label": "Sitian", "enabled": bool(messier_patches)},
-                {"id": "hsc_image", "label": "HSC coadd/noisy/denoised", "enabled": bool(hsc_image_patches and hsc_image_bands), "reason": "" if bool(hsc_image_patches and hsc_image_bands) else "not found"},
-                {"id": "ztf", "label": "ZTF", "enabled": bool(ztf_patches and ztf_bands), "reason": "" if bool(ztf_patches and ztf_bands) else "not found"},
-                {"id": "jwst", "label": "JWST NIRCam", "enabled": bool(jwst_patches and jwst_bands), "reason": "" if bool(jwst_patches and jwst_bands) else "not found"},
-            ],
+            "datasets": [{k: d[k] for k in ("id", "label", "enabled", "reason") if k in d}
+                         for d in by_dataset.values()],
+            "dataset_groups": [
+                {"label": "HSC", "members": ["hsc_raw", "hsc_image"]},
+                {"label": "JWST NIRCam", "members": ["jwst", "jwst_cosmos", "jwst_abell"]},
+                {"label": "Sitian", "members": ["sitian"]},
+                {"label": "ZTF", "members": ["ztf"]}],
             "by_dataset": by_dataset,
         }
 
     def start_browser(self, payload: dict[str, Any]) -> None:
         dataset = str(payload.get("dataset") or self.args.dataset)
-        if dataset not in {"hsc_raw", "sitian", "hsc_image", "ztf", "jwst"}:
+        if dataset not in ({"hsc_raw", "sitian", "hsc_image", "ztf"} | JWST_DATASETS):
             raise NotImplementedError(f"{dataset_label(dataset)} is a placeholder")
         self.args.dataset = dataset
-        default_tract = self.args.ztf_field if dataset == "ztf" else ("default" if dataset == "jwst" else self.args.tract)
+        default_tract = self.args.ztf_field if dataset == "ztf" else ("default" if dataset in JWST_DATASETS else self.args.tract)
         tract = str(payload.get("tract") or default_tract)
         patches = [str(v) for v in payload.get("patches", []) if str(v)]
         bands = [str(v) for v in payload.get("bands", []) if str(v)]
@@ -478,6 +519,8 @@ class Server(ThreadingHTTPServer):
                 patches = [str(v) for v in self.args.messier_patches]
             elif dataset == "ztf":
                 patches = [str(v) for v in self.args.ztf_patches]
+            elif dataset in {"jwst_cosmos", "jwst_abell"}:
+                patches = make_access(dataset, self.args, "default").available_patches(bands or None)[:1]
             elif dataset == "jwst":
                 patches = [str(v) for v in self.args.jwst_patches]
                 if not patches:
@@ -504,13 +547,16 @@ class Server(ThreadingHTTPServer):
                 bands = ["default"]
             elif dataset == "ztf":
                 bands = [str(v) for v in self.args.ztf_bands]
+            elif dataset in {"jwst_cosmos", "jwst_abell"}:
+                available = make_access(dataset, self.args, "default").available_bands()
+                bands = [b for b in ("F115W", "F150W", "F277W", "F444W") if b in available] or available[:1]
             elif dataset == "jwst":
                 bands = [str(v) for v in self.args.jwst_bands]
             elif dataset == "hsc_image":
                 bands = [str(v) for v in DEFAULT_HSC_IMAGE_BANDS]
             else:
                 bands = [str(v) for v in self.args.bands]
-        tract = "default" if dataset in {"sitian", "jwst"} else tract
+        tract = "default" if dataset in ({"sitian"} | JWST_DATASETS) else tract
         all_tiles = bool(payload.get("all_tiles", False))
         n_tiles_raw = payload.get("n_tiles", None)
         n_tiles = None if n_tiles_raw in (None, "", 0) else int(n_tiles_raw)
@@ -545,7 +591,7 @@ def main() -> None:
     base = Path(__file__).resolve().parent
     stamp = time.strftime("%Y%m%d_%H%M%S")
     parser = argparse.ArgumentParser(description="Serve interactive CELLECT/SAM QC browser for multiple astronomy image datasets.")
-    parser.add_argument("--dataset", choices=("hsc_raw", "sitian", "hsc_image", "ztf", "jwst"), default="hsc_raw")
+    parser.add_argument("--dataset", choices=("hsc_raw", "sitian", "hsc_image", "ztf", "jwst", "jwst_cosmos", "jwst_abell"), default="hsc_raw")
     parser.add_argument("--root", "--data-root", dest="root", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--hsc-image-root", type=Path, default=DEFAULT_HSC_IMAGE_ROOT)
     parser.add_argument("--hsc-coadd-profile", choices=("half", "official", "custom"), default="half")
@@ -570,6 +616,16 @@ def main() -> None:
     parser.add_argument("--ztf-ccd", default="c03")
     parser.add_argument("--ztf-cut-origin-dir", type=Path, default=DEFAULT_ZTF_CUT_ORIGIN_DIR)
     parser.add_argument("--ztf-tile-size", type=int, choices=(256, 512), default=DEFAULT_ZTF_TILE_SIZE)
+    parser.add_argument("--cosmos-root", type=Path, default=DEFAULT_COSMOS_ROOT)
+    parser.add_argument("--abell-plan", type=Path, default=DEFAULT_ABELL_PLAN)
+    parser.add_argument("--image-workers", type=int, default=4, help="Concurrent CPU/FITS readers; also used to prepare detection batches. No additional GPU workers.")
+    parser.add_argument("--scaling-workers", type=int, default=2, help="Separate concurrency limit for expensive parent scaling; does not block raw thumbnails.")
+    parser.add_argument("--browser-cache-mb", type=int, default=128, help="Bounded cache of read pixels and scaled tensors; no fixed display scaling.")
+    parser.add_argument("--jwst-input-scaling", choices=("training_parent", "browser"), default="training_parent", help="COSMOS/Abell: parent RGB or the supplied --scaling-mode. View scaling is always adjustable.")
+    parser.add_argument("--make-masks", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--mask-chunk-size", type=int, default=32)
+    parser.add_argument("--mask-threshold", type=float, default=0.0)
+    parser.add_argument("--mask-box-scale", type=float, default=2.0)
     parser.add_argument("--jwst-root", type=Path, default=DEFAULT_JWST_NIRCAM_ROOT)
     parser.add_argument("--jwst-tile-size", type=int, default=DEFAULT_JWST_NIRCAM_TILE_SIZE)
     parser.add_argument("--tract", default="9813")
@@ -632,6 +688,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8788)
     parser.add_argument("--run-name", type=str, default=f"")
     args = parser.parse_args()
+    args.checkpoint = _resolve_checkpoint_path(args.checkpoint)
     if args.patches is None:
         args.patches = [args.patch]
     if args.messier_patches is None:

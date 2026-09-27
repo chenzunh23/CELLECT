@@ -92,7 +92,7 @@ from preprocessing.utils.image_level import (
 
 
 DEFAULT_BANDS = ("HSC-G", "HSC-R", "HSC-I", "HSC-Z", "HSC-Y", "NB0387", "NB0816", "NB0921", "NB1010")
-MASK_PLANES_FOR_STRICT_IGNORE = ("SAT", "BAD", "EDGE", "NO_DATA", "UNMASKEDNAN")
+MASK_PLANES_FOR_STRICT_IGNORE = ("SAT", "BAD", "NO_DATA", "UNMASKEDNAN")
 
 
 
@@ -332,6 +332,14 @@ def write_classified_patch(task: StoreTask, image: np.ndarray, labels: PatchLabe
         from preprocessing.utils.large_sources import valid_tile_specs
         valid_mask=np.isfinite(image) if valid_mask is None else valid_mask
         specs=valid_tile_specs(specs,valid_mask,origin,max_invalid_fraction)
+    dataset = input_source.dataset if input_source is not None else (provenance or {}).get('dataset')
+    if dataset in ('cosmos', 'abell'):
+        from preprocessing.utils.truncated_kron import filter_truncated_kron_tiles
+        specs, truncation_audit = filter_truncated_kron_tiles(labels, specs, origin)
+        provenance = {**(provenance or {}), 'truncated_kron_filter': truncation_audit}
+        audit_output = _store_output_path(task.output_root, task.patch, task.band, task.dataset_source, task.group)
+        audit_output.parent.mkdir(parents=True, exist_ok=True)
+        Path(str(audit_output) + '_tile_filter.json').write_text(json.dumps(truncation_audit, indent=2))
     if task.max_tiles > 0:
         specs = specs[: int(task.max_tiles)]
     n = len(specs)
@@ -811,7 +819,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--groups", nargs="*", default=["all"])
     parser.add_argument("--tile-size", type=int, default=512)
     parser.add_argument("--stride", type=int, default=368)
-    parser.add_argument("--chunk-tiles", type=int, default=16)
+    parser.add_argument("--chunk-tiles", type=int, default=20)
     parser.add_argument("--max-tiles", type=int, default=0, help="debug limit per output store; 0 means all tiles")
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--overwrite", action="store_true")

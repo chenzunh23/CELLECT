@@ -60,8 +60,15 @@ def parse_args() -> argparse.Namespace:
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--input", type=Path, action="append", help="Input FITS file. Repeat for multiple bands.")
     src.add_argument("--zarr-store", type=Path, help="Direct-zarr store to visualize.")
+    src.add_argument("--field", choices=("cosmos", "abell"), help="Crop the registered half/final coadd; select --patch and --band.")
     src.add_argument("--root", type=Path, help="Direct-zarr root used to select coadd/noisy/denoised samples.")
     p.add_argument("--band", action="append", default=None, help="Band labels for FITS input; repeat with --input.")
+    p.add_argument("--dataset", choices=("auto", "cosmos", "abell", "hsc"), default="auto", help="Filter a mixed Zarr root by survey.")
+    p.add_argument("--proposal", type=int, choices=(1727, 5893), default=None)
+    p.add_argument("--cosmos-root", type=Path, default=Path("/data/czh23/JWST/COSMOS_1727_5893"))
+    p.add_argument("--abell-plan", type=Path, default=Path("/data/czh23/JWST/Abell2744_preprocessing"))
+    p.add_argument("--zarr-xy", type=float, nargs=2, metavar=("X", "Y"), help="Select a stored tile containing zero-based grid coordinates; --sample-index selects among matches.")
+    p.add_argument("--sky-center", type=float, nargs=2, metavar=("RA", "DEC"), help="Degrees ICRS: center a FITS crop, or select a containing Zarr tile.")
     p.add_argument("--sample-index", type=int, default=0)
     p.add_argument("--zarr-band", default=None, help="Band inside zarr store.")
     p.add_argument("--patch", default=None)
@@ -184,6 +191,9 @@ def _input_overlay_channel(scaled: np.ndarray, scaling: str) -> tuple[int, np.nd
 
 def _visual_options(args: argparse.Namespace) -> dict[str, object]:
     return {
+        "source": {"field": args.field, "dataset": args.dataset, "proposal": args.proposal,
+                   "root": str(args.root), "store": str(args.zarr_store), "input": str(args.input),
+                   "cosmos_root": str(args.cosmos_root), "abell_plan": str(args.abell_plan)},
         "shape_overlay_centers": bool(args.shape_overlay_centers),
         "input_shape_overlay": bool(args.input_shape_overlay),
         "inverse_shape_overlay": bool(args.inverse_shape_overlay),
@@ -229,17 +239,33 @@ def _band_outputs_current(band_dir: Path, band: str, options: dict[str, object])
 
 def _prepare_from_zarr(args: argparse.Namespace, dataset_source: str | None = None):
     effective_group = None if dataset_source == "coadd" else args.group
-    reader, sample_idx, band_idx, attrs = resolve_zarr_sample(
-        zarr_store=args.zarr_store.expanduser().resolve() if args.zarr_store else None,
-        sample_index=int(args.sample_index),
-        root=args.root.expanduser().resolve() if args.root else None,
-        patch=args.patch,
-        tile_name=args.tile_name,
-        band=args.zarr_band,
-        dataset_source=dataset_source,
-        group=effective_group,
-        image_level=bool(args.image_level),
-    )
+    from eval.datasets.jwst_zarr import resolve_field_zarr, zarr_header
+    if args.dataset != "auto" or args.proposal is not None or args.zarr_xy or args.sky_center:
+        reader, sample_idx, band_idx, attrs = resolve_field_zarr(
+            root=args.root, zarr_store=args.zarr_store, sample_index=args.sample_index,
+            band=args.zarr_band, dataset=args.dataset, proposal=args.proposal,
+            patch=args.patch, tile_name=args.tile_name, xy=args.zarr_xy,
+            radec=args.sky_center, dataset_source=dataset_source, group=effective_group)
+    else:
+        reader, sample_idx, band_idx, attrs = resolve_zarr_sample(
+            zarr_store=args.zarr_store.expanduser().resolve() if args.zarr_store else None,
+            sample_index=int(args.sample_index),
+            root=args.root.expanduser().resolve() if args.root else None,
+            patch=args.patch,
+            tile_name=args.tile_name,
+            band=args.zarr_band,
+            dataset_source=dataset_source,
+            group=effective_group,
+            image_level=bool(args.image_level),
+        )
+    if sample_idx < 0 or sample_idx >= reader.meta("images").shape[0]:
+        raise IndexError(f"sample-index outside store: {sample_idx}")
+    if args.zarr_band:
+        requested = args.zarr_band.upper()
+        found = [i for i, b in enumerate(attrs.get("bands", [])) if str(b).upper() == requested]
+        if not found:
+            raise ValueError(f"Band {args.zarr_band} not present in {reader.root}")
+        band_idx = found[0]
     sample = read_zarr_sample(reader, sample_idx, band_idx)
     image = np.asarray(sample["image"], dtype=np.float32)
     if image.ndim == 2:
@@ -284,6 +310,7 @@ def _prepare_from_zarr(args: argparse.Namespace, dataset_source: str | None = No
         root=args.root.expanduser().resolve() if args.root else None,
         store=args.zarr_store.expanduser().resolve() if args.zarr_store else None,
     )
+    patch_label = f"{attrs.get('dataset', 'data')}_{attrs.get('proposal') or ''}_{patch_label}"
     stem = f"{patch_label}_{tile_name}_{scaling_label}_{ckpt_root}_epoch{epoch_num}"
     x0 = int(reader.read_full_small("tile_x0")[sample_idx]) if reader.has_array("tile_x0") else 0
     y0 = int(reader.read_full_small("tile_y0")[sample_idx]) if reader.has_array("tile_y0") else 0
@@ -297,7 +324,36 @@ def _prepare_from_zarr(args: argparse.Namespace, dataset_source: str | None = No
         "scaling": scaling_label,
         "clip_threshold": zarr_clip_threshold,
     }
-    return tensor, [display], [image], [None], [str(band)], stem, [x0], [y0], context
+    return tensor, [display], [image], [zarr_header(attrs)], [str(band)], stem, [x0], [y0], context
+
+
+def _prepare_from_field(args):
+    from eval.datasets.jwst_fields import CosmosAccess, AbellAccess
+    from astropy.wcs import WCS
+    if not args.patch or not args.band:
+        raise ValueError("--field requires --patch and at least one --band")
+    if args.field == 'cosmos':
+        access = CosmosAccess(args.cosmos_root)
+        patch = args.patch
+        if not patch.startswith('p1727_') and not patch.startswith('p5893_'):
+            if args.proposal is None:
+                raise ValueError("COSMOS --field requires --proposal 1727/5893 or a namespaced --patch p1727_P0019")
+            patch = f'p{args.proposal}_P{int(patch.upper().removeprefix("P")):04d}'
+    else:
+        if args.proposal is not None:
+            raise ValueError("Abell does not take --proposal")
+        access, patch = AbellAccess(args.abell_plan), args.patch
+    args.scaling_mode, args.clip_threshold, args.log_a = "zscore-log-lupton-rgb", 5.0, 1000.0
+    width, height = int(args.width or args.size), int(args.height or args.size)
+    x, y = args.x0, args.y0
+    if args.sky_center:
+        cx, cy = WCS(access.grid_header(args.band[0], patch)).celestial.world_to_pixel_values(*args.sky_center)
+        x, y = int(round(float(cx)-(width-1)/2)), int(round(float(cy)-(height-1)/2))
+    rows = [access.scaled_window(band, patch, x, y, width, height) for band in args.band]
+    raw, scaled, headers = [r[0] for r in rows], [r[1] for r in rows], [r[2] for r in rows]
+    tensor = torch.from_numpy(np.stack(scaled)[None])
+    stem = f'{args.field}_{patch}_x{x}_y{y}_parent-rgb_{args.checkpoint.parent.name}_{args.checkpoint.stem}'
+    return tensor, raw, scaled, headers, [b.upper() for b in args.band], stem, [x]*len(rows), [y]*len(rows), None
 
 
 def _prepare_from_fits(args: argparse.Namespace):
@@ -332,7 +388,9 @@ def _prepare_from_fits(args: argparse.Namespace):
 def _run_one(args: argparse.Namespace, dataset_source: str | None = None) -> Path:
     width = int(args.width or args.size)
     height = int(args.height or args.size)
-    if args.input:
+    if args.field:
+        tensor, raw_images, scaled_images, headers, bands, stem, image_x0, image_y0, zarr_context = _prepare_from_field(args)
+    elif args.input:
         tensor, raw_images, scaled_images, headers, bands, stem, image_x0, image_y0, zarr_context = _prepare_from_fits(args)
     else:
         tensor, raw_images, scaled_images, headers, bands, stem, image_x0, image_y0, zarr_context = _prepare_from_zarr(args, dataset_source)
@@ -506,7 +564,11 @@ def _run_one(args: argparse.Namespace, dataset_source: str | None = None) -> Pat
 
 def main() -> int:
     args = parse_args()
-    if args.input or args.zarr_store:
+    if args.input and (args.sky_center or args.zarr_xy or args.dataset != 'auto' or args.proposal is not None):
+        raise ValueError("Use --field for registered JWST sky coordinates/parent scaling; generic --input uses --x0/--y0.")
+    if args.field and args.zarr_xy:
+        raise ValueError("--zarr-xy is only for Zarr input; use --x0/--y0 or --sky-center with --field")
+    if args.input or args.zarr_store or args.field:
         if args.dataset_source:
             raise ValueError("--dataset-source is only used with --root")
         out_dirs = [_run_one(args, None)]

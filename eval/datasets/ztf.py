@@ -11,6 +11,7 @@ import numpy as np
 from astropy.io import fits
 
 from .base import FrameRef, TileRow
+from .intensity import header_float, hsc_intensity_frame
 
 
 DEFAULT_ZTF_ROOT = Path("/data/shared/ZTF/quadrants")
@@ -426,17 +427,41 @@ class ZtfAccess:
         )
         return out
 
+    def _prepare_frame(self, image: np.ndarray, header: Any) -> np.ndarray:
+        zeropoint = header_float(header, ("MAGZP", "MAGZPAVG", "ZP", "ZEROPOINT"))
+        if zeropoint is None:
+            return hsc_intensity_frame(image, header, input_unit="native", nan_policy="hybrid")
+        try:
+            return hsc_intensity_frame(
+                image,
+                header,
+                input_unit="zp-flux",
+                input_zeropoint=zeropoint,
+                nan_policy="hybrid",
+            )
+        except Exception:
+            return hsc_intensity_frame(
+                image,
+                header,
+                input_unit="zp-flux",
+                pixel_scale_arcsec=self.pixel_scale_arcsec,
+                input_zeropoint=zeropoint,
+                nan_policy="hybrid",
+            )
+
     def read_frame(self, ref: FrameRef) -> np.ndarray:
         with fits.open(Path(ref.pack_path), memmap=True) as hdul:
             data = hdul[0].data
             if data is None:
                 raise ValueError(f"no image in primary HDU: {ref.pack_path}")
+            header = hdul[0].header.copy()
             origin = self._cut_origin_for_path(Path(ref.pack_path), ref.patch)
             if origin is not None:
-                return self._read_aligned_frame(ref, np.asarray(data), origin)
+                return self._prepare_frame(self._read_aligned_frame(ref, np.asarray(data), origin), header)
             if self._load_cut_origins(ref.patch):
                 raise KeyError(f"ZTF cut-origin row not found for {ref.pack_path}")
-            return np.array(data[int(ref.y0) : int(ref.y1), int(ref.x0) : int(ref.x1)], dtype=np.float32, copy=True)
+            crop = np.array(data[int(ref.y0) : int(ref.y1), int(ref.x0) : int(ref.x1)], dtype=np.float32, copy=True)
+            return self._prepare_frame(crop, header)
 
     def manifest(self, patch: str) -> dict[str, Any]:
         rows = []

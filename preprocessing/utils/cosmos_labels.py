@@ -54,7 +54,12 @@ def classify_window(raw, header, catalog, catalog_path, gaia, background, band):
         config=JWSTBrightConfig('cosmos',scale,PSF_FWHM_ARCSEC[band],gaia_reference_epoch=2016.))
     dense = fill_dense_regions(tab, bright.labels, raw.shape, geometry=geom,
                               background_mask=background, quality_ignore_mask=~np.isfinite(raw))
+    from .truncated_kron import large_kron_geometry
+    raw_large=large_kron_geometry(catalog['id'],x,y,
+        np.asarray(catalog['kron2_a'],float)/scale,np.asarray(catalog['kron2_b'],float)/scale,
+        np.deg2rad(np.asarray(catalog['theta_world'],float)))
     return PatchLabels(tab,dense,bright.labels.source_class.copy(),geom.x,geom.y,geom.major,geom.minor,
         geom.theta,np.asarray(tab['id'],np.int64),bright.strict_center_x,bright.strict_center_y,
         bright.strict_center_source_id,
-        strict_is_gaia=np.array(['gaia' in str(r) for r in bright.strict_center_reason],bool))
+        strict_is_gaia=np.array(['gaia' in str(r) for r in bright.strict_center_reason],bool),
+        truncation_geometry=raw_large)

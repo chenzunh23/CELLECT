@@ -126,13 +126,16 @@ def cosmos_parent(args,row):
         source_catalog=str(catalog_path),background_method='precomputed aggressive SExtractor',
         background_manifest=row['background'],scaling_statistics='4096 training parent',
         label_window=[ox,oy,ox+size,oy+size],sample_kind='grid')
+    from .utils.parent_zarr import ParentStoreAssembly
+    assembly=ParentStoreAssembly(task,audit/"_parts")
+    part_task=assembly.task(task)
     outputs=[];grid_samples=0
     if not args.large_only:
         specs=[TileSpec(f'x{x}_y{y}',x,y,512) for y in range(py,py+4096,512) for x in range(px,px+4096,512)]
-        result=write_classified_patch(task,prep.image,labels,origin=(ox,oy),tile_specs=specs,valid_mask=valid,
+        result=write_classified_patch(part_task,prep.image,labels,origin=(ox,oy),tile_specs=specs,valid_mask=valid,
             max_invalid_fraction=args.jwst_max_invalid_fraction,scaled_image_chw=apply_parent_rgb(prep.image,params),
             cosmos_catalog=catalog_path,image_wcs=WCS(header_info(source.image_fits)[0]).celestial,provenance=provenance)
-        if result.get('output'):outputs.append(result['output'])
+        assembly.add(result)
         grid_samples=result['samples']
     owned=(labels.geom_x>=halo)&(labels.geom_x<halo+4096)&(labels.geom_y>=halo)&(labels.geom_y<halo+4096)
     specs=large_source_specs(labels,'cosmos',origin=(ox,oy),selected=owned)
@@ -148,7 +151,7 @@ def cosmos_parent(args,row):
         if np.count_nonzero(valid[1792:2304,1792:2304])<(1-args.jwst_max_invalid_fraction)*512**2:continue
         sky,bgmeta=cosmos_region(row['background'],source.image_fits,cx,cy,4096,4096)
         lab=classify_window(raw,ch,catalog,catalog_path,gaia,sky,source.band)
-        stask=replace(task,patch=patch+'_'+spec.name.split('_')[1])
+        stask=replace(part_task,patch=patch+'_'+spec.name.split('_')[1])
         metadata={**provenance,'sample_kind':'large_source','stamp_bounds':[spec.x0,spec.y0,spec.x1,spec.y1],
             'label_window':[cx,cy,cx+4096,cy+4096], 'labels_generated_independently':True,
             'background_tiles':cosmos_region(row['background'],source.image_fits,spec.x0,spec.y0,512,512)[1],
@@ -158,12 +161,18 @@ def cosmos_parent(args,row):
             max_invalid_fraction=args.jwst_max_invalid_fraction,scaled_image_chw=apply_parent_rgb(prepared.image,params),
             cosmos_catalog=catalog_path,image_wcs=WCS(header_info(source.image_fits)[0]).celestial,provenance=metadata)
         if result.get('output'):
-            outputs.append(result['output'])
+            assembly.add(result)
             info=dict(name=spec.name,output=result['output'],bounds=metadata['stamp_bounds'],background=metadata['background_tiles'])
             if args.diagnostic_dir:
                 diagnostic(args,row['name'],raw,lab,spec,(cx,cy),task,source,info)
             rows.append(info)
         del raw,valid,sky,lab,prepared;gc.collect()
+    output=assembly.finish()
+    outputs=[output] if output else []
+    for j,info in enumerate(rows):
+        info.update(output=output,sample_index=grid_samples+j)
+        if args.diagnostic_dir:
+            (Path(args.diagnostic_dir)/f"{row['name']}_{info['name']}.json").write_text(json.dumps(info,indent=2))
     (audit/'large_sources.json').write_text(json.dumps(rows,indent=2))
     return dict(status='complete',grid_samples=grid_samples,large_samples=len(rows),outputs=outputs)
 
@@ -224,10 +233,16 @@ def hsc_job(args,row):
     measure_psf(reference,psfpath)
     task=replace(task,confidence_config_path=str(psfpath))
     labels=_classify_patch(task,image,header,origin,reference,background_override=sky)
-    valid=np.isfinite(image)&~_read_fits_quality_mask(path,image.shape)
-    return write_classified_patch(task,image,labels,origin,valid_mask=valid,max_invalid_fraction=.10,
+    from .utils.hsc_quality import hsc_training_tile_quality
+    specs=make_tile_specs(parent_origin=origin,image_shape=(image.shape[1],image.shape[0]),
+                         tile_size=512,stride=368,compare_origin=None)
+    valid,specs,quality_audit=hsc_training_tile_quality(path,image,origin,specs)
+    audit=root/'audit'/row['name'];audit.mkdir(parents=True,exist_ok=True)
+    (audit/'tile_quality.json').write_text(json.dumps(quality_audit,indent=2))
+    return write_classified_patch(task,image,labels,origin,tile_specs=specs,valid_mask=valid,max_invalid_fraction=.10,
         provenance=dict(dataset='hsc',image_fits=str(path),reference_fits=str(reference),
             background_mask=str(bgpath),background_method='aggressive SExtractor on matching training input',
+            hsc_quality_policy='0827_bad_score_edge0p1',hsc_bad_score_threshold=.13,
             split_group=f'HSC_{args.tract}_{patch}'))
 
 
@@ -279,7 +294,7 @@ def run_job(args,row):
         if row['kind']=='hsc_noisy':
             paths.append(str(Path(args.background_root)/'hsc/noisy'/row['band']/row['patch']/Path(row['source']).stem/'background_mask.npz'))
     stamps=[dict(path=str(Path(p).resolve()),bytes=Path(p).stat().st_size,mtime_ns=Path(p).stat().st_mtime_ns) for p in paths if p]
-    signature=dict(job=row,inputs=stamps,code=digest.hexdigest(),max_tiles=args.max_tiles,large_only=args.large_only,
+    signature=dict(job=row,inputs=stamps,code=digest.hexdigest(),chunk_tiles=args.chunk_tiles,parent_packed_stamps=True,max_tiles=args.max_tiles,large_only=args.large_only,
         cross_boundary_only=args.cross_boundary_only,large_limit=args.large_limit,
         max_invalid_fraction=args.jwst_max_invalid_fraction)
     if receipt.exists() and not args.overwrite:

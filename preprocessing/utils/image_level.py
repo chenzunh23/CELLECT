@@ -12,7 +12,7 @@ from preprocessing.image_processing import read_background_mask, ImageProcessing
 from preprocessing.labels import LabelWeights, SourceClass
 from preprocessing.utils.geometry import paint_ellipse
 
-MASK_PLANES_FOR_STRICT_IGNORE = ("SAT", "BAD", "EDGE", "NO_DATA", "UNMASKEDNAN")
+MASK_PLANES_FOR_STRICT_IGNORE = ("SAT", "BAD", "NO_DATA", "UNMASKEDNAN")
 
 
 @dataclass(frozen=True)
@@ -88,6 +88,7 @@ class PatchLabels:
     strict_is_gaia: np.ndarray | None = None
     segmentation_policy: dict | None = None
     segmentation_overlap_masks: list[dict] | None = None
+    truncation_geometry: dict | None = None  # Raw large Krons, including off-window centers.
 
 
 def attach_cosmos_segmentation(labels: PatchLabels, wcs, catalog_path, *,

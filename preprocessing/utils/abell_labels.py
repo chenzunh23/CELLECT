@@ -85,4 +85,9 @@ def classify_reference(reference, header, catalog, gaia, background, band, *, tr
     labels=PatchLabels(table,dense,result.labels.source_class.copy(),geom.x,geom.y,geom.major,geom.minor,
         geom.theta,np.asarray(table['NUMBER'],np.int64),result.strict_center_x,result.strict_center_y,result.strict_center_source_id,
         strict_is_gaia=np.array(['gaia' in str(reason) for reason in result.strict_center_reason],bool))
+    from .truncated_kron import large_kron_geometry
+    labels.truncation_geometry=large_kron_geometry(catalog['NUMBER'],x,y,
+        np.asarray(catalog['KRON_RADIUS']*catalog['A_IMAGE'],float),
+        np.asarray(catalog['KRON_RADIUS']*catalog['B_IMAGE'],float),
+        np.deg2rad(np.asarray(catalog['THETA_IMAGE'],float)))
     return labels,dict(sources=len(table),classes={str(k):int(v) for k,v in zip(*np.unique(labels.label_classes,return_counts=True))})
