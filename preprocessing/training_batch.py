@@ -218,7 +218,14 @@ def hsc_job(args,row):
     task=task_for(args,output_root=root/'zarr'/'hsc',coadd_fits_root=Path(args.data_root),
         denoised_fits_root=Path(args.hsc_products_root),band=band,patch=patch,group=row['group'],dataset_source=source_kind)
     image,header,origin=_read_image_header_origin(path)
-    if source_kind=='half_coadd':
+    background_method=getattr(args,'hsc_background_method','sextractor')
+    if background_method=='lsst':
+        from .utils.hsc_background import resolve_lsst_background,read_lsst_background
+        bgpath,bgreceipt=resolve_lsst_background(args.variant_lsst_background_root,row,args.tract)
+        sky=read_lsst_background(bgpath,image.shape,origin,bgreceipt) & np.isfinite(image)
+    elif background_method!='sextractor':
+        raise ValueError(f'Unknown HSC background method: {background_method}')
+    elif source_kind=='half_coadd':
         dest=root/'background'/'hsc_half'/band/patch/path.stem/'background_mask.npz'
         sky=aggressive_sextractor_background(image,header,dest,source=str(path),
             config=AggressiveSkyConfig(thresholds_sigma=(2.5,3.,3.5),grow_native_pixels=(4,10,20)),
@@ -241,7 +248,10 @@ def hsc_job(args,row):
     (audit/'tile_quality.json').write_text(json.dumps(quality_audit,indent=2))
     return write_classified_patch(task,image,labels,origin,tile_specs=specs,valid_mask=valid,max_invalid_fraction=.10,
         provenance=dict(dataset='hsc',image_fits=str(path),reference_fits=str(reference),
-            background_mask=str(bgpath),background_method='aggressive SExtractor on matching training input',
+            background_mask=str(bgpath),
+            background_method=('LSST on matching training input' if background_method=='lsst'
+                               else 'aggressive SExtractor on matching training input'),
+            hsc_background_method=background_method,
             hsc_quality_policy='0827_bad_score_edge0p1',hsc_bad_score_threshold=.13,
             split_group=f'HSC_{args.tract}_{patch}'))
 
@@ -291,12 +301,19 @@ def run_job(args,row):
         paths=[row['source'],str(_coadd_image_path(Path(args.data_root),row['band'],args.tract,row['patch'])),
                str(_refit_csv_path(Path(args.refit_root),args.tract,row['band'],row['patch'])),
                str(_band_catalog_path(Path(args.data_root),row['band'],args.tract,row['patch'])),args.gaia_fits]
-        if row['kind']=='hsc_noisy':
+        if getattr(args,'hsc_background_method','sextractor')=='lsst':
+            from .utils.hsc_background import resolve_lsst_background
+            bgpath,bgreceipt=resolve_lsst_background(args.variant_lsst_background_root,row,args.tract)
+            paths.append(str(bgpath))
+            if bgreceipt is not None:paths.append(str(bgreceipt))
+        elif row['kind']=='hsc_noisy':
             paths.append(str(Path(args.background_root)/'hsc/noisy'/row['band']/row['patch']/Path(row['source']).stem/'background_mask.npz'))
     stamps=[dict(path=str(Path(p).resolve()),bytes=Path(p).stat().st_size,mtime_ns=Path(p).stat().st_mtime_ns) for p in paths if p]
     signature=dict(job=row,inputs=stamps,code=digest.hexdigest(),chunk_tiles=args.chunk_tiles,parent_packed_stamps=True,max_tiles=args.max_tiles,large_only=args.large_only,
         cross_boundary_only=args.cross_boundary_only,large_limit=args.large_limit,
         max_invalid_fraction=args.jwst_max_invalid_fraction)
+    if row['kind'] in ('hsc_half','hsc_noisy'):
+        signature['hsc_background_method']=getattr(args,'hsc_background_method','sextractor')
     if receipt.exists() and not args.overwrite:
         previous=json.loads(receipt.read_text())
         if previous.get('signature')==signature and all(Path(p).exists() and Path(p+'_manifest.json').exists() for p in previous['result'].get('outputs',[])):

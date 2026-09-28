@@ -693,7 +693,6 @@ def classify_component_bright(
                 comp > 0
                 and cluster_is_source_isolated
                 and not component_is_singleton_cluster
-                and not source_region_fully_inside_component(sources[cluster[0]], component_labels, comp)
             )
             if not cluster_finalized and cluster_is_singleton_source and (
                 singleton_component_isolated
@@ -710,7 +709,9 @@ def classify_component_bright(
                 if comp <= 0:
                     comp_area = int(round(float(only.get("area", 0.0))))
                 size_area = max(float(comp_area), float(only.get("area", 0.0)))
-                source_fully_inside_component = comp > 0 and source_region_fully_inside_component(only, component_labels, comp)
+                # A source can be entirely inside its own bright isophote.
+                # Containment in this image mask is not evidence of an
+                # unreliable source or shape, including in bridged components.
                 blendedness = source_blendedness(only)
                 high_blendedness = math.isfinite(blendedness) and blendedness > float(config.blendedness_ignore_threshold)
                 if high_blendedness and size_area < config.isolated_area_max:
@@ -741,19 +742,11 @@ def classify_component_bright(
                     cluster_finalized = True
                 elif bridged_component_isolated_source and only_shape_ok:
                     only["final_label"] = "center_only_external"
-                    only["reason"] = "isolated_cluster_partial_bright_component_center_only"
+                    only["reason"] = "isolated_cluster_in_bright_component_weak_shape"
                     cluster_finalized = True
                 elif size_area < config.isolated_area_max and only_shape_ok:
                     only["final_label"] = "clean"
                     only["reason"] = "isolated_small_bright_source_clean" if comp <= 0 else "single_cluster_small_bright_component_clean"
-                    cluster_finalized = True
-                elif source_fully_inside_component:
-                    only["final_label"] = "ignore"
-                    if size_area < config.isolated_area_max:
-                        only["reason"] = "isolated_small_source_fully_inside_bright_component_ignore"
-                        only["paint_ordinary_ignore"] = True
-                    else:
-                        only["reason"] = "isolated_large_source_fully_inside_bright_component_ignore"
                     cluster_finalized = True
                 elif only_shape_ok:
                     only["final_label"] = "center_only_external"

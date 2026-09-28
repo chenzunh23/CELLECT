@@ -736,6 +736,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument('--plan-only', action='store_true')
     parser.add_argument('--background-root', default='/data/czh23/analysis/2026-09/2026-09-25/batch_aggressive_background')
     parser.add_argument('--hsc-products-root', default='/data/czh23/Subaru_products')
+    parser.add_argument('--hsc-background-method', choices=['sextractor', 'lsst'], default='sextractor',
+                        help='For --training-batch HSC half/noisy only: use SExtractor or matching LSST masks from --variant-lsst-background-root. JWST continues to use its SExtractor masks.')
     parser.add_argument('--training-kinds', nargs='+', choices=['hsc_half','hsc_noisy','cosmos','abell'], default=['hsc_half','hsc_noisy','cosmos','abell'])
     parser.add_argument('--job-limit', type=int, default=0, help='Pilot job limit; 0 means all')
     parser.add_argument('--large-only', action='store_true', help='Pilot: write centered large sources without ordinary grid')
@@ -831,9 +833,9 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="patch keeps image scaling consistent with full-patch bright labels; tile reproduces old direct-zarr local scaling for diagnostics.",
     )
     parser.add_argument("--bright-mask-mode", default="log-lupton")
-    parser.add_argument("--bright-threshold", type=float, default=2.99)
+    parser.add_argument("--bright-threshold", type=float, default=4.99)
     parser.add_argument("--bright-dilation", type=int, default=2)
-    parser.add_argument("--clip-threshold", type=float, default=3.0, help="Clip image after scaling.")
+    parser.add_argument("--clip-threshold", type=float, default=5.0, help="Clip image after scaling.")
     parser.add_argument("--log-a", type=float, default=float("nan"), help="Compatibility override for both --image-log-a and --bright-log-a.")
     parser.add_argument("--image-log-a", type=float, default=float("nan"), help="Log exponent for the RGB image written to zarr; default is per-band broad=1000, NB1010=100, NB0387=3000.")
     parser.add_argument("--bright-log-a", type=float, default=float("nan"), help="Log exponent for bright-region labels; default is broad=1000, NB1010=100, NB0387=3000.")
