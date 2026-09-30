@@ -18,8 +18,13 @@ def read_instance_targets(reader, sample, band_pu, image):
         if reader.has_array('band_valid_mask')
         else torch.isfinite(image).all(dim=1) if image.ndim == 4 else torch.isfinite(image)
     )
-    method = str(reader.attrs.get('background_method', '')).lower()
-    trusted = (band_pu == 4) & valid if 'sextractor' in method else torch.zeros_like(valid)
+    # Both pipelines write their accepted background into dense class 4.
+    # The backend controls how it was measured, not whether SAM may use it.
+    # Keep unknown provenance opt-out for old stores with ambiguous labels.
+    methods = ' '.join(str(reader.attrs.get(k, '')).lower() for k in (
+        'background_method', 'training_background', 'hsc_background_method'))
+    trusted_backend = 'sextractor' in methods or 'lsst' in methods
+    trusted = (band_pu == 4) & valid if trusted_backend else torch.zeros_like(valid)
     result = [[] for _ in range(bands)]
     if not reader.has_array('band_segmentation_ids'):
         return result, valid, trusted

@@ -483,6 +483,7 @@ def draw_points(
     rows: Sequence[dict[str, float]],
     *,
     color: str | None = None,
+    background_rgb: np.ndarray | None = None,
 ) -> np.ndarray:
     import matplotlib
 
@@ -491,7 +492,8 @@ def draw_points(
     from matplotlib.backends.backend_agg import FigureCanvasAgg
 
     fig, ax = plt.subplots(figsize=(image.shape[1] / 100.0, image.shape[0] / 100.0), dpi=100)
-    ax.imshow(zscale_gray(image), origin="lower", cmap="gray", vmin=0.0, vmax=1.0, interpolation="nearest")
+    ax.imshow(zscale_gray(image) if background_rgb is None else background_rgb,
+              origin="lower", cmap="gray", vmin=0.0, vmax=1.0, interpolation="nearest")
     for row in rows:
         row_color = color or SOURCE_CLASS_COLORS.get(int(row.get("class_id", 1)), "yellow")
         ax.plot(float(row["x"]), float(row["y"]), marker="+", color=row_color, markersize=4.0, mew=1.0)
@@ -506,8 +508,9 @@ def draw_points(
     return np.flipud(rgba[..., :3]).astype(np.float32) / 255.0
 
 
-def label_mask_overlay(image: np.ndarray, pu_class: np.ndarray, *, alpha: float = 0.36) -> np.ndarray:
-    rgb = zscale_rgb(image)
+def label_mask_overlay(image: np.ndarray, pu_class: np.ndarray, *, alpha: float = 0.36,
+                       background_rgb: np.ndarray | None = None) -> np.ndarray:
+    rgb = zscale_rgb(image) if background_rgb is None else np.array(background_rgb, dtype=np.float32, copy=True)
     # The zarr target stores one mutually-exclusive class id per pixel. This
     # visualization intentionally does not reconstruct labels from component
     # masks or impose any extra priority beyond those stored class ids.
@@ -524,8 +527,9 @@ def label_mask_overlay(image: np.ndarray, pu_class: np.ndarray, *, alpha: float 
     return rgb
 
 
-def confidence_overlay(image: np.ndarray, confidence: np.ndarray, *, alpha: float = 0.72) -> np.ndarray:
-    rgb = zscale_rgb(image)
+def confidence_overlay(image: np.ndarray, confidence: np.ndarray, *, alpha: float = 0.72,
+                       background_rgb: np.ndarray | None = None) -> np.ndarray:
+    rgb = zscale_rgb(image) if background_rgb is None else np.array(background_rgb, dtype=np.float32, copy=True)
     for level in (1, 2, 3, 4, 5, 6, 7):
         alpha_blend(rgb, np.asarray(confidence) == level, CONF_COLORS[level], alpha)
     return rgb

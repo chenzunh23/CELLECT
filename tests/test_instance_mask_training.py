@@ -52,7 +52,7 @@ def test_area_lower_has_gradient_below_old_clamp_and_bounds():
     with unittest.TestCase().assertRaises(ValueError):area_ratio_penalty(r,0.,2.)
 
 
-def test_bce_negative_only_sky_unknown_zero_gradient_dice_only_labelled():
+def test_labelled_ignore_is_negative_unlabelled_unknown_has_zero_gradient():
     logits=torch.zeros((2,1,4,4),requires_grad=True)
     pos=torch.zeros(2,4,4);pos[0,1,1]=1
     neg=torch.zeros_like(pos);neg[:,3,3]=1
@@ -61,7 +61,8 @@ def test_bce_negative_only_sky_unknown_zero_gradient_dice_only_labelled():
     (bce.sum()+dice.sum()).backward()
     assert logits.grad[0,0,1,1]<0 and logits.grad[0,0,3,3]>0
     assert logits.grad[1,0,3,3]>0
-    assert torch.all(logits.grad[:,:,0,0]==0)
+    assert logits.grad[0,0,0,0]>0  # Non-mask, even though absent from trusted sky.
+    assert logits.grad[1,0,0,0]==0  # No instance label: unknown stays unsupervised.
     assert logits.grad[1,0,1,1]==0
 
 
@@ -80,8 +81,52 @@ def test_clipping_overlap_and_invalid_pixels_preserves_tiny_masks():
         image_hw=(4,4),mask_hw=(2,2),device='cpu')
     assert low[0][1,0,0]==.25 and low[4].all()
     logits=torch.full((2,1,2,2),-30.);logits[:,0,0,0]=30
-    _,dice,_=partial_bce_dice(logits,low[0],torch.zeros_like(low[1]),low[4])
-    assert dice[1]<1e-6  # the unknown remainder of the cell is not negative
+    _,dice,_=partial_bce_dice(logits,low[0],torch.zeros_like(low[1]),low[4],valid=low[2])
+    assert torch.allclose(dice[1],torch.tensor([1/3]),atol=1e-6)
+    # The rest of this observed cell is now non-instance, not ignored.
+
+
+def test_full_mask_bce_is_ordinary_pixel_mean_and_invalid_is_excluded():
+    import torch.nn.functional as F
+    logits=torch.tensor([[[[2.,-1.],[.5,3.]]]],requires_grad=True)
+    pos=torch.tensor([[[1.,0.],[0.,0.]]])
+    valid=torch.tensor([[[1.,1.],[1.,0.]]])
+    bce,dice,eligible=partial_bce_dice(logits,pos,torch.zeros_like(pos),torch.tensor([True]),valid=valid)
+    expected=F.binary_cross_entropy_with_logits(logits[0,0][valid[0]>0],pos[0][valid[0]>0])
+    assert torch.allclose(bce[0,0],expected) and eligible.item()
+    (bce+dice).sum().backward()
+    assert logits.grad[0,0,1,1]==0
+    assert logits.grad[0,0,1,0]>0
+
+
+def test_fractional_valid_coverage_does_not_create_false_negatives():
+    # An input cell is 1/4 observed, all of that quarter is the target source.
+    logits=torch.tensor([[[[5.,8.]]]],requires_grad=True)
+    pos=torch.tensor([[[.25,0.]]]);valid=pos.clone()
+    bce,dice,eligible=partial_bce_dice(logits,pos,torch.zeros_like(pos),torch.tensor([True]),valid=valid)
+    assert bce.item()<.007 and dice.item()<.002 and eligible.item()
+    (bce+dice).sum().backward()
+    assert logits.grad[0,0,0,0]<0 and logits.grad[0,0,0,1]==0
+
+
+def test_expansion_into_ignore_now_increases_both_losses():
+    pos=torch.zeros(1,8,8);pos[:,3:5,3:5]=1
+    sky=torch.zeros_like(pos);sky[:,0,:]=1
+    exact=torch.where(pos[:,None]>0,12.,-12.)
+    expanded=exact.clone();expanded[:,:,2:6,2:6]=12
+    old_bce,old_dice,_=partial_bce_dice(exact,pos,sky,torch.tensor([True]))
+    new_bce,new_dice,_=partial_bce_dice(expanded,pos,sky,torch.tensor([True]))
+    assert new_bce.item()>old_bce.item()+1
+    assert new_dice.item()>old_dice.item()+.5
+
+
+def test_no_label_no_sky_is_ineligible_and_has_zero_gradient():
+    logits=torch.zeros(1,1,4,4,requires_grad=True)
+    empty=torch.zeros(1,4,4)
+    bce,dice,eligible=partial_bce_dice(logits,empty,empty,torch.tensor([False]))
+    assert not eligible.any() and bce.sum()==0 and dice.sum()==0
+    (bce+dice).sum().backward()
+    assert not logits.grad.any()
 
 
 def test_geometry_ignores_invalid_pixels_and_clips_area_reference():
@@ -162,9 +207,29 @@ def test_loader_parent_override_sparse_masks_and_flip():
     assert not sky[0,2,2] and sky[0,7,7]
     flipped={r['source_id']:r for r in flip_instance_targets(rows,8)[0]}
     assert flipped[10]['x0']==3 and flipped[20]['x0']==5
-    # Unknown provenance must not silently turn non-SExtractor background into negatives.
+    # Unknown provenance still does not declare ambiguous labels trusted sky.
     reader=Reader(data);reader.attrs={}
     assert not read_instance_targets(reader,0,torch.full((1,8,8),4),torch.ones(1,3,8,8))[2].any()
+
+
+def test_lsst_and_sextractor_background_reach_negative_only_mask_loss():
+    pu=torch.tensor([[[4,3],[1,4]]],dtype=torch.uint8)
+    valid=np.ones((1,1,2,2),bool);valid[0,0,1,1]=False
+    for attrs in [{'background_method':'LSST on matching training input'},
+                  {'background_method':'precomputed aggressive SExtractor'},
+                  {'hsc_background_method':'lsst'},
+                  {'training_background':'sextractor'}]:
+        reader=Reader(dict(band_valid_mask=valid));reader.attrs=attrs
+        rows,v,sky=read_instance_targets(reader,0,pu,torch.ones(1,3,2,2))
+        assert rows==[[]] and sky.sum()==1 and sky[0,0,0]
+        p=prompts(center=(0.,0.))
+        b=dict(band_valid_mask=v[None],band_trusted_background=sky[None])
+        out,model=run(torch.zeros(1,1,2,2),p,weights(mask_supervision_weight=1),b)
+        assert torch.allclose(out['bce'],torch.tensor(np.log(2),dtype=torch.float32))
+        assert out['dice']==0
+        out['total'].backward()
+        assert model.logits.grad[0,0,0,0]>0
+        assert torch.count_nonzero(model.logits.grad)==1
 
 
 def test_source_ids_beat_dense_shape_in_nested_region_and_epoch30_keeps_gt():

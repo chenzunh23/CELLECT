@@ -88,11 +88,12 @@ def combine_prompts(mandatory, gt, pred, *, pred_ratio, max_gt=128, max_pred=128
 
 
 def partial_targets(prompts, batch, *, image_hw, mask_hw, device):
-    """Positive fractional coverage; negative pixels require trusted sky only.
+    """Instance coverage, trusted sky and observed coverage at mask resolution.
 
-    Downsample with area coverage to preserve tiny positive masks. A negative
-    output pixel must be entirely trusted sky. Unobserved pixels never become
-    negative padding. Independent parent/child masks remain overlapping.
+    Labelled prompts supervise mask/non-mask throughout observed coverage.
+    Unlabelled prompts use only trusted sky as negatives; a low-resolution sky
+    cell must be entirely trusted. Area averaging preserves small positives and
+    partial observed coverage. Independent parent/child masks remain overlapping.
     """
     n = len(prompts['centers']); h, w = image_hw
     positive = torch.zeros((n, h, w), device=device)
@@ -127,21 +128,43 @@ def partial_targets(prompts, batch, *, image_hw, mask_hw, device):
     return positive, negative, valid, quality, labelled
 
 
-def partial_bce_dice(logits, positive, negative, labelled):
-    """Balance positive/negative means; Dice only on labelled prompts and P|N."""
-    pos, neg = positive[:, None], negative[:, None]
-    pos_count = pos.sum((-1, -2)); neg_count = neg.sum((-1, -2))
-    has_pos, has_neg = pos_count > 0, neg_count > 0
-    bce_pos = (F.softplus(-logits)*pos).sum((-1, -2))/pos_count.clamp_min(1e-6)
-    bce_neg = (F.softplus(logits)*neg).sum((-1, -2))/neg_count.clamp_min(1e-6)
-    bce = (bce_pos*has_pos + bce_neg*has_neg)/(has_pos.float()+has_neg.float()).clamp_min(1)
+def partial_bce_dice(logits, positive, negative, labelled, *, valid=None):
+    """Full-instance BCE/Dice when labelled; trusted-sky BCE otherwise.
+
+    ``positive`` and ``valid`` are area-averaged fractions of the original input
+    cell, not a hard nearest-neighbour mask. For a labelled instance, every
+    observed pixel outside that instance is negative, including dense-label
+    ignore pixels. BCE is an ordinary pixel mean, without separately balancing
+    positive/negative classes. Fractional no-data coverage remains excluded.
+
+    For unlabelled prompts, only ``negative`` (trusted background) contributes
+    BCE and Dice is disabled. The caller retains per-prompt weighting/reduction.
+    """
+    logits = logits.float()
+    coverage = torch.ones_like(positive) if valid is None else valid
+    coverage = coverage.to(dtype=logits.dtype).clamp(0, 1)[:, None]
+    pos = torch.minimum(positive.to(dtype=logits.dtype).clamp_min(0)[:, None], coverage)
+    neg = torch.minimum(negative.to(dtype=logits.dtype).clamp_min(0)[:, None], coverage)
+    pos_count = pos.sum((-1, -2))
+    valid_count = coverage.sum((-1, -2))
+    neg_count = neg.sum((-1, -2))
+    has_label = labelled[:, None] & (pos_count > 0)
+
+    # Equivalent to BCEWithLogits(target=pos/coverage), weighted by coverage.
+    # This form avoids treating the unobserved fraction of a cell as background.
+    positive_loss = F.softplus(-logits)
+    negative_loss = F.softplus(logits)
+    full_bce = (positive_loss*pos + negative_loss*(coverage-pos)).sum((-1, -2))
+    full_bce = full_bce / valid_count.clamp_min(1e-6)
+    sky_bce = (negative_loss*neg).sum((-1, -2)) / neg_count.clamp_min(1e-6)
+    bce = torch.where(has_label, full_bce, sky_bce)
+
     prob = logits.sigmoid()
-    # Coverage weights preserve a one-pixel positive after downsampling without
-    # declaring the rest of its low-res cell (unknown/invalid) to be negative.
-    known = torch.maximum(pos, neg)
-    dice = 1-(2*(prob*pos).sum((-1, -2))+1)/((prob*known).sum((-1, -2))+pos_count+1)
-    dice = dice*labelled[:, None]
-    return bce, dice, (has_pos | has_neg)[:, 0]
+    dice = 1-(2*(prob*pos).sum((-1, -2))+1)/(
+        (prob*coverage).sum((-1, -2))+pos_count+1)
+    dice = torch.where(has_label, dice, torch.zeros_like(dice))
+    eligible = has_label | (neg_count > 0)
+    return bce, dice, eligible[:, 0]
 
 
 def area_ratio_penalty(ratio, lower, upper):

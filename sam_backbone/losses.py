@@ -466,7 +466,8 @@ def _sam_mask_loss_for_prompts(
     t_phase = _mark_mask_timing(debug_timing, f"{timing_prefix}.target", t_phase, needs_target=float(needs_target))
 
     if weight_bce or weight_dice:
-        bce, dice, bce_eligible = partial_bce_dice(logits, positive, negative, labelled)
+        bce, dice, bce_eligible = partial_bce_dice(
+            logits, positive, negative, labelled, valid=valid)
     else:
         bce = dice = logits.new_zeros((n, int(logits.shape[1])))
         bce_eligible = torch.zeros(n, device=logits.device, dtype=torch.bool)

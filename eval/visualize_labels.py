@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import sys
 from pathlib import Path
@@ -37,6 +38,7 @@ from eval.eval_utils import (
     draw_ellipses,
     draw_points,
     input_channel_display_limits,
+    input_channel_to_rgb,
     label_mask_overlay,
     normalize_group_name,
     read_fits_image,
@@ -88,6 +90,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fits-hdu", type=int, default=None)
     p.add_argument("--out-dir", type=Path, default=Path("output/eval_visualizations/labels"))
     p.add_argument("--png-scale", type=int, default=1)
+    p.add_argument(
+        "--input-scaling", action=argparse.BooleanOptionalAction, default=True,
+        help="Also save input-scaled single images and panels using the stored Zarr channel; "
+             "log-lupton uses log (channel 1), other modes use channel 0. No additional zscale.",
+    )
+    p.add_argument("--input-channel", type=int, default=None,
+                   help="Override the automatically selected input display channel (zero-based).")
     p.add_argument(
         "--confidence-negative-overlay",
         action=argparse.BooleanOptionalAction,
@@ -177,6 +186,8 @@ def _source_shapes_overlay(
     image: np.ndarray,
     sources: list[dict[str, float]],
     external_centers: list[dict[str, float]],
+    *,
+    background_rgb: np.ndarray | None = None,
 ) -> np.ndarray:
     import matplotlib
 
@@ -185,7 +196,7 @@ def _source_shapes_overlay(
     from matplotlib.patches import Ellipse
 
     fig, ax = plt.subplots(figsize=(image.shape[1] / 100.0, image.shape[0] / 100.0), dpi=100)
-    ax.imshow(zscale_rgb(image), origin="lower", interpolation="nearest")
+    ax.imshow(zscale_rgb(image) if background_rgb is None else background_rgb, origin="lower", interpolation="nearest")
     for row in sorted(sources, key=lambda r: abs(float(r["major"]) * float(r["minor"])), reverse=True):
         color = _source_color(row)
         ax.add_patch(
@@ -218,8 +229,9 @@ def _confidence_negative_mask(sample: dict[str, np.ndarray]) -> np.ndarray:
     return (confidence == 0) & np.isfinite(weight) & (weight > 0.0)
 
 
-def _confidence_negative_overlay(image: np.ndarray, negative: np.ndarray, *, alpha: float) -> np.ndarray:
-    rgb = zscale_rgb(image)
+def _confidence_negative_overlay(image: np.ndarray, negative: np.ndarray, *, alpha: float,
+                                 background_rgb: np.ndarray | None = None) -> np.ndarray:
+    rgb = zscale_rgb(image) if background_rgb is None else background_rgb.copy()
     mask = np.asarray(negative, dtype=bool)
     color = np.asarray((1.0, 0.58, 0.0), dtype=np.float32)
     if bool(mask.any()):
@@ -227,8 +239,9 @@ def _confidence_negative_overlay(image: np.ndarray, negative: np.ndarray, *, alp
     return rgb
 
 
-def _confidence_negative_clear_overlay(image: np.ndarray, negative: np.ndarray, *, alpha: float) -> np.ndarray:
-    rgb = zscale_rgb(image)
+def _confidence_negative_clear_overlay(image: np.ndarray, negative: np.ndarray, *, alpha: float,
+                                       background_rgb: np.ndarray | None = None) -> np.ndarray:
+    rgb = zscale_rgb(image) if background_rgb is None else background_rgb.copy()
     cover = ~np.asarray(negative, dtype=bool)
     color = np.asarray((0.10, 0.36, 0.90), dtype=np.float32)
     if bool(cover.any()):
@@ -244,12 +257,13 @@ def _save_confidence_negative_plot(
     title: str,
     alpha: float,
     clear_negative: bool = False,
+    background_rgb: np.ndarray | None = None,
 ) -> None:
     negative = _confidence_negative_mask(sample)
     overlay = (
-        _confidence_negative_clear_overlay(image, negative, alpha=alpha)
+        _confidence_negative_clear_overlay(image, negative, alpha=alpha, background_rgb=background_rgb)
         if bool(clear_negative)
-        else _confidence_negative_overlay(image, negative, alpha=alpha)
+        else _confidence_negative_overlay(image, negative, alpha=alpha, background_rgb=background_rgb)
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(5.2, 5.2), dpi=150)
@@ -278,6 +292,29 @@ def _parse_zarr_uri(uri: str) -> tuple[Path, int]:
 
 def _safe_stem(text: object) -> str:
     return str(text).replace(",", "_").replace("/", "_").replace(" ", "_")
+
+
+def _input_scaled_background(sample, attrs, *, channel=None):
+    """Use the actual stored input, preserving parent-level normalization."""
+    stack = np.asarray(sample["image"], dtype=np.float32)
+    if stack.ndim == 2:
+        stack = stack[None]
+    if stack.ndim != 3:
+        raise ValueError(f"Expected input [C,H,W] or [H,W], got {stack.shape}")
+    mode = str(attrs.get("image_scaling_mode") or attrs.get("scaling_mode") or "zscore")
+    normalized = mode.lower().replace("_", "-")
+    # All composite aliases are written in [zscore, log, lupton] order.
+    composite = "log" in normalized and "lupton" in normalized
+    index = (1 if composite and len(stack) >= 3 else 0) if channel is None else int(channel)
+    if not 0 <= index < len(stack):
+        raise ValueError(f"Input channel {index} outside stored channel range 0..{len(stack)-1}")
+    name = ("zscore", "log", "lupton")[index] if composite and len(stack) == 3 else normalized.removesuffix("-rgb")
+    threshold = float(attrs.get("clip_threshold", attrs.get("image_clip_threshold", 3.0)))
+    lo, hi = input_channel_display_limits(stack[index], scaling=mode, channel_index=index, clip_threshold=threshold)
+    rgb = input_channel_to_rgb(stack[index], scaling=mode, channel_index=index, clip_threshold=threshold)
+    metadata = dict(scaling_mode=mode, channel_index=index, channel_name=name,
+                    display_limits=[lo, hi], source="stored Zarr input; no zscale or per-tile renormalization")
+    return rgb, f"{name} [{lo:g}, {hi:g}]", metadata
 
 
 def _run_all_confidence_negative_overlays(args: argparse.Namespace, dataset_source: str | None) -> list[Path]:
@@ -331,6 +368,13 @@ def _run_all_confidence_negative_overlays(args: argparse.Namespace, dataset_sour
             clear_negative=bool(args.confidence_negative_clear_overlay),
         )
         outputs.append(out_path)
+        if args.input_scaling:
+            rgb, label, _ = _input_scaled_background(sample, attrs, channel=args.input_channel)
+            input_path = out_dir / f"{stem}_input_scaling_{suffix}.png"
+            _save_confidence_negative_plot(input_path, image, sample,
+                title=f"{title} | {label}", alpha=float(args.negative_alpha),
+                clear_negative=bool(args.confidence_negative_clear_overlay), background_rgb=rgb)
+            outputs.append(input_path)
     if not outputs:
         raise RuntimeError("no matching samples for confidence-negative visualization")
     return outputs
@@ -343,15 +387,21 @@ def _panel(
     conf: np.ndarray,
     sources: list[dict[str, float]],
     external_centers: list[dict[str, float]],
+    *,
+    background_rgb: np.ndarray | None = None,
+    display_label: str = "",
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fig, axes = plt.subplots(1, 3, figsize=(15, 5), dpi=150)
-    axes[0].imshow(label_mask_overlay(image, pu), origin="lower", interpolation="nearest")
+    axes[0].imshow(label_mask_overlay(image, pu, background_rgb=background_rgb), origin="lower", interpolation="nearest")
     axes[0].set_title("PU regions")
-    axes[1].imshow(confidence_overlay(image, conf), origin="lower", interpolation="nearest")
+    axes[1].imshow(confidence_overlay(image, conf, background_rgb=background_rgb), origin="lower", interpolation="nearest")
     axes[1].set_title("GT confidence")
-    axes[2].imshow(zscale_rgb(image), origin="lower", interpolation="nearest")
+    axes[2].imshow(zscale_rgb(image) if background_rgb is None else background_rgb, origin="lower", interpolation="nearest")
     axes[2].set_title("source ellipses")
+    if display_label:
+        for ax in axes:
+            ax.set_title(f"{ax.get_title()} — {display_label}")
     for row in sorted(sources, key=lambda r: abs(float(r["major"]) * float(r["minor"])), reverse=True):
         from matplotlib.patches import Ellipse
 
@@ -512,6 +562,30 @@ def _run_one(args: argparse.Namespace, dataset_source: str | None) -> Path:
             clear_negative=True,
         )
     _panel(out_dir / f"{out_stem}_panel.png", image, pu, conf, sources, strict_centers)
+    if args.input_scaling:
+        rgb, display_label, metadata = _input_scaled_background(sample, attrs, channel=args.input_channel)
+        input_stem = f"{out_stem}_input_scaling"
+        overlays = {
+            "image": rgb,
+            "pu_overlay": label_mask_overlay(image, pu, background_rgb=rgb),
+            "confidence_overlay": confidence_overlay(image, conf, background_rgb=rgb),
+            "source_shapes_overlay": _source_shapes_overlay(image, sources, strict_centers, background_rgb=rgb),
+            "centers_overlay": draw_points(image, all_centers, background_rgb=rgb),
+        }
+        for suffix, overlay in overlays.items():
+            save_pixel_png(out_dir / f"{input_stem}_{suffix}.png", overlay, scale=args.png_scale)
+        _panel(out_dir / f"{input_stem}_panel.png", image, pu, conf, sources, strict_centers,
+               background_rgb=rgb, display_label=display_label)
+        for enabled, clear, suffix in [
+            (args.confidence_negative_overlay, False, "confidence_negative_overlay"),
+            (args.confidence_negative_clear_overlay, True, "confidence_negative_clear_overlay"),
+        ]:
+            if enabled:
+                _save_confidence_negative_plot(out_dir / f"{input_stem}_{suffix}.png", image, sample,
+                    title=f"{dataset}{group_part} {patch_name} {band_name} sample {sample_idx} | {display_label}",
+                    alpha=float(args.negative_alpha), clear_negative=clear, background_rgb=rgb)
+        metadata.update(zarr_store=str(reader.root), sample_index=sample_idx, band=str(band_name))
+        (out_dir / f"{input_stem}.json").write_text(json.dumps(metadata, indent=2) + "\n")
     _write_counts_csv(
         out_dir / f"{out_stem}_label_counts.csv",
         pu=pu,
