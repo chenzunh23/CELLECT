@@ -13,6 +13,8 @@ from utils.train_ops_utils import flatten_per_band_outputs as _flatten_per_band_
 from .mask_supervision import (instance_prompts, combine_prompts, partial_targets,
                                partial_bce_dice, area_ratio_penalty)
 
+from .mask_metrics import GROUP_STAT_KEYS, group_statistics
+
 MaskTimingFn = Callable[[str, float, Dict[str, float]], float]
 
 
@@ -189,6 +191,7 @@ def _zero_mask_losses(anchor: Tensor) -> Dict[str, Tensor]:
         "gt_prompts": zero,
         "pred_prompts": zero,
         "supervised_prompts": zero,
+        "group_stats": anchor.new_zeros(len(GROUP_STAT_KEYS), dtype=torch.float64),
     }
 
 
@@ -373,6 +376,7 @@ def _sam_mask_loss_for_prompts(
     debug_timing: Optional[MaskTimingFn] = None,
     timing_prefix: str = "mask",
     batch: Optional[Dict[str, object]] = None,
+    return_selection: bool = False,
 ) -> Dict[str, Tensor]:
     if prompts["centers"].numel() == 0:
         return _zero_mask_losses(outputs["confidence"])
@@ -647,8 +651,12 @@ def _sam_mask_loss_for_prompts(
                       ('pred_iou','mask_pred_iou'), ('stability','mask_stability')]:
         q, denom = (dice_weights, dice_denom) if key == 'dice' else (bce_weights, bce_denom) if key == 'bce' else (geom_weights, geom_denom)
         per_prompt = per_prompt + float(getattr(weights, attr, 0.0))*selected[key]*q/denom
+    out['group_stats'] = group_statistics(selected, kinds, prompt_weights, labelled,
+                                          bce_eligible, instance_quality, supervision_scale)
     out['gt_total'] = per_prompt[kinds != 1].sum()
     out['pred_total'] = per_prompt[kinds == 1].sum()
+    if return_selection:
+        out['selected_indices'] = best.detach()
     _mark_mask_timing(debug_timing, f"{timing_prefix}.reduce", t_phase, valid_prompts=float(valid_prompt.sum().detach().item()))
     return out
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import csv
 import io
 import json
@@ -70,7 +70,7 @@ from eval.eval_utils import (  # noqa: E402
     select_band_outputs,
     zscale_gray,
 )
-from utils.source_snr import SourceSnrConfig, filter_snr_rows, measure_source_snrs  # noqa: E402
+from utils.source_snr import SourceSnrConfig, filter_snr_rows, measure_source_snrs, measure_source_snrs_both  # noqa: E402
 
 
 DEFAULT_ROOT = DEFAULT_HSC_RAW_ROOT
@@ -81,6 +81,29 @@ DEFAULT_CHECKPOINT = Path("/data/czh23/ckpts/sam_anscombe_0803/epoch_0030.pt")
 PAGES_DIR = Path(__file__).with_name("pages")
 HTML_PATH = PAGES_DIR / "index.html"
 ASSETS_DIR = CELLECT_ROOT / "eval" / "assets"
+_SNR_LOG_LOCK = threading.Lock()
+
+
+def _log_snr(ref: FrameRef, context: str, methods: str, stage: str, status: str,
+             n_sources: int, *, seconds: float | None = None,
+             log_path: Path | None = None, **details: Any) -> None:
+    fields = [f"[snr] {time.strftime('%Y-%m-%dT%H:%M:%S')}", f"context={context}",
+              f"token={ref.token}", f"candidate={ref.candidate_id}",
+              f"worker={threading.current_thread().name}", f"methods={methods}",
+              f"sources={n_sources}", f"stage={stage}", f"status={status}"]
+    if seconds is not None:
+        fields.append(f"elapsed={seconds:.3f}s")
+    fields.extend(f"{key}={value}" for key, value in details.items())
+    # Keep each message intact when multiple export workers finish together.
+    line = " ".join(fields)
+    with _SNR_LOG_LOCK:
+        print(line, flush=True)
+        if log_path is not None:
+            try:
+                with log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(line + "\n")
+            except OSError as exc:
+                print(f"[snr] unable to append log {log_path}: {exc}", file=sys.stderr, flush=True)
 
 
 def _slug_text(text: str, *, fallback: str = "run") -> str:
@@ -684,7 +707,23 @@ def _save_titled_png(path: Path, image_rgb: np.ndarray, title: str, *, min_image
     canvas.save(path)
 
 
+_SNR_PLOT_LOCK = threading.Lock()
+
+
 def _save_snr_overlay_png(
+    path: Path,
+    image: np.ndarray,
+    rows: list[dict[str, Any]],
+    *,
+    title: str,
+    threshold: float = 5.0,
+) -> None:
+    # Matplotlib has global state; only rendering is serialized, not SNR work.
+    with _SNR_PLOT_LOCK:
+        _save_snr_overlay_png_locked(path, image, rows, title=title, threshold=threshold)
+
+
+def _save_snr_overlay_png_locked(
     path: Path,
     image: np.ndarray,
     rows: list[dict[str, Any]],
@@ -791,7 +830,9 @@ def make_access(dataset_id: str, args: argparse.Namespace, tract: str):
             cut_origin_dir=Path(args.ztf_cut_origin_dir) if args.ztf_cut_origin_dir else None,
         )
     if dataset_id == "jwst_cosmos":
-        return CosmosAccess(path_arg("cosmos_root", DEFAULT_COSMOS_ROOT), tile_size=int(getattr(args, "jwst_tile_size", 512)))
+        return CosmosAccess(path_arg("cosmos_root", DEFAULT_COSMOS_ROOT), tile_size=int(getattr(args, "jwst_tile_size", 512)),
+                            lazy_browser=True, parent_cache_mb=getattr(args, "cosmos_parent_cache_mb", 320),
+                            image_workers=getattr(args, "image_workers", 4))
     if dataset_id == "jwst_abell":
         return AbellAccess(path_arg("abell_plan", DEFAULT_ABELL_PLAN), tile_size=int(getattr(args, "jwst_tile_size", 512)))
     if dataset_id == "jwst":
@@ -843,6 +884,9 @@ class BrowserState:
             default_frames_per_tile = int(args.frames_per_tile)
         self.n_tiles_requested = None if all_tiles else int(n_tiles if n_tiles is not None else default_n_tiles)
         self.all_tiles = bool(all_tiles)
+        if self.dataset_id == "jwst_cosmos":
+            self.all_tiles = True
+            self.n_tiles_requested = None
         self.frames_per_tile = max(1, int(frames_per_tile if frames_per_tile is not None else default_frames_per_tile))
         if self.dataset_id in JWST_DATASETS:
             self.frames_per_tile = 1
@@ -895,6 +939,10 @@ class BrowserState:
         self._frame_cache = ArrayCache(int(getattr(args, "browser_cache_mb", 128)) * 1024**2)
         self._mask_cache = ArrayCache(128 * 1024**2)
         self.image_workers = max(1, int(getattr(args, "image_workers", 4)))
+        self.export_workers = max(1, int(getattr(args, "export_workers", 4)))
+        self._export_lock = threading.Lock()
+        self._export_progress_lock = threading.Lock()
+        self._export_progress = {"stage": "idle", "completed": 0, "total": 0}
         self._image_load = ParallelLoad(self.image_workers, "image-read")
         self._scale_load = ParallelLoad(getattr(args, "scaling_workers", 2), "image-scale")
         if hasattr(self.access, "_parent_load"):
@@ -903,10 +951,15 @@ class BrowserState:
         self.make_masks = bool(getattr(args, "make_masks", True))
         self.mask_chunk_size = int(getattr(args, "mask_chunk_size", 32))
         self.mask_threshold = float(getattr(args, "mask_threshold", 0.0))
-        self.mask_box_scale = float(getattr(args, "mask_box_scale", 2.0))
+        self.mask_box_scale = float(getattr(args, "mask_box_scale", 1.0))
+        self.mask_selection = str(getattr(args, "mask_selection", "pred_iou"))
         self.jwst_input_scaling = str(getattr(args, "jwst_input_scaling", "training_parent"))
         for patch in self.patches:
             self.selected_tiles_by_patch[patch] = self._choose_tiles(patch, self.seed + 1009 * len(self.selected_tiles_by_patch))
+        self._tile_pages_by_patch = {}
+        if self.dataset_id == "jwst_cosmos":
+            self._tile_pages_by_patch = {p: self.access.browse_pages(p, self._bands_for_patch(p), self.tiles_per_page)
+                                         for p in self.patches}
         self._build_refs()
         self._build_tile_maps()
         self.session_dir.mkdir(parents=True, exist_ok=True)
@@ -1055,6 +1108,8 @@ class BrowserState:
         draw = ImageDraw.Draw(image)
         font = ImageFont.load_default()
         title = f"{dataset_label(self.dataset_id)} {self.tract}/{patch}: selected groups per tile"
+        if self.dataset_id == "jwst_cosmos":
+            title = f"COSMOS {patch}: all tiles (coverage not pre-scanned)"
         draw.text((left, 16), title, fill=(25, 25, 25), font=font)
 
         for tile_id, (tx, ty) in parsed.items():
@@ -1121,7 +1176,27 @@ class BrowserState:
 
     @property
     def n_pages(self) -> int:
+        if self.patch in getattr(self, "_tile_pages_by_patch", {}):
+            return max(1, len(self._tile_pages_by_patch[self.patch]))
         return max(1, int(np.ceil(len(self.selected_tiles) / self.tiles_per_page)))
+
+    def _page_tile_ids(self, page_index):
+        page_index = max(0, min(page_index, self.n_pages - 1))
+        pages = getattr(self, "_tile_pages_by_patch", {}).get(self.patch)
+        if pages is not None:
+            return pages[page_index] if pages else []
+        start = page_index * self.tiles_per_page
+        return self.selected_tiles[start:start+self.tiles_per_page]
+
+    def _inference_parameters(self):
+        return {name: getattr(self, name) for name in (
+            "scaling_mode", "clip_threshold", "log_a", "log_high_percentile",
+            "lupton_stretch", "lupton_q", "anscombe_clip", "anscombe_scale",
+            "jwst_input_scaling", "confidence_threshold", "confidence_score",
+            "nms_radius", "center_refinement", "center_refinement_radius",
+            "mask_box_scale", "mask_threshold", "amp")} | {
+            "mask_branch": "checkpoint_training_multimask",
+            "mask_selection": self.mask_selection}
 
     def _write_manifest(self) -> None:
         payload = {
@@ -1143,8 +1218,11 @@ class BrowserState:
             "selected_tile_ids_by_patch": self.selected_tiles_by_patch,
             "checkpoint": str(self.checkpoint),
             "image_workers": self.image_workers,
+            "export_workers": self.export_workers,
+            "snr_log_path": str(self.session_dir / "snr.log"),
             "scaling_workers": self._scale_load.workers,
             "make_masks": self.make_masks,
+            "inference_parameters": self._inference_parameters(),
             "scaling_mode": self.scaling_mode,
             "visit": self.visit,
             "note": (
@@ -1181,6 +1259,9 @@ class BrowserState:
             "n_pages": self.n_pages,
             "checkpoint_name": self.checkpoint.name,
             "image_workers": self.image_workers,
+            "export_workers": self.export_workers,
+            "snr_log_path": str(self.session_dir / "snr.log"),
+            "export_progress": self.export_status(),
             "scaling_workers": self._scale_load.workers,
             "make_masks": self.make_masks,
             "scaling_mode": self.scaling_mode,
@@ -1201,6 +1282,9 @@ class BrowserState:
             raise KeyError(f"tile is not loaded in current patch: {tile_id}")
         ref = refs[0]
         index = self.selected_tiles.index(tile_id)
+        page = index // self.tiles_per_page
+        if self.patch in getattr(self, "_tile_pages_by_patch", {}):
+            page = next(i for i, ids in enumerate(self._tile_pages_by_patch[self.patch]) if tile_id in ids)
         return {
             "tile_id": tile_id,
             "tile_index": int(ref.tile_index),
@@ -1208,8 +1292,8 @@ class BrowserState:
             "y0": int(ref.y0),
             "x1": int(ref.x1),
             "y1": int(ref.y1),
-            "page": int(index // self.tiles_per_page),
-            "page_display": int(index // self.tiles_per_page + 1),
+            "page": int(page),
+            "page_display": int(page + 1),
             "n_pages": int(self.n_pages),
         }
 
@@ -1244,8 +1328,7 @@ class BrowserState:
 
     def page_payload(self, page_index: int) -> dict[str, Any]:
         page_index = max(0, min(page_index, self.n_pages - 1))
-        start = page_index * self.tiles_per_page
-        tile_ids = set(self.selected_tiles[start : start + self.tiles_per_page])
+        tile_ids = set(self._page_tile_ids(page_index))
         refs = []
         for ref in self.refs:
             if ref.tile_id in tile_ids:
@@ -1278,24 +1361,80 @@ class BrowserState:
         normalized = str(method or "ap2").strip().lower().replace("_", "-")
         return "kron" if normalized in {"kron", "kron-snr"} else "ap2"
 
+    def _log_snr(self, *args: Any, **kwargs: Any) -> None:
+        session_dir = getattr(self, "session_dir", None)
+        _log_snr(*args, log_path=Path(session_dir) / "snr.log" if session_dir is not None else None, **kwargs)
+
     def _snr_rows_for_token(self, token: str, method: str) -> list[dict[str, Any]]:
         method = self._normalize_snr_method(method)
         key = (str(token), method)
         cached = self.snr_rows_by_token_method.get(key)
         if cached is not None:
+            self._log_snr(self.ref_by_token[token], "view", method, "total", "cached",
+                     len(cached), seconds=0.0, cache="hit")
             return cached
         if token not in self.detect_rows_by_token:
             return []
         ref = self.ref_by_token[token]
         image = self._detection_image_for_ref(ref)
-        rows, _summary = measure_source_snrs(
-            image,
-            self.detect_rows_by_token[token],
-            method=method,
-            config=self.snr_config,
-        )
-        self.snr_rows_by_token_method[key] = rows
-        return rows
+        rows, _timings = self._measure_snr_rows_for_ref(
+            ref, image, self.detect_rows_by_token[token], methods=(method,), context="view")
+        return rows[method]
+
+    def _measure_snr_rows_for_ref(self, ref: FrameRef, image: np.ndarray,
+                                  detect_rows: list[dict[str, Any]], *,
+                                  methods: tuple[str, ...] = ("ap2", "kron"),
+                                  context: str = "export") -> tuple[dict[str, Any], dict[str, float]]:
+        cached = {method: (self.snr_rows_by_token_method.get((ref.token, method))
+                           if self.detect_rows_by_token.get(ref.token) is detect_rows else None)
+                  for method in methods}
+        missing = [method for method, value in cached.items() if value is None]
+        costs: dict[str, float] = {}
+        for method, value in cached.items():
+            if value is not None:
+                self._log_snr(ref, context, method, "total", "cached", len(value),
+                         seconds=0.0, cache="hit")
+        if not missing:
+            return cached, costs
+        method_label = ",".join(missing)
+        if not detect_rows:
+            for method in missing:
+                cached[method] = []
+            self._log_snr(ref, context, method_label, "total", "skipped", 0,
+                     seconds=0.0, cache="miss", reason="no_detections")
+        else:
+            self._log_snr(ref, context, method_label, "total", "start", len(detect_rows),
+                     cache="miss", shape=f"{image.shape[0]}x{image.shape[1]}",
+                     background_box=self.snr_config.background_box)
+            started = time.perf_counter()
+
+            def progress(stage: str, status: str, seconds: float | None) -> None:
+                if status == "done":
+                    costs[f"snr_{stage}"] = seconds
+                self._log_snr(ref, context, method_label, stage, status, len(detect_rows),
+                         seconds=seconds, cache="miss")
+
+            try:
+                if len(missing) == 2:
+                    cached.update(measure_source_snrs_both(image, detect_rows,
+                        config=self.snr_config, progress=progress))
+                else:
+                    method = missing[0]
+                    cached[method] = measure_source_snrs(image, detect_rows, method=method,
+                        config=self.snr_config, progress=progress)[0]
+            except Exception as exc:
+                self._log_snr(ref, context, method_label, "total", "error", len(detect_rows),
+                         seconds=time.perf_counter() - started, error=repr(exc))
+                raise
+            self._log_snr(ref, context, method_label, "total", "done", len(detect_rows),
+                     seconds=time.perf_counter() - started,
+                     background=f"{costs.get('snr_background', 0):.3f}s",
+                     ap2=f"{costs.get('snr_ap2', 0):.3f}s",
+                     kron=f"{costs.get('snr_kron', 0):.3f}s")
+        if self.detect_rows_by_token.get(ref.token) is detect_rows:
+            for method, value in cached.items():
+                self.snr_rows_by_token_method[(ref.token, method)] = value
+        return cached, costs
 
     def _snr_filtered_rows(self, token: str, method: str, threshold: float) -> list[dict[str, Any]]:
         return filter_snr_rows(self._snr_rows_for_token(token, method), threshold=float(threshold))
@@ -1385,10 +1524,14 @@ class BrowserState:
     def _store_masks(self, model, band_outputs, rows, ref):
         if not self.make_masks:
             return
+        valid = None
+        if self.dataset_id in ("jwst_cosmos", "jwst_abell"):
+            valid = self.access.read_window(ref.band, ref.patch, ref.x0, ref.y0, ref.width, ref.height)[1]
         masks = decode_masks(model, band_outputs, rows, device=torch.device(self.device_name),
             amp=self.amp, width=ref.width, height=ref.height, chunk_size=self.mask_chunk_size,
-            threshold=self.mask_threshold, box_scale=self.mask_box_scale)
+            threshold=self.mask_threshold, box_scale=self.mask_box_scale, valid_mask=valid, selection=self.mask_selection)
         self._mask_cache.put(ref.token, masks)
+        return masks
 
     def _masks_for_token(self, token):
         if not self.make_masks:
@@ -1404,8 +1547,7 @@ class BrowserState:
                 model, _ = self._load_model([ref.band])
                 tensor = torch.from_numpy(self._scaled_input_for_ref(ref)[None,None])
                 outputs = infer_cellect(model=model, image_tensor=tensor, device=torch.device(self.device_name), amp=self.amp)
-                self._store_masks(model, select_band_outputs(outputs, 0), self.detect_rows_by_token[token], ref)
-                masks = self._mask_cache.get(token)
+                masks = self._store_masks(model, select_band_outputs(outputs, 0), self.detect_rows_by_token[token], ref)
             if masks is None:
                 raise RuntimeError("Mask result exceeds cache capacity")
             return masks
@@ -1602,14 +1744,13 @@ class BrowserState:
                     list(key),
                     dynamic_image_size=True,
                 )
+                model._browser_mask_config = dict(cfg or {})
                 self._model_by_bands[key] = (model, dict(cfg or {}))
             model, cfg = self._model_by_bands[key]
             return model, dict(cfg or {})
 
     def _page_tile_slots(self, page_index: int) -> list[tuple[str, int]]:
-        page_index = max(0, min(page_index, self.n_pages - 1))
-        start = page_index * self.tiles_per_page
-        tile_ids = self.selected_tiles[start : start + self.tiles_per_page]
+        tile_ids = self._page_tile_ids(page_index)
         slot_counts = self.frame_slots_by_patch.get(self.patch, {})
         return [(tile_id, frame_slot) for tile_id in tile_ids for frame_slot in range(int(slot_counts.get(tile_id, 0)))]
 
@@ -1625,62 +1766,7 @@ class BrowserState:
         frame_slot: int,
         refs_by_key: dict[tuple[str, int], dict[str, FrameRef]] | None = None,
     ) -> dict[str, int]:
-        refs_by_key = refs_by_key or self._refs_by_tile_slot()
-        per_band = refs_by_key.get((tile_id, frame_slot), {})
-        bands = [band for band in self._bands_for_patch(self.patch) if band in per_band]
-        if not bands:
-            return {"n_images": 0, "n_detections": 0}
-        if all(per_band[band].token in self.detect_rows_by_token for band in bands):
-            return {
-                "n_images": len(bands),
-                "n_detections": sum(len(self.detect_rows_by_token.get(per_band[band].token, ())) for band in bands),
-            }
-        try:
-            model, _cfg = self._load_model(bands)
-        except Exception as exc:
-            message = f"{tile_id} slot {frame_slot + 1}: detection skipped for bands {bands}: {exc}"
-            self.warnings.append(message)
-            print(f"WARNING: {message}", flush=True)
-            return {"n_images": 0, "n_detections": 0}
-        device = torch.device(self.device_name)
-        prepared = self._prepare_detection_inputs([per_band[band] for band in bands])
-        raw_images = [item[0] for item in prepared]
-        scaled = [item[1] for item in prepared]
-        tensor = torch.from_numpy(np.stack(scaled, axis=0).astype(np.float32, copy=False))[None]
-        outputs = infer_cellect(model=model, image_tensor=tensor, device=device, amp=self.amp)
-        total_images = 0
-        total_detections = 0
-        for band_idx, band in enumerate(bands):
-            ref = per_band[band]
-            rows = detection_rows(
-                select_band_outputs(outputs, band_idx),
-                threshold=self.confidence_threshold,
-                nms_radius=self.nms_radius,
-                confidence_score=self.confidence_score,
-                center_refinement=self.center_refinement,
-                center_refinement_radius=self.center_refinement_radius,
-                width=per_band[band].width,
-                height=per_band[band].height,
-            )
-            self._store_masks(model, select_band_outputs(outputs, band_idx), rows, ref)
-            self.detect_rows_by_token[ref.token] = rows
-            for method in ("ap2", "kron"):
-                self.snr_rows_by_token_method.pop((ref.token, method), None)
-            self.detect_png_by_token[ref.token] = _overlay_png_bytes(
-                raw_images[band_idx],
-                rows,
-                draw_centers=self.shape_overlay_centers,
-            )
-            self.input_shape_png_by_token[ref.token] = _input_shape_overlay_png_bytes(
-                scaled[band_idx],
-                rows,
-                scaling=self.scaling_mode,
-                clip_threshold=self.clip_threshold,
-                draw_centers=self.shape_overlay_centers,
-            )
-            total_images += 1
-            total_detections += len(rows)
-        return {"n_images": total_images, "n_detections": total_detections}
+        return self._detect_tile_slots([(tile_id, frame_slot)], refs_by_key)
 
     @staticmethod
     def _select_sample_outputs(outputs: dict[str, torch.Tensor], sample_idx: int) -> dict[str, torch.Tensor]:
@@ -1696,12 +1782,27 @@ class BrowserState:
         self,
         slots: list[tuple[str, int]],
         refs_by_key: dict[tuple[str, int], dict[str, FrameRef]] | None = None,
+        *,
+        mask_sink: dict[str, Any] | None = None,
+    ) -> dict[str, int]:
+        # All encoder/decoder calls share the mask lock. CPU export threads
+        # never run inference or create their own model/CUDA context.
+        with self._mask_lock:
+            return self._detect_tile_slots_locked(slots, refs_by_key, mask_sink=mask_sink)
+
+    def _detect_tile_slots_locked(
+        self,
+        slots: list[tuple[str, int]],
+        refs_by_key: dict[tuple[str, int], dict[str, FrameRef]] | None = None,
+        *,
+        mask_sink: dict[str, Any] | None = None,
     ) -> dict[str, int]:
         refs_by_key = refs_by_key or self._refs_by_tile_slot()
         pending: list[tuple[str, int, dict[str, FrameRef]]] = []
         for tile_id, frame_slot in slots:
             per_band = refs_by_key.get((tile_id, frame_slot), {})
-            bands = [band for band in self._bands_for_patch(self.patch) if band in per_band]
+            patch = next(iter(per_band.values())).patch if per_band else self.patch
+            bands = [band for band in self._bands_for_patch(patch) if band in per_band]
             if not bands:
                 continue
             if all(per_band[band].token in self.detect_rows_by_token for band in bands):
@@ -1748,7 +1849,9 @@ class BrowserState:
                                     width=ref.width,
                                     height=ref.height,
                                 )
-                                self._store_masks(model, select_band_outputs(sample_outputs, band_idx), rows, ref)
+                                masks = self._store_masks(model, select_band_outputs(sample_outputs, band_idx), rows, ref)
+                                if mask_sink is not None and masks is not None:
+                                    mask_sink[ref.token] = masks
                                 self.detect_rows_by_token[ref.token] = rows
                                 for method in ("ap2", "kron"):
                                     self.snr_rows_by_token_method.pop((ref.token, method), None)
@@ -1774,7 +1877,8 @@ class BrowserState:
         total_detections = 0
         for tile_id, frame_slot in slots:
             per_band = refs_by_key.get((tile_id, frame_slot), {})
-            bands = [band for band in self._bands_for_patch(self.patch) if band in per_band]
+            patch = next(iter(per_band.values())).patch if per_band else self.patch
+            bands = [band for band in self._bands_for_patch(patch) if band in per_band]
             if not bands:
                 continue
             total_images += len(bands)
@@ -1785,8 +1889,8 @@ class BrowserState:
         refs_by_key = self._refs_by_tile_slot()
         return self._detect_tile_slots(self._page_tile_slots(page_index), refs_by_key)
 
-    def write_selection_csv(self, out_dir: Path | None = None) -> Path:
-        refs = self.selected_refs()
+    def write_selection_csv(self, out_dir: Path | None = None, *, refs: list[FrameRef] | None = None) -> Path:
+        refs = self.selected_refs() if refs is None else refs
         if not refs:
             raise RuntimeError("no selected candidates")
         target_dir = (out_dir or self.session_dir).expanduser().resolve()
@@ -1799,103 +1903,245 @@ class BrowserState:
             writer.writerows(rows)
         return path
 
-    def export_selected(self, write_png: bool = True) -> dict[str, Any]:
-        refs = self.selected_refs()
-        if not refs:
-            raise RuntimeError("no selected candidates")
-        self.export_dir.mkdir(parents=True, exist_ok=True)
-        selection_csv = self.write_selection_csv(self.export_dir)
-        refs_by_key = self._refs_by_tile_slot()
-        selected_slots = sorted({(ref.tile_id, ref.frame_slot) for ref in refs})
-        self._detect_tile_slots(selected_slots, refs_by_key)
-        manifest = []
-        for ref in refs:
-            image = self._raw_image_for_ref(ref)
-            detection_image = self._detection_image_for_ref(ref)
-            out_dir = self.export_dir / ref.tract / ref.patch / ref.band / ref.tile_id
-            out_dir.mkdir(parents=True, exist_ok=True)
-            stem = ref.candidate_id
-            npz_path = out_dir / f"{stem}.npz"
-            np.savez_compressed(npz_path, image=image)
-            png_path = out_dir / f"{stem}.png"
-            detect_png_path = out_dir / f"{stem}_detect_overlay.png"
-            input_shape_png_path = out_dir / f"{stem}_input_shape_overlay.png"
-            ap2_snr_png_path = out_dir / f"{stem}_ap2_snr_overlay.png"
-            kron_snr_png_path = out_dir / f"{stem}_kron_snr_overlay.png"
-            detect_csv_path = out_dir / f"{stem}_detections.csv"
-            mask_png_path = out_dir / f"{stem}_mask_overlay.png"
-            if write_png:
-                Image.fromarray(display_gray(image), mode="L").convert("RGB").save(png_path)
-            detect_rows = self.detect_rows_by_token.get(ref.token, [])
-            fieldnames = sorted({key for item in detect_rows for key in item}) if detect_rows else [
-                "x",
-                "y",
-                "score",
-                "major",
-                "minor",
-                "theta",
-            ]
-            with detect_csv_path.open("w", newline="", encoding="utf-8") as handle:
-                writer = csv.DictWriter(handle, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(detect_rows)
-            if write_png and self.make_masks and ref.token in self.detect_rows_by_token:
-                mask_png_path.write_bytes(self.mask_png(ref.token))
-            if write_png:
-                overlay = _overlay_uint8(detection_image, detect_rows, draw_centers=self.shape_overlay_centers)
-                _save_titled_png(
-                    detect_png_path,
-                    overlay,
-                    f"{ref.candidate_id} detections={len(detect_rows)}",
-                    min_image_size=512,
+    def _export_ref(self, ref: FrameRef, detect_rows: list[dict[str, Any]], masks: Any,
+                    write_png: bool) -> tuple[dict[str, Any], dict[str, float]]:
+        """CPU-only export of one candidate; masks are pinned by the producer."""
+        started = last = time.perf_counter()
+        timings: dict[str, float] = {}
+
+        def mark(stage: str) -> None:
+            nonlocal last
+            now = time.perf_counter()
+            timings[stage] = now - last
+            last = now
+
+        image = self._raw_image_for_ref(ref)
+        detection_image = self._detection_image_for_ref(ref)
+        mark("read")
+        out_dir = self.export_dir / ref.tract / ref.patch / ref.band / ref.tile_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stem = ref.candidate_id
+        npz_path = out_dir / f"{stem}.npz"
+        np.savez_compressed(npz_path, image=image)
+        png_path = out_dir / f"{stem}.png"
+        detect_png_path = out_dir / f"{stem}_detect_overlay.png"
+        input_shape_png_path = out_dir / f"{stem}_input_shape_overlay.png"
+        ap2_snr_png_path = out_dir / f"{stem}_ap2_snr_overlay.png"
+        kron_snr_png_path = out_dir / f"{stem}_kron_snr_overlay.png"
+        detect_csv_path = out_dir / f"{stem}_detections.csv"
+        mask_png_path = out_dir / f"{stem}_mask_overlay.png"
+        if write_png:
+            Image.fromarray(display_gray(image), mode="L").convert("RGB").save(png_path)
+        fieldnames = sorted({key for item in detect_rows for key in item}) if detect_rows else [
+            "x",
+            "y",
+            "score",
+            "major",
+            "minor",
+            "theta",
+        ]
+        with detect_csv_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(detect_rows)
+        mark("raw_npz_png_csv")
+        if write_png and masks is not None:
+            base = _display_input_uint8(detection_image, display_scaling="zscale")
+            mask_png_path.write_bytes(_png_bytes(overlay_masks(base, masks)))
+        mark("mask_png")
+        if write_png:
+            overlay = _overlay_uint8(detection_image, detect_rows, draw_centers=self.shape_overlay_centers)
+            _save_titled_png(
+                detect_png_path,
+                overlay,
+                f"{ref.candidate_id} detections={len(detect_rows)}",
+                min_image_size=512,
+            )
+            scaled = self._scaled_input_for_ref(ref)
+            input_overlay = _input_shape_overlay_uint8(
+                scaled,
+                detect_rows,
+                scaling=self.scaling_mode,
+                clip_threshold=self.clip_threshold,
+                draw_centers=self.shape_overlay_centers,
+            )
+            _save_titled_png(
+                input_shape_png_path,
+                input_overlay,
+                f"{ref.candidate_id} input shape detections={len(detect_rows)}",
+                min_image_size=512,
+            )
+            mark("detection_pngs")
+            cached_snr, snr_costs = self._measure_snr_rows_for_ref(ref, detection_image, detect_rows)
+            timings.update(snr_costs)
+            mark("snr_measurement")
+            for method, snr_png_path, label in (
+                ("ap2", ap2_snr_png_path, "AP2"),
+                ("kron", kron_snr_png_path, "Kron"),
+            ):
+                snr_rows = cached_snr[method]
+                plot_started = time.perf_counter()
+                _save_snr_overlay_png(
+                    snr_png_path,
+                    detection_image,
+                    snr_rows,
+                    title=f"{ref.candidate_id} {label} SNR, red<5 green>5 gray=bad",
+                    threshold=5.0,
                 )
-                scaled = self._scaled_input_for_ref(ref)
-                input_overlay = _input_shape_overlay_uint8(
-                    scaled,
-                    detect_rows,
-                    scaling=self.scaling_mode,
-                    clip_threshold=self.clip_threshold,
-                    draw_centers=self.shape_overlay_centers,
-                )
-                _save_titled_png(
-                    input_shape_png_path,
-                    input_overlay,
-                    f"{ref.candidate_id} input shape detections={len(detect_rows)}",
-                    min_image_size=512,
-                )
-                for method, snr_png_path, label in (
-                    ("ap2", ap2_snr_png_path, "AP2"),
-                    ("kron", kron_snr_png_path, "Kron"),
-                ):
-                    snr_rows = self._snr_rows_for_token(ref.token, method)
-                    _save_snr_overlay_png(
-                        snr_png_path,
-                        detection_image,
-                        snr_rows,
-                        title=f"{ref.candidate_id} {label} SNR, red<5 green>5 gray=bad",
-                        threshold=5.0,
-                    )
-            row = {
-                **ref.to_dict(),
-                "npz_path": str(npz_path),
-                "png_path": str(png_path) if write_png else "",
-                "detect_png_path": str(detect_png_path) if write_png else "",
-                "input_shape_png_path": str(input_shape_png_path) if write_png else "",
-                "ap2_snr_png_path": str(ap2_snr_png_path) if write_png else "",
-                "kron_snr_png_path": str(kron_snr_png_path) if write_png else "",
-                "detect_csv_path": str(detect_csv_path),
-                "mask_png_path": str(mask_png_path) if write_png and self.make_masks and ref.token in self.detect_rows_by_token else "",
-                "export_subdir": str(out_dir),
-                "n_detections": len(detect_rows),
-            }
-            (out_dir / f"{stem}.json").write_text(json.dumps(row, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-            manifest.append(row)
-        with (self.export_dir / "export_manifest.jsonl").open("w", encoding="utf-8") as handle:
-            for row in manifest:
-                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-        return {
-            "n_exported": len(manifest),
-            "out_dir": str(self.export_dir),
-            "selection_csv": str(selection_csv),
-            "n_detections": sum(int(row["n_detections"]) for row in manifest),
+                self._log_snr(ref, "export", method, "plot", "done", len(snr_rows),
+                         seconds=time.perf_counter() - plot_started)
+        mark("snr_pngs")
+        row = {
+            **ref.to_dict(),
+            "npz_path": str(npz_path),
+            "png_path": str(png_path) if write_png else "",
+            "detect_png_path": str(detect_png_path) if write_png else "",
+            "input_shape_png_path": str(input_shape_png_path) if write_png else "",
+            "ap2_snr_png_path": str(ap2_snr_png_path) if write_png else "",
+            "kron_snr_png_path": str(kron_snr_png_path) if write_png else "",
+            "detect_csv_path": str(detect_csv_path),
+            "mask_png_path": str(mask_png_path) if write_png and masks is not None else "",
+            "export_subdir": str(out_dir),
+            "n_detections": len(detect_rows),
+            "inference_parameters": self._inference_parameters(),
+            "checkpoint": str(self.checkpoint),
         }
+        (out_dir / f"{stem}.json").write_text(json.dumps(row, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        mark("metadata")
+        timings["total"] = time.perf_counter() - started
+        return row, timings
+
+    def export_status(self) -> dict[str, Any]:
+        with self._export_progress_lock:
+            status = dict(self._export_progress)
+            if status["stage"] in {"preparing", "exporting"}:
+                status["elapsed_seconds"] = time.perf_counter() - self._export_started
+            return status
+
+    def _set_export_progress(self, **changes: Any) -> None:
+        with self._export_progress_lock:
+            self._export_progress.update(changes)
+
+    def export_selected(self, write_png: bool = True, *, workers: int | None = None) -> dict[str, Any]:
+        workers = self.export_workers if workers is None else int(workers)
+        if workers < 1:
+            raise ValueError("export workers must be at least 1")
+        if not self._export_lock.acquire(blocking=False):
+            raise RuntimeError("an export is already running; see /api/export_status")
+        started = time.perf_counter()
+        self._export_started = started
+        timings: list[dict[str, Any]] = []
+        detect_seconds = 0.0
+        regenerated_masks = 0
+        completed = 0
+        pending = {}
+        try:
+            # Snapshot selection and patch before doing any asynchronous work.
+            refs = self.selected_refs()
+            if not refs:
+                raise RuntimeError("no selected candidates")
+            refs_by_key = self._refs_by_tile_slot()
+            workers = min(workers, len(refs))
+            self._set_export_progress(stage="preparing", completed=0, total=len(refs),
+                                      workers=workers, elapsed_seconds=0.0, error=None)
+            self.export_dir.mkdir(parents=True, exist_ok=True)
+            selection_csv = self.write_selection_csv(self.export_dir, refs=refs)
+            by_slot: dict[tuple[str, int], list[tuple[int, FrameRef]]] = {}
+            for index, ref in enumerate(refs):
+                by_slot.setdefault((ref.tile_id, ref.frame_slot), []).append((index, ref))
+            slots = sorted(by_slot)
+            band_count = max(len(refs_by_key.get(slot, {})) for slot in slots)
+            chunk_size = min(self.detect_batch_size, max(1, (2 * workers) // max(1, band_count)))
+            manifest: list[Any] = [None] * len(refs)
+
+            def collect_done(block: bool = False) -> None:
+                nonlocal completed
+                if not pending:
+                    return
+                done, _ = wait(pending, timeout=None if block else 0,
+                               return_when=FIRST_COMPLETED)
+                for future in done:
+                    index, ref = pending.pop(future)
+                    row, costs = future.result()
+                    manifest[index] = row
+                    timings.append({"index": index, "token": ref.token, "seconds": costs})
+                    completed += 1
+                    self._set_export_progress(completed=completed,
+                                              elapsed_seconds=time.perf_counter() - started)
+                    print(f"[export] {completed}/{len(refs)} {ref.candidate_id} "
+                          f"total={costs['total']:.2f}s snr={costs.get('snr_measurement', 0):.2f}s", flush=True)
+
+            print(f"[export] start candidates={len(refs)} workers={workers} "
+                  f"max_pending={2 * workers}", flush=True)
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="browser-export") as pool:
+                for start in range(0, len(slots), chunk_size):
+                    while len(pending) >= 2 * workers:
+                        collect_done(block=True)
+                    chunk = slots[start:start + chunk_size]
+                    mask_sink: dict[str, Any] = {}
+                    detect_started = time.perf_counter()
+                    # Capture masks while inference is locked; later LRU eviction
+                    # cannot cause a worker to re-run the encoder/mask decoder.
+                    with self._mask_lock:
+                        self._detect_tile_slots(chunk, refs_by_key, mask_sink=mask_sink)
+                        jobs = []
+                        for slot in chunk:
+                            for index, ref in by_slot[slot]:
+                                if ref.token not in self.detect_rows_by_token:
+                                    raise RuntimeError(f"detection failed for {ref.candidate_id}; see server log")
+                                masks = None
+                                if write_png and self.make_masks:
+                                    masks = mask_sink.get(ref.token)
+                                    if masks is None:
+                                        if self._mask_cache.get(ref.token) is None:
+                                            regenerated_masks += 1
+                                        masks = self._masks_for_token(ref.token)
+                                jobs.append((index, ref, self.detect_rows_by_token[ref.token], masks))
+                    detect_seconds += time.perf_counter() - detect_started
+                    self._set_export_progress(stage="exporting", elapsed_seconds=time.perf_counter() - started)
+                    for index, ref, rows, masks in jobs:
+                        while len(pending) >= 2 * workers:
+                            collect_done(block=True)
+                        future = pool.submit(self._export_ref, ref, rows, masks, write_png)
+                        pending[future] = (index, ref)
+                        collect_done()
+                    # Only the bounded queue retains this chunk's masks.
+                    jobs.clear()
+                    mask_sink.clear()
+                while pending:
+                    collect_done(block=True)
+            target = self.export_dir / "export_manifest.jsonl"
+            temp = target.with_suffix(".jsonl.tmp")
+            with temp.open("w", encoding="utf-8") as handle:
+                for row in manifest:
+                    handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+            temp.replace(target)
+            elapsed = time.perf_counter() - started
+            report = {"workers": workers, "n_exported": len(manifest), "elapsed_seconds": elapsed,
+                      "detection_and_mask_seconds": detect_seconds,
+                      "regenerated_cached_masks": regenerated_masks,
+                      "cpu_stage_seconds_sum": {key: sum(item["seconds"].get(key, 0) for item in timings)
+                          for key in ("read", "raw_npz_png_csv", "mask_png", "detection_pngs",
+                                      "snr_measurement", "snr_background", "snr_ap2", "snr_kron",
+                                      "snr_pngs", "metadata", "total")},
+                      "candidates": sorted(timings, key=lambda item: item["index"])}
+            (self.export_dir / "export_timings.json").write_text(
+                json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            self._set_export_progress(stage="done", elapsed_seconds=elapsed)
+            cpu_times = report["cpu_stage_seconds_sum"]
+            print(f"[export] done candidates={len(manifest)} workers={workers} wall={elapsed:.2f}s "
+                  f"detection_and_masks={detect_seconds:.2f}s "
+                  f"snr_compute_sum={cpu_times['snr_measurement']:.2f}s "
+                  f"snr_plot_sum={cpu_times['snr_pngs']:.2f}s", flush=True)
+            return {"n_exported": len(manifest), "out_dir": str(self.export_dir),
+                    "selection_csv": str(selection_csv), "workers": workers, "elapsed_seconds": elapsed,
+                    "timings_path": str(self.export_dir / "export_timings.json"),
+                    "n_detections": sum(int(row["n_detections"]) for row in manifest)}
+        except Exception as exc:
+            for future in pending:
+                future.cancel()
+            self._set_export_progress(stage="error", error=str(exc),
+                                      elapsed_seconds=time.perf_counter() - started)
+            raise
+        finally:
+            self._export_lock.release()

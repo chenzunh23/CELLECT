@@ -157,6 +157,8 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/state":
                 state = self.server.browser_state  # type: ignore[attr-defined]
                 self._send_json(state.state_payload() if state is not None else {"started": False})
+            elif parsed.path == "/api/export_status":
+                self._send_json(self.state.export_status())
             elif parsed.path == "/api/page":
                 page = int(parse_qs(parsed.query).get("page", ["0"])[0])
                 self._send_json(self.state.page_payload(page))
@@ -308,7 +310,8 @@ class Handler(BaseHTTPRequestHandler):
                 mask_paths = self.state.save_selected_masks()
                 self._send_json({"selection_csv": str(path), "n_selected": len(self.state.selected), "n_mask_images": len(mask_paths), "mask_paths": mask_paths})
             elif parsed.path == "/api/export":
-                result = self.state.export_selected(write_png=bool(payload.get("write_png", True)))
+                result = self.state.export_selected(write_png=bool(payload.get("write_png", True)),
+                                                    workers=payload.get("workers"))
                 self._send_json(result)
             else:
                 self._send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
@@ -620,12 +623,15 @@ def main() -> None:
     parser.add_argument("--abell-plan", type=Path, default=DEFAULT_ABELL_PLAN)
     parser.add_argument("--image-workers", type=int, default=4, help="Concurrent CPU/FITS readers; also used to prepare detection batches. No additional GPU workers.")
     parser.add_argument("--scaling-workers", type=int, default=2, help="Separate concurrency limit for expensive parent scaling; does not block raw thumbnails.")
+    parser.add_argument("--export-workers", type=int, default=4, help="CPU workers for selected export (PNG/NPZ/SNR). GPU inference stays serialized; queued exports are bounded.")
     parser.add_argument("--browser-cache-mb", type=int, default=128, help="Bounded cache of read pixels and scaled tensors; no fixed display scaling.")
+    parser.add_argument("--cosmos-parent-cache-mb", type=int, default=320, help="COSMOS on-demand 4096-pixel FITS parent cache, shared across bands and pointings (MiB). Search uses headers only.")
     parser.add_argument("--jwst-input-scaling", choices=("training_parent", "browser"), default="training_parent", help="COSMOS/Abell: parent RGB or the supplied --scaling-mode. View scaling is always adjustable.")
     parser.add_argument("--make-masks", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--mask-chunk-size", type=int, default=32)
     parser.add_argument("--mask-threshold", type=float, default=0.0)
-    parser.add_argument("--mask-box-scale", type=float, default=2.0)
+    parser.add_argument("--mask-box-scale", type=float, default=1.0, help="Multiplier of the training Kron bbox; 1 matches training exactly.")
+    parser.add_argument("--mask-selection", choices=("pred_iou", "geometry"), default="pred_iou", help="Select among trained mask candidates; default highest raw predicted IoU score.")
     parser.add_argument("--jwst-root", type=Path, default=DEFAULT_JWST_NIRCAM_ROOT)
     parser.add_argument("--jwst-tile-size", type=int, default=DEFAULT_JWST_NIRCAM_TILE_SIZE)
     parser.add_argument("--tract", default="9813")

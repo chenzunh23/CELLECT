@@ -220,8 +220,8 @@ def hsc_job(args,row):
     image,header,origin=_read_image_header_origin(path)
     background_method=getattr(args,'hsc_background_method','sextractor')
     if background_method=='lsst':
-        from .utils.hsc_background import resolve_lsst_background,read_lsst_background
-        bgpath,bgreceipt=resolve_lsst_background(args.variant_lsst_background_root,row,args.tract)
+        from .utils.hsc_background import resolve_training_lsst_background,read_lsst_background
+        bgpath,bgreceipt=resolve_training_lsst_background(args,row)
         sky=read_lsst_background(bgpath,image.shape,origin,bgreceipt) & np.isfinite(image)
     elif background_method!='sextractor':
         raise ValueError(f'Unknown HSC background method: {background_method}')
@@ -252,6 +252,7 @@ def hsc_job(args,row):
             background_method=('LSST on matching training input' if background_method=='lsst'
                                else 'aggressive SExtractor on matching training input'),
             hsc_background_method=background_method,
+            hsc_half_lsst_background_source=getattr(args,'hsc_half_lsst_background_source','training'),
             hsc_quality_policy='0827_bad_score_edge0p1',hsc_bad_score_threshold=.13,
             split_group=f'HSC_{args.tract}_{patch}'))
 
@@ -302,8 +303,8 @@ def run_job(args,row):
                str(_refit_csv_path(Path(args.refit_root),args.tract,row['band'],row['patch'])),
                str(_band_catalog_path(Path(args.data_root),row['band'],args.tract,row['patch'])),args.gaia_fits]
         if getattr(args,'hsc_background_method','sextractor')=='lsst':
-            from .utils.hsc_background import resolve_lsst_background
-            bgpath,bgreceipt=resolve_lsst_background(args.variant_lsst_background_root,row,args.tract)
+            from .utils.hsc_background import resolve_training_lsst_background
+            bgpath,bgreceipt=resolve_training_lsst_background(args,row)
             paths.append(str(bgpath))
             if bgreceipt is not None:paths.append(str(bgreceipt))
         elif row['kind']=='hsc_noisy':
@@ -314,6 +315,7 @@ def run_job(args,row):
         max_invalid_fraction=args.jwst_max_invalid_fraction)
     if row['kind'] in ('hsc_half','hsc_noisy'):
         signature['hsc_background_method']=getattr(args,'hsc_background_method','sextractor')
+        signature['hsc_half_lsst_background_source']=getattr(args,'hsc_half_lsst_background_source','training')
     if receipt.exists() and not args.overwrite:
         previous=json.loads(receipt.read_text())
         if previous.get('signature')==signature and all(Path(p).exists() and Path(p+'_manifest.json').exists() for p in previous['result'].get('outputs',[])):

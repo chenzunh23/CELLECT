@@ -42,6 +42,7 @@ def combine_prompts(mandatory, gt, pred, *, pred_ratio, max_gt=128, max_pred=128
     GT/pred quota is selected by the epoch schedule, not by weighting the same
     labelled sources twice. A nonpositive cap retains the historical unlimited
     option for ordinary points. Labelled prompts survive the all-predicted phase.
+    Unfilled GT/predicted quotas remain empty; neither pool fills the other pool.
     """
     sets = [(2, mandatory), (0, gt), (1, pred)]
     sets = [(kind, p) for kind, p in sets if p is not None]
@@ -73,9 +74,6 @@ def combine_prompts(mandatory, gt, pred, *, pred_ratio, max_gt=128, max_pred=128
         remaining = max(0, cap-len(labelled))
         want_pred = round(remaining*pred_ratio)
         npred, ngt = min(want_pred, len(pools[1])), min(remaining-want_pred, len(pools[0]))
-        spare = remaining-npred-ngt
-        extra = min(spare, len(pools[1])-npred); npred += extra; spare -= extra
-        ngt += min(spare, len(pools[0])-ngt)
         selected.extend((0, gt, j) for j in pools[0][:ngt])
         selected.extend((1, pred, j) for j in pools[1][:npred])
     if not selected:

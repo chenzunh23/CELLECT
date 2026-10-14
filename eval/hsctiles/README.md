@@ -140,6 +140,18 @@ opens a full-screen dialog:
 Search only covers tiles loaded into the current session. Use `max` on the menu
 page when coordinate search needs to cover every available tile.
 
+COSMOS is an exception: every tile in the selected pointing(s) is indexed from
+FITS headers, regardless of the tile-count setting. Search and page jumps can
+reach the entire mosaic without scanning science pixels for coverage. Empty and
+partially covered edge tiles remain searchable. On opening a page, only its
+4096×4096 parent is read for each requested band; neighboring pages reuse those
+pixels. Pages stay within a parent, so a page may contain fewer tiles than the
+configured maximum. The browser receives the visible 512×512 PNGs, not the full
+mosaic. The byte-bounded parent cache defaults to 320 MiB (four float32 science
+and boolean validity parents), adjustable with `--cosmos-parent-cache-mb`.
+FITS remain the image source and display scaling remains adjustable. This lazy
+index is browser-only; offline coverage filtering is unchanged.
+
 The browser has independent detection and view controls:
 
 - `Detect`: runs CELLECT on the current page and toggles cached detection
@@ -170,6 +182,39 @@ directory under `eval/hsctiles/interactive_selected/`.
 
 Each exported tile includes raw PNG/NPZ, detection CSV, raw-background detection
 overlay, and input-shape overlay.
+
+Selected export now uses a bounded CPU thread pool, default **4 workers**.
+Set `--export-workers 4` in the server command, or change **Export workers**
+beside **Export Selected** for the next export. This is independent of
+`--image-workers` and `--scaling-workers`. Encoder and mask decoding remain
+serialized on the existing GPU model; CPU workers render/write PNG/NPZ/CSV
+and calculate SNR. Detection runs in bounded chunks, with masks retained until
+their export finishes, avoiding re-inference caused by mask-cache eviction.
+AP2 and Kron share the same 65×65 median background; their numerical definitions
+and the exported products are unchanged. Tiles with no detections skip SNR
+calculation. Manifest/selection order remains stable across worker counts.
+
+The button immediately displays `Exporting ...` while images load and detections
+are prepared; routine page-loading messages do not replace export progress.
+The browser shows completed/total images and elapsed time. `GET /api/export_status`
+returns progress; `POST /api/export` accepts `{"write_png": true, "workers": 4}`.
+Only one export per browser session can run at a time. Each completed export
+adds `export_timings.json` with wall time, detection/mask time and per-candidate
+CPU timings. CPU stage totals sum concurrent work and can exceed wall time.
+Server logs print `[export]` progress and timings. Existing Python servers must
+be restarted and the browser refreshed to load these changes.
+
+SNR work also prints flushed `[snr]` lines for both export and the interactive
+SNR view and appends the same lines to `<session_dir>/snr.log` immediately.
+`/api/state` and `browser_manifest.json` expose `snr_log_path`.
+Each line identifies the candidate, worker thread, source count,
+method, stage and cache hit/miss. Calculation emits start/done/error for the
+shared `background` (65×65 median filtering), `ap2`, `kron`, and `total` stages;
+rendering is explicitly labeled `stage=plot`. Cached results and empty
+detections print `status=cached` / `status=skipped`, without pretending to
+recalculate. `export_timings.json` includes `snr_background`, `snr_ap2`, and
+`snr_kron` as components of `snr_measurement`. These sums represent concurrent
+worker elapsed times, not overall export wall time.
 
 ## COSMOS / Abell and grouped dataset menu
 
@@ -252,3 +297,23 @@ Regression checks:
   eval.tests.test_jwst_fields eval.tests.test_browser_fast_masks -v
 node eval/tests/test_dataset_menu.js
 ```
+
+
+### Mask inference alignment (2026-10-01)
+
+The browser now reads `mask_multimask` from the checkpoint run configuration:
+trained multi-mask tokens 1–3 are used for the current experiments. Center and
+rotated-Kron bounding-box prompts use the training helper, with `--mask-box-scale 1`
+(default); remove any old explicit `--mask-box-scale 2` argument. Restart the
+server to clear model/mask caches after this change. Bounding boxes shown on the
+mask overlay are tight *output* bounds, not the input prompt boxes.
+
+GT masks are unavailable during inference. `--mask-selection pred_iou` (default)
+selects the highest raw predicted IoU score among the trained candidates. Scores
+are not clamped to [0,1] and no absolute IoU threshold is imposed. The alternative
+`--mask-selection geometry` reuses centroid/outside/area terms; this can prefer
+small centered masks and is retained for comparisons. Neither mode reproduces
+GT-dependent training selection. Empty masks are not replaced by the largest
+candidate. Training still selects candidates by its configured loss. JWST invalid coverage
+is excluded. New session/export manifests record numeric scaling and detection
+settings as well as the mask policy, for repeatable comparisons.

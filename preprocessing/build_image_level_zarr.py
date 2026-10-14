@@ -738,6 +738,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument('--hsc-products-root', default='/data/czh23/Subaru_products')
     parser.add_argument('--hsc-background-method', choices=['sextractor', 'lsst'], default='sextractor',
                         help='For --training-batch HSC half/noisy only: use SExtractor or matching LSST masks from --variant-lsst-background-root. JWST continues to use its SExtractor masks.')
+    parser.add_argument('--hsc-half-lsst-background-source',choices=['training','coadd'],default='training',
+                        help='Explicitly use matching half backgrounds or aligned full-coadd LSST backgrounds for HSC half. Noisy always uses its own backgrounds.')
     parser.add_argument('--training-kinds', nargs='+', choices=['hsc_half','hsc_noisy','cosmos','abell'], default=['hsc_half','hsc_noisy','cosmos','abell'])
     parser.add_argument('--job-limit', type=int, default=0, help='Pilot job limit; 0 means all')
     parser.add_argument('--large-only', action='store_true', help='Pilot: write centered large sources without ordinary grid')

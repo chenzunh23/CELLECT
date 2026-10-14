@@ -23,6 +23,8 @@ from preprocessing.image_processing import prepare_image
 from preprocessing.utils.parent_scaling import fit_parent_rgb, apply_parent_rgb
 from preprocessing.utils.sky_tiles import SkyTile, tile_header, reproject_tile
 from .parallel_load import ParallelLoad
+from .array_cache import ArrayCache
+from .base import TileRow
 from .jwst import JwstNircamAccess
 
 DEFAULT_COSMOS_ROOT = Path('/data/czh23/JWST/COSMOS_1727_5893')
@@ -186,6 +188,64 @@ class JwstFieldAccess(JwstNircamAccess):
 class CosmosAccess(JwstFieldAccess):
     dataset = 'jwst_cosmos'
     display_name = 'COSMOS 1727 / 5893'
+    parent_size = 4096
+
+    def __init__(self, *args, lazy_browser=False, parent_cache_mb=320, image_workers=4, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.lazy_browser = bool(lazy_browser)
+        self._parent_pixels = ArrayCache(max(0, int(parent_cache_mb)) * 1024**2)
+        self._pixel_load = ParallelLoad(image_workers, 'cosmos-parent-read')
+        self._browse_grids = {}
+
+    def _browse_grid(self, patch, bands):
+        """Full searchable geometry, including edge/empty tiles; no pixel scan."""
+        present = self._present_bands(patch, list(bands))
+        key = (patch, present)
+        if key not in self._browse_grids:
+            if not present:
+                self._browse_grids[key] = {}
+            else:
+                ny, nx = self._shape(self._reference_band(patch, present), patch)
+                size = self.tile_size
+                tiles = [TileRow(iy*((nx+size-1)//size)+ix, f'x{ix:03d}_y{iy:03d}',
+                                 x, y, x+size, y+size)
+                         for iy, y in enumerate(range(0, ny, size))
+                         for ix, x in enumerate(range(0, nx, size))]
+                # Keep adjacent pages in one parent to amortize the bounded read.
+                tiles.sort(key=lambda t: (t.y0//self.parent_size, t.x0//self.parent_size, t.y0, t.x0))
+                self._browse_grids[key] = {t.tile_id: t for t in tiles}
+        return self._browse_grids[key]
+
+    def choose_tiles(self, patch, bands, *, n_tiles, all_tiles, seed, mode='default'):
+        if not self.lazy_browser:
+            return super().choose_tiles(patch, bands, n_tiles=n_tiles, all_tiles=all_tiles, seed=seed, mode=mode)
+        self._active_bands_by_patch[str(patch)] = self._present_bands(patch, bands)
+        # n_tiles samples science in offline evaluation; browser search always
+        # indexes every tile, and only image requests trigger reads.
+        return list(self._browse_grid(patch, bands))
+
+    def tiles(self, band, patch):
+        if not self.lazy_browser:
+            return super().tiles(band, patch)
+        return list(self.tile_by_id(band, patch).values())
+
+    def tile_by_id(self, band, patch):
+        if not self.lazy_browser:
+            return super().tile_by_id(band, patch)
+        return self._browse_grid(patch, self._active_bands_by_patch.get(str(patch), (band,)))
+
+    def browse_pages(self, patch, bands, tiles_per_page):
+        pages, current, parent = [], [], None
+        for tile in self._browse_grid(patch, bands).values():
+            key = (tile.x0//self.parent_size, tile.y0//self.parent_size)
+            if current and (key != parent or len(current) >= tiles_per_page):
+                pages.append(current)
+                current = []
+            current.append(tile.tile_id)
+            parent = key
+        if current:
+            pages.append(current)
+        return pages
 
     def _discover(self):
         if self._files_by_patch is None:
@@ -204,7 +264,33 @@ class CosmosAccess(JwstFieldAccess):
 
     def _read_window(self, band, patch, x, y, width, height):
         self._discover()
-        return fits_window(self._sources[(patch, band.lower())], x, y, width, height)
+        source = self._sources[(patch, band.lower())]
+        if not self.lazy_browser:
+            return fits_window(source, x, y, width, height)
+        header = self.grid_header(band, patch)
+        nx, ny = int(header['NAXIS1']), int(header['NAXIS2'])
+        out = np.full((height, width), np.nan, np.float32)
+        valid = np.zeros((height, width), bool)
+        xa, ya, xb, yb = max(0, x), max(0, y), min(nx, x+width), min(ny, y+height)
+        size = self.parent_size
+        if xa < xb and ya < yb:
+            for py in range((ya//size)*size, yb, size):
+                for px in range((xa//size)*size, xb, size):
+                    key = (patch, band.lower(), px, py)
+                    raw, good, _ = self._pixel_load.cached(self._parent_pixels, key,
+                        lambda px=px, py=py: fits_window(source, px, py, size, size))
+                    left, top, right, bottom = max(xa, px), max(ya, py), min(xb, px+size), min(yb, py+size)
+                    dst = np.s_[top-y:bottom-y, left-x:right-x]
+                    src = np.s_[top-py:bottom-py, left-px:right-px]
+                    out[dst], valid[dst] = raw[src], good[src]
+        return out, valid, window_header(header, x, y, width, height)
+
+    def manifest(self, patch):
+        result = super().manifest(patch)
+        if self.lazy_browser:
+            result.update(loading='on-demand FITS parents', parent_size=self.parent_size,
+                          coverage_filter='not applied to browser search', max_no_data_fraction=None)
+        return result
 
 
 class AbellAccess(JwstFieldAccess):

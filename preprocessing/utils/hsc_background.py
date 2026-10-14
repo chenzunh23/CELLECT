@@ -60,3 +60,36 @@ def read_lsst_background(path, shape, origin, receipt=None):
     if mask.shape != tuple(shape):
         raise ValueError(f'LSST background shape mismatch: {path}: {mask.shape} != {shape}')
     return mask
+
+
+def resolve_training_lsst_background(args, row):
+    """Explicitly select matching-input or full-coadd sky for HSC half images."""
+    mode=getattr(args,'hsc_half_lsst_background_source','training')
+    if row['kind']!='hsc_half' or mode=='training':
+        return resolve_lsst_background(args.variant_lsst_background_root,row,args.tract)
+    if mode!='coadd':raise ValueError(f'Unknown HSC half background source: {mode}')
+    from .image_level import _coadd_image_path
+    from ..dataset_inputs import header_info
+    from astropy.wcs import WCS
+    reference=_coadd_image_path(Path(args.data_root),row['band'],args.tract,row['patch'])
+    folder=Path(args.variant_lsst_background_root)/'coadd'/str(args.tract)/row['patch']/'coadd'/row['band']
+    mask=folder/'background_mask.npz';receipt=folder/'summary.json'
+    if not mask.is_file() or not receipt.is_file():
+        raise FileNotFoundError(f'Missing full-coadd HSC background or receipt: {folder}')
+    doc=json.loads(receipt.read_text())
+    if doc.get('status') not in ('ok','done') or Path(doc.get('input','')).resolve()!=reference.resolve():
+        raise ValueError(f'Full-coadd background provenance mismatch: {receipt}')
+    half_header,half_shape,_=header_info(row['source'])
+    full_header,full_shape,_=header_info(reference)
+    if half_shape!=full_shape or tuple(doc['shape_yx'])!=half_shape:
+        raise ValueError(f'Half/full-coadd background grid shape mismatch: {folder}')
+    for key in ('LTV1','LTV2'):
+        if not np.isclose(half_header.get(key,0),full_header.get(key,0)):
+            raise ValueError(f'Half/full-coadd pixel origin mismatch: {folder}')
+    h,w=half_shape;xs=np.array([0,w-1,0,w-1,(w-1)/2]);ys=np.array([0,0,h-1,h-1,(h-1)/2])
+    sky=WCS(half_header).celestial.pixel_to_world_values(xs,ys)
+    fx,fy=WCS(full_header).celestial.world_to_pixel_values(*sky)
+    error=np.hypot(fx-xs,fy-ys)
+    if not np.isfinite(error).all() or np.max(error)>.01:
+        raise ValueError(f'Half/full-coadd WCS mismatch: {folder}; max error={np.max(error)} px')
+    return mask,receipt

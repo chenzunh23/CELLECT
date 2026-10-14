@@ -254,6 +254,106 @@ def test_source_ids_beat_dense_shape_in_nested_region_and_epoch30_keeps_gt():
     assert out['dice']>0;out['total'].backward();assert model.logits.grad.abs().sum()>0
 
 
+def test_no_cross_pool_backfill_and_mandatory_masks_survive():
+    gt=prompts(2); pred=prompts(100)
+    out=combine_prompts(None,gt,pred,pred_ratio=.05,max_gt=128,max_pred=128)
+    assert (out['source_kind']==0).sum()==2
+    assert (out['source_kind']==1).sum()==6  # Not 126 from spare GT slots.
+    out=combine_prompts(None,prompts(100),prompts(1),pred_ratio=.5,max_gt=10,max_pred=10)
+    assert (out['source_kind']==0).sum()==5  # No reverse backfill either.
+    assert (out['source_kind']==1).sum()==1
+    mandatory=prompts(4);mandatory['instance_masks']=[{'mask':torch.ones(1,1)}]*4
+    out=combine_prompts(mandatory,None,None,pred_ratio=1,max_gt=2,max_pred=2)
+    assert len(out['centers'])==4 and (out['source_kind']==2).all()
+    assert combine_prompts(None,None,pred,pred_ratio=0,max_gt=128,max_pred=128) is None
+    assert combine_prompts(None,gt,None,pred_ratio=1,max_gt=128,max_pred=128) is None
+
+
+def test_group_metrics_reduction_preserves_weighting_and_missing_supervision():
+    from sam_backbone.mask_metrics import GROUP_STAT_KEYS, group_statistics, finish_group_metrics, COMPONENT_WEIGHTS
+    kinds=torch.tensor([2,0,1,1]);pw=torch.tensor([1.,1.,.2,1.])
+    lab=torch.tensor([True,False,False,False]);elig=torch.tensor([True,True,False,True]);q=torch.tensor([.25,1.,1.,1.])
+    selected={k:torch.tensor([1.,3.,7.,9.],requires_grad=True) for k in COMPONENT_WEIGHTS}
+    stats=group_statistics(selected,kinds,pw,lab,elig,q,1.)
+    assert not stats.requires_grad
+    w=weights(mask_supervision_weight=1,mask_centroid=1)
+    metric=finish_group_metrics(dict(zip(GROUP_STAT_KEYS,stats.tolist())),w)
+    assert metric['mask_gt_mean_centroid']==2
+    assert abs(metric['mask_gt_mean_dice']-.25)<1e-6  # q not normalized away.
+    assert metric['mask_pred_mean_dice']==0 and metric['mask_pred_supervised_count']==0
+    assert metric['mask_pred_mean_bce']==9
+    assert abs(metric['mask_pred_mean_centroid']-(.2*7+9)/1.2)<1e-6
+    assert metric['mask_gt_count']==2 and metric['mask_actual_pred_fraction']==.5
+    # Unequal batch/rank sizes: sum sufficient stats, do not average means.
+    parts=[]
+    for ids in [torch.tensor([0]),torch.tensor([1,2,3])]:
+        parts.append(group_statistics({k:v[ids] for k,v in selected.items()},kinds[ids],pw[ids],lab[ids],elig[ids],q[ids],1.))
+    torch.testing.assert_close(sum(parts),stats)
+    assert finish_group_metrics(dict(zip(GROUP_STAT_KEYS,sum(parts).tolist())),w)==metric
+
+
+def test_pred_iou_selection_and_split_metrics_do_not_change_loss_contributions():
+    from sam_backbone.mask_metrics import GROUP_STAT_KEYS,finish_group_metrics
+    class Multi(Model):
+        def forward_sam_masks(self,emb,indices,centers,boxes,**kwargs):
+            a=self.logits.expand(len(indices),1,*self.logits.shape[-2:])
+            return torch.cat((a,a+2,a-2),1),a.new_tensor([[1.1,1.7,1.3]]).expand(len(indices),-1)
+    p=prompts(2);p['source_kind']=torch.tensor([0,1]);p['weights']=torch.tensor([1.,.2])
+    model=Multi(torch.zeros(1,1,16,16));w=weights(mask_selection='pred_iou',mask_multimask=True)
+    out=_sam_mask_loss_for_prompts(model,{'confidence':torch.zeros(1),'image_embeddings':torch.zeros(1)},p,
+        weights=w,image_hw=(16,16),ellipse_sigma=1.,batch={'band_trusted_background':torch.ones(1,1,16,16)},return_selection=True)
+    assert out['selected_indices'].tolist()==[1,1]
+    torch.testing.assert_close(out['total'],out['gt_total']+out['pred_total'])
+    m=finish_group_metrics(dict(zip(GROUP_STAT_KEYS,out['group_stats'].tolist())),w)
+    assert m['mask_gt_count']==1 and m['mask_pred_count']==1
+    assert abs(m['mask_gt_mean_bce']-m['mask_pred_mean_bce'])<1e-6
+    out['total'].backward();assert model.logits.grad.abs().sum()>0
+
+
+def test_train_and_validation_publish_group_metrics_with_mixed_prompts():
+    import inspect
+    from unittest.mock import patch
+    import astro_train_ops as ops
+    from sam_backbone.losses import _zero_mask_losses
+    from sam_backbone.mask_metrics import group_statistics,COMPONENT_WEIGHTS
+    model=torch.nn.Linear(1,1);w=ops.LossWeights(mask_outer_weight=1,mask_loss_warmup_epochs=0)
+    batches=[{'image':torch.zeros(2,1,3,4,4),'kinds':torch.tensor([0,1])},
+             {'image':torch.zeros(1,1,3,4,4),'kinds':torch.tensor([1,1,1])}]
+    def forward(m,image,batch):return {'confidence':m.weight.sum()[None]}
+    def dense(outputs,*args,**kwargs):
+        z=outputs['confidence'].sum()*0
+        return {key:z for key in ['total','seg','confidence','shape','center','small_shape','style_router']}
+    def masks(m,outputs,batch,**kwargs):
+        out=_zero_mask_losses(outputs['confidence']);k=batch['kinds'];n=len(k)
+        vals=outputs['confidence'].sum()*0+torch.arange(1,n+1).float()
+        selected={key:vals for key in COMPONENT_WEIGHTS}
+        out.update(total=vals.mean(),gt_total=vals[k==0].sum()/n,pred_total=vals[k==1].sum()/n,
+            prompts=vals.new_tensor(n),gt_prompts=(k==0).sum(),pred_prompts=(k==1).sum(),
+            group_stats=group_statistics(selected,k,torch.ones(n),k==0,torch.ones(n,dtype=torch.bool),torch.ones(n),1.))
+        return out
+    common=dict(device=torch.device('cpu'),weights=w,triplet_loss_fn=None,triplet_enabled=False,
+        ex_enabled=False,en_enabled=False,matcher_candidate_count=1,matcher_max_anchors_per_band=1,
+        triplet_max_sources_per_group=1,triplet_negative_scope='batch',ex_band_pairs=None,
+        center_radius_px=3,epoch_index=10,show_progress=False)
+    logs=[]
+    with patch.object(ops,'model_forward_with_batch_context',forward),patch.object(ops,'dense_losses_any',dense),patch.object(ops,'sam_prompt_mask_losses',masks):
+        train=ops.run_epoch(model,batches,optimizer=torch.optim.SGD(model.parameters(),lr=0),
+            iteration_log_interval=1,iteration_log_fn=lambda d,step:logs.append(d),**common)
+        extra=dict(compute_detection=False,threshold=2.,nms_radius=1,confidence_score='ordinal_expectation',
+            use_ordinal_expectation=False,debug_ordinal_expectation=False,center_refinement='integer',
+            center_refinement_radius=1,use_en_postprocess=False,en_threshold=.5,
+            use_ex_link_postprocess=False,ex_link_threshold=.5,band_names=['F444W'])
+        val,_=ops.validate_epoch(model,batches,**common,**extra)
+    for m in [train,val]:
+        assert m['mask_gt_count']==1 and m['mask_pred_count']==4
+        assert m['mask_gt_mean_centroid']==1 and m['mask_pred_mean_centroid']==2
+        assert m['mask_actual_pred_fraction']==.8
+        assert not any(k.startswith('_mask_group') for k in m)
+    assert logs[0]['loss/mask_gt_count']==1
+    assert logs[1]['loss/mask_gt_count']==0 and logs[1]['loss/mask_pred_count']==3
+    assert logs[1]['loss/mask_pred_supervised_count']==0
+
+
 if __name__ == "__main__":
     suite = unittest.TestSuite(unittest.FunctionTestCase(value) for name, value in list(globals().items()) if name.startswith("test_") and callable(value))
     result = unittest.TextTestRunner(verbosity=2).run(suite)

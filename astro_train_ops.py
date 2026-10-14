@@ -23,6 +23,7 @@ from tqdm import tqdm
 from astro_cellect2d import AstroMatchNet2D, ordinal_confidence_loss
 from astro_match_eval import matcher_classification_loss as vectorized_matcher_classification_loss
 from sam_backbone.losses import mask_outer_weight_for_epoch, prompt_pred_ratio, sam_prompt_mask_losses
+from sam_backbone.mask_metrics import GROUP_STAT_KEYS, finish_group_metrics
 from utils.eval_metrics_utils import (
     _accumulate_link_metrics,
     _centers_from_confidence_target,
@@ -2848,6 +2849,7 @@ def run_epoch(
         "mask_active": 0.0,
         "mask_weight_scale": 0.0,
     }
+    sums.update({key: 0. for key in GROUP_STAT_KEYS})
     count = 0
     rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
     debug_start = int(debug_batch_start)
@@ -2932,7 +2934,7 @@ def run_epoch(
             "pred_prompts",
             "supervised_prompts",
         )
-        return {key: zero for key in keys}
+        return {key: zero for key in keys} | {"group_stats": anchor.new_zeros(len(GROUP_STAT_KEYS), dtype=torch.float64)}
 
     step_scale = max(1, int(global_step_scale))
     progress = tqdm(
@@ -3130,6 +3132,9 @@ def run_epoch(
         sums["mask_gt_prompts"] += float(mask_losses["gt_prompts"].detach()) * batch_size
         sums["mask_pred_prompts"] += float(mask_losses["pred_prompts"].detach()) * batch_size
         sums["mask_supervised_prompts"] += float(mask_losses["supervised_prompts"].detach()) * batch_size
+        group_stats = dict(zip(GROUP_STAT_KEYS, mask_losses["group_stats"].detach().cpu().tolist()))
+        for key, value in group_stats.items():
+            sums[key] += value
         sums["mask_active"] += float(mask_active) * batch_size
         sums["mask_weight_scale"] += float(mask_weight_scale) * batch_size
         should_log_iteration = (
@@ -3178,19 +3183,23 @@ def run_epoch(
                 local_metrics["loss/mask_supervised_prompts"] = float(mask_losses["supervised_prompts"].detach())
                 local_metrics["loss/mask_active"] = float(mask_active)
                 local_metrics["loss/mask_weight_scale"] = float(mask_weight_scale)
+                local_metrics.update(group_stats)
             if distributed and dist.is_available() and dist.is_initialized():
                 metric_keys = list(local_metrics.keys())
                 packed = torch.tensor(
-                    [local_metrics[key] * float(batch_size) for key in metric_keys] + [float(batch_size)],
+                    [local_metrics[key] if key in GROUP_STAT_KEYS else local_metrics[key] * float(batch_size) for key in metric_keys] + [float(batch_size)],
                     device=device,
                     dtype=torch.float64,
                 )
                 dist.all_reduce(packed, op=dist.ReduceOp.SUM)
                 denom = float(packed[-1].item()) if float(packed[-1].item()) > 0.0 else 1.0
                 local_metrics = {
-                    key: float(packed[idx].item()) / denom
+                    key: float(packed[idx].item()) if key in GROUP_STAT_KEYS else float(packed[idx].item()) / denom
                     for idx, key in enumerate(metric_keys)
                 }
+            if any(key in local_metrics for key in GROUP_STAT_KEYS):
+                grouped = finish_group_metrics({key: local_metrics.pop(key) for key in GROUP_STAT_KEYS}, weights)
+                local_metrics.update({f"loss/{key}": value for key, value in grouped.items()})
             if optimizer is not None:
                 for group_idx, group in enumerate(optimizer.param_groups):
                     name = str(group.get("name", group_idx))
@@ -3229,7 +3238,8 @@ def run_epoch(
         sums = {key: float(packed[idx].item()) for idx, key in enumerate(keys)}
         count = int(packed[-1].item())
     # print(f"[DEBUG] Epoch completed in {time.time() - t_epoch_start:.3f} seconds.")
-    return {key: val / max(count, 1) for key, val in sums.items()}
+    return finish_group_metrics({key: val if key in GROUP_STAT_KEYS else val / max(count, 1)
+                                 for key, val in sums.items()}, weights)
 
 
 @torch.no_grad()
@@ -3300,6 +3310,7 @@ def validate_epoch(
         "mask_pred_prompts": 0.0,
         "mask_supervised_prompts": 0.0,
     }
+    sums.update({key: 0. for key in GROUP_STAT_KEYS})
     count = 0
     det_totals = _init_detection_totals(band_names, collect_candidate_stats=collect_candidate_stats) if compute_detection else None
     effective_mask_outer_weight = mask_outer_weight_for_epoch(epoch_index, weights)
@@ -3424,6 +3435,9 @@ def validate_epoch(
         sums["mask_gt_prompts"] += float(mask_losses["gt_prompts"].detach()) * batch_size
         sums["mask_pred_prompts"] += float(mask_losses["pred_prompts"].detach()) * batch_size
         sums["mask_supervised_prompts"] += float(mask_losses["supervised_prompts"].detach()) * batch_size
+        group_stats = dict(zip(GROUP_STAT_KEYS, mask_losses["group_stats"].detach().cpu().tolist()))
+        for key, value in group_stats.items():
+            sums[key] += value
 
     if distributed and dist.is_available() and dist.is_initialized():
         keys = list(sums.keys())
@@ -3439,7 +3453,8 @@ def validate_epoch(
                 band_names,
             )
 
-    dense = {key: val / max(count, 1) for key, val in sums.items()}
+    dense = finish_group_metrics({key: val if key in GROUP_STAT_KEYS else val / max(count, 1)
+                                  for key, val in sums.items()}, weights)
     det = (
         _finalize_detection_totals(
             det_totals,

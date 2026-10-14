@@ -5,6 +5,7 @@ let optionsCache = null;
 let selectedDataset = 'hsc_raw';
 let showDetect = false;
 let detectBusy = false;
+let exportBusy = false;
 let imageVersion = 0;
 let viewShape = true;
 let viewCenter = false;
@@ -32,6 +33,8 @@ async function fetchJson(url, options) {
 }
 
 function setStatus(text, isError=false) {
+  // Page/image loading may finish during export; keep export progress visible.
+  if (exportBusy && !isError && !String(text).startsWith('Export')) return;
   const el = document.getElementById('status');
   el.textContent = text;
   el.className = isError ? 'status error' : 'status';
@@ -117,6 +120,9 @@ function selectDataset(datasetId) {
   nmsInput.value = String(cfg.default_nms_radius == null ? 3 : cfg.default_nms_radius);
   nmsInput.placeholder = String(cfg.default_nms_radius == null ? 3 : cfg.default_nms_radius);
   document.getElementById('nTilesInput').placeholder = String(cfg.default_n_tiles || 4);
+  const lazyCosmos = datasetId === 'jwst_cosmos';
+  document.getElementById('nTilesInput').disabled = lazyCosmos;
+  document.getElementById('maxTilesInput').disabled = lazyCosmos;
   const framesInput = document.getElementById('framesPerTileInput');
   framesInput.placeholder = String(cfg.default_frames_per_tile || 1);
   framesInput.disabled = datasetId.startsWith('jwst');
@@ -124,6 +130,7 @@ function selectDataset(datasetId) {
   document.getElementById('tilesPerPageInput').placeholder = String(cfg.default_tiles_per_page || 2);
   document.getElementById('startButton').disabled = !cfg.enabled;
   if (!cfg.enabled) setStatus(`${cfg.label} is a placeholder in this browser.`, true);
+  else if (lazyCosmos) setStatus('All COSMOS tiles are searchable. FITS pixels load on demand in 4096×4096 parents; opening the browser does not scan mosaic coverage.');
   else setStatus(cfg.scaling ? `Input scaling: ${cfg.scaling}.` : '');
 }
 
@@ -275,6 +282,11 @@ function showMenu() {
 
 async function refreshState(updateTitle=true) {
   state = await fetchJson('/api/state');
+  const exportWorkers = document.getElementById('exportWorkers');
+  if (exportWorkers.dataset.session !== state.session_name) {
+    exportWorkers.value = state.export_workers || 4;
+    exportWorkers.dataset.session = state.session_name;
+  }
   if (!state.started) {
     showMenu();
     return;
@@ -289,7 +301,8 @@ async function refreshState(updateTitle=true) {
   document.getElementById('detect').disabled = detectBusy;
   updateViewMenu();
   const warningText = state.warnings && state.warnings.length ? ` Warnings: ${state.warnings.join(' | ')}` : '';
-  setStatus(`${state.dataset_label || state.dataset} ${state.patch}: ${state.n_candidates} frames from ${state.n_tiles} spatial tiles; groups/tile=${state.frames_per_tile}; tiles/page=${state.tiles_per_page}; detect batch=${state.detect_batch_size}; nms=${state.nms_radius}; selected ${state.n_selected}. Scaling=${state.scaling_mode}; checkpoint=${state.checkpoint_name}.${warningText}`, Boolean(warningText));
+  const loadingText = state.dataset === 'jwst_cosmos' ? ' All tiles searchable; 4096×4096 FITS parents load on demand (empty edge tiles included).' : '';
+  setStatus(`${state.dataset_label || state.dataset} ${state.patch}: ${state.n_candidates} frames from ${state.n_tiles} spatial tiles; groups/tile=${state.frames_per_tile}; tiles/page=${state.tiles_per_page}; detect batch=${state.detect_batch_size}; nms=${state.nms_radius}; selected ${state.n_selected}. Scaling=${state.scaling_mode}; checkpoint=${state.checkpoint_name}.${loadingText}${warningText}`, Boolean(warningText));
 }
 
 async function startBrowser() {
@@ -302,7 +315,7 @@ async function startBrowser() {
   const framesRaw = document.getElementById('framesPerTileInput').value.trim();
   const tilesPageRaw = document.getElementById('tilesPerPageInput').value.trim();
   const nmsRaw = document.getElementById('nmsRadiusInput').value.trim();
-  const maxTiles = document.getElementById('maxTilesInput').checked;
+  const maxTiles = selectedDataset === 'jwst_cosmos' || document.getElementById('maxTilesInput').checked;
   const payload = {
     dataset: selectedDataset,
     tract: document.getElementById('tractInput').value.trim() || cfg.tract || 'default',
@@ -561,12 +574,42 @@ async function saveCsv() {
 }
 
 async function exportSelected() {
-  const result = await fetchJson('/api/export', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({write_png: true})
-  });
-  setStatus(`Exported ${result.n_exported} raw frames and ${result.n_detections} detections to ${result.out_dir}; mask PNGs use normal ZScale.`);
+  if (exportBusy) return;
+  const workers = Number(document.getElementById('exportWorkers').value);
+  if (!Number.isInteger(workers) || workers < 1) throw new Error('Export workers must be a positive integer.');
+  exportBusy = true;
+  document.getElementById('export').disabled = true;
+  document.getElementById('export').textContent = 'Exporting ...';
+  document.getElementById('exportWorkers').disabled = true;
+  setStatus(`Exporting ... loading images and preparing detections (${state.n_selected} images, ${workers} workers).`);
+  let polling = false;
+  const timer = setInterval(async () => {
+    if (polling) return;
+    polling = true;
+    try {
+      const progress = await fetchJson('/api/export_status');
+      if (exportBusy && ['preparing', 'exporting'].includes(progress.stage)) {
+        const phase = progress.stage === 'preparing' ? 'loading images / preparing detections' : 'processing / writing files';
+        setStatus(`Exporting ... ${phase}: ${progress.completed}/${progress.total} images, ${progress.workers} workers, ${Math.round(progress.elapsed_seconds || 0)} s elapsed.`);
+      }
+    } catch (_) { /* The export request reports errors. */ }
+    finally { polling = false; }
+  }, 2000);
+  try {
+    const result = await fetchJson('/api/export', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({write_png: true, workers})
+    });
+    const timing = Number.isFinite(result.elapsed_seconds) ? ` in ${result.elapsed_seconds.toFixed(1)} s (${result.workers} workers)` : '';
+    setStatus(`Exported ${result.n_exported} raw frames and ${result.n_detections} detections${timing} to ${result.out_dir}; mask PNGs use normal ZScale.`);
+  } finally {
+    exportBusy = false;
+    clearInterval(timer);
+    document.getElementById('export').disabled = false;
+    document.getElementById('export').textContent = 'Export Selected';
+    document.getElementById('exportWorkers').disabled = false;
+  }
 }
 
 document.getElementById('prev').onclick = () => loadPage(page - 1);

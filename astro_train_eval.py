@@ -2347,6 +2347,8 @@ def main() -> None:
             "sam_compile_mask_decoder": bool(model_variant == "sam_per_band" and args.sam_compile_mask_decoder),
             "mask_loss_interval": int(args.mask_loss_interval),
             "mask_loss_interval_scale": bool(args.mask_loss_interval_scale),
+            "mask_prompt_backfill": False,
+            "mask_group_metric_normalization": "sum_numerators_and_denominators_across_batches_and_ranks",
             "sam_lr_schedule": (
                 {
                     "type": "iteration_warmup_step",
@@ -2513,6 +2515,10 @@ def main() -> None:
                     metric_key = f"mask_{key}"
                     if metric_key in metrics:
                         filtered[metric_key] = float(metrics[metric_key])
+            # Group means are normalized within GT/pred pools (not contributions
+            # to the mixed loss). Counts distinguish zero loss from no targets.
+            filtered.update({key: float(value) for key, value in metrics.items()
+                if key.startswith(("mask_gt_", "mask_pred_")) or key == "mask_actual_pred_fraction"})
             return filtered
 
         for epoch in range(args.epochs):

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 import numpy as np
 from scipy import ndimage
@@ -108,8 +109,9 @@ def build_ap2_noise_fields(
     rows: Sequence[dict[str, Any]],
     *,
     config: SourceSnrConfig = SourceSnrConfig(),
+    _background: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
 ) -> tuple[ApertureNoiseFields, np.ndarray]:
-    residual, _background, total_mask = background_residual(image, rows, config=config)
+    residual, _bg, total_mask = _background if _background is not None else background_residual(image, rows, config=config)
     fields = build_aperture_noise_fields(
         residual,
         source_mask=total_mask,
@@ -165,9 +167,10 @@ def measure_ap2_snr(
     rows: Sequence[dict[str, Any]],
     *,
     config: SourceSnrConfig = SourceSnrConfig(),
+    _background: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
 ) -> tuple[list[dict[str, Any]], SourceSnrSummary]:
     arr = np.asarray(image, dtype=np.float32)
-    fields, _residual = build_ap2_noise_fields(arr, rows, config=config)
+    fields, _residual = build_ap2_noise_fields(arr, rows, config=config, _background=_background)
     out: list[dict[str, Any]] = []
     n_good = 0
     n_bad = 0
@@ -228,9 +231,10 @@ def measure_kron_snr(
     rows: Sequence[dict[str, Any]],
     *,
     config: SourceSnrConfig = SourceSnrConfig(),
+    _background: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
 ) -> tuple[list[dict[str, Any]], SourceSnrSummary]:
     arr = np.asarray(image, dtype=np.float32)
-    residual, _background, total_mask = background_residual(arr, rows, config=config)
+    residual, _bg, total_mask = _background if _background is not None else background_residual(arr, rows, config=config)
     sky = np.isfinite(residual) & (~total_mask)
     values = residual[sky]
     pixel_sigma = robust_sigma(values)
@@ -443,19 +447,66 @@ def measure_local_aperture_snr(image, x, y, *, major=None, minor=None,
                 background_method="lsst_sky" if sky_mask is not None else "high_threshold_heuristic")
 
 
+def _timed_snr_stage(stage: str, compute: Callable[[], Any],
+                     progress: Callable[[str, str, float | None], None] | None) -> Any:
+    if progress is None:
+        return compute()
+    progress(stage, "start", None)
+    started = time.perf_counter()
+    try:
+        result = compute()
+    except Exception:
+        progress(stage, "error", time.perf_counter() - started)
+        raise
+    progress(stage, "done", time.perf_counter() - started)
+    return result
+
+
 def measure_source_snrs(
     image: np.ndarray,
     rows: Sequence[dict[str, Any]],
     *,
     method: str = "ap2",
     config: SourceSnrConfig = SourceSnrConfig(),
+    progress: Callable[[str, str, float | None], None] | None = None,
 ) -> tuple[list[dict[str, Any]], SourceSnrSummary]:
     normalized = str(method or "ap2").strip().lower()
+    if progress is not None:
+        if normalized in {"ap2", "aperture", "aperture2"}:
+            stage, measure = "ap2", measure_ap2_snr
+        elif normalized in {"kron", "kron_snr", "kron-snr"}:
+            stage, measure = "kron", measure_kron_snr
+        else:
+            raise ValueError(f"unknown SNR method: {method}")
+        prepared = _timed_snr_stage("background",
+            lambda: background_residual(image, rows, config=config), progress)
+        return _timed_snr_stage(stage,
+            lambda: measure(image, rows, config=config, _background=prepared), progress)
     if normalized in {"ap2", "aperture", "aperture2"}:
         return measure_ap2_snr(image, rows, config=config)
     if normalized in {"kron", "kron_snr", "kron-snr"}:
         return measure_kron_snr(image, rows, config=config)
     raise ValueError(f"unknown SNR method: {method}")
+
+
+def measure_source_snrs_both(
+    image: np.ndarray,
+    rows: Sequence[dict[str, Any]],
+    *,
+    config: SourceSnrConfig = SourceSnrConfig(),
+    progress: Callable[[str, str, float | None], None] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Same AP2/Kron measurements, sharing the expensive median background."""
+    if not rows:
+        return {"ap2": [], "kron": []}
+    prepared = _timed_snr_stage("background",
+        lambda: background_residual(image, rows, config=config), progress)
+    return {
+        "ap2": _timed_snr_stage("ap2",
+            lambda: measure_ap2_snr(image, rows, config=config, _background=prepared)[0], progress),
+        "kron": _timed_snr_stage("kron",
+            lambda: measure_kron_snr(image, rows, config=config, _background=prepared)[0], progress),
+    }
 
 
 def filter_snr_rows(rows: Sequence[dict[str, Any]], *, threshold: float) -> list[dict[str, Any]]:

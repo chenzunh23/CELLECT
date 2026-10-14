@@ -19,10 +19,11 @@ from eval.tests.test_jwst_fields import header
 
 
 class FakeDecoder:
+    patch_size=8
     def __init__(self): self.batch_sizes=[]
     def forward_sam_masks(self, embeds, indices, points, boxes, *, chunk_size, output_size, **kw):
         self.batch_sizes.append(len(points))
-        h,w=output_size
+        h,w=(16,16) if output_size is None else output_size
         out=torch.full((len(points),1,h,w),-1.)
         for i,point in enumerate(points):
             x,y=point.to(torch.int64)
@@ -107,6 +108,34 @@ class FastFitsAndMasksTests(unittest.TestCase):
         np.testing.assert_array_equal(out[15-3,4],[0,255,0]) # tight box, flipped Y
         np.testing.assert_array_equal(out[5,6],[0,0,0])
         self.assertFalse(overlay_masks(np.zeros_like(out),masks,[]).any())
+
+    def test_trained_candidates_bbox_selection_and_chunk_invariance(self):
+        from sam_backbone.losses import _boxes_from_centers_shapes
+        class Candidates:
+            patch_size = 8
+            _browser_mask_config = {'_top': {'args': {'ellipse_sigma': 1.25},
+                                            'loss_weights': {'mask_multimask': True}}}
+            def forward_sam_masks(self, embeds, indices, points, boxes, **kw):
+                assert kw['multimask_output'] is True
+                expected = _boxes_from_centers_shapes(points, torch.tensor([[3.,2.,.3]]).expand(len(points),-1),
+                    image_size=(16,16), ellipse_sigma=1.25)
+                torch.testing.assert_close(boxes, expected)
+                masks = torch.full((len(points),3,16,16),-12.)
+                masks[:,0,:3,:3]=12. # distant bad candidate with highest IoU score
+                masks[:,1,6:11,6:11]=12.
+                masks[:,2,:,:]=12. # oversized candidate
+                return masks, torch.tensor([[10.,0.,0.]]).expand(len(points),-1)
+        rows = [dict(x=8.,y=8.,major=3.,minor=2.,theta=.3)]*3
+        outputs = {'image_embeddings': torch.zeros(1,1,2,2)}
+        a = decode_masks(Candidates(),outputs,rows,device=torch.device('cpu'),width=16,height=16,chunk_size=1,selection='geometry')
+        b = decode_masks(Candidates(),outputs,rows,device=torch.device('cpu'),width=16,height=16,chunk_size=3,selection='geometry')
+        np.testing.assert_array_equal(a['selected_tokens'],[2,2,2])
+        by_iou = decode_masks(Candidates(),outputs,rows,device=torch.device('cpu'),width=16,height=16)
+        np.testing.assert_array_equal(by_iou['selected_tokens'],[1,1,1])
+        np.testing.assert_array_equal(by_iou['candidate_pred_iou'],[[10.,0.,0.]]*3)
+        self.assertEqual(by_iou['selection'],'pred_iou')
+        for key in ('packed','offsets','bounds','selected_tokens','candidate_areas'):
+            np.testing.assert_array_equal(a[key],b[key])
 
     def test_export_is_fixed_normal_zscale_and_cached_reads(self):
         state=object.__new__(BrowserState)
