@@ -145,15 +145,17 @@ class OrdinaryDatasetTests(unittest.TestCase):
 
     def test_nested_priority_and_same_priority(self):
         for flags, expected in (([0, 3], [2, 2]), ([3, 0], [3, 1]),
-                                ([3, 3], [4, 2]), ([0, 16], [2, 4])):
+                                ([3, 3], [4, 2]), ([0, 16], [4, 3]),
+                                ([16, 0], [3, 1]), ([16, 19], [3, 3]),
+                                ([8, 19], [4, 3])):
             data = sources([50, 53], a=[10, 2], flags=flags)
             with self.subTest(flags=flags):
                 out = classify(data, "a2744", config=A2744OrdinaryConfig(1))
                 np.testing.assert_array_equal(out.labels.source_class, expected)
 
-    def test_iou_keeps_brighter(self):
+    def test_iou_keeps_brighter_center_but_protects_blended_body(self):
         data = sources([50, 51], a=[10, 10], mag=[20, 24])
-        np.testing.assert_array_equal(classify(data, "a2744", config=A2744OrdinaryConfig(.5)).labels.source_class, [1, 3])
+        np.testing.assert_array_equal(classify(data, "a2744", config=A2744OrdinaryConfig(.5)).labels.source_class, [4, 3])
 
     def test_ignored_parent_stops_demoting_neighbors(self):
         data = sources([50, 54, 40], a=[20, 2, 2], flags=[2, 0, 3])
@@ -161,11 +163,73 @@ class OrdinaryDatasetTests(unittest.TestCase):
         np.testing.assert_array_equal(out.labels.source_class, [3, 1, 1])
 
     def test_snr_applies_to_strict_candidates(self):
-        data = sources(np.arange(5)*30, flags=[16]*5, snr=[-1, 2.99, 3, 5, np.nan])
-        out = classify(data, "a2744", config=A2744OrdinaryConfig(1))
+        data = sources(np.arange(5)*30, flags=[0]*5, snr=[-1, 2.99, 3, 5, np.nan])
+        labels = SourceLabels.empty(5)
+        labels.assign(np.ones(5, bool), C.STRICT_CENTER_ONLY, 'containment_candidate')
+        out = classify_ordinary_sources(data, np.ones(5, bool), labels, dataset='a2744', config=A2744OrdinaryConfig(1))
         np.testing.assert_array_equal(out.labels.source_class, [3, 3, 4, 4, 3])
         apply_remeasured_aperture_snr(out, data.mag, dict(snr=[100, 100, -2, 4, 100], trusted=[False]*5))
         np.testing.assert_array_equal(out.labels.source_class, [3, 3, 3, 4, 3])
+
+    def test_a2744_flag_ignore_cannot_suppress_or_revive(self):
+        for separation in (.1, 1.):
+            for flag in (16, 17, 18, 19):
+                for mag in ([20, 24], [24, 20]):
+                    data = sources([50, 50+separation], a=[10, 10], flags=[0, flag], mag=mag)
+                    out = classify(data, 'a2744', config=A2744OrdinaryConfig(2),
+                        aperture_measurement=dict(snr=[100, 100], trusted=[True, True]))
+                    np.testing.assert_array_equal(out.labels.source_class, [4, 3])
+                    self.assertEqual(out.labels.reason[1], 'a2744_flag_ignore')
+
+    def test_a2744_ignore_flags_are_exact_categories(self):
+        data = sources(np.arange(7)*30, flags=[16, 17, 18, 19, 20, 32, 48])
+        out = classify(data, 'a2744', config=A2744OrdinaryConfig(1))
+        np.testing.assert_array_equal(out.labels.source_class, [3, 3, 3, 3, 1, 1, 1])
+
+    def test_a2744_nonflag_ignored_child_protects_parent(self):
+        for snr in (1., 10.):
+            data = sources([50, 53], a=[10, 2], flags=[0, 3], snr=[10, snr])
+            out = classify(data, 'a2744', config=A2744OrdinaryConfig(1),
+                aperture_measurement=dict(snr=[10, 1], trusted=[True, True]))
+            np.testing.assert_array_equal(out.labels.source_class, [4, 3])
+            self.assertTrue(out.diagnostics['ignore_child_parents'][0])
+
+    def test_a2744_ignored_overlap_without_containment_keeps_shape(self):
+        data = sources([50, 61], a=[10, 3], flags=[0, 16])
+        out = classify(data, 'a2744', config=A2744OrdinaryConfig(1))
+        np.testing.assert_array_equal(out.labels.source_class, [1, 3])
+
+    def test_a2744_parent_of_nan_child_keeps_shape(self):
+        data = sources([50, 53], a=[10, 2], flags=[0, 16])
+        data.center_invalid = np.array([False, True])
+        out = classify(data, 'a2744', config=A2744OrdinaryConfig(1))
+        np.testing.assert_array_equal(out.labels.source_class, [1, 3])
+
+    def test_a2744_blended_parent_zarr_has_no_body_negatives(self):
+        from types import SimpleNamespace
+        from preprocessing.region_filling import fill_dense_regions
+        from preprocessing.utils.image_level import PatchLabels, _tile_targets
+        data = sources([50, 53], a=[10, 2], flags=[0, 16])
+        out = classify(data, 'a2744', config=A2744OrdinaryConfig(1))
+        g = data.geometry
+        dense = fill_dense_regions(Table(), out.labels, (100, 100), geometry=g,
+                                   background_mask=np.ones((100, 100), bool))
+        labels = PatchLabels(Table(), dense, out.labels.source_class, g.x, g.y,
+            g.major, g.minor, g.theta, np.array([1, 2]), np.array([]), np.array([]), np.array([], dtype=int))
+        targets = _tile_targets(labels, SimpleNamespace(x0=0, y0=0, size=100), (0, 0))
+        np.testing.assert_array_equal(targets['strict_ids'], [1])
+        self.assertEqual(len(targets['shape_ids']), 0)
+        self.assertGreater(targets['confidence'][50, 50], 0)
+        self.assertEqual(targets['conf_weight'][50, 58], 0)
+        self.assertEqual(targets['shape_weight'][50, 58], 0)
+        self.assertEqual(targets['conf_weight'][20, 20], 1)
+
+    def test_a2744_dropped_flag_geometry_stays_excluded(self):
+        data = sources([50, 53], a=[10, 2], flags=[0, 16])
+        labels = SourceLabels.empty(2)
+        labels.assign(np.array([False, True]), C.DROPPED, 'area_drop')
+        out = classify_ordinary_sources(data, np.ones(2, bool), labels, dataset='a2744', config=A2744OrdinaryConfig(1))
+        np.testing.assert_array_equal(out.labels.source_class, [1, 0])
 
     def test_star_footprint_protects_bright_sources(self):
         data = sources([30, 60], mag=[21.9, 22])

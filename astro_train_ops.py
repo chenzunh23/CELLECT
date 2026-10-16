@@ -404,8 +404,9 @@ def source_center_shape_loss(
     center_only_factor: float,
     angle_weight: float,
     geometry_loss: str,
+    source_weights_list: Optional[Sequence[Tensor]] = None,
 ) -> Tensor:
-    """Average shape error within each source core, then average over sources."""
+    """Average within source cores, then take a size/reliability weighted mean."""
 
     if pred_shape.ndim != 4 or pred_shape.shape[1] < 3:
         raise ValueError(f"pred_shape must be [N,C,H,W] with C>=3, got {tuple(pred_shape.shape)}")
@@ -420,7 +421,10 @@ def source_center_shape_loss(
 
     source_centers = []
     source_values = []
+    if source_weights_list is not None and len(source_weights_list) != n:
+        raise ValueError("source_weights_list must contain one entry per prediction")
     source_classes = []
+    source_size_weights = []
     source_batch = []
     for batch_idx, (centers, values, classes) in enumerate(zip(centers_list, values_list, classes_list)):
         if centers.numel() == 0:
@@ -430,6 +434,11 @@ def source_center_shape_loss(
         classes = classes.to(device=pred_shape.device, dtype=torch.long).reshape(-1)
         if not (len(centers) == len(values) == len(classes)):
             raise ValueError("shape source centers, values, and classes must have equal lengths")
+        size_weights = (torch.ones(len(centers), device=pred_shape.device) if source_weights_list is None
+                        else source_weights_list[batch_idx].to(device=pred_shape.device, dtype=torch.float32).reshape(-1))
+        if len(size_weights) != len(centers):
+            raise ValueError("shape source weights and centers must have equal lengths")
+        source_size_weights.append(size_weights)
         source_centers.append(centers)
         source_values.append(values)
         source_classes.append(classes)
@@ -441,6 +450,7 @@ def source_center_shape_loss(
     values = torch.cat(source_values, dim=0)
     classes = torch.cat(source_classes, dim=0)
     batch_indices = torch.cat(source_batch, dim=0)
+    size_weights = torch.cat(source_size_weights, dim=0)
     valid_sources = (
         torch.isfinite(centers).all(dim=1)
         & torch.isfinite(values).all(dim=1)
@@ -450,6 +460,7 @@ def source_center_shape_loss(
         & (centers[:, 1] < float(h))
         & (values[:, 0] > 0.0)
         & (values[:, 1] > 0.0)
+        & torch.isfinite(size_weights) & (size_weights > 0)
     )
     centers = centers[valid_sources]
     values = values[valid_sources]
@@ -483,7 +494,7 @@ def source_center_shape_loss(
     ).reshape(sampled_pred.shape[:2])
     valid_float = valid_points.to(dtype=point_loss.dtype)
     per_source = (point_loss * valid_float).sum(dim=1) / valid_float.sum(dim=1).clamp_min(1.0)
-    source_weight = torch.ones_like(per_source)
+    source_weight = size_weights[valid_sources].to(dtype=per_source.dtype)
     source_weight = torch.where(
         classes == 2,
         source_weight * float(max(0.0, center_only_factor)),
@@ -596,6 +607,7 @@ def dense_losses(
                 batch["shape_source_centers"],  # type: ignore[arg-type]
                 batch["shape_source_values"],  # type: ignore[arg-type]
                 batch["shape_source_classes"],  # type: ignore[arg-type]
+                source_weights_list=batch.get("shape_source_weights"),
                 center_size=int(weights.shape_center_size),
                 center_only_factor=float(weights.center_only_shape_factor),
                 angle_weight=float(weights.shape_angle_weight),
@@ -723,6 +735,8 @@ def dense_losses_any(
         "shape_source_values": _flatten_band_centers(batch["band_shape_source_values"]),  # type: ignore[arg-type]
         "shape_source_classes": _flatten_band_centers(batch["band_shape_source_classes"]),  # type: ignore[arg-type]
     }
+    if "band_shape_source_weights" in batch:
+        flat_batch["shape_source_weights"] = _flatten_band_centers(batch["band_shape_source_weights"])
     if "seg_logits" in outputs:
         flat_batch["seg"] = batch["band_seg"].reshape(-1, *batch["band_seg"].shape[2:])  # type: ignore[union-attr]
         flat_batch["seg_loss_weight"] = batch["band_seg_loss_weight"].reshape(

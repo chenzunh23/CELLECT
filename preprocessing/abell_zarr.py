@@ -48,7 +48,8 @@ def build_parent(args, row):
     from .utils.confidence import confidence_asset
     mode = 'psf-ee' if args.confidence_mode == 'auto' else args.confidence_mode
     asset = confidence_asset(mode, getattr(args, 'confidence_config_path', None))[1] if mode != 'manhattan' else None
-    signature=dict(confidence_asset=asset,max_invalid_fraction=args.jwst_max_invalid_fraction,
+    from .utils.source_weights import source_area_weight_policy
+    signature=dict(source_area_weight_policy=source_area_weight_policy(),confidence_asset=asset,max_invalid_fraction=args.jwst_max_invalid_fraction,
         stride=368,max_tiles=args.max_tiles,large_only=getattr(args,'large_only',False),
         large_limit=getattr(args,'large_limit',0),cross_boundary_only=getattr(args,'cross_boundary_only',False),
         background_root=args.background_root,sex_detect_thresh=args.sex_detect_thresh,
@@ -57,7 +58,7 @@ def build_parent(args, row):
         reference_mtime_ns=Path(row['reference_fits']).stat().st_mtime_ns,
         catalog_mtime_ns=Path(args.abell_catalog).stat().st_mtime_ns,gaia_mtime_ns=Path(args.abell_gaia).stat().st_mtime_ns,
         confidence_mode=args.confidence_mode,confidence_fwhm_min=args.confidence_fwhm_min,
-        confidence_fwhm_max=args.confidence_fwhm_max,confidence_fwhm_pixels=args.confidence_fwhm_pixels,policy_version=7,chunk_tiles=args.chunk_tiles,parent_packed_stamps=True,reference_background_method=AGGRESSIVE_BACKGROUND_METHOD)
+        confidence_fwhm_max=args.confidence_fwhm_max,confidence_fwhm_pixels=args.confidence_fwhm_pixels,policy_version=9,abell_ignore_flags=[16,17,18,19],ignore_child_parent_class='strict_center_only',chunk_tiles=args.chunk_tiles,parent_packed_stamps=True,reference_background_method=AGGRESSIVE_BACKGROUND_METHOD)
     if receipt.exists() and not args.overwrite:
         previous=json.loads(receipt.read_text())
         if previous.get('max_invalid_fraction')!=args.jwst_max_invalid_fraction:

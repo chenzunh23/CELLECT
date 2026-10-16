@@ -11,7 +11,7 @@ from torch import Tensor, nn
 
 from utils.train_ops_utils import flatten_per_band_outputs as _flatten_per_band_outputs
 from .mask_supervision import (instance_prompts, combine_prompts, partial_targets,
-                               partial_bce_dice, area_ratio_penalty)
+                               partial_bce_dice, area_ratio_penalty, mask_iou_targets)
 
 from .mask_metrics import GROUP_STAT_KEYS, group_statistics
 
@@ -564,9 +564,14 @@ def _sam_mask_loss_for_prompts(
         max_area_loss = torch.zeros_like(area_loss)
     t_phase = _mark_mask_timing(debug_timing, f"{timing_prefix}.max_area", t_phase, enabled=float(weight_max_area))
 
+    target_ious = None
     if weight_pred_iou:
-        pred_iou_thresh = float(getattr(weights, "mask_pred_iou_thresh", 0.8))
-        pred_iou_loss = F.relu(pred_iou_thresh - iou_predictions) / max(pred_iou_thresh, 1e-6)
+        target_ious = mask_iou_targets(logits, prompts, labelled & valid_prompt,
+            image_hw=image_hw, batch=batch)
+        # Calibrate all candidates, including those not selected for mask loss.
+        # Unlabelled prompts never train the quality head toward an arbitrary
+        # threshold. Keep them in the graph with zero gradient for DDP.
+        pred_iou_loss = (iou_predictions - target_ious).square() * labelled[:, None]
     else:
         pred_iou_loss = logits.new_zeros((n, int(logits.shape[1])))
     t_phase = _mark_mask_timing(debug_timing, f"{timing_prefix}.pred_iou", t_phase, enabled=float(weight_pred_iou))
@@ -592,7 +597,6 @@ def _sam_mask_loss_for_prompts(
             + (float(getattr(weights, "mask_outside")) * outside if weight_outside else 0.0)
             + (float(getattr(weights, "mask_min_area")) * area_loss if weight_min_area else 0.0)
             + (float(getattr(weights, "mask_max_area", 0.1)) * max_area_loss if weight_max_area else 0.0)
-            + (float(getattr(weights, "mask_pred_iou", 0.1)) * pred_iou_loss if weight_pred_iou else 0.0)
             + (float(getattr(weights, "mask_stability", 0.1)) * stability_loss if weight_stability else 0.0)
         )
         best = torch.argmin(selection_score.detach(), dim=1)
@@ -608,7 +612,7 @@ def _sam_mask_loss_for_prompts(
         "outside": outside[row, best],
         "area": area_loss[row, best],
         "max_area": max_area_loss[row, best],
-        "pred_iou": pred_iou_loss[row, best],
+        "pred_iou": pred_iou_loss.mean(dim=1),
         "stability": stability_loss[row, best],
     }
 
@@ -619,6 +623,7 @@ def _sam_mask_loss_for_prompts(
     bce_weights = prompt_weights * bce_eligible * instance_quality * supervision_scale
     dice_denom = (prompt_weights * labelled).sum().clamp_min(1.0)
     bce_denom = (prompt_weights * bce_eligible).sum().clamp_min(1.0)
+    iou_weights = prompt_weights * labelled * instance_quality
     out = {
         "dice": (selected["dice"] * dice_weights).sum() / dice_denom if weight_dice else zero,
         "bce": (selected["bce"] * bce_weights).sum() / bce_denom if weight_bce else zero,
@@ -626,7 +631,7 @@ def _sam_mask_loss_for_prompts(
         "outside": (selected["outside"] * geom_weights).sum() / geom_denom if weight_outside else zero,
         "area": (selected["area"] * geom_weights).sum() / geom_denom if weight_min_area else zero,
         "max_area": (selected["max_area"] * geom_weights).sum() / geom_denom if weight_max_area else zero,
-        "pred_iou": (selected["pred_iou"] * geom_weights).sum() / geom_denom if weight_pred_iou else zero,
+        "pred_iou": (selected["pred_iou"] * iou_weights).sum() / dice_denom if weight_pred_iou else zero,
         "stability": (selected["stability"] * geom_weights).sum() / geom_denom if weight_stability else zero,
     }
     total = (
@@ -649,7 +654,10 @@ def _sam_mask_loss_for_prompts(
     for key, attr in [('dice','mask_dice'), ('bce','mask_bce'), ('centroid','mask_centroid'),
                       ('outside','mask_outside'), ('area','mask_min_area'), ('max_area','mask_max_area'),
                       ('pred_iou','mask_pred_iou'), ('stability','mask_stability')]:
-        q, denom = (dice_weights, dice_denom) if key == 'dice' else (bce_weights, bce_denom) if key == 'bce' else (geom_weights, geom_denom)
+        q, denom = ((dice_weights, dice_denom) if key == 'dice' else
+                    (bce_weights, bce_denom) if key == 'bce' else
+                    (iou_weights, dice_denom) if key == 'pred_iou' else
+                    (geom_weights, geom_denom))
         per_prompt = per_prompt + float(getattr(weights, attr, 0.0))*selected[key]*q/denom
     out['group_stats'] = group_statistics(selected, kinds, prompt_weights, labelled,
                                           bce_eligible, instance_quality, supervision_scale)
@@ -657,6 +665,10 @@ def _sam_mask_loss_for_prompts(
     out['pred_total'] = per_prompt[kinds == 1].sum()
     if return_selection:
         out['selected_indices'] = best.detach()
+        if target_ious is not None:
+            out['candidate_true_ious'] = target_ious
+            out['candidate_pred_ious'] = iou_predictions.detach()
+            out['iou_labelled'] = labelled & valid_prompt
     _mark_mask_timing(debug_timing, f"{timing_prefix}.reduce", t_phase, valid_prompts=float(valid_prompt.sum().detach().item()))
     return out
 

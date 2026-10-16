@@ -2,7 +2,7 @@
 
 Reduce numerators/denominators across batches and ranks BEFORE taking means.
 These diagnostics never change the mixed training objective. Reliability q is
-retained in the numerator, as in the training BCE/Dice losses.
+retained in the numerator, as in the training BCE/Dice and IoU calibration losses.
 """
 import torch
 
@@ -26,9 +26,11 @@ def group_statistics(selected, kinds, prompt_weights, labelled, bce_eligible,
         weight = prompt_weights.detach().double() * member
         dw, bw = weight * labelled, weight * bce_eligible
         for component in COMPONENT_WEIGHTS:
-            w = dw if component == 'dice' else bw if component == 'bce' else weight
+            w = dw if component in ('dice', 'pred_iou') else bw if component == 'bce' else weight
             if component in ('dice', 'bce'):
                 w = w * quality * supervision_scale
+            elif component == 'pred_iou':
+                w = w * quality
             values.append((selected[component].detach().double() * w).sum())
         values.extend([dw.sum(), bw.sum(), weight.sum(),
                        ((weight > 0)).sum(), ((weight > 0) & labelled).sum(),
@@ -44,7 +46,7 @@ def finish_group_metrics(metrics, weights):
         prefix = f'_mask_group_{group}_'
         total = 0.
         for component, attr in COMPONENT_WEIGHTS.items():
-            denom_key = 'dice_weight' if component == 'dice' else 'bce_weight' if component == 'bce' else 'geom_weight'
+            denom_key = 'dice_weight' if component in ('dice', 'pred_iou') else 'bce_weight' if component == 'bce' else 'geom_weight'
             denominator = raw[prefix + denom_key]
             mean = raw[prefix + component] / denominator if denominator > 0 else 0.
             metrics[f'mask_{group}_mean_{component}'] = mean

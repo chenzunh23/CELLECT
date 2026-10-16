@@ -682,18 +682,26 @@ class ZarrCutoutDataset(Dataset):
         band_shape_source_values = []
         band_shape_source_classes = []
         band_shape_source_ids = []
+        band_shape_source_weights = []
         if reader.has_array("shape_source_offsets"):
             shape_offsets = reader.read_full_small("shape_source_offsets").astype(np.int64, copy=False)
             shape_centers_flat = reader.read_full_small("shape_source_centers").astype(np.float32, copy=False)
             shape_values_flat = reader.read_full_small("shape_source_values").astype(np.float32, copy=False)
             shape_classes_flat = reader.read_full_small("shape_source_classes").astype(np.uint8, copy=False)
             shape_ids_flat = reader.read_full_small("shape_source_ids").astype(np.int64, copy=False)
+            shape_weights_flat = (reader.read_full_small("shape_source_weights").astype(np.float32, copy=False)
+                                  if reader.has_array("shape_source_weights")
+                                  else np.ones(len(shape_ids_flat), np.float32))
+            if (shape_weights_flat.shape != shape_ids_flat.shape
+                    or not np.isfinite(shape_weights_flat).all() or np.any(shape_weights_flat <= 0)):
+                raise ValueError("Invalid source weights in Zarr store")
             for b in range(int(image.shape[0])):
                 s0, s1 = int(shape_offsets[sample_idx, b]), int(shape_offsets[sample_idx, b + 1])
                 band_shape_source_centers.append(torch.from_numpy(shape_centers_flat[s0:s1]))
                 band_shape_source_values.append(torch.from_numpy(shape_values_flat[s0:s1]))
                 band_shape_source_classes.append(torch.from_numpy(shape_classes_flat[s0:s1]))
                 band_shape_source_ids.append(torch.from_numpy(shape_ids_flat[s0:s1]))
+                band_shape_source_weights.append(torch.from_numpy(shape_weights_flat[s0:s1]))
         else:
             # Backward compatibility for stores created before source-level
             # shape metadata was added. Only clean centers are recoverable.
@@ -722,6 +730,7 @@ class ZarrCutoutDataset(Dataset):
                 band_shape_source_values.append(values)
                 band_shape_source_classes.append(torch.ones((len(source_centers),), dtype=torch.uint8))
                 band_shape_source_ids.append(source_ids)
+                band_shape_source_weights.append(torch.ones(len(source_ids), dtype=torch.float32))
 
         if self.augment and random.random() < 0.5:
             width = int(image.shape[-1])
@@ -810,10 +819,12 @@ class ZarrCutoutDataset(Dataset):
             "shape_source_values": shape_source_values,
             "shape_source_classes": shape_source_classes,
             "shape_source_ids": shape_source_ids,
+            "shape_source_weights": band_shape_source_weights[0],
             "band_shape_source_centers": band_shape_source_centers,
             "band_shape_source_values": band_shape_source_values,
             "band_shape_source_classes": band_shape_source_classes,
             "band_shape_source_ids": band_shape_source_ids,
+            "band_shape_source_weights": band_shape_source_weights,
             "name": rec.name,
             "tile_name": rec.tile_name,
             "tract": rec.tract,

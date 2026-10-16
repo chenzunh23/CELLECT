@@ -8,7 +8,7 @@ from scipy import ndimage
 from ..image_processing import prepare_image, build_bright_components, BrightRegionConfig
 from ..meas_processing import classify_catalog_basics
 from ..ordinary_common import OrdinaryInput, classify_ordinary_sources
-from ..ordinary_a2744 import A2744OrdinaryConfig
+from ..ordinary_a2744 import A2744OrdinaryConfig, protect_ignored_children
 from ..bright_label import project_gaia_rows
 from ..bright_label_jwst import JWSTBrightConfig, label_bright_sources
 from ..region_filling import fill_dense_regions
@@ -76,6 +76,14 @@ def classify_reference(reference, header, catalog, gaia, background, band, *, tr
         bright_region=bright,component_labels=components,gaia_table=gaia,image_header=header,
         source_ids=np.asarray(table['NUMBER']),
         config=JWSTBrightConfig('a2744',.03,gaia_reference_epoch=2016.))
+    # Bright-cluster rejection may introduce additional ignored catalog children.
+    # Preserve center-only supervision on their surviving parents as well.
+    if 'ignore_child_parents' in ordinary.diagnostics:
+        from ..snr import apply_remeasured_aperture_snr
+        while protect_ignored_children(data, ordinary, A2744OrdinaryConfig(PSF_FWHM_ARCSEC[band]/.03)).any():
+            measurement = ordinary.diagnostics.get('aperture_measurement')
+            if measurement is not None:
+                apply_remeasured_aperture_snr(ordinary, data.mag, measurement, mag_min=None)
     restricted=np.isin(components,result.restricted_fallback_component_ids) if len(result.restricted_fallback_component_ids) else None
     ignored=np.isin(components,result.ordinary_ignore_component_ids) if len(result.ordinary_ignore_component_ids) else None
     dense=fill_dense_regions(table,result.labels,reference.shape,geometry=geom,

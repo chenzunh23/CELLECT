@@ -23,3 +23,4 @@ debug.sh
 patches/
 eval/hsctiles/interactive*/**
 *.pyc
+tmp.txt

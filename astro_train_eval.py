@@ -1264,7 +1264,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mask-outside-weight", type=float, default=0.5)
     parser.add_argument("--mask-min-area-weight", type=float, default=0.1)
     parser.add_argument("--mask-max-area-weight", type=float, default=0.1)
-    parser.add_argument("--mask-pred-iou-weight", type=float, default=0.1)
+    parser.add_argument("--mask-pred-iou-weight", type=float, default=0.1,
+                        help="MSE calibration of every candidate's predicted IoU to its detached GT IoU; labelled instances only.")
     parser.add_argument("--mask-stability-weight", type=float, default=0.1)
     parser.add_argument("--mask-unmatched-prompt-weight", type=float, default=0.2)
     parser.add_argument("--center-only-shape-factor", type=float, default=0.2)
@@ -1282,7 +1283,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Upper bound for mask_area / prompted_shape_area used by mask area ratio loss.",
     )
     parser.add_argument("--mask-max-area-ratio", type=float, default=0.5)
-    parser.add_argument("--mask-pred-iou-thresh", type=float, default=0.8)
+    parser.add_argument("--mask-pred-iou-thresh", type=float, default=0.8,
+                        help="Legacy compatibility argument; unused by GT-IoU calibration training.")
     parser.add_argument("--mask-stability-score-thresh", type=float, default=0.95)
     parser.add_argument("--mask-stability-score-offset", type=float, default=1.0)
     parser.add_argument("--mask-stability-temperature", type=float, default=10.0)
@@ -2348,6 +2350,8 @@ def main() -> None:
             "mask_loss_interval": int(args.mask_loss_interval),
             "mask_loss_interval_scale": bool(args.mask_loss_interval_scale),
             "mask_prompt_backfill": False,
+            "mask_iou_supervision": "gt_binary_iou_mse_all_candidates",
+            "mask_iou_target_resolution": "input_image_valid_pixels",
             "mask_group_metric_normalization": "sum_numerators_and_denominators_across_batches_and_ranks",
             "sam_lr_schedule": (
                 {

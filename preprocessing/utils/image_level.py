@@ -558,7 +558,9 @@ def _paint_confidence(conf: np.ndarray, weight: np.ndarray, centers: np.ndarray,
     h, w = conf.shape
     yy, xx = np.mgrid[0:h, 0:w]
     radius = int(levels) - 1
-    for cx, cy in np.asarray(centers, dtype=np.float32).reshape(-1, 2):
+    centers = np.asarray(centers, dtype=np.float32).reshape(-1, 2)
+    source_weights = np.broadcast_to(np.asarray(value_weight, float), (len(centers),))
+    for (cx, cy), source_weight in zip(centers, source_weights):
         cx_i = int(round(float(cx)))
         cy_i = int(round(float(cy)))
         if not (0 <= cx_i < w and 0 <= cy_i < h):
@@ -573,7 +575,7 @@ def _paint_confidence(conf: np.ndarray, weight: np.ndarray, centers: np.ndarray,
         patch_conf = conf[y0:y1, x0:x1]
         patch_weight = weight[y0:y1, x0:x1]
         patch_conf[keep] = np.maximum(patch_conf[keep], vals[keep])
-        patch_weight[keep] = np.maximum(patch_weight[keep], float(value_weight))
+        patch_weight[keep] = np.maximum(patch_weight[keep], float(source_weight))
 
 
 def _source_indices_in_tile(labels: PatchLabels, mask: np.ndarray, spec, origin: tuple[int, int]) -> np.ndarray:
@@ -630,21 +632,25 @@ def _tile_targets(labels: PatchLabels, spec, origin: tuple[int, int], *, confide
     center_idx = _source_indices_in_tile(labels, train_center, spec, origin)
     center_xy = np.column_stack([labels.geom_x[center_idx] - tile_x0, labels.geom_y[center_idx] - tile_y0]).astype(np.float32)
     strict_extra_xy, strict_extra_ids, strict_extra_gaia = _strict_centers_in_tile(labels, spec, origin, with_gaia=True)
+    from .source_weights import kron_area_weights
+    area_weights = kron_area_weights(labels.geom_major, labels.geom_minor)
     all_conf_centers = center_xy
+    all_conf_weights = area_weights[center_idx]
     if len(strict_extra_xy):
         all_conf_centers = np.concatenate([all_conf_centers, strict_extra_xy], axis=0)
+        all_conf_weights = np.concatenate([all_conf_weights, np.ones(len(strict_extra_xy), np.float32)])
     if confidence is not None and confidence['mode'] == 'psf-ee':
         from .confidence import paint_ee_confidence
         paint_ee_confidence(conf, conf_weight, all_conf_centers,
-                            level_radii_pixels=confidence['level_radii_pixels'])
+                            level_radii_pixels=confidence['level_radii_pixels'], value_weight=all_conf_weights)
     elif confidence is not None and confidence['mode'] == 'psf-matched':
         from .confidence import paint_psf_confidence
         minimum, maximum = confidence['fwhm_clip_pixels']
         paint_psf_confidence(conf, conf_weight, all_conf_centers,
                              fwhm_pixels=confidence['fwhm_pixels_used'],
-                             minimum=minimum, maximum=maximum)
+                             minimum=minimum, maximum=maximum, value_weight=all_conf_weights)
     else:
-        _paint_confidence(conf, conf_weight, all_conf_centers, levels=5, value_weight=1.0)
+        _paint_confidence(conf, conf_weight, all_conf_centers, levels=5, value_weight=all_conf_weights)
 
     shape_idx = _source_indices_in_tile(labels, clean_or_weak, spec, origin)
     for idx in shape_idx:
@@ -661,7 +667,7 @@ def _tile_targets(labels: PatchLabels, spec, origin: tuple[int, int], *, confide
         shape[0][inside] = major
         shape[1][inside] = minor
         shape[2][inside] = theta
-        shape_weight[inside] = 1.0
+        shape_weight[inside] = area_weights[idx]
 
     source_idx = _source_indices_in_tile(labels, clean_or_weak, spec, origin)
     source_centers = np.column_stack([labels.geom_x[source_idx] - tile_x0, labels.geom_y[source_idx] - tile_y0]).astype(np.float32)
@@ -690,6 +696,7 @@ def _tile_targets(labels: PatchLabels, spec, origin: tuple[int, int], *, confide
         "shape_values": shape_values,
         "shape_classes": shape_classes,
         "shape_ids": shape_ids,
+        "shape_weights": area_weights[source_idx],
     }
     if (labels.segmentation_ids is None) != (labels.segmentation_weight is None):
         raise ValueError("segmentation IDs and weights must be supplied together")

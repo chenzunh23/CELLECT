@@ -33,6 +33,7 @@ class ZarrSampleBatch:
     shape_source_ids: np.ndarray | None = None
     shape_source_offsets: np.ndarray | None = None
     diagnostic_source_rows: Sequence[Mapping[str, object]] | None = None
+    shape_source_weights: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,14 @@ class ImageLevelTrainingBatch:
     band_segmentation_weight: np.ndarray | None = None
     segmentation_overlap: dict | None = None
     band_valid_mask: np.ndarray | None = None
+    shape_source_weights: np.ndarray | None = None
+
+
+def _validated_source_weights(values, count):
+    weights = np.ones(count, np.float32) if values is None else np.asarray(values, np.float32)
+    if weights.shape != (count,) or not np.isfinite(weights).all() or np.any(weights <= 0):
+        raise ValueError("shape_source_weights must be positive finite weights aligned with source IDs")
+    return weights
 
 
 def write_image_level_zarr(
@@ -125,6 +134,8 @@ def write_image_level_zarr(
         group.array("shape_source_values", shape=values.shape, chunks=(max(1, len(values)), 3), dtype=np.float32).write_full(values)
         group.array("shape_source_classes", shape=classes.shape, chunks=(max(1, len(classes)),), dtype=np.uint8).write_full(classes)
         group.array("shape_source_ids", shape=ids.shape, chunks=(max(1, len(ids)),), dtype=np.int64).write_full(ids)
+        source_weights = _validated_source_weights(batch.shape_source_weights, len(ids))
+        group.array("shape_source_weights", shape=source_weights.shape, chunks=(max(1, len(ids)),), dtype=np.float32).write_full(source_weights)
         group.array("shape_source_offsets", shape=offsets.shape, chunks=(max(1, offsets.shape[0]), offsets.shape[1]), dtype=np.int64).write_full(offsets)
     if batch.diagnostic_source_rows is not None:
         write_json(output / "diagnostic_source_rows.json", {"rows": list(batch.diagnostic_source_rows)})
@@ -253,6 +264,7 @@ def write_training_image_level_zarr(
     _write_flat("shape_source_values", batch.shape_source_values, np.float32, width=3)
     _write_flat("shape_source_classes", batch.shape_source_classes, np.uint8)
     _write_flat("shape_source_ids", batch.shape_source_ids, np.int64)
+    _write_flat("shape_source_weights", _validated_source_weights(batch.shape_source_weights, len(batch.shape_source_ids)), np.float32)
     writer.array(
         "shape_source_offsets",
         shape=np.asarray(batch.shape_source_offsets).shape,

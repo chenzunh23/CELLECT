@@ -392,6 +392,7 @@ def write_classified_patch(task: StoreTask, image: np.ndarray, labels: PatchLabe
     shape_values_flat: list[np.ndarray] = []
     shape_classes_flat: list[np.ndarray] = []
     shape_ids_flat: list[np.ndarray] = []
+    shape_weights_flat: list[np.ndarray] = []
     shape_offsets = np.zeros((n, 2), dtype=np.int64)
     source_cursor = 0
     strict_cursor = 0
@@ -418,7 +419,7 @@ def write_classified_patch(task: StoreTask, image: np.ndarray, labels: PatchLabe
             target['pu'][~v]=int(DenseLabel.STRICT_IGNORE)
             if 'segmentation_weight' in target:target['segmentation_weight'][~v]=0
             for center_key,others in [('source_centers',['source_ids']),('strict_centers',['strict_ids']),
-                                      ('shape_centers',['shape_values','shape_classes','shape_ids'])]:
+                                      ('shape_centers',['shape_values','shape_classes','shape_ids','shape_weights'])]:
                 centers=target[center_key]
                 xy=np.clip(np.floor(centers+.5).astype(int),0,h-1)
                 keep=v[xy[:,1],xy[:,0]]
@@ -466,6 +467,7 @@ def write_classified_patch(task: StoreTask, image: np.ndarray, labels: PatchLabe
         shape_values_flat.append(target["shape_values"])
         shape_classes_flat.append(target["shape_classes"])
         shape_ids_flat.append(target["shape_ids"])
+        shape_weights_flat.append(target["shape_weights"])
         shape_cursor += len(target["shape_centers"])
         shape_offsets[i, 1] = shape_cursor
 
@@ -479,6 +481,7 @@ def write_classified_patch(task: StoreTask, image: np.ndarray, labels: PatchLabe
 
     output = _store_output_path(task.output_root, task.patch, task.band, task.dataset_source, task.group)
     from preprocessing.utils.segmentation_storage import pack_overlap_masks
+    from preprocessing.utils.source_weights import source_area_weight_policy
     batch = ImageLevelTrainingBatch(
         images=images,
         band_confidence=band_conf,
@@ -536,6 +539,7 @@ def write_classified_patch(task: StoreTask, image: np.ndarray, labels: PatchLabe
             "source_export_mode": "preprocessing_v3",
             **(provenance or {}),
             "confidence_config": confidence_config,
+            "source_area_weight_policy": source_area_weight_policy(),
             "segmentation_policy": labels.segmentation_policy,
         },
         source_centers=_cat(centers_flat, 2, np.float32),
@@ -549,6 +553,7 @@ def write_classified_patch(task: StoreTask, image: np.ndarray, labels: PatchLabe
         shape_source_classes=_cat(shape_classes_flat, None, np.uint8),
         shape_source_ids=_cat(shape_ids_flat, None, np.int64),
         shape_source_offsets=shape_offsets,
+        shape_source_weights=_cat(shape_weights_flat, None, np.float32),
     )
     write_training_image_level_zarr(output, batch, overwrite=task.overwrite, chunk_tiles=task.chunk_tiles)
     return {"output": str(output), "samples": n, "patch": task.patch, "band": task.band, "dataset_source": task.dataset_source, "group": task.group}

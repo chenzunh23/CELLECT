@@ -146,7 +146,9 @@ def paint_ee_confidence(conf, weight, centers, *, level_radii_pixels, value_weig
         raise ValueError('Confidence and weights must share a 2-D shape')
     h,w = conf.shape
     radius = int(math.ceil(radii[-1])) + 1
-    for cx,cy in np.asarray(centers,dtype=np.float64).reshape(-1,2):
+    centers = np.asarray(centers, dtype=np.float64).reshape(-1, 2)
+    source_weights = np.broadcast_to(np.asarray(value_weight, float), (len(centers),))
+    for (cx,cy), source_weight in zip(centers, source_weights):
         if not (np.isfinite(cx) and np.isfinite(cy) and 0<=cx<w and 0<=cy<h):
             continue
         # At the image edge choose the closest existing center; interior ties round up.
@@ -161,7 +163,7 @@ def paint_ee_confidence(conf, weight, centers, *, level_radii_pixels, value_weig
         local=conf[y0:y1,x0:x1]
         np.maximum(local,values,out=local)
         local_weight=weight[y0:y1,x0:x1];positive=values>0
-        local_weight[positive]=np.maximum(local_weight[positive],value_weight)
+        local_weight[positive]=np.maximum(local_weight[positive],source_weight)
 
 
 def paint_psf_confidence(conf, weight, centers, *, fwhm_pixels,
@@ -176,7 +178,9 @@ def paint_psf_confidence(conf, weight, centers, *, fwhm_pixels,
     if conf.ndim != 2 or weight.shape != conf.shape:
         raise ValueError('Confidence and weights must share a 2-D shape')
     h, w = conf.shape
-    for cx, cy in np.asarray(centers, dtype=np.float64).reshape(-1, 2):
+    centers = np.asarray(centers, dtype=np.float64).reshape(-1, 2)
+    source_weights = np.broadcast_to(np.asarray(value_weight, float), (len(centers),))
+    for (cx, cy), source_weight in zip(centers, source_weights):
         cx, cy = float(cx), float(cy)
         if not np.isfinite(cx+cy):
             continue
@@ -196,4 +200,4 @@ def paint_psf_confidence(conf, weight, centers, *, fwhm_pixels,
         np.maximum(local, values, out=local)
         local_weight = weight[y0:y1, x0:x1]
         positive = values > 0
-        local_weight[positive] = np.maximum(local_weight[positive], value_weight)
+        local_weight[positive] = np.maximum(local_weight[positive], source_weight)

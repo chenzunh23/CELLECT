@@ -165,6 +165,55 @@ def partial_bce_dice(logits, positive, negative, labelled, *, valid=None):
     return bce, dice, eligible[:, 0]
 
 
+@torch.no_grad()
+def mask_iou_targets(logits, prompts, labelled, *, image_hw, batch=None, chunk_size=16):
+    """Detached GT IoU for every candidate at the inference image resolution.
+
+    Resize logits with bilinear interpolation before thresholding at zero,
+    matching the binary inference mask. Use original instance pixels rather
+    than thresholded, downsampled GT so tiny masks survive. Ignore unobserved
+    pixels in both intersection and union. Unlabelled prompts have no target
+    (their returned zero rows must be excluded by the caller's loss weights).
+    Chunks bound the memory needed for full-resolution multimask predictions.
+    """
+    n, candidates = logits.shape[:2]
+    targets = logits.new_zeros((n, candidates), dtype=torch.float32)
+    indices = torch.where(labelled.to(device=logits.device, dtype=torch.bool))[0]
+    if not len(indices):
+        return targets
+    h, w = map(int, image_hw)
+    masks = prompts.get('instance_masks', [None]*n)
+    valid = None
+    if batch is not None and 'band_valid_mask' in batch:
+        valid = batch['band_valid_mask'].to(device=logits.device, dtype=torch.bool).reshape(-1, h, w)
+    flat_indices = prompts['batch_indices'].to(device=logits.device, dtype=torch.long)
+    for selected in indices.split(max(1, int(chunk_size))):
+        truth = torch.zeros((len(selected), h, w), device=logits.device, dtype=torch.bool)
+        for row_index, prompt_index in enumerate(selected.tolist()):
+            row = masks[prompt_index]
+            if row is None:
+                raise ValueError('A labelled IoU prompt requires an instance mask')
+            x, y = int(row['x0']), int(row['y0'])
+            mh, mw = row['mask'].shape
+            xa, ya, xb, yb = max(0, x), max(0, y), min(w, x+mw), min(h, y+mh)
+            if xa < xb and ya < yb:
+                truth[row_index, ya:yb, xa:xb] = row['mask'][ya-y:yb-y, xa-x:xb-x].to(
+                    device=logits.device, dtype=torch.bool)
+        work = logits[selected].float()
+        if tuple(work.shape[-2:]) != (h, w):
+            work = F.interpolate(work, size=(h, w), mode='bilinear', align_corners=False)
+        prediction = work > 0
+        if valid is not None:
+            observed = valid[flat_indices[selected]]
+            truth &= observed
+            prediction &= observed[:, None]
+        intersection = (prediction & truth[:, None]).sum((-1, -2), dtype=torch.float32)
+        union = (prediction.sum((-1, -2), dtype=torch.float32)
+                 + truth.sum((-1, -2), dtype=torch.float32)[:, None] - intersection)
+        targets[selected] = intersection / union.clamp_min(1)
+    return targets
+
+
 def area_ratio_penalty(ratio, lower, upper):
     if lower <= 0 or upper <= lower:
         raise ValueError('mask area bounds require 0 < lower < upper')

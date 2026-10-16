@@ -1870,10 +1870,15 @@ def collate_cutouts(batch: Sequence[Dict[str, object]]) -> Dict[str, object]:
         "shape_source_values": [item["shape_source_values"] for item in batch],
         "shape_source_classes": [item["shape_source_classes"] for item in batch],
         "shape_source_ids": [item["shape_source_ids"] for item in batch],
+        "shape_source_weights": [item["shape_source_weights"] if "shape_source_weights" in item
+                                 else torch.ones(len(item["shape_source_ids"])) for item in batch],
         "band_shape_source_centers": [item["band_shape_source_centers"] for item in batch],
         "band_shape_source_values": [item["band_shape_source_values"] for item in batch],
         "band_shape_source_classes": [item["band_shape_source_classes"] for item in batch],
         "band_shape_source_ids": [item["band_shape_source_ids"] for item in batch],
+        "band_shape_source_weights": [item["band_shape_source_weights"] if "band_shape_source_weights" in item
+                                      else [torch.ones(len(ids)) for ids in item["band_shape_source_ids"]]
+                                      for item in batch],
         "name": [item["name"] for item in batch],
         "tile_name": [item["tile_name"] for item in batch],
         "tract": [item["tract"] for item in batch],

@@ -1,0 +1,11 @@
+{
+  "version": "kron_area_2500_10000_v1",
+  "enabled": true,
+  "area_definition": "pi * adopted_gt_kron_semimajor * adopted_gt_kron_semiminor",
+  "units": "native_image_pixel_squared",
+  "thresholds_exclusive": [2500.0, 10000.0],
+  "weights": [1.0, 2.0, 4.0],
+  "confidence": "positive PSF confidence pixels only; merge by maximum",
+  "shape": "source weight multiplied by existing weak-shape reliability; normalized weighted mean",
+  "unknown_geometry_weight": 1.0
+}
