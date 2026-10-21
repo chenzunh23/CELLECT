@@ -428,16 +428,18 @@ class ZtfAccess:
         return out
 
     def _prepare_frame(self, image: np.ndarray, header: Any) -> np.ndarray:
+        # read_frame already made the repair decision on the full original.
+        # Do not reconsider rejected sky holes with crop-local statistics.
         zeropoint = header_float(header, ("MAGZP", "MAGZPAVG", "ZP", "ZEROPOINT"))
         if zeropoint is None:
-            return hsc_intensity_frame(image, header, input_unit="native", nan_policy="hybrid")
+            return hsc_intensity_frame(image, header, input_unit="native", nan_policy="none")
         try:
             return hsc_intensity_frame(
                 image,
                 header,
                 input_unit="zp-flux",
                 input_zeropoint=zeropoint,
-                nan_policy="hybrid",
+                nan_policy="none",
             )
         except Exception:
             return hsc_intensity_frame(
@@ -446,7 +448,7 @@ class ZtfAccess:
                 input_unit="zp-flux",
                 pixel_scale_arcsec=self.pixel_scale_arcsec,
                 input_zeropoint=zeropoint,
-                nan_policy="hybrid",
+                nan_policy="none",
             )
 
     def read_frame(self, ref: FrameRef) -> np.ndarray:
@@ -456,6 +458,11 @@ class ZtfAccess:
                 raise ValueError(f"no image in primary HDU: {ref.pack_path}")
             header = hdul[0].header.copy()
             origin = self._cut_origin_for_path(Path(ref.pack_path), ref.patch)
+            # Judge NaN connectivity on the original FITS before resampling or
+            # taking a window; newly padded pixels remain NaN in the crop.
+            from preprocessing.utils.image import fill_nonfinite_hybrid
+            if not np.isfinite(data).all():
+                data = fill_nonfinite_hybrid(np.asarray(data, dtype=np.float32))[0]
             if origin is not None:
                 return self._prepare_frame(self._read_aligned_frame(ref, np.asarray(data), origin), header)
             if self._load_cut_origins(ref.patch):

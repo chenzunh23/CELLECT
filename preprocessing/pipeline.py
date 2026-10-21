@@ -148,7 +148,8 @@ class PreprocessingPipeline:
             table = attach_refit_geometry(table, None, self.config.refit)
 
         image, image_header = read_fits_image(inputs.image_fits, hdu=self.config.image.hdu)
-        prepared = prepare_image(image, header=image_header, config=self.config.image_preparation) if self.config.image_preparation is not None else image
+        prepared = prepare_image(image, header=image_header, config=self.config.image_preparation,
+                                 source_path=inputs.image_fits) if self.config.image_preparation is not None else image
         scaled = scale_image_for_training(prepared, config=self.config.image)
         if scaled.ndim == 2:
             scaled = scaled[None, ...]

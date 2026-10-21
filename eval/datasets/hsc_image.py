@@ -482,4 +482,10 @@ class HscImageAccess:
         local_x0, local_y0 = crop_origin_for_image(full, header, x0=int(ref.x0), y0=int(ref.y0), width=width, height=height)
         crop, valid = crop_or_pad(full, x0=local_x0, y0=local_y0, width=width, height=height, inference_size=self.tile_size)
         crop = np.where(valid, crop, np.nan).astype(np.float32, copy=False)
-        return crop[:height, :width]
+        from preprocessing.image_processing import prepare_image, ImagePreparationConfig
+        from astropy.wcs import WCS
+        ch = header.copy()
+        if 'CRPIX1' in ch: ch['CRPIX1'] -= local_x0
+        if 'CRPIX2' in ch: ch['CRPIX2'] -= local_y0
+        return prepare_image(crop[:height, :width], header=ch, source_path=path if WCS(ch).has_celestial else None,
+            config=ImagePreparationConfig(input_unit='native')).image

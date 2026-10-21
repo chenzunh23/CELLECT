@@ -1505,11 +1505,15 @@ class BrowserState:
             # never wait behind the expensive 4096-parent scaling computation.
             if image is None:
                 image = self._detection_image_for_ref(ref)
-            factory = lambda: make_training_rgb(
-                image, mode=self.scaling_mode, clip_threshold=self.clip_threshold,
-                log_a=self.log_a, log_high_percentile=self.log_high_percentile,
-                lupton_stretch=self.lupton_stretch, lupton_q=self.lupton_q,
-                anscombe_clip=self.anscombe_clip, anscombe_scale=self.anscombe_scale)
+            def factory():
+                rgb=make_training_rgb(
+                    image, repair_nan=False, mode=self.scaling_mode, clip_threshold=self.clip_threshold,
+                    log_a=self.log_a, log_high_percentile=self.log_high_percentile,
+                    lupton_stretch=self.lupton_stretch, lupton_q=self.lupton_q,
+                    anscombe_clip=self.anscombe_clip, anscombe_scale=self.anscombe_scale)
+                if self.dataset_id in JWST_DATASETS:
+                    rgb[...,~np.isfinite(image)]=0
+                return rgb
         return self._scale_load.cached(self._frame_cache, key, factory)
 
     def _prepare_detection_inputs(self, refs):
@@ -1526,7 +1530,7 @@ class BrowserState:
             return
         valid = None
         if self.dataset_id in ("jwst_cosmos", "jwst_abell"):
-            valid = self.access.read_window(ref.band, ref.patch, ref.x0, ref.y0, ref.width, ref.height)[1]
+            valid = self.access.input_valid_mask(ref)
         masks = decode_masks(model, band_outputs, rows, device=torch.device(self.device_name),
             amp=self.amp, width=ref.width, height=ref.height, chunk_size=self.mask_chunk_size,
             threshold=self.mask_threshold, box_scale=self.mask_box_scale, valid_mask=valid, selection=self.mask_selection)
@@ -1848,6 +1852,7 @@ class BrowserState:
                                     center_refinement_radius=self.center_refinement_radius,
                                     width=ref.width,
                                     height=ref.height,
+                                    valid_mask=np.isfinite(raw_by_sample[sample_idx][band_idx]),
                                 )
                                 masks = self._store_masks(model, select_band_outputs(sample_outputs, band_idx), rows, ref)
                                 if mask_sink is not None and masks is not None:

@@ -92,7 +92,7 @@ def prepare_frozen_variant(snapshot_dir, image_fits, background_npz, *, origin=(
             raise ValueError('background array shape mismatch')
         sky=bg[y0:y0+h,x0:x0+w].astype(bool)
     sources=load_frozen_sources(snapshot_dir,target_wcs)
-    prepared=prepare_image(raw,header=header)
+    prepared=prepare_image(raw,header=header,source_path=image_fits)
     config=bright_config or BrightRegionConfig(threshold=5,clip_threshold=5,statistics_clip_sigma=5)
     bright,components=build_bright_components(prepared,config=config)
     return dict(sources=sources,prepared=prepared,image_header=header,

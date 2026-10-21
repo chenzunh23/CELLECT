@@ -8,6 +8,9 @@ from ..meas_processing import classify_catalog_basics
 from ..ordinary_common import OrdinaryInput, classify_ordinary_sources
 from ..bright_label_jwst import JWSTBrightConfig, label_bright_sources
 from ..region_filling import fill_dense_regions
+from ..labels import SourceLabels
+from ..image_processing import prepare_image, build_bright_components, BrightRegionConfig
+from ..bright_label import project_gaia_rows
 from .geometry import EllipseGeometry
 from .image_level import PatchLabels
 from .segmentation import cosmos_fill_ratios
@@ -24,6 +27,8 @@ def load_catalog(path, band):
 
 
 def classify_window(raw, header, catalog, catalog_path, gaia, background, band):
+    if gaia is not None and 'ref_epoch' not in gaia.colnames:
+        gaia=gaia.copy();gaia['ref_epoch']=2016.
     w = WCS(header).celestial
     scale = float(np.mean(proj_plane_pixel_scales(w))*3600)
     x, y = w.all_world2pix(catalog['ra'], catalog['dec'], 0)
@@ -52,14 +57,30 @@ def classify_window(raw, header, catalog, catalog_path, gaia, background, band):
     bright = label_bright_sources(data, ordinary.labels, image_shape=raw.shape, image_header=header,
         gaia_table=gaia,source_ids=np.asarray(tab['id']),
         config=JWSTBrightConfig('cosmos',scale,PSF_FWHM_ARCSEC[band],gaia_reference_epoch=2016.))
-    dense = fill_dense_regions(tab, bright.labels, raw.shape, geometry=geom,
-                              background_mask=background, quality_ignore_mask=~np.isfinite(raw))
     from .truncated_kron import large_kron_geometry
     raw_large=large_kron_geometry(catalog['id'],x,y,
         np.asarray(catalog['kron2_a'],float)/scale,np.asarray(catalog['kron2_b'],float)/scale,
         np.deg2rad(np.asarray(catalog['theta_world'],float)))
-    return PatchLabels(tab,dense,bright.labels.source_class.copy(),geom.x,geom.y,geom.major,geom.minor,
+    labels = PatchLabels(tab,np.empty(raw.shape,np.uint8),bright.labels.source_class.copy(),geom.x,geom.y,geom.major,geom.minor,
         geom.theta,np.asarray(tab['id'],np.int64),bright.strict_center_x,bright.strict_center_y,
         bright.strict_center_source_id,
         strict_is_gaia=np.array(['gaia' in str(r) for r in bright.strict_center_reason],bool),
         truncation_geometry=raw_large)
+    from .jwst_star_protection import bright_star_footprint, apply_star_protection
+    gaia_rows=project_gaia_rows(gaia,image_shape=raw.shape,image_header=header,pixel_origin=0)
+    footprint=np.zeros(raw.shape,bool)
+    if any(np.isfinite(r.get('phot_rp_mean_mag',np.nan)) and r['phot_rp_mean_mag']<=18 for r in gaia_rows):
+        prepared=prepare_image(raw,header=header)
+        bright_pixels,_=build_bright_components(prepared,config=BrightRegionConfig(threshold=5,clip_threshold=5,statistics_clip_sigma=5))
+        footprint=bright_star_footprint(prepared,bright_pixels,gaia_rows)
+    # Use observed half-coadd wings for orientation/SNR; repaired cores are
+    # encoder context, never independent evidence for the rotation fit.
+    # Rotation and the SNR ratio are invariant to the linear unit conversion.
+    wings=apply_star_protection(labels,image=raw,header=header,gaia=gaia,band=band,pixel_scale=scale,
+        footprint=footprint,sky_mask=background,valid_mask=np.isfinite(raw))
+    final_geom=EllipseGeometry(labels.geom_x,labels.geom_y,labels.geom_major,labels.geom_minor,labels.geom_theta,
+                              np.pi*labels.geom_major*labels.geom_minor)
+    labels.dense=fill_dense_regions(labels.table,SourceLabels(labels.label_classes,np.full(len(labels.source_ids),'',object)),
+        raw.shape,geometry=final_geom,background_mask=background,
+        quality_ignore_mask=~np.isfinite(raw),star_wings_mask=wings)
+    return labels

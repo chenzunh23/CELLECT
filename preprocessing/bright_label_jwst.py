@@ -25,7 +25,7 @@ class JWSTBrightConfig:
     mode: str
     pixel_scale_arcsec: float
     psf_fwhm_arcsec: float | None = None
-    gaia_mag_max: float = 22.0
+    gaia_mag_max: float | None = 22.0
     gaia_reference_epoch: float | None = None
     cosmos_match_arcsec: float = 1.0
     source_mag_max: float = 22.0
@@ -59,8 +59,9 @@ def _gaia_rows(table, rows, header, shape, config):
     unique = {}
     for row in rows:
         x, y, mag = float(row['x']), float(row['y']), float(row['phot_g_mean_mag'])
-        magnitude_ok = mag <= config.gaia_mag_max if config.mode == 'a2744' else mag < config.gaia_mag_max
-        if np.isfinite(x+y+mag) and 0 <= x < shape[1] and 0 <= y < shape[0] and magnitude_ok:
+        magnitude_ok = config.gaia_mag_max is None or (
+            np.isfinite(mag) and (mag <= config.gaia_mag_max if config.mode == 'a2744' else mag < config.gaia_mag_max))
+        if np.isfinite(x+y) and 0 <= x < shape[1] and 0 <= y < shape[0] and magnitude_ok:
             unique.setdefault(int(row['source_id']), dict(row))
     return list(unique.values())
 

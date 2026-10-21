@@ -96,7 +96,8 @@ class HscRawAccess:
 
     def read_frame(self, ref: FrameRef) -> np.ndarray:
         group = self.group(ref.band, ref.patch)
-        return np.asarray(group["images"][ref.frame_index], dtype=np.float32)
+        from preprocessing.utils.image import fill_nonfinite_hybrid
+        return fill_nonfinite_hybrid(np.asarray(group["images"][ref.frame_index], dtype=np.float32))[0]
 
     def available_bands(self) -> list[str]:
         if not self.root.is_dir():

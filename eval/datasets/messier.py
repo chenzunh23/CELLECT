@@ -161,7 +161,9 @@ class MessierAccess:
     def read_image_file(self, patch: str, frame_index: int = 0) -> np.ndarray:
         key = self._image_key(patch, frame_index)
         if key not in self._images:
-            self._images[key] = _read_image(self.image_files(patch)[frame_index])
+            from preprocessing.utils.image import fill_nonfinite_hybrid
+            # Repair before cropping, so connectivity is judged on the original.
+            self._images[key] = fill_nonfinite_hybrid(_read_image(self.image_files(patch)[frame_index]))[0]
         return self._images[key]
 
     def _crop_tile(self, image: np.ndarray, tile_index: int, cx: int, cy: int) -> TileRow:

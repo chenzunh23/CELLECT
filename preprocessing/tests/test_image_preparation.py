@@ -47,10 +47,12 @@ class ImagePreparationTests(unittest.TestCase):
         raw[10:12, 10:12] = np.inf
         prepared = prepare_image(raw, config=ImagePreparationConfig(input_unit="native"))
         self.assertEqual(prepared.image.shape, raw.shape)
-        self.assertTrue(np.isfinite(prepared.image).all())
+        self.assertTrue(np.isfinite(prepared.image[63:65,63:65]).all())
+        self.assertTrue(np.isnan(prepared.image[10:12,10:12]).all())
         np.testing.assert_array_equal(prepared.image[prepared.finite_mask], raw[np.isfinite(raw)])
         self.assertEqual(prepared.metadata["nan_pixels_nearest_fill"], 4)
-        self.assertEqual(prepared.metadata["nan_pixels_background_fill"], 4)
+        self.assertEqual(prepared.metadata["nan_pixels_background_fill"], 0)
+        self.assertEqual(prepared.metadata["nan_pixels_background_unfilled"], 4)
         self.assertGreater(prepared.image[63, 63], 9)
         with self.assertRaises(ValueError):
             prepare_image(prepared)
@@ -68,7 +70,7 @@ class ImagePreparationTests(unittest.TestCase):
     def test_all_invalid_has_no_bright_components(self):
         prepared = prepare_image(np.full((16, 16), np.nan),
                                  config=ImagePreparationConfig(input_unit="native"))
-        self.assertTrue(np.isfinite(prepared.image).all())
+        self.assertTrue(np.isnan(prepared.image).all())
         for mode in ("log-lupton", "anscombe", "zscore"):
             bright, labels = build_bright_components(prepared, config=BrightRegionConfig(mode=mode))
             self.assertFalse(bright.any())

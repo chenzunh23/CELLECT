@@ -476,7 +476,14 @@ class JwstNircamAccess:
             out = np.asarray(out, dtype=np.float32)
             out[~common] = np.nan
         _shape, _wcs, header = self._shape_wcs_header(path)
-        return hsc_intensity_frame(out, header, input_unit="auto", nan_policy="hybrid")
+        # out is sampled on the reference-band tile grid, not this band's
+        # full native grid. Keep that WCS for original-FITS NaN connectivity.
+        reference_header=self._shape_wcs_header(self.image_file(ref_band,patch))[2].copy()
+        reference_header['CRPIX1']-=tile.x0;reference_header['CRPIX2']-=tile.y0
+        reference_header['NAXIS1']=out.shape[1];reference_header['NAXIS2']=out.shape[0]
+        for key in ('BUNIT','PIXAR_A2','PIXAR_SR'):
+            if key in header:reference_header[key]=header[key]
+        return hsc_intensity_frame(out, reference_header, input_unit="auto", nan_policy="hybrid",source_path=path)
 
     def manifest(self, patch: str) -> dict[str, Any]:
         return {

@@ -109,12 +109,24 @@ class JwstFieldAccess(JwstNircamAccess):
         return WCS(self.grid_header(band, patch)).celestial
 
     def _valid_mask_for_band(self, band, patch, ref_band, tile):
+        # Tile coverage is measured from real observations, before hole repair.
         return self.read_window(band, patch, tile.x0, tile.y0, tile.x1-tile.x0, tile.y1-tile.y0)[1]
 
-    def read_frame(self, ref):
-        raw, valid, h = self.read_window(ref.band, ref.patch, ref.x0, ref.y0, ref.width, ref.height)
+    def _prepared_window(self, band, patch, x, y, width, height):
+        raw, valid, h = self.read_window(band, patch, x, y, width, height)
+        hard_bad = ~valid & np.isfinite(raw)
         raw[~valid] = np.nan
-        return prepare_image(raw, header=h).image.astype(np.float32)
+        return prepare_image(raw, header=h,
+            source_path=h.get('ORIGFILE') or self.image_file(band,patch),
+            protected_invalid_mask=hard_bad), h
+
+    def input_valid_mask(self, ref):
+        return self._prepared_window(ref.band, ref.patch, ref.x0, ref.y0, ref.width, ref.height)[0].input_valid_mask
+
+    def read_frame(self, ref):
+        prepared = self._prepared_window(ref.band, ref.patch, ref.x0, ref.y0, ref.width, ref.height)[0].image
+        # Science display keeps unfilled no-coverage regions as NaN.
+        return prepared.astype(np.float32)
 
     def read_window(self, band, patch, x, y, width, height):
         key = ("field", band.lower(), patch, x, y, width, height)
@@ -131,6 +143,7 @@ class JwstFieldAccess(JwstNircamAccess):
                  Path(__file__).parents[2]/'preprocessing/image_processing.py',
                  Path(__file__).parents[2]/'preprocessing/utils/parent_scaling.py',
                  Path(__file__).parents[2]/'preprocessing/utils/image.py',
+                 Path(__file__).parents[2]/'preprocessing/utils/nan_boundaries.py',
                  Path(__file__).parents[2]/'data_filtering/sam_input_scaling.py']
         source = getattr(self, '_sources', {}).get((patch, band.lower()))
         if source is not None and source.quality_mask_npz is not None:
@@ -150,10 +163,10 @@ class JwstFieldAccess(JwstNircamAccess):
                 return cached
         except (OSError, ValueError, TypeError):
             pass
-        raw, _, h = self.read_window(band, patch, px, py, 4096, 4096)
-        if not np.isfinite(raw).any():
+        prepared, _ = self._prepared_window(band, patch, px, py, 4096, 4096)
+        if not prepared.input_valid_mask.any():
             raise ValueError(f'No finite pixels in scaling parent: {patch}/{band} ({px},{py})')
-        params = fit_parent_rgb(prepare_image(raw, header=h).image)
+        params = fit_parent_rgb(prepared.image)
         try:
             cache_file.parent.mkdir(parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile('w', dir=cache_file.parent, delete=False) as f:
@@ -165,15 +178,17 @@ class JwstFieldAccess(JwstNircamAccess):
         return params
 
     def scaled_window(self, band, patch, x, y, width=512, height=512):
-        raw, valid, h = self.read_window(band, patch, x, y, width, height)
-        raw[~valid] = np.nan
-        prepared = prepare_image(raw, header=h).image
+        prep, h = self._prepared_window(band, patch, x, y, width, height)
+        prepared, valid = prep.image, prep.input_valid_mask
         # Center chooses the owning parent, including a crop straddling a seam.
         px, py = (int((x+width/2)//4096)*4096, int((y+height/2)//4096)*4096)
         if self.dataset == 'jwst_abell':
             px = py = 0
         params = self.scaling_parameters(str(band).lower(), patch, px, py)
-        return prepared, apply_parent_rgb(prepared, params), self.grid_header(band, patch), valid
+        scaled=apply_parent_rgb(prepared, params)
+        # Keep repaired holes, exclude open no-coverage and hard quality failures.
+        scaled[:,~valid]=0
+        return prepared, scaled, self.grid_header(band, patch), valid
 
     def read_scaled_frame(self, ref):
         return self.scaled_window(ref.band, ref.patch, ref.x0, ref.y0, ref.width, ref.height)[1]

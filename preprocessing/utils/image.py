@@ -84,52 +84,81 @@ def hsc_surface_brightness_factor(header=None, *, input_unit="auto",
     }
 
 
-def fill_nonfinite_hybrid(image: np.ndarray) -> tuple[np.ndarray, dict[str, int]]:
-    """Reference JWST NaN fill: source rings -> nearest; other holes -> smooth.
+NAN_FILL_POLICY = 'enclosed_source_ring_only_v2'
+NAN_SOURCE_RING_PIXELS = 8
+NAN_SOURCE_MEDIAN_SIGMA = 3.
+NAN_SOURCE_P90_SIGMA = 5.
 
-    Gaussian sigma=32 pixels; an 8-pixel ring is source-like if its median
+
+def fill_nonfinite_hybrid(image: np.ndarray, *, edge_connected_mask=None,
+                         background_stats=None) -> tuple[np.ndarray, dict[str, int]]:
+    """Fill only enclosed holes with a source-like finite surrounding ring.
+
+    An 8-pixel ring is source-like if its median
     exceeds background+3 sigma or its p90 exceeds background+5 sigma.
-    Component rings use bounded ROIs, equivalent to full-image dilation.
+    Source holes use nearest finite samples. Background and edge-connected
+    NaNs stay NaN: there is deliberately no smooth-background fallback.
+    For cropped images pass connectivity measured on the original FITS, not
+    connectivity to the crop's edges. With no mask this array is the full image.
     """
     arr = np.asarray(image, dtype=np.float32)
     if arr.ndim != 2 or arr.size == 0:
         raise ValueError("NaN filling requires a nonempty 2-D image")
     bad = ~np.isfinite(arr)
     stats = {"nan_pixels": int(bad.sum()), "nan_components": 0,
-             "nan_pixels_nearest_fill": 0, "nan_pixels_background_fill": 0}
+             "nan_pixels_nearest_fill": 0, "nan_pixels_background_fill": 0,
+             "nan_pixels_background_unfilled": 0,
+             "nan_pixels_unfilled": 0, "nan_components_unfilled": 0}
+    if edge_connected_mask is not None and np.shape(edge_connected_mask) != arr.shape:
+        raise ValueError('NaN edge-connectivity mask shape differs from image')
     if not bad.any():
         return arr.copy(), stats
     if bad.all():
-        stats.update(nan_components=1, nan_pixels_background_fill=int(bad.size))
-        return np.zeros_like(arr), stats
+        stats.update(nan_components=1, nan_pixels_unfilled=int(bad.size), nan_components_unfilled=1)
+        return np.full_like(arr,np.nan), stats
+    from .nan_boundaries import edge_connected_nonfinite
+    protected = edge_connected_nonfinite(arr) if edge_connected_mask is None else bad & np.asarray(edge_connected_mask,bool)
+    _, count = ndimage.label(bad)
+    _, blocked_count = ndimage.label(protected)
+    # The original-FITS mask is authoritative per pixel. Cropping/reprojection
+    # or padding can artificially join an enclosed hole to protected pixels.
+    stats.update(nan_components=int(count), nan_components_unfilled=int(blocked_count),
+                 nan_pixels_unfilled=int(protected.sum()))
+    repair = bad & ~protected
+    if not repair.any():
+        result = arr.copy(); result[bad] = np.nan
+        return result, stats
     good = ~bad
     values = arr[good].astype(np.float64)
-    _, median, std = sigma_clipped_stats(values, sigma=3.0, maxiters=None)
-    bg = float(median) if np.isfinite(median) else float(np.median(values))
-    sigma = float(std) if np.isfinite(std) and std > 0 else float(np.std(values))
+    if background_stats is None:
+        _, median, std = sigma_clipped_stats(values, sigma=3.0, maxiters=None)
+        bg = float(median) if np.isfinite(median) else float(np.median(values))
+        sigma = float(std) if np.isfinite(std) and std > 0 else float(np.std(values))
+    else:
+        bg, sigma = map(float, background_stats)
+        if not np.isfinite(bg) or not np.isfinite(sigma) or sigma <= 0:
+            raise ValueError('NaN source-ring background statistics must be finite with positive sigma')
     if not np.isfinite(sigma) or sigma <= 0:
         sigma = 1.0
-    weights = good.astype(np.float32)
-    safe = np.where(good, arr, bg).astype(np.float32)
-    numerator = ndimage.gaussian_filter(safe * weights, sigma=32.0, mode="nearest")
-    denominator = ndimage.gaussian_filter(weights, sigma=32.0, mode="nearest")
-    smooth = np.full_like(arr, bg)
-    np.divide(numerator, denominator, out=smooth, where=denominator > 1e-4)
-    nearest = arr[tuple(ndimage.distance_transform_edt(bad, return_distances=False, return_indices=True))]
+    nearest = None  # Allocate the full nearest-index map only for source holes.
     filled = arr.copy()
-    filled[bad] = smooth[bad]
-    labels, count = ndimage.label(bad)
-    stats["nan_components"] = int(count)
+    filled[bad] = np.nan
+    labels, _ = ndimage.label(repair)
     for component, slices in enumerate(ndimage.find_objects(labels), 1):
         sy, sx = slices
-        sy = slice(max(0, sy.start - 8), min(arr.shape[0], sy.stop + 8))
-        sx = slice(max(0, sx.start - 8), min(arr.shape[1], sx.stop + 8))
+        sy = slice(max(0, sy.start - NAN_SOURCE_RING_PIXELS), min(arr.shape[0], sy.stop + NAN_SOURCE_RING_PIXELS))
+        sx = slice(max(0, sx.start - NAN_SOURCE_RING_PIXELS), min(arr.shape[1], sx.stop + NAN_SOURCE_RING_PIXELS))
         comp = labels[sy, sx] == component
-        ring = ndimage.binary_dilation(comp, iterations=8) & good[sy, sx] & ~comp
+        ring = ndimage.binary_dilation(comp, iterations=NAN_SOURCE_RING_PIXELS) & good[sy, sx] & ~comp
         if ring.any():
             ring_values = arr[sy, sx][ring].astype(np.float64)
-            if np.median(ring_values) > bg + 3 * sigma or np.percentile(ring_values, 90) > bg + 5 * sigma:
+            if (np.median(ring_values) > bg + NAN_SOURCE_MEDIAN_SIGMA * sigma
+                    or np.percentile(ring_values, 90) > bg + NAN_SOURCE_P90_SIGMA * sigma):
+                if nearest is None:
+                    nearest = arr[tuple(ndimage.distance_transform_edt(bad, return_distances=False, return_indices=True))]
                 filled[sy, sx][comp] = nearest[sy, sx][comp]
                 stats["nan_pixels_nearest_fill"] += int(comp.sum())
-    stats["nan_pixels_background_fill"] = stats["nan_pixels"] - stats["nan_pixels_nearest_fill"]
+    stats['nan_pixels_background_unfilled'] = int(repair.sum()) - stats['nan_pixels_nearest_fill']
+    stats['nan_pixels_unfilled'] = int(bad.sum()) - stats['nan_pixels_nearest_fill']
+    stats['nan_components_unfilled'] = int(ndimage.label(~np.isfinite(filled))[1])
     return filled, stats

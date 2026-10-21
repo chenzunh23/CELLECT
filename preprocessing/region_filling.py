@@ -23,6 +23,7 @@ class RegionFillingConfig:
     class_priority: tuple[DenseLabel, ...] = (
         DenseLabel.CLEAN,
         DenseLabel.WEAK_SHAPE,
+        DenseLabel.STAR_WINGS,
         DenseLabel.RESTRICTED_BRIGHT_REGION,
         DenseLabel.STRICT_IGNORE,
         DenseLabel.BACKGROUND,
@@ -42,6 +43,7 @@ def fill_dense_regions(
     ordinary_ignore_mask: np.ndarray | None = None,
     ordinary_ignore_source_mask: np.ndarray | None = None,
     bright_region_mask: np.ndarray | None = None,
+    star_wings_mask: np.ndarray | None = None,
     geometry: EllipseGeometry | None = None,
     config: RegionFillingConfig = RegionFillingConfig(),
     refit_config: RefitConfig = RefitConfig(),
@@ -86,6 +88,15 @@ def fill_dense_regions(
     class_by_label = {dense_label: source_class for source_class, dense_label in SOURCE_TO_DENSE.items()}
     paint_order = [label for label in reversed(config.class_priority) if label not in {DenseLabel.ORDINARY_IGNORE, DenseLabel.BACKGROUND}]
     for dense_label in paint_order:
+        if dense_label == DenseLabel.STAR_WINGS:
+            if star_wings_mask is not None:
+                mask = np.asarray(star_wings_mask, bool)
+                if mask.shape != shape:
+                    raise ValueError('star wings/image shape mismatch')
+                if quality_ignore_mask is not None:
+                    mask = mask & ~np.asarray(quality_ignore_mask, bool)
+                dense[mask] = int(dense_label)
+            continue
         if dense_label == DenseLabel.RESTRICTED_BRIGHT_REGION and restricted_fallback_mask is not None:
             dense[np.asarray(restricted_fallback_mask, dtype=bool)] = int(dense_label)
         source_class = class_by_label.get(dense_label)

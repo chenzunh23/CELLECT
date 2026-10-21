@@ -259,6 +259,7 @@ def project_gaia_rows(
             {
                 "source_id": int(sid[idx]),
                 "phot_g_mean_mag": finite_float(gmag[idx]),
+                "phot_rp_mean_mag": finite_float(gaia_table['phot_rp_mean_mag'][idx]) if 'phot_rp_mean_mag' in gaia_table.colnames else float('nan'),
                 "x": float(x[idx]),
                 "y": float(y[idx]),
             }

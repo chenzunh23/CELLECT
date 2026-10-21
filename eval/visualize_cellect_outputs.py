@@ -441,6 +441,7 @@ def _run_one(args: argparse.Namespace, dataset_source: str | None = None) -> Pat
             center_refinement_radius=int(args.center_refinement_radius),
             width=width,
             height=height,
+            valid_mask=np.isfinite(image) if zarr_context is None else None,
         )
         score = _score_map(band_outputs)[:height, :width]
         save_heatmap(band_dir / f"{band}_confidence_score.png", score, title=f"{band} confidence score")

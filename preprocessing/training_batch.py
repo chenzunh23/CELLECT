@@ -82,20 +82,24 @@ def restore_source(row):
     return ImageInput(**d)
 
 
-def read_window(source, x, y, size):
+def read_window(source, x, y, size, *, return_hard_bad=False):
     """Bounded FITS window, padded without shifting a source at an image edge."""
     full, (h,w), _=header_info(source.image_fits)
     xa,ya=max(0,x),max(0,y);xb,yb=min(w,x+size),min(h,y+size)
     raw=np.full((size,size),np.nan,np.float32)
     valid=np.zeros((size,size),bool)
+    hard_bad=np.zeros((size,size),bool) if return_hard_bad else None
     if xa<xb and ya<yb:
         loaded=load_image(source,origin=(xa,ya),shape=(yb-ya,xb-xa))
         raw[ya-y:yb-y,xa-x:xb-x]=loaded.image
         valid[ya-y:yb-y,xa-x:xb-x]=~loaded.bad
+        if hard_bad is not None:
+            hard_bad[ya-y:yb-y,xa-x:xb-x]=loaded.bad & np.isfinite(loaded.image)
     raw[~valid]=np.nan
     header=full.copy();header['CRPIX1']-=x;header['CRPIX2']-=y
     header['NAXIS1']=header['NAXIS2']=size
-    return raw,valid,header
+    header['ORIGFILE']=str(source.image_fits)
+    return (raw,valid,header,hard_bad) if return_hard_bad else (raw,valid,header)
 
 
 def cosmos_parent(args,row):
@@ -107,13 +111,17 @@ def cosmos_parent(args,row):
     catalog=load_catalog(catalog_path,source.band);gaia=Table.read(args.paths['cosmos']['gaia_fits'])
     # A halo provides neighbors and complete segmentation masks across parent edges.
     halo=256;ox,oy=px-halo,py-halo;size=4096+2*halo
-    raw,valid,header=read_window(source,ox,oy,size)
+    raw,valid,header,hard_bad=read_window(source,ox,oy,size,return_hard_bad=True)
     sky,bgmeta=cosmos_region(row['background'],source.image_fits,ox,oy,size,size)
     labels=classify_window(raw,header,catalog,catalog_path,gaia,sky,source.band)
     core=raw[halo:halo+4096,halo:halo+4096]
     if not np.isfinite(core).any():return dict(status='empty',outputs=[])
-    prep=prepare_image(raw,header=header)
-    params=fit_parent_rgb(prepare_image(core,header=header).image)
+    prep=prepare_image(raw,header=header,protected_invalid_mask=hard_bad)
+    core_header=header.copy()
+    core_header['CRPIX1']-=halo;core_header['CRPIX2']-=halo
+    core_header['NAXIS1']=core.shape[1];core_header['NAXIS2']=core.shape[0]
+    params=fit_parent_rgb(prepare_image(core,header=core_header,
+        protected_invalid_mask=hard_bad[halo:halo+4096,halo:halo+4096]).image)
     (audit/'scaling.json').write_text(json.dumps(params,indent=2))
     patch=f'P{source.patch}_x{px:05d}_y{py:05d}'
     task=task_for(args,output_root=root/'zarr'/'cosmos'/f'proposal_{source.proposal}',
@@ -133,6 +141,7 @@ def cosmos_parent(args,row):
     if not args.large_only:
         specs=[TileSpec(f'x{x}_y{y}',x,y,512) for y in range(py,py+4096,512) for x in range(px,px+4096,512)]
         result=write_classified_patch(part_task,prep.image,labels,origin=(ox,oy),tile_specs=specs,valid_mask=valid,
+            input_valid_mask=prep.input_valid_mask,
             max_invalid_fraction=args.jwst_max_invalid_fraction,scaled_image_chw=apply_parent_rgb(prep.image,params),
             cosmos_catalog=catalog_path,image_wcs=WCS(header_info(source.image_fits)[0]).celestial,provenance=provenance)
         assembly.add(result)
@@ -143,11 +152,11 @@ def cosmos_parent(args,row):
         specs=[s for s in specs if s.x0<px or s.y0<py or s.x1>px+4096 or s.y1>py+4096]
     if args.large_limit:specs=specs[:args.large_limit]
     rows=[]
-    del prep,raw,sky,labels;gc.collect()
+    del prep,raw,sky,labels,hard_bad;gc.collect()
     for spec in specs:
         # Fresh, source-centered context: all labels and segmentation regenerated.
         cx,cy=spec.x0-1792,spec.y0-1792
-        raw,valid,ch=read_window(source,cx,cy,4096)
+        raw,valid,ch,hard_bad=read_window(source,cx,cy,4096,return_hard_bad=True)
         if np.count_nonzero(valid[1792:2304,1792:2304])<(1-args.jwst_max_invalid_fraction)*512**2:continue
         sky,bgmeta=cosmos_region(row['background'],source.image_fits,cx,cy,4096,4096)
         lab=classify_window(raw,ch,catalog,catalog_path,gaia,sky,source.band)
@@ -156,8 +165,9 @@ def cosmos_parent(args,row):
             'label_window':[cx,cy,cx+4096,cy+4096], 'labels_generated_independently':True,
             'background_tiles':cosmos_region(row['background'],source.image_fits,spec.x0,spec.y0,512,512)[1],
             'large_source_policy':'final clean and original Kron a > 100 pixels'}
-        prepared=prepare_image(raw,header=ch)
+        prepared=prepare_image(raw,header=ch,protected_invalid_mask=hard_bad)
         result=write_classified_patch(stask,prepared.image,lab,origin=(cx,cy),tile_specs=[spec],valid_mask=valid,
+            input_valid_mask=prepared.input_valid_mask,
             max_invalid_fraction=args.jwst_max_invalid_fraction,scaled_image_chw=apply_parent_rgb(prepared.image,params),
             cosmos_catalog=catalog_path,image_wcs=WCS(header_info(source.image_fits)[0]).celestial,provenance=metadata)
         if result.get('output'):
@@ -166,7 +176,7 @@ def cosmos_parent(args,row):
             if args.diagnostic_dir:
                 diagnostic(args,row['name'],raw,lab,spec,(cx,cy),task,source,info)
             rows.append(info)
-        del raw,valid,sky,lab,prepared;gc.collect()
+        del raw,valid,sky,lab,prepared,hard_bad;gc.collect()
     output=assembly.finish()
     outputs=[output] if output else []
     for j,info in enumerate(rows):
@@ -223,6 +233,12 @@ def hsc_job(args,row):
         from .utils.hsc_background import resolve_training_lsst_background,read_lsst_background
         bgpath,bgreceipt=resolve_training_lsst_background(args,row)
         sky=read_lsst_background(bgpath,image.shape,origin,bgreceipt) & np.isfinite(image)
+    elif background_method=='sextractor-precomputed':
+        bgpath,bgreceipt=precomputed_hsc_background(args,row)
+        sky=read_mask(bgpath)
+        if sky.shape!=image.shape:
+            raise ValueError(f'Precomputed HSC background/image shape mismatch: {bgpath}')
+        sky &= np.isfinite(image)
     elif background_method!='sextractor':
         raise ValueError(f'Unknown HSC background method: {background_method}')
     elif source_kind=='half_coadd':
@@ -246,15 +262,33 @@ def hsc_job(args,row):
     valid,specs,quality_audit=hsc_training_tile_quality(path,image,origin,specs)
     audit=root/'audit'/row['name'];audit.mkdir(parents=True,exist_ok=True)
     (audit/'tile_quality.json').write_text(json.dumps(quality_audit,indent=2))
-    return write_classified_patch(task,image,labels,origin,tile_specs=specs,valid_mask=valid,max_invalid_fraction=.10,
+    from .image_processing import ImagePreparationConfig
+    prepared = prepare_image(image, header=header, source_path=path,
+        config=ImagePreparationConfig(input_unit='native'),
+        protected_invalid_mask=~valid & np.isfinite(image))
+    return write_classified_patch(task,prepared.image,labels,origin,tile_specs=specs,valid_mask=valid,
+        input_valid_mask=prepared.input_valid_mask,max_invalid_fraction=.10,
         provenance=dict(dataset='hsc',image_fits=str(path),reference_fits=str(reference),
             background_mask=str(bgpath),
             background_method=('LSST on matching training input' if background_method=='lsst'
-                               else 'aggressive SExtractor on matching training input'),
+                               else 'SExtractor on matching training input'),
+            bright_source='training_image',bright_image_fits=str(path),
             hsc_background_method=background_method,
             hsc_half_lsst_background_source=getattr(args,'hsc_half_lsst_background_source','training'),
             hsc_quality_policy='0827_bad_score_edge0p1',hsc_bad_score_threshold=.13,
             split_group=f'HSC_{args.tract}_{patch}'))
+
+
+def precomputed_hsc_background(args,row):
+    kind='half_coadd' if row['kind']=='hsc_half' else 'noisy'
+    folder=Path(args.background_root)/'hsc'/kind/row['band']/row['patch']/Path(row['source']).stem
+    receipt=folder/'complete.json';doc=json.loads(receipt.read_text())
+    if doc.get('status')!='done':
+        raise ValueError(f'HSC background is not complete: {receipt}')
+    check_source(doc['signature']['source'],row['source'])
+    if doc['job'].get('input_kind')!=kind or Path(doc['job']['source']).resolve()!=Path(row['source']).resolve():
+        raise ValueError(f'HSC background belongs to another training variant: {receipt}')
+    return folder/'background_mask.npz',receipt
 
 
 def abell_job(args,row):
@@ -289,6 +323,7 @@ def run_job(args,row):
     digest=hashlib.sha256()
     for p in sorted(Path(__file__).parent.rglob('*.py'))+sorted((Path(__file__).parent/'assets').glob('*.json')):
         if 'tests' not in p.parts:digest.update(p.read_bytes())
+    digest.update((Path(__file__).parent.parent/'data_filtering/sam_input_scaling.py').read_bytes())
     paths=[]
     if row['kind']=='cosmos':
         paths=[row['source']['image_fits'],row['source']['quality_mask_npz'],row['background'],
@@ -307,12 +342,18 @@ def run_job(args,row):
             bgpath,bgreceipt=resolve_training_lsst_background(args,row)
             paths.append(str(bgpath))
             if bgreceipt is not None:paths.append(str(bgreceipt))
+        elif getattr(args,'hsc_background_method','sextractor')=='sextractor-precomputed':
+            bgpath,bgreceipt=precomputed_hsc_background(args,row)
+            paths.extend([str(bgpath),str(bgreceipt)])
         elif row['kind']=='hsc_noisy':
             paths.append(str(Path(args.background_root)/'hsc/noisy'/row['band']/row['patch']/Path(row['source']).stem/'background_mask.npz'))
     stamps=[dict(path=str(Path(p).resolve()),bytes=Path(p).stat().st_size,mtime_ns=Path(p).stat().st_mtime_ns) for p in paths if p]
     signature=dict(job=row,inputs=stamps,code=digest.hexdigest(),chunk_tiles=args.chunk_tiles,parent_packed_stamps=True,max_tiles=args.max_tiles,large_only=args.large_only,
         cross_boundary_only=args.cross_boundary_only,large_limit=args.large_limit,
         max_invalid_fraction=args.jwst_max_invalid_fraction)
+    if row['kind'] in ('abell','cosmos'):
+        from .utils.jwst_star_psf import star_policy
+        signature['jwst_star_protection']=star_policy()
     if row['kind'] in ('hsc_half','hsc_noisy'):
         signature['hsc_background_method']=getattr(args,'hsc_background_method','sextractor')
         signature['hsc_half_lsst_background_source']=getattr(args,'hsc_half_lsst_background_source','training')

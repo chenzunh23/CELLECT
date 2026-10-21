@@ -41,6 +41,7 @@ from preprocessing.bright_label import (
 from preprocessing.image_processing import (
     BrightRegionConfig,
     build_bright_components,
+    prepare_image, ImagePreparationConfig,
 )
 from preprocessing.labels import SourceClass
 from preprocessing.dataset_inputs import (
@@ -117,7 +118,11 @@ def _classify_patch(task: StoreTask, image: np.ndarray, image_header: fits.Heade
         anscombe_clip=bool(task.image_anscombe_clip),
         anscombe_scale=float(task.bright_anscombe_scale),
     )
-    bright_region, components = build_bright_components(image, config=bright_config)
+    bright_input_path = (_variant_image_path(task.denoised_fits_root, task.patch, task.group, task.band, task.dataset_source, task.tract)
+                         if task.dataset_source != 'coadd' else coadd_image_fits)
+    bright_input = prepare_image(image, header=image_header, source_path=bright_input_path,
+        config=ImagePreparationConfig(input_unit='native'))
+    bright_region, components = build_bright_components(bright_input, config=bright_config)
     quality = _read_fits_quality_mask(
         _variant_image_path(task.denoised_fits_root, task.patch, task.group, task.band, task.dataset_source, task.tract)
         if task.dataset_source != "coadd"
@@ -275,7 +280,10 @@ def _build_store(task: StoreTask) -> dict[str, object]:
         raise FileNotFoundError(f"image FITS not found: {image_fits}")
     image, header, origin = _read_image_header_origin(image_fits)
     labels = _classify_patch(task, image, header, origin, coadd_image_fits)
-    return write_classified_patch(task, image, labels, origin, provenance={
+    prepared = prepare_image(image, header=header, source_path=image_fits,
+        config=ImagePreparationConfig(input_unit='native'))
+    return write_classified_patch(task, prepared.image, labels, origin,
+        valid_mask=prepared.finite_mask, input_valid_mask=prepared.input_valid_mask, provenance={
         "image_fits": str(image_fits), "coadd_image_fits": str(coadd_image_fits),
         "refit_csv": str(_refit_csv_path(task.refit_root, task.tract, task.band, task.patch)),
     })
@@ -284,7 +292,7 @@ def _build_store(task: StoreTask) -> dict[str, object]:
 def write_classified_patch(task: StoreTask, image: np.ndarray, labels: PatchLabels,
                            origin=(0, 0), *, cosmos_catalog=None, image_wcs=None,
                            provenance=None, input_source: ImageInput | None = None,
-                           tile_specs=None, valid_mask=None, max_invalid_fraction=None,
+                           tile_specs=None, valid_mask=None, input_valid_mask=None, max_invalid_fraction=None,
                            scaled_image_chw=None, include_large_sources=True) -> dict[str, object]:
     """Write already classified sources without rerunning HSC source filters.
 
@@ -295,6 +303,10 @@ def write_classified_patch(task: StoreTask, image: np.ndarray, labels: PatchLabe
     input_source namespaces JWST outputs by dataset/proposal and records both
     training-image and catalog-selection reference paths. Labels must already
     be on the training-image grid; this function does not rerun source filters.
+    valid_mask is observed coverage (also used for the 10% tile gate and mask
+    GT). Optional input_valid_mask includes enclosed, repaired holes: they stay
+    visible and can carry existing confidence positives, but gain no new
+    background, shape, or segmentation truth merely from interpolation.
     """
     if input_source is not None:
         task = bind_task(task, input_source)
@@ -328,6 +340,14 @@ def write_classified_patch(task: StoreTask, image: np.ndarray, labels: PatchLabe
     if valid_mask is not None:
         valid_mask=np.asarray(valid_mask,bool)
         if valid_mask.shape != image.shape:raise ValueError('valid mask/image shape mismatch')
+    if input_valid_mask is not None:
+        input_valid_mask = np.asarray(input_valid_mask, bool)
+        if input_valid_mask.shape != image.shape:
+            raise ValueError('input valid mask/image shape mismatch')
+        if np.any(input_valid_mask & ~np.isfinite(image)):
+            raise ValueError('model-valid pixels must have finite prepared intensities')
+        if valid_mask is None:
+            raise ValueError('input validity requires the original observed valid mask')
     if max_invalid_fraction is not None:
         from preprocessing.utils.large_sources import valid_tile_specs
         valid_mask=np.isfinite(image) if valid_mask is None else valid_mask
@@ -410,21 +430,37 @@ def write_classified_patch(task: StoreTask, image: np.ndarray, labels: PatchLabe
         target = _tile_targets(labels, spec, origin, confidence=confidence_config)
         if valid_mask is not None:
             v=_crop(valid_mask,spec.x0,spec.y0,origin,h)
-            band_valid[i,0]=v
-            images[i,0,...,~v]=0
-            target['confidence'][~v]=0
-            target['conf_weight'][~v]=0
+            context = v if input_valid_mask is None else _crop(input_valid_mask,spec.x0,spec.y0,origin,h)
+            # The trainer uses band_valid_mask specifically for mask losses
+            # and IoU calibration. Interpolated flux must not become mask GT.
+            # Encoder inputs and confidence positives have separate validity.
+            band_valid[i,0]=v & context
+            images[i,0,...,~context]=0
+            # Repaired intensities are usable context. Only existing positive
+            # center cores gain confidence supervision; never invent negatives.
+            positive_fill = context & ~v & (target['confidence'] > 0)
+            confidence_valid = (v & context) | positive_fill
+            target['confidence'][~confidence_valid]=0
+            target['conf_weight'][~confidence_valid]=0
             target['shape_weight'][~v]=0
             from preprocessing.labels import DenseLabel
             target['pu'][~v]=int(DenseLabel.STRICT_IGNORE)
+            target['pu'][positive_fill]=int(DenseLabel.STRICT_CENTER_ONLY)
             if 'segmentation_weight' in target:target['segmentation_weight'][~v]=0
             for center_key,others in [('source_centers',['source_ids']),('strict_centers',['strict_ids']),
                                       ('shape_centers',['shape_values','shape_classes','shape_ids','shape_weights'])]:
                 centers=target[center_key]
                 xy=np.clip(np.floor(centers+.5).astype(int),0,h-1)
-                keep=v[xy[:,1],xy[:,0]]
-                if center_key == 'strict_centers':
-                    keep |= target['strict_is_gaia']
+                center_valid = context if center_key == 'strict_centers' else (v & context)
+                keep=center_valid[xy[:,1],xy[:,0]]
+                if center_key in ('source_centers','shape_centers') and labels.star_protection_sources:
+                    # The PSF shape prior comes from Gaia + a simulation,
+                    # independently of interpolated science at a stellar core.
+                    id_key='source_ids' if center_key=='source_centers' else 'shape_ids'
+                    model_ids=[r['gaia_id'] for r in labels.star_protection_sources]
+                    keep |= np.isin(target[id_key],model_ids) & context[xy[:,1],xy[:,0]]
+                if center_key == 'strict_centers' and input_valid_mask is None:
+                    keep |= target['strict_is_gaia']  # Legacy callers retain their policy.
                 for key in [center_key]+others:target[key]=target[key][keep]
         band_conf[i, 0] = target["confidence"]
         band_conf_weight[i, 0] = target["conf_weight"]
@@ -535,12 +571,18 @@ def write_classified_patch(task: StoreTask, image: np.ndarray, labels: PatchLabe
             "bright_object_mask_root": str(task.bright_object_mask_root) if task.bright_object_mask_root is not None else "",
             "tile_size": int(task.tile_size),
             "max_invalid_fraction": max_invalid_fraction,
+            "nan_input_policy": ('repaired_context_positive_centers_v1' if input_valid_mask is not None else 'observed_only'),
+            "nan_fill_policy": 'enclosed_source_ring_only_v2' if input_valid_mask is not None else 'caller_defined',
+            "band_valid_mask_semantics": "observed_science_for_mask_losses",
+            "tile_coverage_policy": "original_observed_valid_pixels",
             "stride": int(task.stride),
             "source_export_mode": "preprocessing_v3",
             **(provenance or {}),
             "confidence_config": confidence_config,
             "source_area_weight_policy": source_area_weight_policy(),
             "segmentation_policy": labels.segmentation_policy,
+            "jwst_star_protection": labels.star_protection_policy,
+            "jwst_star_sources": labels.star_protection_sources,
         },
         source_centers=_cat(centers_flat, 2, np.float32),
         source_ids=_cat(ids_flat, None, np.int64),
@@ -741,7 +783,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument('--plan-only', action='store_true')
     parser.add_argument('--background-root', default='/data/czh23/analysis/2026-09/2026-09-25/batch_aggressive_background')
     parser.add_argument('--hsc-products-root', default='/data/czh23/Subaru_products')
-    parser.add_argument('--hsc-background-method', choices=['sextractor', 'lsst'], default='sextractor',
+    parser.add_argument('--hsc-background-method', choices=['sextractor', 'sextractor-precomputed', 'lsst'], default='sextractor',
                         help='For --training-batch HSC half/noisy only: use SExtractor or matching LSST masks from --variant-lsst-background-root. JWST continues to use its SExtractor masks.')
     parser.add_argument('--hsc-half-lsst-background-source',choices=['training','coadd'],default='training',
                         help='Explicitly use matching half backgrounds or aligned full-coadd LSST backgrounds for HSC half. Noisy always uses its own backgrounds.')

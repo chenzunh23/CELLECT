@@ -422,7 +422,7 @@ def _panel(
     _draw_external_centers(axes[2], external_centers, label="external strict center")
     for ax in axes:
         ax.set_axis_off()
-    pu_patches = [mpatches.Patch(color=PU_COLORS[k], label=PU_CLASS_NAMES[k]) for k in (1, 2, 5, 6, 7, 3, 4)]
+    pu_patches = [mpatches.Patch(color=PU_COLORS[k], label=PU_CLASS_NAMES[k]) for k in (1, 2, 8, 5, 6, 7, 3, 4)]
     conf_patches = [mpatches.Patch(color=CONF_COLORS[k], label=f"conf {k}") for k in (1, 2, 3, 4)]
     axes[0].legend(handles=pu_patches, loc="lower right", fontsize=7, framealpha=0.75)
     axes[1].legend(handles=conf_patches, loc="lower right", fontsize=7, framealpha=0.75)

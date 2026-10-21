@@ -18,6 +18,37 @@ from preprocessing.build_image_level_zarr import write_classified_patch
 
 
 class NaNCenterTests(unittest.TestCase):
+    def test_repaired_input_trains_inserted_centers_without_fake_background(self):
+        from preprocessing.labels import DenseLabel
+        from preprocessing.image_processing import ImagePreparationConfig, prepare_image
+        lab = labels()
+        lab.dense[:] = int(DenseLabel.BACKGROUND)
+        lab.strict_x = np.array([4., 10., 0.]); lab.strict_y = np.array([4., 10., 5.])
+        lab.strict_ids = np.array([-123, -456, -789])
+        lab.strict_is_gaia = np.array([True, False, True])
+        raw = np.random.default_rng(2).normal(1, .01, (32,32)).astype('f4')
+        raw[2:7,2:7]+=10;raw[8:13,8:13]+=10
+        raw[4,4] = raw[10,10] = raw[14,14] = np.nan
+        raw[:,0] = np.nan  # Original-FITS boundary: even Gaia stays invalid.
+        prep = prepare_image(raw, config=ImagePreparationConfig(input_unit='native'))
+        with tempfile.TemporaryDirectory() as tmp, patch('preprocessing.build_image_level_zarr._scale_image_chw', side_effect=lambda a,t:a[None]):
+            out = write_classified_patch(task(tmp), prep.image, lab,
+                valid_mask=prep.finite_mask, input_valid_mask=prep.input_valid_mask, max_invalid_fraction=.1)
+            store = zarr.open_group(out['output'], mode='r')
+            self.assertEqual(set(store['strict_center_only_ids'][:]), {-123,-456})
+            for x,y in ((4,4),(10,10)):
+                self.assertFalse(store['band_valid_mask'][0,0,y,x])  # No fabricated mask truth.
+                self.assertNotEqual(store['images'][0,0,0,y,x],0)
+                self.assertEqual(store['band_confidence'][0,0,y,x],4)
+                self.assertGreater(store['band_conf_weight'][0,0,y,x],0)
+                self.assertEqual(store['band_shape_weight'][0,0,y,x],0)
+            self.assertEqual(store['band_conf_weight'][0,0,14,14],0)
+            self.assertEqual(store['band_pu_class_mask'][0,0,14,14],int(DenseLabel.STRICT_IGNORE))
+            self.assertTrue((store['images'][0,0,:,:,0]==0).all())
+            self.assertFalse(store['band_valid_mask'][0,0,5,0])
+            self.assertEqual(store['band_conf_weight'][0,0,5,0],0)
+            self.assertEqual(store.attrs['nan_input_policy'],'repaired_context_positive_centers_v1')
+
     def test_first_filter_overrides_area_and_source_cuts(self):
         data = sources([20, 40, 60, 80], a=[10000, 2, 2, 2], mag=[20, 24, 24, 24])
         image = np.zeros((100, 100)); image[50, [20, 40]] = np.nan

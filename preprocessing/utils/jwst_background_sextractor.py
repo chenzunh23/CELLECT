@@ -69,7 +69,7 @@ def _block_mean(image, valid, factor):
 
 def _smooth_valid(image, coverage, sigma):
     good = coverage > 0
-    signal = ndimage.gaussian_filter(image * coverage, sigma, mode='nearest',
+    signal = ndimage.gaussian_filter(np.where(good,image,0.) * coverage, sigma, mode='nearest',
                                      output=np.float32, truncate=3)
     norm = ndimage.gaussian_filter(coverage, sigma, mode='nearest',
                                    output=np.float32, truncate=3)

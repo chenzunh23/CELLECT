@@ -1,4 +1,4 @@
-"""Native-grid AUTO background, three-scale residual detection, PSF RMS grow.
+"""Native-grid AUTO background, PSF-scale residual detection, PSF RMS grow.
 
 This is an opt-in training-background recipe. It never modifies science pixels
 or the background used to classify sources on the full reference coadd.
@@ -18,7 +18,7 @@ from scipy import ndimage
 from .jwst_background_sextractor import AggressiveSkyConfig, aggressive_sextractor_background
 from ..dataset_inputs import effective_band
 
-METHOD = 'sextractor_native_auto128_psf_rms_v1'
+METHOD = 'sextractor_native_auto128_psf_smoothing_v2'
 
 
 @dataclass(frozen=True)
@@ -29,19 +29,31 @@ class LocalSkyConfig:
     background_mesh: int = 128
     background_filter_size: int = 3
     grow_factor: float = 2.4
-    factors: tuple = (1, 2, 4)
-    smoothing_sigma_pixels: tuple = (2., 10., 28.)
-    thresholds_sigma: tuple = (1.8, 2.2, 2.7)
-    minarea_native_pixels: tuple = (16, 32, 128)
+    # fixed mode remains available for explicitly requested legacy experiments.
+    smoothing_mode: str = 'psf'
+    smoothing_sigma_floor_pixels: float = 1.
+    factors: tuple = (1,)
+    smoothing_sigma_pixels: tuple = (1.,)  # used only in fixed mode
+    thresholds_sigma: tuple = (1.5,) #1.8
+    minarea_native_pixels: tuple = (1,)
 
     def __post_init__(self):
         if self.background_mesh < 16 or self.background_filter_size < 1 or self.grow_factor <= 0:
             raise ValueError('Invalid local background configuration')
-        self.detection_config()
+        if self.smoothing_mode not in {'psf','fixed'} or not np.isfinite(self.smoothing_sigma_floor_pixels) or self.smoothing_sigma_floor_pixels<=0:
+            raise ValueError('Invalid smoothing mode or sigma floor')
+        if self.smoothing_mode=='psf' and tuple(self.factors)!=(1,):
+            raise ValueError('PSF smoothing uses one native-resolution pass; use fixed mode for multiscale')
+        self.detection_config(psf_sigma=1.)
 
-    def detection_config(self):
+    def detection_config(self, *, psf_sigma=None):
+        sigmas=self.smoothing_sigma_pixels
+        if self.smoothing_mode=='psf':
+            if psf_sigma is None or not np.isfinite(psf_sigma) or psf_sigma<=0:
+                raise ValueError('A positive science-grid PSF sigma is required')
+            sigmas=(max(self.smoothing_sigma_floor_pixels,float(psf_sigma)),)
         return AggressiveSkyConfig(factors=self.factors,
-            smoothing_sigma_pixels=self.smoothing_sigma_pixels,
+            smoothing_sigma_pixels=sigmas,
             thresholds_sigma=self.thresholds_sigma,
             minarea_native_pixels=self.minarea_native_pixels,
             grow_native_pixels=(0,) * len(self.factors))
@@ -98,10 +110,13 @@ def local_sextractor_background(image, header, output, *, config, source='',
     psf=validate_psf_asset(config,band)
     scale=float(np.sqrt(np.prod(proj_plane_pixel_scales(WCS(header).celestial)))*3600)
     if not np.isfinite(scale) or scale<=0:raise ValueError('Invalid science pixel scale')
-    radius=int(config.grow_factor*psf['lsst_adaptive_sigma_arcsec']/scale+.5)
+    psf_sigma=psf['lsst_adaptive_sigma_arcsec']/scale
+    detection=config.detection_config(psf_sigma=psf_sigma)
+    radius=int(config.grow_factor*psf_sigma+.5)
     sig=dict(method=METHOD,config=json.loads(json.dumps(asdict(config))),source=str(source),
         shape=list(image.shape),image_sha256=hashlib.sha256(np.ascontiguousarray(image).view('u1')).hexdigest(),
-        band=band,pixel_scale_arcsec=scale,grow_radius_pixels=radius,psf=psf)
+        band=band,pixel_scale_arcsec=scale,grow_radius_pixels=radius,psf=psf,
+        psf_sigma_native_pixels=psf_sigma,resolved_detection_config=json.loads(json.dumps(asdict(detection))))
     meta=output.with_suffix('.json')
     if output.exists() and meta.exists() and json.loads(meta.read_text()).get('signature')==sig:
         with np.load(output) as z:sky=np.array(z['background_mask'],dtype=bool)
@@ -118,7 +133,7 @@ def local_sextractor_background(image, header, output, *, config, source='',
             model_percentiles=np.percentile(model[valid],[1,50,99]).tolist()
             residual=image-model
             sky0=aggressive_sextractor_background(residual,header,work/'residual_sky.npz',
-                config=config.detection_config(),source=f'{source}#native-AUTO={config.background_mesh}',executable=sex)
+                config=detection,source=f'{source}#native-AUTO={config.background_mesh}',executable=sex)
             passes=json.loads((work/'residual_sky.json').read_text())['passes']
             shutil.copyfile(work/'residual_sky.log',output.with_suffix('.log'))
             found=valid&~sky0

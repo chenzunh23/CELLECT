@@ -19,6 +19,7 @@ class DenseLabel(IntEnum):
     STRICT_CENTER_ONLY = 5
     RESTRICTED_BRIGHT_REGION = 6
     STRICT_IGNORE = 7
+    STAR_WINGS = 8
 
 
 class SourceClass(IntEnum):
@@ -59,6 +60,7 @@ class LabelWeights:
     strict_center_only: float = 1.0
     restricted_bright_region: float = 1.0
     strict_ignore: float = 0.0
+    star_wings: float = 0.2
 
     def as_array(self) -> np.ndarray:
         out = np.zeros(max(int(label) for label in DenseLabel) + 1, dtype=np.float32)
@@ -69,6 +71,7 @@ class LabelWeights:
         out[DenseLabel.STRICT_CENTER_ONLY] = self.strict_center_only
         out[DenseLabel.RESTRICTED_BRIGHT_REGION] = self.restricted_bright_region
         out[DenseLabel.STRICT_IGNORE] = self.strict_ignore
+        out[DenseLabel.STAR_WINGS] = self.star_wings
         return out
 
 

@@ -6,7 +6,7 @@ from astropy.coordinates import SkyCoord
 from astropy.time import Time
 
 
-def astrometric_evidence(table):
+def astrometric_evidence(table, *, allow_absolute_motion=True):
     """COSMOS reference stellar evidence; missing astrometry is not evidence."""
     n = len(table)
     def col(name):
@@ -21,7 +21,8 @@ def astrometric_evidence(table):
     parallax = significance(col('parallax'), col('parallax_error'))
     pmra, pmdec = col('pmra'), col('pmdec')
     pm_snr = np.hypot(significance(pmra, col('pmra_error')), significance(pmdec, col('pmdec_error')))
-    return (parallax >= 3) | (pm_snr >= 3) | (np.hypot(pmra, pmdec) >= 3)
+    evidence = (parallax >= 3) | (pm_snr >= 3)
+    return evidence | (np.hypot(pmra, pmdec) >= 3) if allow_absolute_motion else evidence
 
 
 def matching_radius_pixels(pixel_scale_arcsec, *, arcsec=None, hsc_pixels=6.0):

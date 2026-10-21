@@ -171,6 +171,9 @@ def log_single(image: np.ndarray, *, minimum: float, high_pct: float, a: float) 
     x = np.clip((safe - minimum) / (hi - minimum), 0.0, 1.0)
     a = float(a) if np.isfinite(a) and a > 0.0 else 300.0
     y = np.log1p(a * x) / np.log(a)
+    # Preserve no-data through the next self-standardization. Replacing it by
+    # zero here would let large edge padding change the log-channel statistics.
+    y[~np.isfinite(image)] = np.nan
     return y.astype(np.float32), {
         "minimum": minimum,
         "hi": hi,
@@ -189,7 +192,9 @@ def lupton_single(image: np.ndarray, *, minimum: float, stretch: float, q: float
         Q=float(q),
         output_dtype=float,
     )
-    return np.asarray(rgb[..., 0], dtype=np.float32), {
+    plane = np.asarray(rgb[..., 0], dtype=np.float32).copy()
+    plane[~np.isfinite(image)] = np.nan
+    return plane, {
         "minimum": float(minimum),
         "stretch": float(stretch),
         "q": float(q),
@@ -224,14 +229,15 @@ def anscombe_single(image: np.ndarray, *, scale: float, clip=False) -> tuple[np.
     safe = np.nan_to_num(image, nan=minimum, posinf=minimum, neginf=minimum).astype(np.float64, copy=False)
     if clip:
         # Clip the image to raw_mean ± 3 * raw_std before applying the Anscombe transform.
-        mean = float(np.mean(safe))
-        std = float(np.std(safe))
+        mean = float(np.mean(values))
+        std = float(np.std(values))
         clip_min = mean - 3.0 * std
         minimum = max(minimum, clip_min)
         values = np.clip(values, clip_min, mean + 3.0 * std)
         safe = np.clip(safe, clip_min, mean + 3.0 * std)
     shifted_scaled = np.maximum((safe - minimum) * scale, 0.0)
     transformed = 2.0 * np.sqrt(shifted_scaled + 3.0 / 8.0)
+    transformed[~np.isfinite(image)] = np.nan
     return transformed.astype(np.float32), {
         "minimum": minimum,
         "scale": scale,
@@ -332,6 +338,7 @@ def build_bright_mask(
         else:
             raise ValueError(f"Unknown bright mask mode: {mode!r}")
 
+    bright &= np.isfinite(image)
     if int(dilation) > 0 and np.any(bright):
         try:
             from scipy import ndimage
@@ -339,7 +346,7 @@ def build_bright_mask(
             bright = ndimage.binary_dilation(bright, iterations=int(dilation))
         except Exception:
             pass
-    return np.asarray(bright, dtype=bool)
+    return np.asarray(bright, dtype=bool) & np.isfinite(image)
 
 
 def scale_training_image(

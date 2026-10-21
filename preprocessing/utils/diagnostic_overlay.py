@@ -9,6 +9,7 @@ DENSE_RGBA = {
     5: (1.00, 0.66, 0.00, 0.38),  # center-only
     6: (1.00, 0.66, 0.00, 0.38),  # bright region
     7: (1.00, 0.00, 0.00, 0.10),  # strict ignore
+    8: (0.64, 0.40, 1.00, 0.28),  # weak confidence negative: stellar wings
 }
 CONFIDENCE_RGBA = {
     1: (0.12, 0.40, 1.00, 0.44), 2: (0.00, 0.85, 0.25, 0.52),

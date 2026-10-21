@@ -1,10 +1,6 @@
 """Abell source labeling on full-coadd references using existing v3 policies."""
 import numpy as np
-from astropy.io import fits
-from astropy.stats import sigma_clipped_stats
-from astropy.table import Table
 from astropy.wcs import WCS
-from scipy import ndimage
 from ..image_processing import prepare_image, build_bright_components, BrightRegionConfig
 from ..meas_processing import classify_catalog_basics
 from ..ordinary_common import OrdinaryInput, classify_ordinary_sources
@@ -12,39 +8,25 @@ from ..ordinary_a2744 import A2744OrdinaryConfig, protect_ignored_children
 from ..bright_label import project_gaia_rows
 from ..bright_label_jwst import JWSTBrightConfig, label_bright_sources
 from ..region_filling import fill_dense_regions
-from ..labels import SourceClass, DenseLabel
-from .geometry import EllipseGeometry, component_at
+from ..labels import DenseLabel, SourceLabels
+from .geometry import EllipseGeometry
 from .image_level import PatchLabels
 from .jwst_background import PSF_FWHM_ARCSEC
 
 
 def star_footprint(prepared, bright, gaia_rows):
-    # 09-08/09-09 Gaia-seeded high/low threshold footprint policy.
-    stars=[r for r in gaia_rows if np.isfinite(r['phot_g_mean_mag']) and r['phot_g_mean_mag']<18]
-    if not stars:return np.zeros(bright.shape,bool)
-    a=prepared.image
-    _,med,std=sigma_clipped_stats(a[np.isfinite(a)],sigma=3.,maxiters=5)
-    if not np.isfinite(std) or std<=0:std=float(np.nanstd(a)) or 1.
-    z=(a-med)/std
-    high,_=ndimage.label(z>=2.5);low,_=ndimage.label(z>=1.25)
-    touched={component_at(high,float(r['x']),float(r['y']),search_radius=12) for r in stars}
-    touched.discard(0)
-    if not touched:return np.zeros(a.shape,bool)
-    mask=np.isin(high,list(touched))
-    comps,n=ndimage.label(bright);areas=np.bincount(comps.ravel())
-    big=areas>=1000;big[0]=False
-    ids=np.unique(high[mask&big[comps]&(high>0)])
-    if len(ids):mask &= np.isin(high,ids)
-    seed=ndimage.binary_dilation(mask,iterations=3)
-    ids=np.unique(low[seed&(low>0)])
-    if len(ids):mask |= np.isin(low,ids)
-    for radius,op in [(4,ndimage.binary_closing),(8,ndimage.binary_dilation)]:
-        y,x=np.ogrid[-radius:radius+1,-radius:radius+1]
-        mask=op(mask,structure=x*x+y*y<=radius*radius)
-    return mask
+    from .jwst_star_protection import bright_star_footprint
+    return bright_star_footprint(prepared, bright, gaia_rows)
 
 
-def classify_reference(reference, header, catalog, gaia, background, band, *, training_background=None):
+def classify_reference(reference, header, catalog, gaia, background, band, *, training_background=None,
+                       bright_image=None, bright_header=None):
+    """Select ordinary sources on full coadd; optionally build bright on half.
+
+    Formal Zarr callers supply the aligned training half image for bright,
+    including independent centered stamps. Reference-only diagnostics can
+    still explicitly omit it to reproduce historical source classifications.
+    """
     w=WCS(header).celestial
     x,y=w.all_world2pix(catalog['ALPHA_J2000'],catalog['DELTA_J2000'],0)
     ny,nx=reference.shape
@@ -61,11 +43,24 @@ def classify_reference(reference, header, catalog, gaia, background, band, *, tr
     snr[fallback]=flux[fallback]/err[fallback]
     data=OrdinaryInput(geom,mag,snr=snr,flags=np.asarray(table['FLAGS']))
     prepared=prepare_image(reference,header=header)
-    bright,components=build_bright_components(prepared,config=BrightRegionConfig(threshold=5,clip_threshold=5,statistics_clip_sigma=5))
+    if bright_image is None:
+        bright_prepared=prepared
+    else:
+        from ..image_processing import PreparedImage
+        if bright_header is None:
+            raise ValueError('Training bright image requires its WCS header')
+        bright_prepared=bright_image if isinstance(bright_image,PreparedImage) else prepare_image(bright_image,header=bright_header)
+        if bright_prepared.image.shape != reference.shape:
+            raise ValueError('Training bright and reference image shapes differ')
+        points=np.array([[0,0],[nx-1,0],[0,ny-1],[nx-1,ny-1],[(nx-1)/2,(ny-1)/2]])
+        projected=np.column_stack(WCS(bright_header).celestial.all_world2pix(*w.all_pix2world(points[:,0],points[:,1],0),0))
+        if not np.allclose(points,projected,atol=1e-3,rtol=0):
+            raise ValueError('Training bright image must align with full-reference WCS')
+    bright,components=build_bright_components(bright_prepared,config=BrightRegionConfig(threshold=5,clip_threshold=5,statistics_clip_sigma=5))
     if 'ref_epoch' not in gaia.colnames:
         gaia=gaia.copy();gaia['ref_epoch']=2016.
     gaia_rows=project_gaia_rows(gaia,image_shape=reference.shape,image_header=header,pixel_origin=0)
-    stars=star_footprint(prepared,bright,gaia_rows)
+    stars=star_footprint(bright_prepared,bright,gaia_rows)
     basics=classify_catalog_basics(geom,mag,dataset='a2744',pixel_scale_arcsec=.03,valid_mask=prepared.finite_mask)
     data.center_invalid=basics.nan_center_ignore
     linear=prepared.image.copy();linear[~prepared.finite_mask]=np.nan
@@ -86,16 +81,31 @@ def classify_reference(reference, header, catalog, gaia, background, band, *, tr
                 apply_remeasured_aperture_snr(ordinary, data.mag, measurement, mag_min=None)
     restricted=np.isin(components,result.restricted_fallback_component_ids) if len(result.restricted_fallback_component_ids) else None
     ignored=np.isin(components,result.ordinary_ignore_component_ids) if len(result.ordinary_ignore_component_ids) else None
-    dense=fill_dense_regions(table,result.labels,reference.shape,geometry=geom,
-        background_mask=background if training_background is None else training_background,quality_ignore_mask=~prepared.finite_mask,
-        bright_region_mask=bright,restricted_fallback_mask=restricted,ordinary_ignore_mask=ignored)
-    dense[~prepared.finite_mask]=int(DenseLabel.STRICT_IGNORE)
-    labels=PatchLabels(table,dense,result.labels.source_class.copy(),geom.x,geom.y,geom.major,geom.minor,
+    labels=PatchLabels(table,np.empty(reference.shape,np.uint8),result.labels.source_class.copy(),geom.x,geom.y,geom.major,geom.minor,
         geom.theta,np.asarray(table['NUMBER'],np.int64),result.strict_center_x,result.strict_center_y,result.strict_center_source_id,
         strict_is_gaia=np.array(['gaia' in str(reason) for reason in result.strict_center_reason],bool))
+    from .jwst_star_protection import apply_star_protection
+    training_linear=bright_prepared.image.copy()
+    training_linear[~bright_prepared.finite_mask]=np.nan
+    wings=apply_star_protection(labels,image=training_linear,header=bright_header if bright_header is not None else header,
+        gaia=gaia,band=band,pixel_scale=.03,footprint=stars,
+        # Recheck only near-star sources, including bright rows which the
+        # ordinary faint-source SNR pass did not measure. Full coadd remains
+        # the measurement reference; rotations/bright footprints use HALF.
+        sky_mask=background,snr_image=linear,valid_mask=bright_prepared.finite_mask)
+    final_geom=EllipseGeometry(labels.geom_x,labels.geom_y,labels.geom_major,labels.geom_minor,labels.geom_theta,
+                              np.pi*labels.geom_major*labels.geom_minor)
+    labels.dense=fill_dense_regions(labels.table,SourceLabels(labels.label_classes,np.full(len(labels.source_ids),'',object)),
+        reference.shape,geometry=final_geom,
+        background_mask=background if training_background is None else training_background,
+        quality_ignore_mask=~bright_prepared.finite_mask,bright_region_mask=bright,
+        restricted_fallback_mask=restricted,ordinary_ignore_mask=ignored,star_wings_mask=wings)
+    labels.dense[~bright_prepared.finite_mask]=int(DenseLabel.STRICT_IGNORE)
     from .truncated_kron import large_kron_geometry
     labels.truncation_geometry=large_kron_geometry(catalog['NUMBER'],x,y,
         np.asarray(catalog['KRON_RADIUS']*catalog['A_IMAGE'],float),
         np.asarray(catalog['KRON_RADIUS']*catalog['B_IMAGE'],float),
         np.deg2rad(np.asarray(catalog['THETA_IMAGE'],float)))
-    return labels,dict(sources=len(table),classes={str(k):int(v) for k,v in zip(*np.unique(labels.label_classes,return_counts=True))})
+    return labels,dict(sources=len(table),bright_source='training_half_coadd' if bright_image is not None else 'full_reference',
+                       classes={str(k):int(v) for k,v in zip(*np.unique(labels.label_classes,return_counts=True))},
+                       star_protection=labels.star_protection_policy)

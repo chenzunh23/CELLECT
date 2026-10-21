@@ -52,7 +52,8 @@ def merge_parent_stores(parts, output, *, attrs, chunk_tiles=20):
     for (root,shift),size in zip(parts,sizes):
         a=json.loads((root/'.zattrs').read_text())
         provenance.append(dict(start=sum(q['count'] for q in provenance),count=size,coordinate_shift=list(shift),
-            **{k:a[k] for k in ['sample_kind','stamp_bounds','label_window','labels_generated_independently','background_tiles','large_source_policy'] if k in a}))
+            **{k:a[k] for k in ['sample_kind','stamp_bounds','label_window','labels_generated_independently','background_tiles','large_source_policy',
+                               'jwst_star_protection','jwst_star_sources'] if k in a}))
     finalattrs['sample_blocks']=provenance
     output.parent.mkdir(parents=True,exist_ok=True)
     temp=Path(tempfile.mkdtemp(prefix='.'+output.name+'.merge-',dir=output.parent));backup=output.with_name('.'+output.name+'.previous')

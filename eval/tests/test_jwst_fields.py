@@ -43,6 +43,80 @@ def store(root, proposal):
 
 
 class JwstInputTests(unittest.TestCase):
+    def test_invalid_pixels_are_excluded_before_detection_nms(self):
+        import torch
+        from eval.eval_utils import detection_rows
+        confidence=torch.full((1,5,8,8),-10.)
+        confidence[:,0]=0
+        confidence[0,4,2,2]=12.;confidence[0,4,2,3]=10.
+        outputs=dict(confidence=confidence,shape=torch.ones(1,3,8,8))
+        valid=np.ones((8,8),bool);valid[2,2]=False
+        rows=detection_rows(outputs,threshold=2.,nms_radius=1,
+            confidence_score='ordinal_expectation',center_refinement='integer',
+            center_refinement_radius=1,width=8,height=8,valid_mask=valid)
+        self.assertEqual([(r['x'],r['y']) for r in rows],[(3.,2.)])
+        self.assertEqual(float(outputs['confidence'][0,4,2,2]),12.)
+
+    def test_same_source_hole_policy_in_writer_bright_and_browser(self):
+        from dataclasses import replace
+        import zarr
+        from preprocessing.image_processing import prepare_image, build_bright_components, BrightRegionConfig
+        from preprocessing.utils.parent_scaling import fit_parent_rgb, apply_parent_rgb
+        from preprocessing.build_image_level_zarr import write_classified_patch
+        from preprocessing.tests.test_segmentation_zarr import labels, task
+        from preprocessing.labels import DenseLabel
+        raw=np.random.default_rng(30).normal(0,.01,(128,128)).astype('f4')
+        raw[44:58,44:58]+=10
+        raw[49:52,49:52]=np.nan                    # Enclosed bright-source core.
+        raw[90:94,90:94]=np.nan                    # Enclosed sky hole.
+        raw[20:40,:6]=np.nan;raw[20:40,6:10]+=10   # Open boundary beside a star.
+        source=self.root/'same.fits';fits.PrimaryHDU(raw,header(128)).writeto(source)
+        quality=self.root/'same_quality.npz';np.savez(quality,bad=~np.isfinite(raw))
+        (self.root/'manifest.json').write_text(json.dumps({'items':[
+            dict(image_fits=str(source),quality_mask_npz=str(quality),sample_name='same',proposal=1727,pointing=19,band='F444W')]}))
+        prep=prepare_image(raw,header=header(128),source_path=source)
+        params=fit_parent_rgb(prep.image);rgb=apply_parent_rgb(prep.image,params)
+        bright,_=build_bright_components(prep,config=BrightRegionConfig(threshold=5,clip_threshold=5))
+        self.assertTrue(bright[50,50]);self.assertFalse(bright[90:94,90:94].any())
+        self.assertFalse(bright[20:40,:6].any())
+        lab=labels();lab.dense=np.full((128,128),int(DenseLabel.BACKGROUND),np.uint8)
+        lab.strict_x=lab.strict_y=np.array([50.]);lab.strict_ids=np.array([-1])
+        lab.strict_is_gaia=np.array([True])
+        out=write_classified_patch(replace(task(self.root/'zarr'),tile_size=128,stride=128),
+            prep.image,lab,valid_mask=prep.finite_mask,input_valid_mask=prep.input_valid_mask,
+            scaled_image_chw=rgb,max_invalid_fraction=.1)
+        store=zarr.open_group(out['output'],mode='r')
+        a=CosmosAccess(self.root,tile_size=128);a.scaling_parameters=lambda *args:params
+        image,web,_,ok=a.scaled_window('F444W','p1727_P0019',0,0,128,128)
+        np.testing.assert_allclose(image,prep.image,equal_nan=True)
+        np.testing.assert_allclose(web,store['images'][0,0])
+        for ys,xs in ((slice(90,94),slice(90,94)),(slice(20,40),slice(0,6))):
+            self.assertTrue(np.isnan(image[ys,xs]).all());self.assertFalse(ok[ys,xs].any())
+            self.assertTrue((web[:,ys,xs]==0).all())
+            self.assertTrue((store['band_conf_weight'][0,0,ys,xs]==0).all())
+        self.assertTrue(ok[50,50]);self.assertGreater(store['band_conf_weight'][0,0,50,50],0)
+        self.assertFalse(store['band_valid_mask'][0,0,50,50])  # No synthetic mask truth.
+        self.assertEqual(prep.metadata['nan_pixels_background_fill'],0)
+        self.assertEqual(prep.metadata['nan_pixels_nearest_fill'],9)
+
+    def test_cli_fits_repairs_cut_hole_before_scaling_without_filling_padding(self):
+        from unittest.mock import patch
+        from eval.eval_utils import build_scaled_tensor_from_fits
+        p=self.root/'cli.fits'
+        raw=np.random.default_rng(9).normal(0,.01,(64,64)).astype('f4')
+        raw[20:38,18:38]+=10
+        raw[28:32,22:28]=np.nan
+        raw[40:44,:30]=np.nan
+        fits.PrimaryHDU(raw,header(64)).writeto(p)
+        with patch.dict('os.environ',{'CELLECT_NAN_CACHE':str(self.root/'cache')}):
+            tensor,images,scaled,_=build_scaled_tensor_from_fits([p],hdu=0,x0=24,y0=24,
+                width=24,height=24,scaling_mode='log_lupton',clip_threshold=5,log_a=1000,
+                log_high_percentile=99.5,lupton_stretch=.5,lupton_q=20,
+                anscombe_clip=False,anscombe_scale=1000)
+        self.assertEqual(tuple(tensor.shape),(1,1,3,24,24))
+        self.assertTrue((images[0][4:8,:4]>1).all())
+        self.assertTrue((scaled[0][:,16:20,:6]==0).all())
+
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.root=Path(self.tmp.name)
     def tearDown(self): self.tmp.cleanup()
@@ -100,6 +174,33 @@ class JwstInputTests(unittest.TestCase):
         for kwargs in [dict(sample_index=-1),dict(sample_index=2),dict(band='F150W'),dict(xy=(50,50))]:
             with self.assertRaises((LookupError,ValueError)):
                 resolve_field_zarr(zarr_store=p,**kwargs)
+
+    def test_scaled_window_zeros_quality_pixels_and_open_nan_boundary(self):
+        from unittest.mock import patch
+        from preprocessing.image_processing import prepare_image
+        from preprocessing.utils.parent_scaling import fit_parent_rgb
+        p=self.root/'science.fits'
+        raw=np.random.default_rng(2).normal(0,.01,(64,64)).astype('f4')
+        raw[20:35,:10]=np.nan;raw[20:35,10:15]+=10
+        raw[40:44,22:28]=np.nan  # Closed hole cut by the requested crop.
+        raw[38:46,20:30]+=10   # Source-like ring; sky holes now remain invalid.
+        h=header(64);fits.PrimaryHDU(raw,h).writeto(p)
+        q=self.root/'quality.npz';bad=np.zeros((64,64),bool);bad[25,12]=True
+        np.savez(q,bad=bad)
+        (self.root/'manifest.json').write_text(json.dumps({'items':[
+            dict(image_fits=str(p),quality_mask_npz=str(q),sample_name='test',proposal=1727,pointing=19,band='F444W')]}))
+        with patch.dict('os.environ',{'CELLECT_NAN_CACHE':str(self.root/'cache')}):
+            a=CosmosAccess(self.root)
+            params=fit_parent_rgb(prepare_image(raw,header=h,source_path=p).image)
+            a.scaling_parameters=lambda *args:params
+            image,rgb,_,valid=a.scaled_window('F444W','p1727_P0019',0,16,32,32)
+            self.assertTrue(np.isnan(image[4:19,:10]).all())
+            self.assertTrue((rgb[:,~valid]==0).all())
+            image,rgb,_,valid=a.scaled_window('F444W','p1727_P0019',24,36,24,20)
+            self.assertTrue(np.isfinite(image[4:8,:4]).all())
+            self.assertTrue(valid[4:8,:4].all())
+            self.assertTrue(np.any(rgb[:,4:8,:4]!=0))
+            self.assertFalse(a.read_window('F444W','p1727_P0019',24,36,24,20)[1][4:8,:4].any())
 
 
 if __name__=='__main__': unittest.main()

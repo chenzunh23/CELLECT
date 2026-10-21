@@ -89,6 +89,8 @@ class PatchLabels:
     segmentation_policy: dict | None = None
     segmentation_overlap_masks: list[dict] | None = None
     truncation_geometry: dict | None = None  # Raw large Krons, including off-window centers.
+    star_protection_policy: dict | None = None
+    star_protection_sources: list[dict] | None = None
 
 
 def attach_cosmos_segmentation(labels: PatchLabels, wcs, catalog_path, *,

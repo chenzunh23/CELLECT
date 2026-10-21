@@ -49,7 +49,8 @@ def build_parent(args, row):
     mode = 'psf-ee' if args.confidence_mode == 'auto' else args.confidence_mode
     asset = confidence_asset(mode, getattr(args, 'confidence_config_path', None))[1] if mode != 'manhattan' else None
     from .utils.source_weights import source_area_weight_policy
-    signature=dict(source_area_weight_policy=source_area_weight_policy(),confidence_asset=asset,max_invalid_fraction=args.jwst_max_invalid_fraction,
+    from .utils.jwst_star_psf import star_policy
+    signature=dict(jwst_star_protection=star_policy(),source_area_weight_policy=source_area_weight_policy(),confidence_asset=asset,max_invalid_fraction=args.jwst_max_invalid_fraction,
         stride=368,max_tiles=args.max_tiles,large_only=getattr(args,'large_only',False),
         large_limit=getattr(args,'large_limit',0),cross_boundary_only=getattr(args,'cross_boundary_only',False),
         background_root=args.background_root,sex_detect_thresh=args.sex_detect_thresh,
@@ -58,7 +59,11 @@ def build_parent(args, row):
         reference_mtime_ns=Path(row['reference_fits']).stat().st_mtime_ns,
         catalog_mtime_ns=Path(args.abell_catalog).stat().st_mtime_ns,gaia_mtime_ns=Path(args.abell_gaia).stat().st_mtime_ns,
         confidence_mode=args.confidence_mode,confidence_fwhm_min=args.confidence_fwhm_min,
-        confidence_fwhm_max=args.confidence_fwhm_max,confidence_fwhm_pixels=args.confidence_fwhm_pixels,policy_version=9,abell_ignore_flags=[16,17,18,19],ignore_child_parent_class='strict_center_only',chunk_tiles=args.chunk_tiles,parent_packed_stamps=True,reference_background_method=AGGRESSIVE_BACKGROUND_METHOD)
+        confidence_fwhm_max=args.confidence_fwhm_max,confidence_fwhm_pixels=args.confidence_fwhm_pixels,policy_version=13,
+        bright_source='training_half_coadd',
+        nan_fill_policy='enclosed_source_ring_only_v2',
+        nan_input_policy='repaired_context_positive_centers_v1',scaling_nan_policy='finite_values_at_every_transform_v1',
+        abell_ignore_flags=[16,17,18,19],ignore_child_parent_class='strict_center_only',chunk_tiles=args.chunk_tiles,parent_packed_stamps=True,reference_background_method=AGGRESSIVE_BACKGROUND_METHOD)
     if receipt.exists() and not args.overwrite:
         previous=json.loads(receipt.read_text())
         if previous.get('max_invalid_fraction')!=args.jwst_max_invalid_fraction:
@@ -80,20 +85,21 @@ def build_parent(args, row):
         receipt.write_text(json.dumps(result,indent=2)+'\n');return result
     print(f'[abell-zarr] {row["band"]} {row["patch"]}: reference labels',flush=True)
     reference,rheader=fits.getdata(row['reference_fits'],header=True)
-    background=ensure_background(Path(row['reference_fits']),audit/'background.npz',
+    background=ensure_background(Path(row['reference_fits']),audit/'reference_snr_background.npz',
                                  image=reference,header=rheader)
     from .utils.background_tiles import abell_region
     training_sky, background_provenance = abell_region(args.background_root, row['band'],
         row['original_training'], row['x0'], row['y0'], row['size'], row['size'])
     catalog=Table.read(args.abell_catalog,hdu=1);gaia=Table.read(args.abell_gaia)
-    labels,summary=classify_reference(reference,rheader,catalog,gaia,background,row['band'],training_background=training_sky)
+    prepared=prepare_image(raw,header=header)
+    labels,summary=classify_reference(reference,rheader,catalog,gaia,background,row['band'],training_background=training_sky,
+                                      bright_image=prepared,bright_header=header)
     del reference,background
     # Keep frozen original geometry and final labels for audits/centered views.
     labels.table['final_class']=labels.label_classes
     labels.table['parent_x']=labels.geom_x;labels.table['parent_y']=labels.geom_y
     labels.table['original_kron_a']=labels.geom_major;labels.table['original_kron_b']=labels.geom_minor
     labels.table.write(audit/'sources.fits',overwrite=True)
-    prepared=prepare_image(raw,header=header)
     params=fit_parent_rgb(prepared.image)
     (audit/'scaling.json').write_text(json.dumps(params,indent=2)+'\n')
     scaled=apply_parent_rgb(prepared.image,params)
@@ -102,10 +108,12 @@ def build_parent(args, row):
         parent_overlap=row['parent_overlap'],image_fits=row['training_fits'],reference_fits=row['reference_fits'],
         reference_catalog=args.abell_catalog,sky_wcs_header=header.tostring(sep='\n'),
         source_selection_reference='full coadd',background_method='SExtractor segmentation on aligned half-coadd parent',
+        bright_source='training_half_coadd',bright_image_fits=row['training_fits'],
         training_background='sextractor',reference_snr_background=AGGRESSIVE_BACKGROUND_METHOD,
         scaling_statistics='4096 half-coadd parent',sample_kind='grid')
-    # Source classes remain those measured from the FULL reference image.
+    # Ordinary-source measurements use FULL; bright decisions use training HALF.
     result=write_classified_patch(part_task,prepared.image,labels,tile_specs=[] if getattr(args,'large_only',False) else grid,valid_mask=valid,
+        input_valid_mask=prepared.input_valid_mask,
         max_invalid_fraction=args.jwst_max_invalid_fraction,scaled_image_chw=scaled,provenance=provenance,
         image_wcs=WCS(header).celestial)
     assembly.add(result)
@@ -133,6 +141,7 @@ def build_parent(args, row):
             if fraction<1-args.jwst_max_invalid_fraction:
                 extra_rows.append(meta);continue
             rch=ch.copy()
+            rch['ORIGFILE']=str(row['original_reference'])
             if 'BUNIT' in refhd[ri].header:rch['BUNIT']=refhd[ri].header['BUNIT']
             refcontext=reproject_tile(refhd[ri].data,refwcs,rch)
             sky,bgmeta=abell_region(args.background_root,row['band'],row['original_training'],
@@ -140,15 +149,18 @@ def build_parent(args, row):
             source_id=spec.name.split('_')[1]
             refsky=ensure_background(Path(row['original_reference']),audit/(source_id+'_reference_sky.npz'),
                                     image=refcontext,header=rch)
-            lab,_=classify_reference(refcontext,rch,catalog,gaia,refsky,row['band'],training_background=sky)
-            extra_task=replace(part_task,patch=row['patch']+'_'+source_id)
             prep=prepare_image(context,header=ch)
+            lab,_=classify_reference(refcontext,rch,catalog,gaia,refsky,row['band'],training_background=sky,
+                                     bright_image=prep,bright_header=ch)
+            extra_task=replace(part_task,patch=row['patch']+'_'+source_id)
             one=TileSpec(spec.name,1792,1792,512,kind='large_source')
             extra_result=write_classified_patch(extra_task,prep.image,lab,tile_specs=[one],valid_mask=ok,
+                input_valid_mask=prep.input_valid_mask,
                 image_wcs=WCS(ch).celestial,
                 max_invalid_fraction=args.jwst_max_invalid_fraction,scaled_image_chw=apply_parent_rgb(prep.image,params),
                 provenance={**provenance,'sample_kind':'large_source','large_source_policy':'final clean/weak AND original a>100',
                     'patch':row['patch'], 'labels_generated_independently':True,
+                    'bright_image_fits':row['original_training'], 'bright_window_origin':[cx,cy],
                     'label_window':[row['x0']+cx,row['y0']+cy,row['x0']+cx+4096,row['y0']+cy+4096],
                     'background_tiles':abell_region(args.background_root,row['band'],row['original_training'],meta['x0'],meta['y0'],512,512)[1],
                     'stamp_bounds':[meta['x0'],meta['y0'],meta['x0']+512,meta['y0']+512],

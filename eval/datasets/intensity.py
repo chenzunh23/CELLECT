@@ -24,6 +24,7 @@ def hsc_intensity_frame(
     pixel_scale_arcsec: float | None = None,
     input_zeropoint: float | None = None,
     nan_policy: str = "hybrid",
+    source_path=None,
 ) -> np.ndarray:
     from preprocessing.image_processing import ImagePreparationConfig, prepare_image
 
@@ -33,5 +34,5 @@ def hsc_intensity_frame(
         input_zeropoint=input_zeropoint,
         nan_policy=nan_policy,
     )
-    prepared = prepare_image(image, header=header, config=config)
+    prepared = prepare_image(image, header=header, config=config,source_path=source_path)
     return np.asarray(prepared.image, dtype=np.float32)

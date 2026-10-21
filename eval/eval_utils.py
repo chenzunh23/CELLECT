@@ -43,6 +43,7 @@ PU_CLASS_NAMES = {
     5: "strict_center_only",
     6: "restricted_bright_region",
     7: "strict_ignore",
+    8: "star_wings",
 }
 
 PU_COLORS = {
@@ -53,6 +54,7 @@ PU_COLORS = {
     5: np.asarray((0.78, 0.22, 1.00), dtype=np.float32),
     6: np.asarray((1.00, 0.72, 0.00), dtype=np.float32),
     7: np.asarray((0.48, 0.32, 1.00), dtype=np.float32),
+    8: np.asarray((0.64, 0.40, 1.00), dtype=np.float32),
 }
 
 CONF_COLORS = {
@@ -774,8 +776,17 @@ def build_scaled_tensor_from_fits(
         local_x0, local_y0 = crop_origin_for_image(full, header, x0=x0, y0=y0, width=width, height=height)
         crop, valid = crop_or_pad(full, x0=local_x0, y0=local_y0, width=width, height=height)
         crop = np.where(valid, crop, np.nan).astype(np.float32)
+        crop = crop[:height, :width]
+        from preprocessing.image_processing import ImagePreparationConfig, prepare_image
+        ch = header.copy()
+        if 'CRPIX1' in ch: ch['CRPIX1'] -= local_x0
+        if 'CRPIX2' in ch: ch['CRPIX2'] -= local_y0
+        crop = prepare_image(crop, header=ch,
+            source_path=path if WCS(ch).has_celestial else None,
+            config=ImagePreparationConfig(input_unit='native')).image
         scaled = make_training_rgb(
             crop,
+            repair_nan=False,
             mode=scaling_mode,
             clip_threshold=clip_threshold,
             log_a=log_a,
@@ -785,7 +796,8 @@ def build_scaled_tensor_from_fits(
             anscombe_clip=anscombe_clip,
             anscombe_scale=anscombe_scale,
         )
-        raw_images.append(np.nan_to_num(crop, nan=0.0, posinf=0.0, neginf=0.0)[:height, :width])
+        scaled[:, ~np.isfinite(crop)] = 0
+        raw_images.append(crop[:height, :width])
         scaled_images.append(scaled[:, :height, :width])
         headers.append(header)
     tensor = torch.from_numpy(np.stack(scaled_images, axis=0).astype(np.float32, copy=False))[None]
@@ -803,7 +815,13 @@ def make_training_rgb(
     lupton_q: float = 20.0,
     anscombe_clip: bool = False,
     anscombe_scale: float = 1000.0,
+    repair_nan: bool = True,
 ) -> np.ndarray:
+    # Shared fallback for arbitrary arrays. FITS adapters additionally resolve
+    # crop-edge holes against their original FITS before reaching this step.
+    from preprocessing.utils.image import fill_nonfinite_hybrid
+    if repair_nan and not np.isfinite(image).all():
+        image, _ = fill_nonfinite_hybrid(image)
     normalized = str(mode).strip().lower().replace("_", "-")
     if normalized in {"zscore-clip", "zscore", "clip"}:
         return scale_training_image(image, mode="zscore-rgb", clip_threshold=float(clip_threshold))
@@ -948,11 +966,24 @@ def detection_rows(
     center_refinement_radius: int,
     width: int,
     height: int,
+    valid_mask: np.ndarray | None = None,
 ) -> list[dict[str, float]]:
     detect_outputs = {
         key: value.float() if torch.is_tensor(value) and value.dtype in {torch.float16, torch.bfloat16} else value
         for key, value in outputs.items()
     }
+    valid = None if valid_mask is None else np.asarray(valid_mask, bool)
+    if valid is not None:
+        if valid.shape != (height, width):
+            raise ValueError('detection validity/image shape mismatch')
+        logits = detect_outputs['confidence'].clone()
+        allowed = torch.zeros(logits.shape[-2:], dtype=torch.bool, device=logits.device)
+        hh, ww = min(height, allowed.shape[0]), min(width, allowed.shape[1])
+        allowed[:hh,:ww] = torch.as_tensor(valid[:hh,:ww], device=logits.device)
+        logits.masked_fill_(~allowed[None,None], -torch.inf)
+        if logits.shape[1] > 1:
+            logits[:,0].masked_fill_(~allowed[None], 0.)
+        detect_outputs['confidence'] = logits
     found = detect_centers_with_scores(
         detect_outputs,
         threshold=float(threshold),
@@ -969,6 +1000,8 @@ def detection_rows(
         xi = int(round(float(x)))
         yi = int(round(float(y)))
         if xi < 0 or yi < 0 or xi >= width or yi >= height:
+            continue
+        if valid is not None and not valid[yi,xi]:
             continue
         rows.append(
             {

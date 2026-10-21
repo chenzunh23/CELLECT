@@ -6,10 +6,17 @@ from unittest.mock import patch
 import json
 import numpy as np
 from preprocessing.utils.jwst_background_sextractor import (
-    AggressiveSkyConfig, aggressive_sextractor_background, METHOD)
+    AggressiveSkyConfig, aggressive_sextractor_background, METHOD, _smooth_valid)
 
 
 class AggressiveSkyTests(unittest.TestCase):
+    def test_zero_weight_nan_does_not_poison_valid_smoothing(self):
+        image=np.full((32,32),2.,np.float32);image[:8]=np.nan
+        coverage=np.isfinite(image).astype(np.float32)
+        smoothed,good=_smooth_valid(image,coverage,2.)
+        self.assertTrue(np.isfinite(smoothed).all())
+        np.testing.assert_allclose(smoothed[good],2.,atol=1e-6)
+
     def test_multiscale_mask_and_cache_invalidation(self):
         rng=np.random.default_rng(25)
         n=512;y,x=np.mgrid[:n,:n]
