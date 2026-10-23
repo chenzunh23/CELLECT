@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Sequence
 
 import numpy as np
@@ -32,6 +32,32 @@ class SourceSnrConfig:
     annulus_inner_radius: float = 10.0
     annulus_outer_radius: float = 15.0
     min_annulus_pixels: int = 100
+    aperture_diameter_arcsec: float | None = None
+    pixel_scale_arcsec: float | None = None
+
+
+def angular_aperture_config(config: SourceSnrConfig, *, pixel_scale_arcsec: float,
+                            diameter_arcsec: float) -> SourceSnrConfig:
+    """Convert angular *diameter* to radius in pixels; scale the sky annulus.
+
+    The small-pixel-count annulus threshold scales with area, so ZTF's ~1-pixel
+    radius is not incorrectly rejected by the legacy 100-background-pixel gate.
+    """
+    scale, diameter = float(pixel_scale_arcsec), float(diameter_arcsec)
+    if not math.isfinite(scale) or scale <= 0 or not math.isfinite(diameter) or diameter <= 0:
+        raise ValueError("SNR pixel scale and angular diameter must be finite and positive")
+    radius = diameter / (2 * scale)
+    # WCS matrix round-off must not move pixels exactly on the old r=5,
+    # r_in=10, r_out=15 boundaries when the angular aperture is unchanged.
+    half_pixel = round(radius * 2) / 2
+    if math.isclose(radius, half_pixel, rel_tol=1e-12, abs_tol=1e-12):
+        radius = half_pixel
+    ratio = radius / config.aperture_radius
+    return replace(config, aperture_radius=radius,
+                   annulus_inner_radius=config.annulus_inner_radius * ratio,
+                   annulus_outer_radius=config.annulus_outer_radius * ratio,
+                   min_annulus_pixels=max(4, int(math.ceil(config.min_annulus_pixels * ratio**2))),
+                   aperture_diameter_arcsec=diameter, pixel_scale_arcsec=scale)
 
 
 @dataclass(frozen=True)
@@ -61,13 +87,19 @@ def _ellipse_params(row: dict[str, Any]) -> tuple[float, float, float, float, fl
     return x, y, major, minor, theta
 
 
-def _source_mask(rows: Sequence[dict[str, Any]], shape: tuple[int, int], *, scale: float) -> np.ndarray:
+def _source_mask(rows: Sequence[dict[str, Any]], shape: tuple[int, int], *, scale: float, origin: tuple[int, int] = (0, 0)) -> np.ndarray:
     mask_rows = []
     for row in rows:
         if "x" not in row or "y" not in row:
             continue
         x, y, major, minor, theta = _ellipse_params(row)
-        mask_rows.append({"x": x, "y": y, "major": major, "minor": minor, "theta": theta})
+        ox, oy = origin
+        pad = math.ceil(max(major * scale, minor * scale, 1.)) + 2
+        # Skip only ellipses whose original rasterization box cannot intersect
+        # the local window. This preserves the full-image union exactly.
+        if math.floor(x)+pad+1 <= ox or math.floor(y)+pad+1 <= oy or math.floor(x)-pad >= ox+shape[1] or math.floor(y)-pad >= oy+shape[0]:
+            continue
+        mask_rows.append({"x": x-ox, "y": y-oy, "major": major, "minor": minor, "theta": theta})
     return ellipse_union_mask(shape, mask_rows, scale=float(scale))
 
 
@@ -147,7 +179,7 @@ def _annulus_flux(
     aperture = rr2 <= r_ap * r_ap
     annulus = (rr2 >= r_in * r_in) & (rr2 <= r_out * r_out)
     other_rows = [other for other in source_rows if other is not row]
-    other_mask = _source_mask(other_rows, (height, width), scale=1.0)[y0:y1, x0:x1]
+    other_mask = _source_mask(other_rows, (y1-y0, x1-x0), scale=1.0, origin=(x0, y0))
     local = np.asarray(image[y0:y1, x0:x1], dtype=np.float32)
     finite_ap = aperture & np.isfinite(local)
     finite_ann = annulus & np.isfinite(local) & (~other_mask)
@@ -189,6 +221,10 @@ def measure_ap2_snr(
                 "snr_ap2": float(snr),
                 "snr": float(snr),
                 "snr_method": "ap2",
+                "snr_aperture_radius_pixels": float(config.aperture_radius),
+                "snr_aperture_diameter_arcsec": config.aperture_diameter_arcsec,
+                "snr_pixel_scale_arcsec": config.pixel_scale_arcsec,
+                "snr_noise_model": "blank_aperture_rms",
                 "snr_trusted": int(trusted),
                 "snr_bad": int(not trusted),
                 "snr_flux": float(flux),
@@ -257,6 +293,7 @@ def measure_kron_snr(
                 "snr_kron": float(snr),
                 "snr": float(snr),
                 "snr_method": "kron",
+                "snr_noise_model": "global_pixel_rms_sqrt_area",
                 "snr_trusted": int(trusted),
                 "snr_bad": int(not trusted),
                 "snr_flux": float(flux),

@@ -36,7 +36,7 @@ def document(path):
     return json.loads(required(path).read_text())
 
 
-def background_receipt(path, source):
+def background_receipt(path, source, *, allowed_thresholds=(1.5,)):
     doc = document(str(path))
     if doc.get('status') != 'done':
         raise ValueError(f'Background is not complete: {path}')
@@ -44,11 +44,14 @@ def background_receipt(path, source):
     check_source(sig['source'], source)
     if sig['method'] != METHOD:
         raise ValueError(f'Unexpected background method: {path}')
+    thresholds=sig['config'].get('thresholds_sigma')
+    if not any(thresholds==[value] for value in allowed_thresholds):
+        raise ValueError(f'Expected background threshold in {allowed_thresholds}: {path}')
     expected = dict(background_mesh=128, background_filter_size=3,
-        thresholds_sigma=[1.5], minarea_native_pixels=[1], factors=[1],
+        thresholds_sigma=thresholds, minarea_native_pixels=[1], factors=[1],
         smoothing_mode='psf', smoothing_sigma_floor_pixels=1., grow_factor=2.4)
     if any(sig['config'].get(k) != v for k, v in expected.items()):
-        raise ValueError(f'Expected AUTO128 / threshold 1.5 / PSF smoothing: {path}')
+        raise ValueError(f'Expected AUTO128 / PSF smoothing / minarea 1: {path}')
     return doc
 
 
@@ -58,8 +61,8 @@ def check(args):
     if args.workers < 1 or args.chunk_tiles < 1 or args.tile_size != 512:
         raise ValueError('Require workers/chunk-tiles >= 1 and tile-size=512')
     recipe = document(str(Path(args.background_root)/'recipe.json'))
-    if recipe.get('method') != METHOD or recipe.get('input') != 'training half coadd':
-        raise ValueError('Background root must contain the completed half-coadd recipe')
+    if recipe.get('method') != METHOD or recipe.get('input') not in ('training half coadd','training half coadd and noisy'):
+        raise ValueError('Background root must contain the completed training-image recipe')
     rows = plan(args)
     counts = Counter(r['kind'] for r in rows)
     if not rows:
@@ -81,10 +84,15 @@ def check(args):
             manifest = Path(row['background'])
             if manifest not in checked:
                 doc = document(str(manifest))
-                receipt = background_receipt(manifest.parent/'complete.json', source['image_fits'])
+                # COSMOS may use the reviewed threshold=2 recipe; other
+                # families retain their existing threshold=1.5 validation.
+                receipt = background_receipt(manifest.parent/'complete.json', source['image_fits'],
+                                             allowed_thresholds=(1.5,2.))
                 check_source(doc['source'], source['image_fits'])
                 if doc['method'] != METHOD or doc['config'] != receipt['signature']['config']:
                     raise ValueError(f'COSMOS manifest/receipt recipe mismatch: {manifest}')
+                if doc['config']['thresholds_sigma'] != recipe.get('thresholds_sigma'):
+                    raise ValueError(f'COSMOS background root/manifest threshold mismatch: {manifest}')
                 for tile in doc['tiles']:
                     required(tile['mask'])
                 checked.add(manifest)

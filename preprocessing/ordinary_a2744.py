@@ -19,6 +19,7 @@ class A2744OrdinaryConfig:
     aperture_mag_min: float | None = None
     aperture_radius: float = 10.0
     star_overlap_min: float = 0.35
+    star_mask_mag_min: float = 24.0
     enable_containment: bool = True
     enable_catalog_snr: bool = True
     enable_aperture_snr: bool = True
@@ -179,7 +180,7 @@ def label_ordinary_sources(data, candidate, labels, *, config: A2744OrdinaryConf
         result.diagnostics['star_footprint_overlap'] = overlap
         excluded_mask = np.asarray(star_footprint, bool) if excluded_mask is None else np.asarray(excluded_mask, bool) | np.asarray(star_footprint, bool)
     if star_hit is not None and config.enable_star_mask:
-        downgrade(result, np.asarray(star_hit, bool) & (data.mag >= 22), C.ORDINARY_IGNORE, "a2744_star_mask")
+        downgrade(result, np.asarray(star_hit, bool) & (data.mag >= config.star_mask_mag_min), C.ORDINARY_IGNORE, "a2744_star_mask")
         result.snapshot("star_mask")
     if config.enable_containment:
         protect_ignored_children(data, result, config)

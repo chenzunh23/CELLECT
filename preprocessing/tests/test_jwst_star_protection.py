@@ -15,6 +15,7 @@ from preprocessing.utils.image_level import PatchLabels, _tile_targets
 from preprocessing.utils.jwst_star_protection import (apply_star_protection, bright_star_footprint,
     ellipse_intersects, untrusted_near_stars)
 from preprocessing.utils.jwst_star_psf import fit_angle, sample_template, star_asset, assess_point_source
+from preprocessing.utils.jwst_star_masks import StarMask, build_star_masks, detection_magnitudes, neighbor_veto
 from preprocessing.build_image_level_zarr import write_classified_patch
 from preprocessing.tests.test_segmentation_zarr import task
 
@@ -26,7 +27,8 @@ def header(size=256):
 
 
 def labels(x=(64.,104.,108.,200.), classes=(C.CLEAN,C.CLEAN,C.WEAK_SHAPE,C.CLEAN),flags=(0,0,2,0),size=256):
-    n=len(x);tab=Table(dict(NUMBER=np.arange(1,n+1,dtype=np.int32),FLAGS=flags,FLUX_AUTO=np.ones(n)))
+    n=len(x);tab=Table(dict(NUMBER=np.arange(1,n+1,dtype=np.int32),FLAGS=flags,
+                           FLUX_AUTO=np.full(n,10**((27-21)/2.5))))
     return PatchLabels(tab,np.zeros((size,size),np.uint8),np.array(classes,np.int16),np.array(x),
         np.full(n,64.),np.full(n,5.),np.full(n,4.),np.zeros(n),np.arange(1,n+1,dtype=np.int64),
         np.array([64.]),np.array([64.]),np.array([-2320205826528294145],np.int64),strict_is_gaia=np.array([True]))
@@ -41,8 +43,21 @@ def gaia(x=(64.,),g=(23.,),plx=(5.,),pm=(0.,)):
 
 
 class StarProtectionTests(unittest.TestCase):
+    @staticmethod
+    def masks(image,header,stars,band,pixel_scale):
+        # Deterministic segmentation fixture; the real SExtractor connection
+        # and mask geometry are tested independently below.
+        result={}
+        yy,xx=np.indices(image.shape)
+        for row in stars:
+            region=np.hypot(xx-row['x'],yy-row['y'])<=50
+            result[int(row['source_id'])]=StarMask((0,0),region,dict(status='fixture',mask_pixels=int(region.sum())))
+        return result
+
     def apply(self,lab,stars,**kwargs):
-        with patch('preprocessing.utils.jwst_star_protection.fit_angle',return_value=dict(angle_rad=0.,status='test')):
+        kwargs.setdefault('trusted',np.ones(len(lab.source_ids),bool))
+        with patch('preprocessing.utils.jwst_star_protection.fit_angle',return_value=dict(angle_rad=0.,status='test')), \
+             patch('preprocessing.utils.jwst_star_protection.build_star_masks',side_effect=self.masks):
             return apply_star_protection(lab,image=np.ones(lab.dense.shape),header=header(),gaia=stars,
                 band='F444W',pixel_scale=.03,**kwargs)
 
@@ -90,11 +105,11 @@ class StarProtectionTests(unittest.TestCase):
 
     def test_snr_margin_and_trust_precedence(self):
         lab=labels(x=(64.,94.,100.,200.));fp=np.zeros(lab.dense.shape,bool);fp[64,64]=True
-        got=untrusted_near_stars(np.ones(fp.shape),lab,fp,None,trusted=[True,False,False,False])
+        got=untrusted_near_stars(np.ones(fp.shape),lab,fp,None,trusted=[True,False,False,False],magnitudes=np.full(4,25.))
         np.testing.assert_array_equal(got,[False,True,False,False])
         lab.geom_x[1]=94
         with patch('utils.source_snr.measure_local_aperture_snr',return_value={'trusted':np.array([False,False])}):
-            got=untrusted_near_stars(np.ones(fp.shape),lab,fp,None)
+            got=untrusted_near_stars(np.ones(fp.shape),lab,fp,None,magnitudes=np.full(4,25.))
         np.testing.assert_array_equal(got,[True,True,False,False])
 
     def test_dense_priority_and_positive_core(self):
@@ -111,7 +126,7 @@ class StarProtectionTests(unittest.TestCase):
         self.assertEqual(lab.dense[64,110],D.STAR_WINGS)
         self.assertEqual(lab.dense[30,30],D.STRICT_IGNORE)
         result=_tile_targets(lab,SimpleNamespace(x0=0,y0=0,size=256),(0,0))
-        self.assertAlmostEqual(float(result['conf_weight'][64,110]),.1)
+        self.assertAlmostEqual(float(result['conf_weight'][64,110]),LabelWeights().star_wings)
         self.assertEqual(result['confidence'][64,110],0)
         self.assertGreater(result['confidence'][64,64],0)
         self.assertEqual(result['conf_weight'][64,64],1)
@@ -155,6 +170,19 @@ class StarProtectionTests(unittest.TestCase):
         self.assertFalse(result['accepted'])
         self.assertEqual(result['status'],'insufficient_finite_core')
 
+    def test_psf_fallback_cap_rejects_compact_extended_core(self):
+        from scipy.ndimage import gaussian_filter
+        yy,xx=np.indices((128,128))
+        model=gaussian_filter(sample_template('F444W',xx-64,yy-64,.03,.7),1.2083333333)
+        image=model*2000/model.max()+np.random.default_rng(31).normal(0,1,model.shape)
+        previous=assess_point_source(image,(64,64),'F444W',.03,
+            config_override={'unresolved_sigma_cap_pixels':float('inf')})
+        current=assess_point_source(image,(64,64),'F444W',.03)
+        self.assertTrue(previous['accepted'])
+        self.assertFalse(current['accepted'])
+        self.assertEqual(current['status'],'extended')
+        self.assertEqual(current['unresolved_sigma_limit_pixels'],1.)
+
     def test_cosmos_final_pipeline_inserts_faint_star(self):
         from preprocessing.utils.cosmos_labels import classify_window
         hdr=header();world=WCS(hdr).celestial.pixel_to_world([64.,108.],[64.,64.])
@@ -163,7 +191,9 @@ class StarProtectionTests(unittest.TestCase):
             mag_auto_f444w=[25.7,25.7],mag_model_f444w=[25.7,25.7],snr_f444w=[20.,20.]))
         image=np.random.default_rng(4).normal(0,.001,(256,256)).astype('f4')
         with patch('preprocessing.utils.cosmos_labels.cosmos_fill_ratios',return_value=np.ones(2)), \
-             patch('preprocessing.utils.jwst_star_protection.fit_angle',return_value=dict(angle_rad=0.,status='test')):
+             patch('preprocessing.utils.jwst_star_protection.fit_angle',return_value=dict(angle_rad=0.,status='test')), \
+             patch('preprocessing.utils.jwst_star_protection.build_star_masks',side_effect=self.masks), \
+             patch('utils.source_snr.measure_local_aperture_snr',return_value={'trusted':np.ones(2,bool)}):
             lab=classify_window(image,hdr,cat,'unused.fits',gaia(),np.ones(image.shape,bool),'F444W')
         np.testing.assert_array_equal(lab.label_classes,[C.DROPPED,C.ORDINARY_IGNORE,C.WEAK_SHAPE])
         self.assertTrue((lab.dense==D.STAR_WINGS).any())
@@ -176,7 +206,9 @@ class StarProtectionTests(unittest.TestCase):
             KRON_RADIUS=[2.5,2.5],A_IMAGE=[2.,2.],B_IMAGE=[1.6,1.6],THETA_IMAGE=[0.,0.],
             FLAGS=[0,2],FLUX_AUTO=[15.,15.],FLUXERR_AUTO=[1.,1.],SNR_WIN=[20.,20.]))
         image=np.random.default_rng(4).normal(0,.001,(256,256)).astype('f4')
-        with patch('preprocessing.utils.jwst_star_protection.fit_angle',return_value=dict(angle_rad=0.,status='test')):
+        with patch('preprocessing.utils.jwst_star_protection.fit_angle',return_value=dict(angle_rad=0.,status='test')), \
+             patch('preprocessing.utils.jwst_star_protection.build_star_masks',side_effect=self.masks), \
+             patch('utils.source_snr.measure_local_aperture_snr',return_value={'trusted':np.ones(2,bool)}):
             lab,summary=classify_reference(image,hdr,cat,gaia(),np.ones(image.shape,bool),'F444W',
                 bright_image=image,bright_header=hdr,training_background=np.ones(image.shape,bool))
         self.assertEqual(lab.label_classes[0],C.DROPPED)
@@ -202,7 +234,7 @@ class StarProtectionTests(unittest.TestCase):
             self.assertEqual(z['shape_source_classes'][-1],C.WEAK_SHAPE)
             self.assertFalse(z['band_valid_mask'][0,0,64,64])
             self.assertEqual(z['band_confidence'][0,0,64,64],4)
-            self.assertAlmostEqual(float(z['band_conf_weight'][0,0,64,100]),.1)
+            self.assertAlmostEqual(float(z['band_conf_weight'][0,0,64,100]),LabelWeights().star_wings)
             self.assertEqual(z['band_conf_weight'][0,0,64,0],0)
             self.assertEqual(z.attrs['jwst_star_protection']['model_stars'],1)
             from astro_train_zarr_data import _target_defaults_from_pu
@@ -210,7 +242,7 @@ class StarProtectionTests(unittest.TestCase):
             target=_target_defaults_from_pu(confidence=torch.as_tensor(z['band_confidence'][0,0]),
                 shape=torch.as_tensor(z['band_shape'][0,0]),shape_weight=torch.as_tensor(z['band_shape_weight'][0,0]),
                 conf_weight=torch.as_tensor(z['band_conf_weight'][0,0]),pu=torch.as_tensor(z['band_pu_class_mask'][0,0]))
-            self.assertAlmostEqual(target['confidence_weight'][64,100].item(),.1)
+            self.assertAlmostEqual(target['confidence_weight'][64,100].item(),LabelWeights().star_wings)
             self.assertEqual(target['background_mask'][64,100].item(),0)  # Not mask-BCE background.
             from astro_train_ops import hard_ce_confidence_loss
             logits=torch.zeros((1,5,1,3),requires_grad=True)
@@ -218,5 +250,100 @@ class StarProtectionTests(unittest.TestCase):
                 class_weights=[1,4,8,16,32],weight=torch.tensor([[[1.,.1,0.]]])).backward()
             self.assertAlmostEqual(logits.grad[0,0,0,1].item()/logits.grad[0,0,0,0].item(),.1,places=6)
             self.assertEqual(logits.grad[0,0,0,2].item(),0)
+
+    def test_star_mask_flags_beyond_ee95_and_no_added_negatives(self):
+        lab=labels(x=(64.,175.,180.,190.),flags=(0,2,0,4),
+                   classes=(C.CLEAN,C.CLEAN,C.WEAK_SHAPE,C.DROPPED))
+        # A long catalog Kron touches the mask although its center is outside.
+        lab.geom_major[1]=20
+        mask=np.zeros(lab.dense.shape,bool);mask[62:67,155:165]=True
+        star=gaia(g=(26.,));star['phot_rp_mean_mag']=21.
+        m=StarMask((0,0),mask,dict(status='fixture',mask_pixels=int(mask.sum())))
+        with patch('preprocessing.utils.jwst_star_protection.build_star_masks',return_value={int(star['source_id'][0]):m}), \
+             patch('preprocessing.utils.jwst_star_protection.fit_angle',return_value=dict(angle_rad=0.,status='test')):
+            wings=apply_star_protection(lab,image=np.ones(mask.shape),header=header(),gaia=star,band='F444W',pixel_scale=.03,trusted=np.ones(4,bool))
+        self.assertEqual(lab.label_classes.tolist(),[C.DROPPED,C.ORDINARY_IGNORE,C.WEAK_SHAPE,C.DROPPED,C.WEAK_SHAPE])
+        self.assertFalse(wings[64,160])  # Selection mask is NOT STAR_WINGS.
+        self.assertTrue(wings[64,100])  # Existing EE95 negatives are retained.
+        self.assertEqual(lab.star_protection_sources[0]['intersecting_catalog_ids'],[2])
+
+    def test_all_rp_use_same_magnitude_and_flag_rule(self):
+        for rp in [17.,18.,18.01,22.,np.nan]:
+            lab=labels(x=(64.,94.,104.,108.,112.,114.,200.),
+                classes=(C.CLEAN,C.CLEAN,C.STRICT_CENTER_ONLY,C.WEAK_SHAPE,C.STRICT_IGNORE,C.DROPPED,C.CLEAN),
+                flags=(0,0,0,2,0,2,0))
+            lab.table['FLUX_AUTO']=10**((27-np.array([21.,23.99,24.,21.,25.,25.,25.]))/2.5)
+            stars=gaia();stars['phot_rp_mean_mag']=rp
+            self.apply(lab,stars)
+            self.assertEqual(lab.label_classes.tolist(),[C.DROPPED,C.CLEAN,C.ORDINARY_IGNORE,
+                C.ORDINARY_IGNORE,C.STRICT_IGNORE,C.DROPPED,C.CLEAN,C.WEAK_SHAPE])
+            self.assertTrue(lab.table['star_protection_magnitude_veto'][2])
+
+    def test_catalog_magnitude_not_gaia_magnitude_or_invalid_flux(self):
+        lab=labels(x=(64.,94.,104.,108.,110.,112.),flags=(0,0,0,0,0,2))
+        lab.table['FLUX_AUTO']=np.ma.array([100.,0.,-1.,np.nan,10.,1.],mask=[0,0,0,0,1,0])
+        mag=detection_magnitudes(lab,'F444W')
+        self.assertEqual(mag[0],22.)
+        self.assertTrue(np.isnan(mag[1:5]).all())
+        cosmos=SimpleNamespace(table=Table(dict(id=[1,2],mag_auto_f115w=[21.,24.])))
+        np.testing.assert_array_equal(detection_magnitudes(cosmos,'F115W'),[21.,24.])
+
+    def test_faint_kron_contact_without_center_is_only_vetoed_if_flagged(self):
+        lab=labels(x=(60.,60.,50.),flags=(0,2,0),classes=(C.CLEAN,)*3)
+        lab.geom_major[:]=11.;mask=StarMask((50,64),np.ones((1,1),bool),{})
+        f,m,_=neighbor_veto(lab,[{'source_id':123}],{123:mask},[0,2,0],[25.,21.,24.])
+        np.testing.assert_array_equal(f,[False,True,False])
+        np.testing.assert_array_equal(m,[False,False,True])
+
+    def test_mask_pixel_area_continuous_contact(self):
+        mask=StarMask((50,50),np.ones((1,1),bool),{})
+        self.assertTrue(mask.intersects((52.5,50.,2.,.1,0.)))
+        self.assertFalse(mask.intersects((52.5001,50.,2.,.1,0.)))
+        self.assertTrue(mask.intersects((50.49,50.49,.001,.001,0.)))
+
+    def test_faint_zero_flag_still_requires_trusted_snr_in_32px_margin(self):
+        lab=labels(x=(64.,120.,140.,200.),flags=(0,0,0,0))
+        lab.table['FLUX_AUTO']=10**((27-np.array([21.,23.99,24.,25.]))/2.5)
+        star=gaia();star['phot_rp_mean_mag']=21.
+        region=np.zeros(lab.dense.shape,bool);region[64,120]=True
+        m=StarMask((0,0),region,{'status':'fixture'})
+        with patch('preprocessing.utils.jwst_star_protection.build_star_masks',return_value={int(star['source_id'][0]):m}), \
+             patch('preprocessing.utils.jwst_star_protection.fit_angle',return_value=dict(angle_rad=0.,status='test')):
+            apply_star_protection(lab,image=np.ones(region.shape),header=header(),gaia=star,band='F444W',pixel_scale=.03,
+                trusted=[True,True,False,False])
+        self.assertEqual(lab.label_classes.tolist(),[C.DROPPED,C.CLEAN,C.ORDINARY_IGNORE,C.CLEAN,C.WEAK_SHAPE])
+        self.assertTrue(lab.table['star_protection_untrusted'][2])
+
+    def test_manual_nonstellar_overrides_astrometry_and_bright_insertion(self):
+        from preprocessing.bright_label_jwst import _gaia_rows,JWSTBrightConfig
+        stars=gaia(plx=(10.,));stars['source_id'][0]=2320211530244866176
+        stars['phot_rp_mean_mag']=17.
+        lab=labels();before=lab.label_classes.copy()
+        with patch('preprocessing.utils.jwst_star_protection.assess_point_source') as match:
+            wings=self.apply(lab,stars)
+        match.assert_not_called()
+        self.assertIsNone(wings)
+        np.testing.assert_array_equal(lab.label_classes,before)
+        self.assertEqual(lab.star_protection_sources,[])
+        self.assertEqual(_gaia_rows(stars,None,header(),(256,256),
+            JWSTBrightConfig('a2744',.03,gaia_mag_max=None)),[])
+        image=np.ones((256,256));image[60:69,60:69]=100
+        rows=[dict(source_id=2320211530244866176,x=64.,y=64.,phot_rp_mean_mag=17.)]
+        self.assertFalse(bright_star_footprint(image,np.zeros(image.shape,bool),rows).any())
+
+    def test_real_sextractor_faint_star_mask_selects_wings_not_other_islands(self):
+        import shutil
+        if not (shutil.which('source-extractor') or shutil.which('sex')):self.skipTest('SExtractor unavailable')
+        yy,xx=np.indices((256,256));rng=np.random.default_rng(41)
+        dx,dy=xx-64,yy-128
+        image=rng.normal(0,1,xx.shape)+150*np.exp(-(dx*dx+dy*dy)/18)
+        image+=9*np.exp(-dy*dy/5)*np.exp(-dx*dx/11000)
+        image+=80*np.exp(-((xx-225)**2+(yy-210)**2)/12)
+        row=dict(source_id=123,x=64.,y=128.,phot_rp_mean_mag=21.,phot_g_mean_mag=23.)
+        masks=build_star_masks(image,header(),[row],'F444W',.03)
+        self.assertEqual(masks[123].metadata['status'],'seeded_component')
+        self.assertTrue(masks[123].intersects((120.,128.,2.,2.,0.)))
+        self.assertFalse(masks[123].intersects((225.,210.,2.,2.,0.)))
+        self.assertFalse(masks[123].metadata['negative_supervision'])
 
 if __name__=='__main__':unittest.main()

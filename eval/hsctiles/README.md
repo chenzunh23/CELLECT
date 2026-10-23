@@ -190,8 +190,9 @@ beside **Export Selected** for the next export. This is independent of
 serialized on the existing GPU model; CPU workers render/write PNG/NPZ/CSV
 and calculate SNR. Detection runs in bounded chunks, with masks retained until
 their export finishes, avoiding re-inference caused by mask-cache eviction.
-AP2 and Kron share the same 65×65 median background; their numerical definitions
-and the exported products are unchanged. Tiles with no detections skip SNR
+AP2 and Kron share the same 65×65 median background. The fixed-aperture
+angular-size defaults were revised on 2026-10-22 as described below; export
+file layouts and the two noise estimators remain unchanged. Tiles with no detections skip SNR
 calculation. Manifest/selection order remains stable across worker counts.
 
 The button immediately displays `Exporting ...` while images load and detections
@@ -317,3 +318,54 @@ GT-dependent training selection. Empty masks are not replaced by the largest
 candidate. Training still selects candidates by its configured loss. JWST invalid coverage
 is excluded. New session/export manifests record numeric scaling and detection
 settings as well as the mask policy, for repeatable comparisons.
+
+### Angular SNR apertures and ordinary-view workers (2026-10-22)
+
+Previously `AP2` meant a **5-pixel radius for every dataset**, not a 2-arcsec
+aperture. Browser and export now use an angular **diameter** of 2 arcsec for
+HSC, 6 arcsec for ZTF, and 0.3 arcsec for JWST (legacy NIRCam, COSMOS and Abell). Radius is
+`diameter / (2 * pixel_scale_arcsec)`. HSC uses its 0.168-arcsec tract grid; ZTF
+uses its adapter's 1.013-arcsec grid; JWST uses the actual WCS of the common
+detection/reference-band grid, including aligned bands with other native scales.
+The sky annulus remains at 2–3 aperture radii; its minimum pixel count scales
+with area (minimum 4), so ZTF's small annulus does not incorrectly fail the old
+100-pixel requirement. Messier/standalone utility pixel defaults are unchanged.
+
+`--snr-workers 4` (default) enables normal-page SNR concurrency and limits active
+SNR work shared with export/image requests. Equal concurrent requests share one
+measurement. Workers operate across images, not individual sources within an
+image; GPU model inference remains serialized. `--snr-aperture-diameter-arcsec`
+optionally overrides the angular diameter for the active dataset. Restart the
+Python server with its existing checkpoint/dataset/session arguments and refresh
+the page to load these changes; changing the export-worker field alone does not
+change ordinary-view SNR concurrency. The UI and export titles show the diameter;
+the internal method key and `_ap2_snr_overlay.png` suffix remain compatible.
+
+Per-source neighbor masks are now rasterized only in the aperture/annulus
+window. Regression checks preserve the previous full-image-mask flux and
+background values. The 65×65 median-filter background remains expensive.
+
+Noise definitions: fixed aperture uses the sigma-clipped standard deviation of
+source-free aperture sums, scaled by `sqrt(actual_pixels / kernel_area)`; Kron
+uses one robust sky **pixel** sigma per image times `sqrt(Kron_pixels)`. Neither
+uses a spatially varying per-pixel variance/sigma map, weight/ERR plane or added
+source-Poisson model. Bad/untrusted measurements remain shown (class 7); only
+trusted finite SNR below the chosen threshold is hidden. Cache hits require no
+remeasurement. Logs record diameter, pixel radius, scale, annulus and stage costs.
+
+Focused checks:
+
+```bash
+python -m unittest eval.tests.test_browser_angular_snr eval.tests.test_browser_parallel_export -q
+```
+
+ZTF follow-up (2026-10-22): the initial 2-arcsec trial is superseded by a
+**6-arcsec diameter** default (radius 2.9615 pixels at 1.013 arcsec/pixel),
+with sky annulus radii 5.923–8.885 pixels (6–9 arcsec). The 2-arcsec trial
+could measure just 1–4 center pixels and estimate sky inside a bright source;
+a negative source flux is not proof that a visually bright detection is false.
+A verified P00005/zi elongated source changed from SNR 1.316 to 17.851;
+the bright P00000/zg source at local (389,325) changed from -1306.733 to
+8569.946. These are background-limited SNR values, without source Poisson noise.
+The HSC and JWST defaults are unchanged. Remove any explicit
+`--snr-aperture-diameter-arcsec 2` when restarting to use the new ZTF default.

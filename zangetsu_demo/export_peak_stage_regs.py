@@ -24,7 +24,7 @@ from astro_train_ops import (  # noqa: E402
     _merge_close_centers_by_score,
     model_forward_with_batch_context,
 )
-from sam_backbone import build_sam_cellect2d  # noqa: E402
+from sam_backbone import build_sam_cellect2d, prompt_ir_kwargs_from_state_dict  # noqa: E402
 
 
 TRACT = "9813"
@@ -144,6 +144,7 @@ def _make_model(cfg: dict, checkpoint: Path, device: torch.device, bands: Sequen
         shape_feature_dim=6,
         enable_matchers=False,
         astro_preprocess_in_model=False,
+        **prompt_ir_kwargs_from_state_dict(state),
     ).to(device)
 
     incompatible = model.load_state_dict(_strip_module_prefix(state), strict=False)

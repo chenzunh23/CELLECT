@@ -64,8 +64,11 @@ def classify_reference(reference, header, catalog, gaia, background, band, *, tr
     basics=classify_catalog_basics(geom,mag,dataset='a2744',pixel_scale_arcsec=.03,valid_mask=prepared.finite_mask)
     data.center_invalid=basics.nan_center_ignore
     linear=prepared.image.copy();linear[~prepared.finite_mask]=np.nan
+    from .jwst_star_psf import star_policy
+    ordinary_config=A2744OrdinaryConfig(PSF_FWHM_ARCSEC[band]/.03,image_shape=reference.shape,
+                                      star_mask_mag_min=star_policy()['star_mask_faint_mag_min'])
     ordinary=classify_ordinary_sources(data,basics.after_b_basic,basics.labels,dataset='a2744',
-        config=A2744OrdinaryConfig(PSF_FWHM_ARCSEC[band]/.03,image_shape=reference.shape),
+        config=ordinary_config,
         image=linear,excluded_mask=bright.astype(bool)|stars,star_footprint=stars,sky_mask=background)
     result=label_bright_sources(data,ordinary.labels,image_shape=reference.shape,
         bright_region=bright,component_labels=components,gaia_table=gaia,image_header=header,
@@ -75,7 +78,7 @@ def classify_reference(reference, header, catalog, gaia, background, band, *, tr
     # Preserve center-only supervision on their surviving parents as well.
     if 'ignore_child_parents' in ordinary.diagnostics:
         from ..snr import apply_remeasured_aperture_snr
-        while protect_ignored_children(data, ordinary, A2744OrdinaryConfig(PSF_FWHM_ARCSEC[band]/.03)).any():
+        while protect_ignored_children(data, ordinary, ordinary_config).any():
             measurement = ordinary.diagnostics.get('aperture_measurement')
             if measurement is not None:
                 apply_remeasured_aperture_snr(ordinary, data.mag, measurement, mag_min=None)

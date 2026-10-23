@@ -927,6 +927,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--style-prompt-dim", type=int, default=32)
+    parser.add_argument('--sam-prompt-ir',action=argparse.BooleanOptionalAction,default=None,
+        help='Enable random-initialized, image-conditioned multiscale PromptIR in the source decoder; inferred from checkpoint when omitted.')
+    parser.add_argument('--sam-prompt-ir-stages',nargs='+',default=None,
+        choices=('neck','stem','up1','up2','up3','up4','refine'),
+        help='Default: stem up1 up2. neck adapts only the source-side neck output, not SAM mask embeddings.')
+    parser.add_argument('--sam-prompt-ir-components',type=int,default=None)
+    parser.add_argument('--sam-prompt-ir-dim',type=int,default=None)
+    parser.add_argument('--sam-prompt-ir-size',type=int,default=None)
+    parser.add_argument('--sam-prompt-ir-image-conditioning',action=argparse.BooleanOptionalAction,default=None,
+        help='Route prompts jointly from decoder and same-scale shallow image features; on for new PromptIR, inferred for checkpoints. No spatial skip.')
+    parser.add_argument('--sam-prompt-ir-image-channels',type=int,default=None,
+        help='Base width of the shallow image-condition CNN, default 16.')
+    parser.add_argument('--sam-prompt-ir-scale',type=float,default=None,
+        help='Initial nonzero residual scale, default 0.1; learned afterwards.')
+    parser.add_argument('--sam-prompt-ir-lr',type=float,default=None,
+        help='Independent PromptIR peak LR; default 5*max(--lr,--sam-encoder-lr). Uses the same warmup/decay schedule.')
     parser.add_argument("--style-adapter-dim", type=int, default=32)
     parser.add_argument("--style-router-temperature", type=float, default=1.0)
     parser.add_argument(
@@ -1463,8 +1479,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--ddp-find-unused-parameters",
-        action="store_true",
-        help="Force DDP find_unused_parameters=True. auto also enables this when static graph is disabled.",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Explicitly enable/disable unused-parameter search independently of static_graph. When omitted, enables it if static graph is disabled.",
     )
     parser.add_argument(
         "--ddp-progress-step-mode",
@@ -1988,6 +2005,8 @@ def main() -> None:
         else:
             model_variant = args.model_variant
         args.model_variant = model_variant
+        if bool(args.sam_prompt_ir) and model_variant!='sam_per_band':
+            raise ValueError('--sam-prompt-ir requires --model-variant sam_per_band')
         if model_variant == "sam_per_band":
             args.seg_loss_weight = 0.0
             args.disable_ex_loss = True
@@ -2021,6 +2040,28 @@ def main() -> None:
         )
 
         if model_variant == "sam_per_band":
+            from sam_backbone.prompt_ir import PromptIRConfig, normalize_prompt_ir_stages, prompt_ir_kwargs_from_state_dict
+            prompt_state={}
+            if args.checkpoint:
+                prompt_checkpoint=torch.load(_expand_path(args.checkpoint),map_location='cpu')
+                prompt_state=prompt_checkpoint.get('model',prompt_checkpoint)
+            inferred_prompt=prompt_ir_kwargs_from_state_dict(prompt_state)
+            if args.sam_prompt_ir is None:args.sam_prompt_ir=inferred_prompt['decoder_prompt_ir']
+            prompt_config=dict(inferred_prompt.get('prompt_ir_config',{}))
+            for option,key in [('sam_prompt_ir_components','num_prompts'),('sam_prompt_ir_dim','prompt_dim'),
+                               ('sam_prompt_ir_size','prompt_size'),('sam_prompt_ir_scale','init_scale'),
+                               ('sam_prompt_ir_image_conditioning','image_conditioning'),
+                               ('sam_prompt_ir_image_channels','image_channels')]:
+                if getattr(args,option) is not None:prompt_config[key]=getattr(args,option)
+            args.sam_prompt_ir_config=asdict(PromptIRConfig(**prompt_config))
+            args.sam_prompt_ir_stages=list(normalize_prompt_ir_stages(args.sam_prompt_ir_stages or
+                inferred_prompt.get('prompt_ir_stages',('stem','up1','up2'))))
+            if args.sam_prompt_ir_lr is None:
+                args.sam_prompt_ir_lr=5.*max(float(args.lr),float(args.sam_encoder_lr))
+            if not np.isfinite(args.sam_prompt_ir_lr) or args.sam_prompt_ir_lr<0:
+                raise ValueError('--sam-prompt-ir-lr must be finite and nonnegative')
+            if args.checkpoint:del prompt_checkpoint
+            del prompt_state
             if args.sam_encoder_style_prompt is None:
                 args.sam_encoder_style_prompt = False
                 if args.checkpoint:
@@ -2088,6 +2129,9 @@ def main() -> None:
                 style_prompt_layers=(2, 5, 8),
                 style_adapter_dim=int(args.style_adapter_dim),
                 style_router_temperature=float(args.style_router_temperature),
+                decoder_prompt_ir=bool(args.sam_prompt_ir),
+                prompt_ir_stages=args.sam_prompt_ir_stages,
+                prompt_ir_config=args.sam_prompt_ir_config,
                 candidate_count=args.matcher_candidate_count,
                 shape_feature_dim=6,
                 enable_matchers=False,
@@ -2130,10 +2174,12 @@ def main() -> None:
             ckpt = torch.load(_expand_path(args.checkpoint), map_location=device)
             state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
             if model_variant == "sam_per_band" and (
-                bool(args.sam_decoder_film) or bool(args.sam_encoder_style_prompt)
+                bool(args.sam_decoder_film) or bool(args.sam_encoder_style_prompt) or bool(args.sam_prompt_ir)
             ):
                 incompatible = model.load_state_dict(state, strict=False)
                 allowed_missing_prefixes = []
+                if bool(args.sam_prompt_ir):
+                    allowed_missing_prefixes.append('decoder.prompt_ir.')
                 if bool(args.sam_decoder_film):
                     allowed_missing_prefixes.append("decoder.denoised_film.")
                 if bool(args.sam_encoder_style_prompt):
@@ -2278,7 +2324,12 @@ def main() -> None:
                 head_lr=float(args.lr),
                 encoder_lr=float(args.sam_encoder_lr),
                 weight_decay=float(args.weight_decay),
+                prompt_ir_lr=args.sam_prompt_ir_lr,
             )
+            if is_main and args.sam_prompt_ir:
+                group=next(g for g in sam_param_groups if g['name']=='prompt_ir')
+                print(f"Source PromptIR: stages={args.sam_prompt_ir_stages}, config={args.sam_prompt_ir_config}, "
+                      f"parameters={sum(p.numel() for p in group['params'])}, peak_lr={group['lr']:.6g}",flush=True)
             use_fused_adamw = bool(args.sam_fused_adamw) and device.type == "cuda"
             if use_fused_adamw:
                 try:
@@ -2300,6 +2351,11 @@ def main() -> None:
             if int(args.sam_lr_phase2_epoch) >= 0:
                 if args.sam_head_lr_after is not None:
                     sam_phase2_lr_overrides["head"] = float(args.sam_head_lr_after)
+                    if args.sam_prompt_ir:
+                        # Proposal freezing covers its adapters too. Otherwise
+                        # retain the chosen prompt/head LR ratio in phase 2.
+                        ratio=float(args.sam_prompt_ir_lr)/float(args.lr) if float(args.lr)>0 else 1.
+                        sam_phase2_lr_overrides['prompt_ir']=float(args.sam_head_lr_after)*ratio
                 if args.sam_encoder_lr_after is not None:
                     sam_phase2_lr_overrides["encoder"] = float(args.sam_encoder_lr_after)
                 if args.sam_decoder_lr_after is not None:
@@ -2335,6 +2391,9 @@ def main() -> None:
             "sam_checkpoint": str(_expand_path(args.sam_checkpoint)) if model_variant == "sam_per_band" and args.sam_checkpoint else None,
             "sam_cen_enabled": bool(model_variant == "sam_per_band" and not args.disable_sam_cen),
             "sam_decoder_film": bool(model_variant == "sam_per_band" and args.sam_decoder_film),
+            'sam_prompt_ir':bool(model_variant=='sam_per_band' and args.sam_prompt_ir),
+            'sam_prompt_ir_stages':getattr(args,'sam_prompt_ir_stages',None),
+            'sam_prompt_ir_config':getattr(args,'sam_prompt_ir_config',None),
             "sam_encoder_style_prompt": bool(model_variant == "sam_per_band" and args.sam_encoder_style_prompt),
             "style_prompt_dim": int(args.style_prompt_dim),
             "style_adapter_dim": int(args.style_adapter_dim),
@@ -2359,6 +2418,7 @@ def main() -> None:
                     "head_lr": float(args.lr),
                     "encoder_lr": float(args.sam_encoder_lr),
                     "sam_decoder_lr": float(args.lr),
+                    'prompt_ir_lr':float(args.sam_prompt_ir_lr) if args.sam_prompt_ir else None,
                     "total_steps": int(sam_iteration_scheduler.total_steps),
                     "warmup_steps": int(sam_iteration_scheduler.warmup_steps),
                     "drop_steps": [int(step) for step in sam_iteration_scheduler.drop_steps],

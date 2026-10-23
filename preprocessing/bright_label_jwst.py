@@ -41,6 +41,8 @@ class JWSTBrightConfig:
 
 
 def _gaia_rows(table, rows, header, shape, config):
+    from .utils.jwst_star_psf import known_nonstellar_ids
+    nonstellar=known_nonstellar_ids()
     if rows is not None and table is not None:
         raise ValueError('provide gaia_table or gaia_rows, not both')
     if rows is None:
@@ -58,6 +60,7 @@ def _gaia_rows(table, rows, header, shape, config):
             row['astrometric_evidence'] = evidence_by_id.get(int(row['source_id']), False)
     unique = {}
     for row in rows:
+        if int(row['source_id']) in nonstellar:continue
         x, y, mag = float(row['x']), float(row['y']), float(row['phot_g_mean_mag'])
         magnitude_ok = config.gaia_mag_max is None or (
             np.isfinite(mag) and (mag <= config.gaia_mag_max if config.mode == 'a2744' else mag < config.gaia_mag_max))

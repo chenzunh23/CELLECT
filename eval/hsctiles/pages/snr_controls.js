@@ -21,7 +21,9 @@ const SnrControls = (() => {
   }
 
   function methodLabel() {
-    return useKron ? 'Kron' : 'AP2';
+    const s = callbacks.currentState ? callbacks.currentState() : null;
+    const d = s && s.snr_aperture_diameter_arcsec;
+    return useKron ? 'Kron' : d ? `Aperture Ø${d}″` : 'AP2';
   }
 
   function threshold() {
@@ -70,6 +72,8 @@ const SnrControls = (() => {
     }
     const status = el('snrStatusText');
     if (status) status.textContent = statusText();
+    const label = el('snrApertureLabel');
+    if (label) { const s=callbacks.currentState ? callbacks.currentState() : null; label.textContent=s && s.snr_aperture_diameter_arcsec ? `Ø${s.snr_aperture_diameter_arcsec}″` : 'AP2'; }
     for (const id of ['applySnrButton', 'snrOffButton']) {
       const button = el(id);
       if (button) button.disabled = busy;
@@ -193,7 +197,8 @@ const SnrControls = (() => {
     open: openSettings,
     isEnabled: () => enabled,
     method,
-    threshold
+    threshold,
+    methodLabel
   };
 })();
 window.SnrControls = SnrControls;

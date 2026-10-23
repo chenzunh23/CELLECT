@@ -1,6 +1,10 @@
 """Cross-parent sky assembly and production tiling regression checks."""
 import tempfile
 import unittest
+import json
+from types import SimpleNamespace
+from unittest.mock import patch
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import numpy as np
 from preprocessing.utils.background_tiles import assemble
@@ -8,6 +12,35 @@ from preprocessing.utils.npz_window import mask_window
 from preprocessing.utils.inputs import make_tile_specs
 
 class TrainingBatchTests(unittest.TestCase):
+    def test_append_only_schedules_selected_jobs_and_keeps_inventory(self):
+        from preprocessing import training_batch as batch
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            old=dict(kind='cosmos',name='cosmos_kept')
+            noisy=dict(kind='hsc_noisy',name='noisy_new')
+            (root/'queue.json').write_text(json.dumps([old]))
+            kept=dict(name=old['name'],outputs=['kept.zarr'],samples=99)
+            (root/'summary.json').write_text(json.dumps(dict(results=[kept],failures=[])))
+            args=SimpleNamespace(output_root=tmp,tile_size=512,workers=1,plan_only=False,append=True)
+            def pool(**kwargs):return ThreadPoolExecutor(max_workers=1)
+            with patch.object(batch,'plan',return_value=[noisy]),patch.object(batch,'ProcessPoolExecutor',side_effect=pool),patch.object(batch,'run_job',return_value=dict(name=noisy['name'],samples=121)) as job:
+                self.assertEqual(batch.run(args),0)
+            job.assert_called_once_with(args,noisy)
+            self.assertEqual(json.loads((root/'queue.json').read_text()),[old,noisy])
+            summary=json.loads((root/'summary.json').read_text())
+            self.assertEqual(summary['results'][0],kept)
+            self.assertEqual(len(summary['results']),2)
+            # Resuming the same selected job must retain full sample/output counts.
+            (root/'receipts').mkdir()
+            saved=dict(name=noisy['name'],outputs=['noisy.zarr'],samples=121)
+            (root/'receipts'/(noisy['name']+'.json')).write_text(json.dumps(dict(result=saved)))
+            with patch.object(batch,'plan',return_value=[noisy]),patch.object(batch,'ProcessPoolExecutor',side_effect=pool),patch.object(batch,'run_job',return_value=dict(name=noisy['name'],status='cached')):
+                self.assertEqual(batch.run(args),0)
+            summary=json.loads((root/'summary.json').read_text())
+            self.assertEqual(len(summary['results']),2)
+            self.assertEqual(summary['results'][1]['samples'],121)
+            self.assertTrue(summary['results'][1]['cache_reused'])
+
     def test_four_parent_background_and_overlap(self):
         with tempfile.TemporaryDirectory() as tmp:
             rows=[]

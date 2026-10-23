@@ -70,7 +70,7 @@ from eval.eval_utils import (  # noqa: E402
     select_band_outputs,
     zscale_gray,
 )
-from utils.source_snr import SourceSnrConfig, filter_snr_rows, measure_source_snrs, measure_source_snrs_both  # noqa: E402
+from utils.source_snr import SourceSnrConfig, angular_aperture_config, filter_snr_rows, measure_source_snrs, measure_source_snrs_both  # noqa: E402
 
 
 DEFAULT_ROOT = DEFAULT_HSC_RAW_ROOT
@@ -933,6 +933,12 @@ class BrowserState:
         self.detect_rows_by_token: dict[str, list[dict[str, float]]] = {}
         self.snr_rows_by_token_method: dict[tuple[str, str], list[dict[str, Any]]] = {}
         self.snr_config = SourceSnrConfig()
+        self.snr_workers = max(1, int(getattr(args, "snr_workers", 4)))
+        self.snr_aperture_diameter_arcsec = getattr(args, "snr_aperture_diameter_arcsec", None)
+        if self.snr_aperture_diameter_arcsec is not None and (not np.isfinite(self.snr_aperture_diameter_arcsec) or self.snr_aperture_diameter_arcsec <= 0):
+            raise ValueError("--snr-aperture-diameter-arcsec must be positive")
+        self._snr_load = ParallelLoad(self.snr_workers, "source-snr")
+        self._snr_scale_cache = {}
         self.tile_map_png_by_patch: dict[str, bytes] = {}
         self._model_by_bands: dict[tuple[str, ...], tuple[torch.nn.Module, dict[str, Any]]] = {}
         self._model_lock = threading.Lock()
@@ -1219,6 +1225,8 @@ class BrowserState:
             "checkpoint": str(self.checkpoint),
             "image_workers": self.image_workers,
             "export_workers": self.export_workers,
+            "snr_workers": self.snr_workers,
+            "snr_aperture_diameter_arcsec": self._snr_default_diameter(),
             "snr_log_path": str(self.session_dir / "snr.log"),
             "scaling_workers": self._scale_load.workers,
             "make_masks": self.make_masks,
@@ -1260,6 +1268,8 @@ class BrowserState:
             "checkpoint_name": self.checkpoint.name,
             "image_workers": self.image_workers,
             "export_workers": self.export_workers,
+            "snr_workers": self.snr_workers,
+            "snr_aperture_diameter_arcsec": self._snr_default_diameter(),
             "snr_log_path": str(self.session_dir / "snr.log"),
             "export_progress": self.export_status(),
             "scaling_workers": self._scale_load.workers,
@@ -1365,6 +1375,35 @@ class BrowserState:
         session_dir = getattr(self, "session_dir", None)
         _log_snr(*args, log_path=Path(session_dir) / "snr.log" if session_dir is not None else None, **kwargs)
 
+    def _snr_default_diameter(self):
+        override = getattr(self, "snr_aperture_diameter_arcsec", None)
+        if override is not None:
+            return float(override)
+        dataset = getattr(self, "dataset_id", "")
+        return .3 if dataset.startswith("jwst") else 6. if dataset.startswith("ztf") else 2. if dataset.startswith("hsc") else None
+
+    def _snr_config_for_ref(self, ref):
+        diameter = self._snr_default_diameter()
+        if diameter is None:
+            return self.snr_config  # Legacy utilities/Messier retain explicit pixel settings.
+        dataset = self.dataset_id
+        if dataset.startswith("jwst"):
+            key = (ref.patch, tuple(self._bands_for_patch(ref.patch)))
+            scale = self._snr_scale_cache.get(key)
+            if scale is None:
+                # NIRCam band images can have native grids of different scales;
+                # detections are on the adapter's common reference-band grid.
+                active = self.access._present_bands(ref.patch, list(key[1]))
+                band = self.access._reference_band(ref.patch, active)
+                wcs = self.access._wcs_for(band, ref.patch)
+                scale = float(np.sqrt(abs(np.linalg.det(wcs.pixel_scale_matrix))) * 3600.)
+                self._snr_scale_cache[key] = scale
+        elif dataset.startswith("hsc"):
+            scale = .168  # Standard HSC tract/warp and Zarr patch grid.
+        else:
+            scale = float(self.access.pixel_scale_arcsec)
+        return angular_aperture_config(self.snr_config, pixel_scale_arcsec=scale, diameter_arcsec=diameter)
+
     def _snr_rows_for_token(self, token: str, method: str) -> list[dict[str, Any]]:
         method = self._normalize_snr_method(method)
         key = (str(token), method)
@@ -1385,6 +1424,15 @@ class BrowserState:
                                   detect_rows: list[dict[str, Any]], *,
                                   methods: tuple[str, ...] = ("ap2", "kron"),
                                   context: str = "export") -> tuple[dict[str, Any], dict[str, float]]:
+        loader = getattr(self, "_snr_load", None)
+        compute = lambda: self._measure_snr_rows_for_ref_impl(ref, image, detect_rows, methods=methods, context=context)
+        return loader.run((ref.token, id(detect_rows), methods), compute) if loader else compute()
+
+    def _measure_snr_rows_for_ref_impl(self, ref: FrameRef, image: np.ndarray,
+                                  detect_rows: list[dict[str, Any]], *,
+                                  methods: tuple[str, ...] = ("ap2", "kron"),
+                                  context: str = "export") -> tuple[dict[str, Any], dict[str, float]]:
+        config = self._snr_config_for_ref(ref)
         cached = {method: (self.snr_rows_by_token_method.get((ref.token, method))
                            if self.detect_rows_by_token.get(ref.token) is detect_rows else None)
                   for method in methods}
@@ -1405,7 +1453,12 @@ class BrowserState:
         else:
             self._log_snr(ref, context, method_label, "total", "start", len(detect_rows),
                      cache="miss", shape=f"{image.shape[0]}x{image.shape[1]}",
-                     background_box=self.snr_config.background_box)
+                     background_box=config.background_box,
+                     aperture_radius_pixels=config.aperture_radius,
+                     aperture_diameter_arcsec=config.aperture_diameter_arcsec,
+                     pixel_scale_arcsec=config.pixel_scale_arcsec,
+                     annulus_pixels=f"{config.annulus_inner_radius:.3f}:{config.annulus_outer_radius:.3f}",
+                     noise_model="blank_aperture_RMS(ap2),global_pixel_RMS(kron)")
             started = time.perf_counter()
 
             def progress(stage: str, status: str, seconds: float | None) -> None:
@@ -1417,11 +1470,11 @@ class BrowserState:
             try:
                 if len(missing) == 2:
                     cached.update(measure_source_snrs_both(image, detect_rows,
-                        config=self.snr_config, progress=progress))
+                        config=config, progress=progress))
                 else:
                     method = missing[0]
                     cached[method] = measure_source_snrs(image, detect_rows, method=method,
-                        config=self.snr_config, progress=progress)[0]
+                        config=config, progress=progress)[0]
             except Exception as exc:
                 self._log_snr(ref, context, method_label, "total", "error", len(detect_rows),
                          seconds=time.perf_counter() - started, error=repr(exc))
@@ -1453,8 +1506,12 @@ class BrowserState:
         n_sources = 0
         n_bad = 0
         by_token: dict[str, dict[str, Any]] = {}
-        for token in tokens:
-            rows = self._snr_rows_for_token(token, method)
+        workers = min(max(1, getattr(self, "snr_workers", 1)), max(1, len(tokens)))
+        # Parallelize ordinary browser SNR too; the shared loader also bounds
+        # concurrent image requests and exports and deduplicates equal requests.
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="browser-snr") as pool:
+            prepared = list(pool.map(lambda token: self._snr_rows_for_token(token, method), tokens))
+        for token, rows in zip(tokens, prepared):
             good_rows = [
                 row for row in rows
                 if int(row.get("snr_bad", 0)) == 0 and np.isfinite(float(row.get("snr", float("nan")))) and float(row.get("snr", float("nan"))) >= threshold
@@ -1474,6 +1531,8 @@ class BrowserState:
             "method": method,
             "threshold": threshold,
             "n_images": len(tokens),
+            "workers": workers,
+            "aperture_diameter_arcsec": self._snr_default_diameter(),
             "n_sources": int(n_sources),
             "n_bad": int(n_bad),
             "by_token": by_token,
@@ -1981,7 +2040,7 @@ class BrowserState:
             timings.update(snr_costs)
             mark("snr_measurement")
             for method, snr_png_path, label in (
-                ("ap2", ap2_snr_png_path, "AP2"),
+                ("ap2", ap2_snr_png_path, f"Aperture diameter {self._snr_default_diameter()} arcsec" if self._snr_default_diameter() is not None else "AP2"),
                 ("kron", kron_snr_png_path, "Kron"),
             ):
                 snr_rows = cached_snr[method]

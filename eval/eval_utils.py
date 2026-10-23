@@ -893,6 +893,8 @@ def load_cellect_model(
         "encoder.style_router." in str(k) or "encoder.image_encoder.style_adapters." in str(k) for k in state
     )
     film_from_state = isinstance(state, dict) and any("decoder.denoised_film." in str(k) for k in state)
+    from sam_backbone.prompt_ir import prompt_ir_kwargs_from_state_dict
+    prompt_ir_kwargs=prompt_ir_kwargs_from_state_dict(state)
     base_channels = int(top.get("base_channels") or cfg.get("base_channels", 32))
     if dynamic_image_size is None:
         dynamic_image_size = bool(top.get("sam_dynamic_image_size", cfg.get("sam_dynamic_image_size", False)))
@@ -921,6 +923,7 @@ def load_cellect_model(
         enable_matchers=False,
         astro_preprocess_in_model=False,
         dynamic_image_size=bool(dynamic_image_size),
+        **prompt_ir_kwargs,
     ).to(device)
     incompatible = model.load_state_dict(strip_module_prefix(state), strict=False)
     if incompatible.missing_keys or incompatible.unexpected_keys:

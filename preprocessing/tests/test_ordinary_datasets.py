@@ -234,8 +234,14 @@ class OrdinaryDatasetTests(unittest.TestCase):
     def test_star_footprint_protects_bright_sources(self):
         data = sources([30, 60], mag=[21.9, 22])
         mask = np.ones((100, 100), bool)
-        out = classify(data, "a2744", config=A2744OrdinaryConfig(1), star_footprint=mask)
+        out = classify(data, "a2744", config=A2744OrdinaryConfig(1,star_mask_mag_min=22.), star_footprint=mask)
         np.testing.assert_array_equal(out.labels.source_class, [1, 3])
+
+    def test_star_footprint_uses_configured_faint_limit(self):
+        data = sources([30,60],mag=[23.99,24.])
+        out=classify(data,'a2744',config=A2744OrdinaryConfig(1,star_mask_mag_min=24.),
+                     star_footprint=np.ones((100,100),bool))
+        np.testing.assert_array_equal(out.labels.source_class,[1,3])
 
     def test_a_scaled_faint_drop_and_no_resurrection(self):
         data = sources([50, 80], a=[100, 2], mag=[29, 24])

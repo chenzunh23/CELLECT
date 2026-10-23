@@ -781,6 +781,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument('--datasets', nargs='+', choices=['hsc','cosmos','abell'], default=['hsc'])
     parser.add_argument('--training-batch', action='store_true', help='Four-family production runner with precomputed SExtractor masks and independent centered labels')
     parser.add_argument('--plan-only', action='store_true')
+    parser.add_argument('--append', action='store_true',
+                        help='For --training-batch: schedule selected jobs and merge existing queue/summary inventories')
     parser.add_argument('--background-root', default='/data/czh23/analysis/2026-09/2026-09-25/batch_aggressive_background')
     parser.add_argument('--hsc-products-root', default='/data/czh23/Subaru_products')
     parser.add_argument('--hsc-background-method', choices=['sextractor', 'sextractor-precomputed', 'lsst'], default='sextractor',

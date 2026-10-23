@@ -23,7 +23,7 @@ if str(CELLECT_ROOT) not in sys.path:
 
 from astro_train_data import AstroCutoutDataset, collate_cutouts, discover_cutout_records  # noqa: E402
 from astro_train_ops import model_forward_with_batch_context  # noqa: E402
-from sam_backbone import build_sam_cellect2d  # noqa: E402
+from sam_backbone import build_sam_cellect2d, prompt_ir_kwargs_from_state_dict  # noqa: E402
 
 
 DEFAULT_DATA_ROOT = CELLECT_ROOT / "zangetsu_demo/data/sam_x18204_y20924"
@@ -121,6 +121,7 @@ def _make_model(cfg: dict, checkpoint: Path, device: torch.device, bands: Sequen
         shape_feature_dim=6,
         enable_matchers=False,
         astro_preprocess_in_model=False,
+        **prompt_ir_kwargs_from_state_dict(state),
     ).to(device)
 
     incompatible = model.load_state_dict(_strip_module_prefix(state), strict=False)

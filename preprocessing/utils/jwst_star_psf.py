@@ -96,7 +96,12 @@ def star_policy():
             'geometry_normalization':config['normalization']}
 
 
-def assess_point_source(image, center, band, pixel_scale):
+def known_nonstellar_ids():
+    """Explicit user-reviewed exceptions; IDs stay lossless int64 integers."""
+    return {int(sid) for sid in star_asset()[0]['policy'].get('nonstellar_gaia_ids',[])}
+
+
+def assess_point_source(image, center, band, pixel_scale, *, config_override=None, return_fit_grid=False):
     """Classify an astrometrically uncertain Gaia object, without resizing labels.
 
     Compare a rotation-aligned PSF (with a small resampling tolerance) to the
@@ -107,7 +112,7 @@ def assess_point_source(image, center, band, pixel_scale):
     from scipy.ndimage import gaussian_filter
     from scipy.optimize import least_squares
     from .psf import PSF_FWHM_ARCSEC
-    cfg=star_asset()[0]['policy']['psf_fallback']
+    cfg={**star_asset()[0]['policy']['psf_fallback'], **(config_override or {})}
     image=np.asarray(image);h,w=image.shape
     offset_max=cfg['max_offset_arcsec']/pixel_scale
     search=int(np.ceil(offset_max))+2
@@ -143,7 +148,12 @@ def assess_point_source(image, center, band, pixel_scale):
     rotation=fit_angle(image,seed,band,pixel_scale)
     angle=rotation['angle_rad']
     tolerance=max(cfg['unresolved_sigma_floor_pixels'],cfg['unresolved_sigma_fwhm_fraction']*fwhm)
-    widths=np.unique(np.r_[0.,.25,.5,.75,1.,tolerance,tolerance+.5,2.,3.,4.,6.,8.])
+    # A compact galaxy's nucleus can correlate extremely well with a PSF.
+    # Do not let the FWHM-scaled resampling allowance grow without a cap.
+    tolerance=min(tolerance,cfg.get('unresolved_sigma_cap_pixels',np.inf))
+    # Resolve both sides of the cutoff: a half-pixel gap in the extended
+    # grid can make an intermediate-width galaxy prefer the "point" bin.
+    widths=np.unique(np.r_[np.arange(0.,2.01,.25),tolerance,tolerance+.5,3.,4.,6.,8.])
     grid_radius=int(np.ceil(radius))+int(np.ceil(4*widths.max()))+3
     gy,gx=np.mgrid[-grid_radius:grid_radius+1,-grid_radius:grid_radius+1]
     psf=sample_template(band,gx,gy,pixel_scale,angle)
@@ -175,10 +185,13 @@ def assess_point_source(image, center, band, pixel_scale):
     offset=float(np.hypot(fitted_center[0]-center[0],fitted_center[1]-center[1]))
     extended=extension_score>cfg['extension_score_threshold']
     good=not extended and snr>=cfg['min_amplitude_snr'] and correlation>=cfg['min_correlation'] and offset<=offset_max
-    return dict(accepted=bool(good),status='extended' if extended else 'point_source' if good else 'ambiguous_psf',
+    result=dict(accepted=bool(good),status='extended' if extended else 'point_source' if good else 'ambiguous_psf',
         band=band,center_x=float(fitted_center[0]),center_y=float(fitted_center[1]),
         delta_x=float(fitted_center[0]-center[0]),delta_y=float(fitted_center[1]-center[1]),
         center_offset_arcsec=offset*pixel_scale,amplitude_snr=snr,correlation=correlation,
         unresolved_sigma_limit_pixels=float(tolerance),point_sigma_pixels=point['width'],
         extended_sigma_pixels=broad['width'],extension_score=float(extension_score),
         core_finite_fraction=fraction,rotation=rotation,fit_pixels=int(len(observed)))
+    if return_fit_grid:
+        result['width_fits']=[dict(sigma_pixels=r['width'],cost=r['cost']) for r in fits]
+    return result

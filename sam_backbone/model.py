@@ -75,6 +75,15 @@ class SamCellect2D(nn.Module):
         )
         features = encoded["features"]
         images = encoded["preprocessed_images"]
+        decoder_kwargs = {}
+        prompt_ir = getattr(self.decoder, 'prompt_ir', None)
+        if prompt_ir is not None and prompt_ir.image_pyramid is not None:
+            # The encoder sanitizes its input. Preserve known invalid support
+            # for image-condition pooling before nan_to_num loses that mask.
+            valid = torch.isfinite(x)
+            if x.ndim == 5:
+                valid = valid.all(dim=2)
+            decoder_kwargs['image_valid_mask'] = valid
         outputs = self.decoder(
             features,
             images=images,
@@ -82,6 +91,7 @@ class SamCellect2D(nn.Module):
             processing_ids=processing_ids,
             psf_stamps=psf_stamps,
             psf_native_sizes=psf_native_sizes,
+            **decoder_kwargs,
         )
         outputs["image_embeddings"] = features
         if "style_logit" in encoded:
@@ -213,6 +223,9 @@ def build_sam_cellect2d(
     psf_decoder_stages: Sequence[str] = (),
     psf_depthwise_min_kernel_size: int = 3,
     psf_depthwise_max_kernel_size: Optional[int] = None,
+    decoder_prompt_ir: bool = False,
+    prompt_ir_stages: Sequence[str] = ('stem','up1','up2'),
+    prompt_ir_config: Optional[dict] = None,
     candidate_count: int = 5,
     shape_feature_dim: int = 6,
     enable_matchers: bool = False,
@@ -265,6 +278,9 @@ def build_sam_cellect2d(
         psf_depthwise_stages=tuple(psf_decoder_stages),
         psf_depthwise_min_kernel_size=int(psf_depthwise_min_kernel_size),
         psf_depthwise_max_kernel_size=psf_depthwise_max_kernel_size,
+        use_prompt_ir=decoder_prompt_ir,
+        prompt_ir_stages=prompt_ir_stages,
+        prompt_ir_config=prompt_ir_config,
     )
     model = SamCellect2D(
         encoder,

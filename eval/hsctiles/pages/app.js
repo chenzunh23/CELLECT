@@ -384,7 +384,7 @@ async function loadPage(nextPage, preserveDetect=false) {
     if (preserveDetect && showDetect && window.SnrControls && SnrControls.isEnabled()) {
       const snrResult = await SnrControls.prepare();
       if (snrResult) {
-        const snrLabel = snrResult.method === 'kron' ? 'Kron' : 'AP2';
+        const snrLabel = SnrControls.methodLabel();
         setStatus(`${snrLabel} SNR>${Number(snrResult.threshold).toFixed(1)}: sources=${snrResult.n_sources}, bad=${snrResult.n_bad} on ${snrResult.n_images} images.`);
       }
     }
@@ -701,6 +701,7 @@ if (window.ScaleControls) {
 }
 if (window.SnrControls) {
   SnrControls.init({
+    currentState: () => state,
     fetchJson,
     setStatus,
     currentPage: () => page,

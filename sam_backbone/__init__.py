@@ -17,6 +17,7 @@ from .build_sam import build_sam, build_sam_vit_b, build_sam_vit_h, build_sam_vi
 from .decoder import CenterEnhancementNet2D, SamCellectDecoder
 from .image_encoder import ImageEncoderViT
 from .style_conditioning import ConditionalStyleAdapter, ImageStyleRouter
+from .prompt_ir import PromptIRBlock, PromptIRConfig, MultiScalePromptIR, prompt_ir_kwargs_from_state_dict
 from .losses import prompt_pred_ratio, sam_prompt_mask_losses
 from .mask_decoder import MaskDecoder
 from .matcher import AstroMatchNet2D, ENNet2D, EXNet2D
@@ -38,6 +39,10 @@ __all__ = [
     "ImageEncoderViT",
     "ConditionalStyleAdapter",
     "ImageStyleRouter",
+    "PromptIRBlock",
+    "PromptIRConfig",
+    "MultiScalePromptIR",
+    "prompt_ir_kwargs_from_state_dict",
     "PsfChannelCrossAttentionBlock",
     "PsfConditionMapEncoder",
     "PsfDepthwiseConvBlock",

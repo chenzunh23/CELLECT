@@ -374,16 +374,36 @@ def run_job(args,row):
 def run(args):
     if args.tile_size!=512:raise ValueError('This training recipe requires 512-pixel stamps')
     root=Path(args.output_root);root.mkdir(parents=True,exist_ok=True)
-    rows=plan(args);(root/'queue.json').write_text(json.dumps(rows,indent=2))
+    rows=plan(args)
+    append=getattr(args,'append',False)
+    inventory=rows
+    if append and (root/'queue.json').exists():
+        old=json.loads((root/'queue.json').read_text())
+        inventory=list({**{r['name']:r for r in old},**{r['name']:r for r in rows}}.values())
+    (root/'queue.json').write_text(json.dumps(inventory,indent=2))
     print(f'{len(rows)} jobs; kinds {sorted(set(r["kind"] for r in rows))}',flush=True)
     if args.plan_only:return 0
     results=[];failures=[]
+    selected_names={r['name'] for r in rows}
+    if append and (root/'summary.json').exists():
+        old=json.loads((root/'summary.json').read_text())
+        results=[r for r in old.get('results',[]) if r['name'] not in selected_names]
+        failures=[r for r in old.get('failures',[]) if r['name'] not in selected_names]
+    current_failures=0
     # Spawn + recycle isolates large arrays and FITS/Zarr caches after every parent.
     with ProcessPoolExecutor(max_workers=args.workers,max_tasks_per_child=1) as pool:
         fs={pool.submit(run_job,args,row):row for row in rows}
         for f in as_completed(fs):
-            try:results.append(f.result())
+            try:
+                value=f.result()
+                if append and value.get('status')=='cached':
+                    # A cached marker alone loses output/sample counts from the
+                    # combined inventory. Recover the complete existing receipt.
+                    receipt=root/'receipts'/(value['name']+'.json')
+                    value={**json.loads(receipt.read_text())['result'],'cache_reused':True}
+                results.append(value)
             except Exception as exc:
+                current_failures+=1
                 failures.append(dict(name=fs[f]['name'],error=repr(exc)));traceback.print_exc()
             (root/'summary.json').write_text(json.dumps(dict(results=results,failures=failures),indent=2))
-    return 1 if failures else 0
+    return 1 if current_failures else 0

@@ -127,7 +127,8 @@ def wrap_ddp(model: nn.Module, args: argparse.Namespace, device: torch.device, l
         static_graph = not dynamic_graph
     else:
         static_graph = static_mode == "on"
-    find_unused_parameters = bool(getattr(args, "ddp_find_unused_parameters", False)) or not bool(static_graph)
+    unused_mode = getattr(args, "ddp_find_unused_parameters", None)
+    find_unused_parameters = not bool(static_graph) if unused_mode is None else bool(unused_mode)
     setattr(args, "_ddp_static_graph_resolved", bool(static_graph))
     setattr(args, "_ddp_find_unused_parameters_resolved", bool(find_unused_parameters))
     return DistributedDataParallel(
@@ -443,6 +444,7 @@ def sam_optimizer_param_groups(
     head_lr: float,
     encoder_lr: float,
     weight_decay: float,
+    prompt_ir_lr: float | None = None,
 ) -> list[dict[str, object]]:
     """Build SAM fine-tuning parameter groups with separate proposal/SAM decoder/encoder LR."""
 
@@ -450,10 +452,13 @@ def sam_optimizer_param_groups(
     head_params: list[nn.Parameter] = []
     sam_decoder_params: list[nn.Parameter] = []
     encoder_params: list[nn.Parameter] = []
+    prompt_ir_params: list[nn.Parameter] = []
     for name, param in base_model.named_parameters():
         if not param.requires_grad:
             continue
-        if name.startswith((
+        if name.startswith('decoder.prompt_ir.'):
+            prompt_ir_params.append(param)
+        elif name.startswith((
             "encoder.style_router.",
             "encoder.style_prompt_",
             "encoder.image_encoder.style_adapters.",
@@ -496,6 +501,11 @@ def sam_optimizer_param_groups(
                 "name": "encoder",
             }
         )
+    if prompt_ir_params:
+        lr=float(prompt_ir_lr) if prompt_ir_lr is not None else 5.*max(float(head_lr),float(encoder_lr))
+        if not np.isfinite(lr) or lr<0:raise ValueError('PromptIR learning rate must be finite and nonnegative')
+        groups.append(dict(params=prompt_ir_params,lr=lr,base_lr=lr,
+                           weight_decay=float(weight_decay),name='prompt_ir'))
     if not groups:
         raise ValueError("No trainable parameters found for SAM optimizer")
     return groups

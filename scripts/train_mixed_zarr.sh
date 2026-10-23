@@ -82,7 +82,7 @@ common=(--mode "$MODE" --data-format zarr --root "$ROOT" --bands all --checkpoin
   --mask-loss-interval 1 --mask-loss-interval-scale
   --mask-centroid-weight 0.4 --mask-outside-weight 1
   --mask-min-area-weight 1 --mask-max-area-weight 0.1
-  --mask-pred-iou-weight "${MASK_PRED_IOU_WEIGHT:-0.1}" --mask-stability-weight 0
+  --mask-pred-iou-weight "${MASK_PRED_IOU_WEIGHT:-0.2}" --mask-stability-weight 0
   --mask-unmatched-prompt-weight 0.2 --center-only-shape-factor 0.2 --mask-pred-iou-thresh 0.8
   --mask-stability-score-thresh 0.95 --mask-stability-score-offset 1 --mask-stability-temperature 10
   --mask-prompt-gt-epochs "${MASK_GT_EPOCHS:-10}" --mask-prompt-pred-epoch "${MASK_PRED_EPOCH:-30}"
@@ -99,13 +99,47 @@ common=(--mode "$MODE" --data-format zarr --root "$ROOT" --bands all --checkpoin
   --wandb-project Astro_CELLECT2D_SAM --wandb-log-interval 10
   --wandb-run-name "${WANDB_RUN_NAME:-cellect_${SAM_MODEL_TYPE}_pred_iou_1002}"
   --wandb-mode "${WANDB_MODE:-online}")
+# Keep old runs unchanged unless explicitly enabled. A new PromptIR checkpoint
+# is auto-detected when PROMPT_IR is unset; PROMPT_IR=0 explicitly disables it.
+if [[ -n ${PROMPT_IR:-} ]]; then
+  case "$PROMPT_IR" in
+    1) common+=(--sam-prompt-ir) ;;
+    0) common+=(--no-sam-prompt-ir) ;;
+    *) echo 'PROMPT_IR must be 0 or 1' >&2; exit 1 ;;
+  esac
+fi
+if [[ -n ${PROMPT_IR_STAGES:-} ]]; then
+  read -r -a prompt_ir_stages <<< "$PROMPT_IR_STAGES"
+  common+=(--sam-prompt-ir-stages "${prompt_ir_stages[@]}")
+fi
+if [[ -n ${PROMPT_IR_LR:-} ]]; then common+=(--sam-prompt-ir-lr "$PROMPT_IR_LR"); fi
+if [[ -n ${PROMPT_IR_COMPONENTS:-} ]]; then common+=(--sam-prompt-ir-components "$PROMPT_IR_COMPONENTS"); fi
+if [[ -n ${PROMPT_IR_DIM:-} ]]; then common+=(--sam-prompt-ir-dim "$PROMPT_IR_DIM"); fi
+if [[ -n ${PROMPT_IR_SIZE:-} ]]; then common+=(--sam-prompt-ir-size "$PROMPT_IR_SIZE"); fi
+if [[ -n ${PROMPT_IR_SCALE:-} ]]; then common+=(--sam-prompt-ir-scale "$PROMPT_IR_SCALE"); fi
+if [[ -n ${PROMPT_IR_IMAGE_CONDITIONING:-} ]]; then
+  case "$PROMPT_IR_IMAGE_CONDITIONING" in
+    1) common+=(--sam-prompt-ir-image-conditioning) ;;
+    0) common+=(--no-sam-prompt-ir-image-conditioning) ;;
+    *) echo 'PROMPT_IR_IMAGE_CONDITIONING must be 0 or 1' >&2; exit 1 ;;
+  esac
+fi
+if [[ -n ${PROMPT_IR_IMAGE_CHANNELS:-} ]]; then common+=(--sam-prompt-ir-image-channels "$PROMPT_IR_IMAGE_CHANNELS"); fi
+if [[ -n ${DDP_FIND_UNUSED:-} ]]; then
+  case "$DDP_FIND_UNUSED" in
+    1|on) common+=(--ddp-find-unused-parameters) ;;
+    0|off) common+=(--no-ddp-find-unused-parameters) ;;
+    auto) ;;
+    *) echo 'DDP_FIND_UNUSED must be auto, on/off, or 1/0' >&2; exit 1 ;;
+  esac
+fi
 if [[ "$MODE" == train ]]; then
   common+=(--train-patches-file "$TRAIN_FILE" --val-patches-file "$VAL_FILE"
     --out-dir "$OUT" --epochs "${EPOCHS:-60}"
-    --detect-every "${DETECT_EVERY:-5}" --ckpt-interval "${CKPT_INTERVAL:-2}")
+    --detect-every "${DETECT_EVERY:-3}" --ckpt-interval "${CKPT_INTERVAL:-2}")
 elif [[ "$MODE" == eval ]]; then
   common+=(--eval-patches-file "$VAL_FILE" --out-dir "$OUT/eval"
-    --eval-checkpoint "${CHECKPOINT:-$OUT/best.pt}")
+    --checkpoint "${CHECKPOINT:-$OUT/best.pt}")
 else
   echo 'MODE must be train or eval' >&2; exit 1
 fi

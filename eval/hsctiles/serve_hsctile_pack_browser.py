@@ -623,6 +623,8 @@ def main() -> None:
     parser.add_argument("--abell-plan", type=Path, default=DEFAULT_ABELL_PLAN)
     parser.add_argument("--image-workers", type=int, default=4, help="Concurrent CPU/FITS readers; also used to prepare detection batches. No additional GPU workers.")
     parser.add_argument("--scaling-workers", type=int, default=2, help="Separate concurrency limit for expensive parent scaling; does not block raw thumbnails.")
+    parser.add_argument("--snr-workers", type=int, default=4, help="Bounded CPU SNR concurrency for ordinary browsing and exports; independent of GPU inference.")
+    parser.add_argument("--snr-aperture-diameter-arcsec", type=float, default=None, help="Override fixed SNR aperture angular diameter. Default: HSC 2 arcsec, ZTF 6 arcsec, JWST 0.3 arcsec; radius is derived from the detection grid.")
     parser.add_argument("--export-workers", type=int, default=4, help="CPU workers for selected export (PNG/NPZ/SNR). GPU inference stays serialized; queued exports are bounded.")
     parser.add_argument("--browser-cache-mb", type=int, default=128, help="Bounded cache of read pixels and scaled tensors; no fixed display scaling.")
     parser.add_argument("--cosmos-parent-cache-mb", type=int, default=320, help="COSMOS on-demand 4096-pixel FITS parent cache, shared across bands and pointings (MiB). Search uses headers only.")

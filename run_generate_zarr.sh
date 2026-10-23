@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Reusable mixed training Zarr recipe. Reuses completed backgrounds; does not
-# regenerate them. Default: HSC half + COSMOS + Abell, all SExtractor half masks.
+# regenerate them. Default: HSC half + noisy + COSMOS + Abell, using backgrounds
+# from each actual training image. Noisy masks must be generated first.
 #
 # DRY_RUN=1 bash run_generate_zarr.sh              # print command, no writes
 # CHECK_ONLY=1 bash run_generate_zarr.sh           # metadata check, no Zarr
@@ -9,6 +10,8 @@
 # CLI selectors are forwarded, e.g. --training-kinds abell --jwst-bands F444W
 # --abell-parent x+00_y+00. Use a separate OUT for such pilot runs.
 # Existing matching receipts are reused; --overwrite explicitly rebuilds jobs.
+# Add only noisy to an existing mixed root:
+# TRAINING_KINDS=hsc_noisy OUT=/existing/root bash run_generate_zarr.sh --append
 # Weak shape: confidence region=1, shape reliability controlled by training
 # --center-only-shape-factor (default .2). Confidence-region weights come from
 # preprocessing/labels.py and are printed by preflight (STAR_WINGS currently .2).
@@ -22,7 +25,7 @@ BACKGROUND_ROOT=${BACKGROUND_ROOT:-/data/czh23/analysis/2026-10/2026-10-19/backg
 HSC_PRODUCTS_ROOT=${HSC_PRODUCTS_ROOT:-/data/czh23/Subaru_products}
 ZARR_WORKERS=${ZARR_WORKERS:-8}
 CHUNK_TILES=${CHUNK_TILES:-20}
-read -r -a kinds <<< "${TRAINING_KINDS:-hsc_half abell cosmos}"
+read -r -a kinds <<< "${TRAINING_KINDS:-hsc_half hsc_noisy abell cosmos}"
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 args=(--training-batch --training-kinds "${kinds[@]}"
   --background-root "$BACKGROUND_ROOT"

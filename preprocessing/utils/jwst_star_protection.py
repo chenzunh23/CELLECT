@@ -15,14 +15,17 @@ from astropy.table import Table, vstack
 from astropy.wcs import WCS
 from astropy.stats import sigma_clipped_stats
 from .geometry import paint_ellipse
-from .jwst_star_psf import star_asset, star_policy, fit_angle, assess_point_source
+from .jwst_star_psf import star_asset, star_policy, fit_angle, assess_point_source, known_nonstellar_ids
+from .jwst_star_masks import build_star_masks, neighbor_veto, detection_magnitudes
 from ..labels import SourceClass as C
 
 
 def bright_star_footprint(prepared, bright, gaia_rows):
     """Existing Gaia-seeded high/low footprint, now RP<=18 for both families."""
     from .geometry import component_at
-    stars=[r for r in gaia_rows if np.isfinite(r.get('phot_rp_mean_mag',np.nan)) and r['phot_rp_mean_mag']<=18.]
+    nonstellar=known_nonstellar_ids()
+    stars=[r for r in gaia_rows if int(r.get('source_id',-1)) not in nonstellar
+           and np.isfinite(r.get('phot_rp_mean_mag',np.nan)) and r['phot_rp_mean_mag']<=18.]
     if not stars:return np.zeros(bright.shape,bool)
     image=np.asarray(prepared.image if hasattr(prepared,'image') else prepared)
     finite=np.isfinite(image)
@@ -107,7 +110,10 @@ def ellipse_intersects(first, second):
                for i in minima)
 
 
-def untrusted_near_stars(image, labels, footprint, sky, trusted=None):
+def untrusted_near_stars(image, labels, footprint, sky, trusted=None, *, magnitudes, faint_mag_min=None):
+    if faint_mag_min is None:faint_mag_min=star_asset()[0]['policy']['star_mask_faint_mag_min']
+    mag=np.asarray(magnitudes,float)
+    if mag.shape!=labels.source_ids.shape:raise ValueError('SNR magnitude/source length mismatch')
     if not np.any(footprint):return np.zeros(len(labels.source_ids),bool)
     region=ndimage.distance_transform_edt(~footprint)<=32
     h,w=region.shape; x,y=labels.geom_x,labels.geom_y
@@ -115,6 +121,7 @@ def untrusted_near_stars(image, labels, footprint, sky, trusted=None):
     hit=np.zeros(len(x),bool);ii=np.flatnonzero(valid)
     hit[ii]=region[np.minimum(np.floor(y[ii]+.5).astype(int),h-1),np.minimum(np.floor(x[ii]+.5).astype(int),w-1)]
     active=hit & ~np.isin(labels.label_classes,[C.DROPPED,C.ORDINARY_IGNORE,C.STRICT_IGNORE])
+    active &= np.isfinite(mag)&(mag>=faint_mag_min)
     if trusted is None and active.any():
         from utils.source_snr import measure_local_aperture_snr
         ii=np.flatnonzero(active)
@@ -171,11 +178,8 @@ def apply_star_protection(labels, *, image, header, gaia, band, pixel_scale,
         int(sid):bool(ok) for sid,ok in zip(gaia['source_id'] if 'source_id' in gaia.colnames else np.arange(len(gaia)),
                                            astrometric_evidence(gaia,allow_absolute_motion=False))}
     original_class=labels.label_classes.copy()
-    bad_snr=untrusted_near_stars(image if snr_image is None else snr_image,labels,
-                               np.zeros(image.shape,bool) if footprint is None else footprint,
-                               sky_mask,trusted=trusted)
-    labels.label_classes[bad_snr]=int(C.ORDINARY_IGNORE)
     config=star_asset()[0]; policy=star_policy(); item=config['filters'][band];red=config['filters']['F444W']
+    magnitudes=detection_magnitudes(labels,band)
     f444_path=Path(f444_path) if f444_path is not None else resolve_f444_path(header,band)
     stars=[];psf_audits=[]
     for row in rows:
@@ -195,16 +199,30 @@ def apply_star_protection(labels, *, image, header, gaia, band, pixel_scale,
         if assessment['accepted']:
             row['x']+=assessment['delta_x'];row['y']+=assessment['delta_y']
             row['selection']='psf';row['psf_match']=assessment;stars.append(row)
+    # Apply the SAME existing SNR-trust rule around faint as well as bright
+    # stellar masks. Only faint catalog neighbors enter this additional gate.
+    masks=build_star_masks(image,header,stars,band,pixel_scale)
+    snr_footprint=np.zeros(image.shape,bool) if footprint is None else np.array(footprint,bool,copy=True)
+    for mask in masks.values():
+        ox,oy=mask.origin_xy;h,w=mask.pixels.shape
+        snr_footprint[oy:oy+h,ox:ox+w] |= mask.pixels
+    bad_snr=untrusted_near_stars(image if snr_image is None else snr_image,labels,
+                               snr_footprint,sky_mask,trusted=trusted,magnitudes=magnitudes,
+                               faint_mag_min=policy['star_mask_faint_mag_min'])
+    labels.label_classes[bad_snr]=int(C.ORDINARY_IGNORE)
     if not stars and not bad_snr.any():
         labels.star_protection_policy={**policy,'model_stars':0,'untrusted_ignored':0,
             'astrometry_selected':0,'psf_selected':0,
-            'flagged_ignored':0,'replaced_catalog_rows':0,'reference_image':None,'psf_fallback_audit':psf_audits}
+            'flagged_ignored':0,'star_mask_magnitude_ignored':0,'replaced_catalog_rows':0,'reference_image':None,'psf_fallback_audit':psf_audits}
         labels.star_protection_sources=[]
         return None
-    wings=np.zeros(image.shape,np.uint8);records=[];drop=np.zeros(len(flags),bool);flagged=np.zeros(len(flags),bool)
+    # Selection masks are independent of the EE95 negative-target geometry.
+    # Every accepted Gaia star participates, regardless of G or RP magnitude.
+    flagged,magnitude_veto,mask_hits=neighbor_veto(labels,stars,masks,flags,magnitudes,
+                                                faint_mag_min=policy['star_mask_faint_mag_min'])
+    wings=np.zeros(image.shape,np.uint8);records=[];drop=np.zeros(len(flags),bool)
     xy=np.c_[labels.geom_x,labels.geom_y];finite=np.isfinite(xy).all(axis=1)
     idx=np.flatnonzero(finite);tree=cKDTree(xy[idx]) if len(idx) else None
-    radii=np.maximum(labels.geom_major,labels.geom_minor)
     for row in stars:
         center=(row['x'],row['y'])
         current=fit_angle(image,center,band,pixel_scale)
@@ -220,11 +238,8 @@ def apply_star_protection(labels, *, image, header, gaia, band, pixel_scale,
         ellipse=(row['x'],row['y'],red['ee95_a_arcsec']/pixel_scale,
                  red['ee95_b_arcsec']/pixel_scale,red['theta_rad']+redfit['angle_rad'])
         paint_ellipse(wings,*ellipse,1)
-        distance=np.hypot(labels.geom_x-row['x'],labels.geom_y-row['y'])
-        near=(distance<=ellipse[2]+radii)&finite
-        hits=[i for i in np.flatnonzero(near) if ellipse_intersects(
-            (labels.geom_x[i],labels.geom_y[i],labels.geom_major[i],labels.geom_minor[i],labels.geom_theta[i]),ellipse)]
-        flagged[hits] |= ~np.isfinite(flags[hits]) | (flags[hits]!=0)
+        mask=masks[int(row['source_id'])]
+        hits=mask_hits[int(row['source_id'])]
         match=None
         if tree is not None:
             d,j=tree.query(center)
@@ -237,11 +252,13 @@ def apply_star_protection(labels, *, image, header, gaia, band, pixel_scale,
             f444_rotation=redfit,f444_reference=reference_source,ee95=list(ellipse),
             replaced_catalog_id=None if match is None else int(labels.source_ids[match]),
             intersecting_catalog_ids=[int(labels.source_ids[i]) for i in hits],
+            intersection_region='sextractor_star_mask',star_mask=mask.metadata,
+            neighbor_veto='catalog_mag_ge_limit_center_in_mask_or_nonzero_missing_flag_kron_contact',
+            neighbor_mag_min=policy['star_mask_faint_mag_min'],
             rp=float(row['phot_rp_mean_mag']) if np.isfinite(row.get('phot_rp_mean_mag',np.nan)) else None,
             g=float(row['phot_g_mean_mag']) if np.isfinite(row['phot_g_mean_mag']) else None))
     # No upgrades to ordinary neighbors, and no resurrection of dropped rows.
-    flagged &= labels.label_classes!=int(C.DROPPED)
-    labels.label_classes[flagged]=int(C.ORDINARY_IGNORE)
+    labels.label_classes[flagged|magnitude_veto]=int(C.ORDINARY_IGNORE)
     labels.label_classes[drop]=int(C.DROPPED)
     # Preserve table classes for audits and suppress duplicate external positives.
     if records and len(labels.strict_x):
@@ -257,11 +274,14 @@ def apply_star_protection(labels, *, image, header, gaia, band, pixel_scale,
     labels.table['star_protection_class_before']=np.r_[original_class,np.full(len(records),-1)]
     labels.table['star_protection_untrusted']=np.r_[bad_snr,np.zeros(len(records),bool)]
     labels.table['star_protection_flag_veto']=np.r_[flagged,np.zeros(len(records),bool)]
+    labels.table['star_protection_magnitude_veto']=np.r_[magnitude_veto,np.zeros(len(records),bool)]
+    labels.table['star_protection_detection_mag']=np.r_[magnitudes,np.full(len(records),np.nan)]
     labels.table['star_protection_replaced']=np.r_[drop,np.zeros(len(records),bool)]
     labels.star_protection_policy={**policy,'model_stars':len(records),
         'astrometry_selected':sum(r['selection']=='astrometry' for r in records),
         'psf_selected':sum(r['selection']=='psf' for r in records),'psf_fallback_audit':psf_audits,
         'untrusted_ignored':int(bad_snr.sum()),'flagged_ignored':int(flagged.sum()),
+        'star_mask_magnitude_ignored':int(magnitude_veto.sum()),
         'replaced_catalog_rows':int(drop.sum()),'reference_image':None if f444_path is None else str(f444_path)}
     labels.star_protection_sources=records
     if valid_mask is not None:wings &= np.asarray(valid_mask,bool).astype(np.uint8)

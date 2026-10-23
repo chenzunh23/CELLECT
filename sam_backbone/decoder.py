@@ -5,6 +5,7 @@ from typing import Dict, Optional, Sequence, Tuple
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
+from .prompt_ir import MultiScalePromptIR
 
 from .psf_conditioning import (
     PsfDepthwiseConvBlock,
@@ -175,6 +176,9 @@ class SamCellectDecoder(nn.Module):
         psf_depthwise_stages: Sequence[str] = (),
         psf_depthwise_min_kernel_size: int = 3,
         psf_depthwise_max_kernel_size: Optional[int] = None,
+        use_prompt_ir: bool = False,
+        prompt_ir_stages: Sequence[str] = ('stem','up1','up2'),
+        prompt_ir_config: Optional[dict] = None,
     ) -> None:
         super().__init__()
         if len(tuple(decoder_channels)) != 4:
@@ -233,12 +237,15 @@ class SamCellectDecoder(nn.Module):
         self.confidence_head = nn.Conv2d(c4, self.confidence_levels, kernel_size=1, bias=False)
         self.shape_refine = _conv_norm_lrelu(c4 + self.confidence_levels, c4)
         self.shape_head = nn.Conv2d(c4, self.shape_channels, kernel_size=1, bias=False)
+        self.prompt_ir = (MultiScalePromptIR(int(in_channels),{'neck':int(in_channels),**film_channels},
+            stages=prompt_ir_stages,config=prompt_ir_config) if use_prompt_ir else None)
 
     def forward(
         self,
         image_embeddings: Tensor,
         *,
         images: Optional[Tensor] = None,
+        image_valid_mask: Optional[Tensor] = None,
         output_size: Optional[Tuple[int, int]] = None,
         processing_ids: Optional[Tensor] = None,
         psf_stamps: Optional[Tensor] = None,
@@ -281,12 +288,29 @@ class SamCellectDecoder(nn.Module):
             device=flat.device,
         ) if self.psf_depthwise else None
 
+        condition = self.prompt_ir.condition_encoder(flat) if self.prompt_ir is not None else None
+        image_context = None
+        if self.prompt_ir is not None:
+            flat_valid = image_valid_mask
+            if flat_valid is not None and per_band:
+                if flat_images is None or tuple(flat_valid.shape) != (batch, bands, *flat_images.shape[-2:]):
+                    raise ValueError('per-band image_valid_mask must match [B,band,H,W] input images')
+                flat_valid = flat_valid.reshape(batch * bands, 1, *flat_valid.shape[-2:])
+            image_context = self.prompt_ir.prepare_image_condition(flat_images,
+                canvas_size=(int(flat.shape[-2]) * 16, int(flat.shape[-1]) * 16), valid_mask=flat_valid)
+            flat = self.prompt_ir('neck',flat,condition,image_context)
         out = self._forward_conditioned_stage("stem", self.stem, flat, flat_processing_ids, flat_psf, flat_psf_native_sizes)
+        if self.prompt_ir is not None:out = self.prompt_ir('stem',out,condition,image_context)
         out = self._forward_conditioned_stage("up1", self.up1, out, flat_processing_ids, flat_psf, flat_psf_native_sizes)
+        if self.prompt_ir is not None:out = self.prompt_ir('up1',out,condition,image_context)
         ds2 = self._forward_conditioned_stage("up2", self.up2, out, flat_processing_ids, flat_psf, flat_psf_native_sizes)
+        if self.prompt_ir is not None:ds2 = self.prompt_ir('up2',ds2,condition,image_context)
         ds3 = self._forward_conditioned_stage("up3", self.up3, ds2, flat_processing_ids, flat_psf, flat_psf_native_sizes)
+        if self.prompt_ir is not None:ds3 = self.prompt_ir('up3',ds3,condition,image_context)
         out = self._forward_conditioned_stage("up4", self.up4, ds3, flat_processing_ids, flat_psf, flat_psf_native_sizes)
+        if self.prompt_ir is not None:out = self.prompt_ir('up4',out,condition,image_context)
         out = self._forward_conditioned_stage("refine", self.refine, out, flat_processing_ids, flat_psf, flat_psf_native_sizes)
+        if self.prompt_ir is not None:out = self.prompt_ir('refine',out,condition,image_context)
 
         confidence = self.confidence_head(out)
         target_size = tuple(output_size) if output_size is not None else tuple(confidence.shape[-2:])
