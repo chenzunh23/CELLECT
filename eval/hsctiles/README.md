@@ -285,11 +285,38 @@ After **Detect**, open **View → Show Masks**:
   beside `selection.csv` for selected images that have already been detected.
 - Saved mask PNGs always use **non-inverted ZScale**, with green masks and boxes;
   they do not inherit display inversion, smoothing, custom limits, shape overlays
-  or SNR filtering. Full floating-point mask arrays are not exported.
+  or SNR/Mask filtering. Full floating-point mask arrays are not exported.
+
+**View → Mask Filter** uses the SNR Filter-style settings dialog: Pred IoU
+defaults to **0.80**, Stability to **0.90**; **Apply** enables filtering and
+**Off** restores all detections. Both thresholds are inclusive and must pass.
+Shape, Center and Show Masks use the same retained detection subset; SNR Filter
+can be enabled at the same time. Show Confidence remains the complete pixel map.
+Pred IoU is the selected candidate's raw decoder score, without clipping or a
+sigmoid. Stability is the selected mask's area above `mask_threshold + 1`
+divided by its area above `mask_threshold - 1`, measured on the output image
+grid and valid pixels. Empty masks are excluded. Scores are recorded at Detect
+time, so changing thresholds does not rerun inference. Mask Filter starts off
+and requires mask decoding; it does not change saved/exported mask selection.
 
 Mask decoding adds work to Detect, especially in crowded fields. Use
 `--no-make-masks` for an explicitly detection-only session. Reload the server and
 refresh the browser after updating these files.
+
+After **Detect**, **View → Show Confidence** overlays the per-pixel predicted
+class before the detection threshold and NMS: 1 blue, 2 green, 3 yellow, 4 red;
+class 0 is transparent. This is the class argmax, not a rounded ordinal score.
+Scaling, custom limits, inversion and smoothing remain adjustable without model
+inference. Confidence maps are saved even with `--no-make-masks` or zero detections.
+Each detection writes `session_dir/confidence/<candidate>_confidence.npz` with
+float32 `logits` (C,H,W), `labels`, `score`, `ordinal_expectation`, and `valid`.
+Arrays use lower-origin image coordinates. A bounded RAM cache reloads labels
+from these files after eviction; it does not rerun the encoder.
+**Export Selected** always copies this NPZ and additionally writes
+`<candidate>_confidence_overlay.png` using the display scaling selected when
+export starts (default ZScale for API exports without view settings), regardless
+of whether Show Confidence is enabled. Paths and display settings are included
+in the manifest. Existing saved mask PNGs continue to use normal ZScale.
 
 Regression checks:
 

@@ -10,12 +10,15 @@ model construction, and distributed training orchestration.
 from __future__ import annotations
 
 from utils.detection_metadata import sample_band_name, valid_predictions
+from utils.gradient_debug import GradientDebugger
+from utils.hang_debug import register_worker_stack_dump
 
 import argparse
 import csv
 import json
 import random
 import wandb
+from functools import partial
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Optional, Sequence, Tuple
@@ -218,6 +221,7 @@ def _init_wandb_or_disable(
     wandb.define_metric("lr/epoch/*", step_metric="epoch")
     wandb.define_metric("val/epoch/*", step_metric="epoch")
     wandb.define_metric("train/epoch/*", step_metric="epoch")
+    wandb.define_metric("adam/*", step_metric="iteration")
     return run
 
 
@@ -716,6 +720,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out-dir", default="./output/astro_cellect2d")
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--wandb-project", default="Astro_CELLECT2D_SAM")
+    parser.add_argument('--adam-state-log', action=argparse.BooleanOptionalAction, default=False,
+                        help='Log module-level Adam moments and adaptive update summaries to W&B and local JSONL.')
+    parser.add_argument('--adam-state-log-interval', type=int, default=100,
+                        help='Record Adam summaries every N optimizer updates (independent of world size).')
+    parser.add_argument('--gradient-debug', action=argparse.BooleanOptionalAction, default=False,
+                        help='Read-only per-dataset gradient norms/angles; separate W&B group=gradient_debug.')
+    parser.add_argument('--gradient-debug-interval', type=int, default=500, help='Probe every N optimizer updates.')
+    parser.add_argument('--gradient-debug-samples-per-dataset', type=int, default=2,
+                        help='Fixed training probes per dataset. 0 traverses every training record at each probe (expensive).')
+    parser.add_argument('--gradient-debug-batch-size', type=int, default=1, help='Probe microbatch size; independent of training batch size.')
+    parser.add_argument('--gradient-debug-probes', default=None,
+                        help='JSON config for fixed named/spatial probes and scene cohorts; also enables gradient debug.')
+    parser.add_argument('--gradient-debug-hang-timeout', type=float, default=120,
+                        help='Dump local Python stacks after this many seconds without phase progress during gradient-debug training; <=0 disables.')
     parser.add_argument("--wandb-entity", default=None)
     parser.add_argument("--wandb-run-name", default=None)
     parser.add_argument(
@@ -733,6 +751,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument('--loader-start-method', choices=('spawn','forkserver','fork'), default='spawn',
+                        help='DataLoader worker start method. spawn avoids inheriting CUDA/W&B threads and finalizers.')
     parser.add_argument("--pin-memory", action="store_true", help="Enable pinned-memory DataLoader transfers to CUDA.")
     parser.add_argument(
         "--persistent-workers",
@@ -845,7 +865,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--sam-compile",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help=(
             "Compile --model-variant sam_per_band with torch.compile after checkpoint loading. "
             "Saved checkpoints still use the original uncompiled module state_dict."
@@ -1505,6 +1526,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
+    if args.gradient_debug_probes:
+        args.gradient_debug = True
+    if args.adam_state_log and args.adam_state_log_interval < 1:
+        raise ValueError('--adam-state-log-interval must be positive')
+    if args.adam_state_log and args.model_variant != 'sam_per_band':
+        raise ValueError('--adam-state-log currently requires --model-variant sam_per_band')
+    if args.gradient_debug:
+        if args.mode != 'train':
+            raise ValueError('--gradient-debug is a training diagnostic')
+        if args.gradient_debug_interval<1 or args.gradient_debug_samples_per_dataset<0 or args.gradient_debug_batch_size<1:
+            raise ValueError('Gradient debug requires interval>=1, samples>=0, batch-size>=1')
     if args.seg_loss_weight is None:
         args.seg_loss_weight = 0.0 if args.detection_only else 1.0
     if args.single_band_detector:
@@ -1549,6 +1581,7 @@ def main() -> None:
     distributed, rank, world_size, local_rank, device, backend = _setup_distributed(args)
     is_main = _is_main(rank)
     run = None
+    gradient_run = None
     if device.type == "cuda" and not bool(args.disable_tf32):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -1844,10 +1877,13 @@ def main() -> None:
             if int(args.num_workers) > 0:
                 pseudo_kwargs["persistent_workers"] = bool(args.persistent_workers)
                 pseudo_kwargs["prefetch_factor"] = max(1, int(args.prefetch_factor))
+                pseudo_kwargs['multiprocessing_context'] = args.loader_start_method
             pseudo_detect_loader = DataLoader(pseudo_detect_ds, **pseudo_kwargs)
         train_epoch_setter = None
         use_zarr_worker_chunks = args.data_format == "zarr" and bool(args.zarr_worker_owned_chunks)
         use_zarr_chunk_batches = args.data_format == "zarr" and bool(args.zarr_chunk_local_batches)
+        if is_main and int(args.num_workers) > 0:
+            print(f'DataLoader workers={args.num_workers}, start_method={args.loader_start_method}', flush=True)
         if use_zarr_worker_chunks:
             train_iter_ds = (
                 ZarrChunkBatchIterableDataset(
@@ -1861,6 +1897,7 @@ def main() -> None:
                     shuffle_within_chunk=bool(args.zarr_shuffle_within_chunk),
                     equalize_replicas=bool(distributed and args.mode == "train"),
                     augment=True,
+                    multiprocessing_context=args.loader_start_method,
                     pseudo_label_path=pseudo_label_path,
                     pseudo_confidence_weight=args.pu_pseudo_conf_weight,
                     pseudo_seg_weight=args.pu_pseudo_seg_weight,
@@ -1880,6 +1917,7 @@ def main() -> None:
                 drop_last=False,
                 shuffle_within_chunk=False,
                 augment=False,
+                multiprocessing_context=args.loader_start_method,
                 load_eval_ignore_sources=args.mode == "eval" or int(args.detect_every) > 0,
                 **common_ds,
             )
@@ -1894,6 +1932,10 @@ def main() -> None:
                 if int(args.num_workers) > 0:
                     kwargs["persistent_workers"] = bool(args.persistent_workers)
                     kwargs["prefetch_factor"] = max(1, int(args.prefetch_factor))
+                    kwargs['multiprocessing_context'] = args.loader_start_method
+                    if args.gradient_debug and args.gradient_debug_hang_timeout > 0:
+                        kwargs['worker_init_fn'] = partial(register_worker_stack_dump,
+                            output_dir=str(out_dir/'gradient_debug'/'hang_stacks'), rank=rank)
                 return kwargs
 
             train_sampler = None
@@ -1958,6 +2000,7 @@ def main() -> None:
                 if int(args.num_workers) > 0:
                     kwargs["persistent_workers"] = bool(args.persistent_workers)
                     kwargs["prefetch_factor"] = max(1, int(args.prefetch_factor))
+                    kwargs['multiprocessing_context'] = args.loader_start_method
                 return kwargs
 
             train_loader = DataLoader(train_ds, **_zarr_loader_kwargs(train_sampler)) if train_sampler is not None else None
@@ -2368,6 +2411,7 @@ def main() -> None:
         metadata = {
             "args": vars(args),
             "loss_weights": asdict(weights),
+            "mask_inactive_optimizer_policy": "clear_prompt_and_mask_grads_to_none_before_step",
             "num_records": len(records),
             "num_train": len(train_records),
             "num_val": len(val_records),
@@ -2459,6 +2503,62 @@ def main() -> None:
         if is_main:
             (out_dir / "run_config.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
             run = _init_wandb_or_disable(args, out_dir=out_dir, metadata=metadata, is_main=is_main)
+        adam_state_logger = None
+        if args.adam_state_log and is_main:
+            from utils.adam_state import AdamStateLogger
+
+            def adam_log(metrics, iteration, epoch):
+                if run is not None:
+                    run.log({**{f'adam/{k}': v for k, v in metrics.items()},
+                             'iteration': int(iteration), 'epoch': int(epoch)},
+                            step=int(iteration), commit=False)
+
+            adam_state_logger = AdamStateLogger(out_dir / 'adam_state',
+                interval=int(args.adam_state_log_interval), log_fn=adam_log)
+            print(f'[adam_state] enabled: interval={args.adam_state_log_interval} optimizer updates; '
+                  'scopes=encoder,proposal_decoder,mask_decoder; W&B adam/* + local JSONL', flush=True)
+        gradient_debugger = None
+        if args.gradient_debug:
+            if model_variant != 'sam_per_band':
+                raise ValueError('--gradient-debug currently requires --model-variant sam_per_band')
+            if is_main and run is not None:
+                try:
+                    gradient_run = wandb.init(project=str(args.wandb_project),
+                        entity=str(args.wandb_entity) if args.wandb_entity else None,
+                        name=f'{args.wandb_run_name or out_dir.name}-gradient_debug',
+                        group='gradient_debug',job_type='gradient_debug',dir=str(out_dir),
+                        mode=str(args.wandb_mode),reinit='create_new',
+                        settings=wandb.Settings(console='off'),
+                        config=dict(training_run_id=run.id,training_output=str(out_dir),
+                            interval=args.gradient_debug_interval,
+                            samples_per_dataset=args.gradient_debug_samples_per_dataset,
+                            probe_config=args.gradient_debug_probes,
+                            probe_batch_size=args.gradient_debug_batch_size,
+                            probe_mode='eval gradients after optimizer update; fixed examples',
+                            full_mixture='weighted by training record counts; samples=0 enables full traversal'))
+                    gradient_run.define_metric('iteration')
+                    gradient_run.define_metric('gradient_debug/*',step_metric='iteration')
+                except Exception as exc:
+                    print(f'WARNING: gradient_debug W&B unavailable; local JSONL still enabled: {exc}',flush=True)
+
+            def gradient_log(metrics, iteration, epoch):
+                if gradient_run is not None:
+                    gradient_run.log({**{f'gradient_debug/{k}':v for k,v in metrics.items()},
+                                      'iteration':int(iteration),'epoch':int(epoch)},step=int(iteration))
+
+            gradient_debugger = GradientDebugger(train_ds,train_records,collate_cutouts,
+                out_dir/'gradient_debug',interval=int(args.gradient_debug_interval),
+                samples_per_dataset=int(args.gradient_debug_samples_per_dataset),
+                batch_size=int(args.gradient_debug_batch_size),seed=int(args.seed),log_fn=gradient_log,
+                hang_timeout_seconds=float(args.gradient_debug_hang_timeout),
+                probe_config=args.gradient_debug_probes)
+            if is_main:
+                print('[gradient_debug] enabled: group=gradient_debug; exact parameter dot products; '
+                      f'fixed probes={ {k:len(v) for k,v in gradient_debugger.indices.items()} }; '
+                      'full = record-weighted dataset mixture',flush=True)
+                if gradient_debugger.cohorts:
+                    print(f'[gradient_debug] scene cohorts={ {k:len(v) for k,v in gradient_debugger.cohorts.items()} }; '
+                          'cohort gradients reuse the same forwards and are excluded from full mixture',flush=True)
         _sync_distributed()
 
         best_val = float("inf")
@@ -2670,6 +2770,8 @@ def main() -> None:
                 freeze_sam_encoder=encoder_frozen,
                 mask_loss_interval=max(1, int(args.mask_loss_interval)),
                 mask_loss_interval_scale=bool(args.mask_loss_interval_scale),
+                gradient_debugger=gradient_debugger,
+                adam_state_logger=adam_state_logger,
             )
             global_step += len(train_loader) * display_step_scale
 
@@ -2893,6 +2995,8 @@ def main() -> None:
                 train_ds.reload_pseudo_labels(pseudo_label_path)
                 train_loader = DataLoader(train_ds, **_loader_kwargs(args, shuffle=train_sampler is None, sampler=train_sampler))
     finally:
+        if gradient_run is not None:
+            gradient_run.finish()
         if run is not None:
             wandb.finish()
         _cleanup_distributed()

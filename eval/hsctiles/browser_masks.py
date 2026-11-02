@@ -39,6 +39,7 @@ def decode_masks(model, outputs, rows, *, device, amp='none', width=512, height=
     # directly; scores are not probabilities and must not be clamped to [0, 1].
     valid = torch.ones((height,width),device=device) if valid_mask is None else torch.as_tensor(valid_mask,device=device).float()
     packed, bounds, row_indices, selected_tokens, candidate_areas, candidate_scores = [], [], [], [], [], []
+    selected_scores, stability_scores, selected_areas = [], [], []
     chunk_size = max(1, int(chunk_size))
     for start in range(0, len(rows), chunk_size):
         chunk = rows[start:start+chunk_size]
@@ -73,6 +74,15 @@ def decode_masks(model, outputs, rows, *, device, amp='none', width=512, height=
             full=F.interpolate(low.float(),size=padded,mode='bilinear',align_corners=False)[...,:height,:width]
             all_masks=(full>threshold)&valid.bool()[None,None]
             masks=all_masks[torch.arange(len(chunk),device=device),best]
+            chosen=full[torch.arange(len(chunk),device=device),best]
+            # SAM stability: area at logit threshold+1 divided by area at
+            # threshold-1, evaluated on the final image grid and valid pixels.
+            inner=((chosen>threshold+1.)&valid.bool()).sum((-1,-2))
+            outer=((chosen>threshold-1.)&valid.bool()).sum((-1,-2))
+            stability=torch.where(outer>0,inner.float()/outer.clamp_min(1),0.)
+            selected_scores.extend(quality[torch.arange(len(chunk),device=device),best].float().cpu().tolist())
+            stability_scores.extend(stability.cpu().tolist())
+            selected_areas.extend(masks.sum((-1,-2)).cpu().tolist())
             selected_tokens.extend((best+(1 if multimask else 0)).cpu().tolist())
             candidate_areas.extend(all_masks.sum((-1,-2)).cpu().tolist())
         batch = masks[:, :height, :width].cpu().numpy()
@@ -91,6 +101,10 @@ def decode_masks(model, outputs, rows, *, device, amp='none', width=512, height=
                 selected_tokens=np.asarray(selected_tokens,dtype=np.int32),
                 candidate_areas=np.asarray(candidate_areas,dtype=np.int64),
                 candidate_pred_iou=np.asarray(candidate_scores,dtype=np.float32),
+                selected_pred_iou=np.asarray(selected_scores,dtype=np.float32),
+                stability_score=np.asarray(stability_scores,dtype=np.float32),
+                selected_area=np.asarray(selected_areas,dtype=np.int64),
+                stability_offset=1.,
                 selection=selection,box_scale=box_scale)
 
 

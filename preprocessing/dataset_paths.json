@@ -15,6 +15,10 @@
   "abell": {
     "image_root": "/data/shared/JWST/abell2744/stage3_fmodel/mosaic_v2_half/field_ra3p573_dec-30p376",
     "reference_root": "/data/shared/jwst_foundation/raw/Abell2744",
-    "catalog_root": "/data/shared/jwst_foundation/catalog/A2744"
+    "catalog_root": "/data/shared/jwst_foundation/catalog/A2744",
+    "uncover_catalog": "/home/czh23/fits/UNCOVER_DR3_LW_SUPER_catalog.fits",
+    "uncover_detection": "/data/czh23/JWST/UNCOVER/UNCOVER_DR3_DETECTION.fits",
+    "uncover_segmentation": "/data/czh23/JWST/UNCOVER/UNCOVER_DR3_SEGMAP.fits",
+    "uncover_model_root": "/data/czh23/JWST/UNCOVER/models"
   }
 }

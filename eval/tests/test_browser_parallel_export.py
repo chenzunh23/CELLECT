@@ -36,6 +36,13 @@ def make_state(root, count=6):
     state.ref_by_token = {ref.token: ref for ref in refs}
     state.selected = {ref.token for ref in refs}
     state.export_dir = Path(root)
+    state.session_dir = Path(root) / 'session'
+    state.session_dir.mkdir(parents=True, exist_ok=True)
+    state.confidence_paths_by_token = {}
+    state._confidence_cache = ArrayCache(1024**2)
+    state.confidence_score = 'ordinal_expectation'
+    state.confidence_threshold = 2.
+    state.nms_radius = 2
     state.export_workers = 4
     state.detect_batch_size = 80
     state._export_lock = threading.Lock()
@@ -65,6 +72,9 @@ def make_state(root, count=6):
         for slot in slots:
             for ref in refs_by_key[slot].values():
                 state.detect_rows_by_token[ref.token] = []
+                logits = torch.zeros(1, 5, 32, 32)
+                logits[:, 1, 2:4, 3:5] = 8.
+                state._store_confidence({'confidence': logits}, ref, np.ones((32,32), bool))
                 mask_sink[ref.token] = masks
 
     state._detect_tile_slots = detect
@@ -201,7 +211,7 @@ class ParallelExportTests(unittest.TestCase):
             state._store_masks = store
             sink = {}
             with patch.object(browser_core, 'infer_cellect', return_value={}), \
-                 patch.object(browser_core, 'select_band_outputs', return_value={}), \
+                 patch.object(browser_core, 'select_band_outputs', return_value={'confidence': torch.zeros(1,5,32,32)}), \
                  patch.object(browser_core, 'detection_rows', return_value=[]):
                 state._detect_tile_slots(list(state._refs_by_tile_slot()), mask_sink=sink)
             self.assertEqual(set(sink), set(state.ref_by_token))

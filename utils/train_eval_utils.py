@@ -291,6 +291,7 @@ def loader_kwargs(args: argparse.Namespace, *, shuffle: bool, sampler: Distribut
     if int(args.num_workers) > 0:
         kwargs["persistent_workers"] = bool(args.persistent_workers)
         kwargs["prefetch_factor"] = max(1, int(args.prefetch_factor))
+        kwargs['multiprocessing_context'] = getattr(args, 'loader_start_method', 'spawn')
     return kwargs
 
 

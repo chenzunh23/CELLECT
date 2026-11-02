@@ -130,6 +130,19 @@ class ParentStoreAssembly:
 
     def finish(self):
         output=merge_parent_stores(self.parts,self.output,attrs=self.attrs,chunk_tiles=self.chunk_tiles)
+        if output is None:
+            # A successful rebuild may reject every previous sample. Do not
+            # leave the old store discoverable as if it used the new policy.
+            backup=self.output.with_name('.'+self.output.name+'.previous')
+            if backup.exists():raise RuntimeError(f'Recover interrupted publication first: {backup}')
+            if self.output.exists():self.output.rename(backup)
+            try:
+                for suffix in ('_manifest.json','_tile_filter.json'):
+                    Path(str(self.output)+suffix).unlink(missing_ok=True)
+            except BaseException:
+                if backup.exists():backup.rename(self.output)
+                raise
+            if backup.exists():shutil.rmtree(backup)
         audits = [json.loads(p.read_text()) for p in sorted(self.scratch.rglob('*_tile_filter.json'))]
         if audits:
             write_json(Path(str(self.output) + '_tile_filter.json'), dict(parts=audits))

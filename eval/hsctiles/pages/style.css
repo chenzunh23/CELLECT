@@ -141,6 +141,7 @@ select[multiple] { min-height: 180px; width: 180px; }
   min-height: 28px;
   padding: 0 5px;
 }
+.snrRow.maskFilterRow { grid-template-columns: 70px minmax(120px, 1fr) 62px; color: var(--text); }
 .snrModalFields.enabled .snrRow:first-of-type,
 .snrModalFields.enabled.kronActive .snrRow:last-of-type {
   color: var(--text);

@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -60,6 +61,7 @@ from eval.datasets import (  # noqa: E402
 from eval.datasets.parallel_load import ParallelLoad
 from eval.datasets.array_cache import ArrayCache
 from eval.hsctiles.browser_masks import decode_masks, overlay_masks
+from eval.hsctiles.browser_confidence import confidence_maps, confidence_overlay_uint8, confidence_display_options
 from eval.datasets.base import patch_sort_key  # noqa: E402
 from eval.eval_utils import (  # noqa: E402
     detection_rows,
@@ -931,6 +933,8 @@ class BrowserState:
         self.detect_png_by_token: dict[str, bytes] = {}
         self.input_shape_png_by_token: dict[str, bytes] = {}
         self.detect_rows_by_token: dict[str, list[dict[str, float]]] = {}
+        self.confidence_paths_by_token: dict[str, Path] = {}
+        self._confidence_cache = ArrayCache(32 * 1024**2)
         self.snr_rows_by_token_method: dict[tuple[str, str], list[dict[str, Any]]] = {}
         self.snr_config = SourceSnrConfig()
         self.snr_workers = max(1, int(getattr(args, "snr_workers", 4)))
@@ -949,6 +953,8 @@ class BrowserState:
         self._export_lock = threading.Lock()
         self._export_progress_lock = threading.Lock()
         self._export_progress = {"stage": "idle", "completed": 0, "total": 0}
+        self._detect_progress_lock = threading.Lock()
+        self._detect_progress = {"stage": "idle", "completed": 0, "total": 0}
         self._image_load = ParallelLoad(self.image_workers, "image-read")
         self._scale_load = ParallelLoad(getattr(args, "scaling_workers", 2), "image-scale")
         if hasattr(self.access, "_parent_load"):
@@ -989,6 +995,7 @@ class BrowserState:
         except Exception as exc:
             self.warnings.append(f"{patch}: tile selection failed: {exc}")
             print(f"WARNING: {patch}: tile selection failed: {exc}", flush=True)
+            traceback.print_exc()
             return []
         if not tiles:
             self.warnings.append(f"{patch}: no common tiles for available bands {bands}; page will be empty")
@@ -1351,6 +1358,8 @@ class BrowserState:
                 row["input_shape_detected"] = ref.token in self.input_shape_png_by_token
                 row["input_shape_image_url"] = f"/image/{ref.token}.png?input_shape=1&detect=1&v={len(self.input_shape_png_by_token)}"
                 row["n_detections"] = len(self.detect_rows_by_token.get(ref.token, ()))
+                row["confidence_detected"] = ref.token in self.confidence_paths_by_token
+                row["confidence_image_url"] = f"/image/{ref.token}.png?detect=1&confidence=1&shape=0"
                 refs.append(row)
         return {"page": page_index, "n_pages": self.n_pages, "bands": self._bands_for_patch(self.patch), "tile_ids": sorted(tile_ids), "candidates": refs}
 
@@ -1594,7 +1603,53 @@ class BrowserState:
             amp=self.amp, width=ref.width, height=ref.height, chunk_size=self.mask_chunk_size,
             threshold=self.mask_threshold, box_scale=self.mask_box_scale, valid_mask=valid, selection=self.mask_selection)
         self._mask_cache.put(ref.token, masks)
+        self._attach_mask_quality(rows, masks)
         return masks
+
+    @staticmethod
+    def _attach_mask_quality(rows, masks):
+        for row, score, stability, area in zip(rows, masks['selected_pred_iou'], masks['stability_score'], masks['selected_area']):
+            row.update(mask_pred_iou=float(score), mask_stability=float(stability), mask_area=int(area))
+
+    def _mask_filtered_rows(self, token, rows, pred_iou=.8, stability=.9):
+        if not (np.isfinite(pred_iou) and np.isfinite(stability) and 0<=pred_iou<=1 and 0<=stability<=1):
+            raise ValueError('Mask Filter thresholds must be finite numbers between 0 and 1')
+        # Decoder metrics are float32; compare boundaries at the same precision.
+        pred_iou,stability=float(np.float32(pred_iou)),float(np.float32(stability))
+        original=self.detect_rows_by_token[token]
+        if original and any('mask_stability' not in row for row in original):
+            self._attach_mask_quality(original, self._masks_for_token(token))
+        keep={(row['x'],row['y']) for row in original
+              if row.get('mask_area',0)>0 and np.isfinite(row.get('mask_pred_iou',np.nan))
+              and np.isfinite(row.get('mask_stability',np.nan))
+              and row['mask_pred_iou']>=pred_iou and row['mask_stability']>=stability}
+        return [row for row in rows if (row['x'],row['y']) in keep]
+
+    def _store_confidence(self, band_outputs, ref, valid):
+        maps = confidence_maps(band_outputs, width=ref.width, height=ref.height,
+                               valid_mask=valid, score_mode=self.confidence_score)
+        target = self.session_dir / 'confidence' / f'{ref.candidate_id}_confidence.npz'
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.with_suffix('.npz.tmp').open('wb') as handle:
+            np.savez_compressed(handle, **maps, score_mode=self.confidence_score,
+                checkpoint=str(self.checkpoint), token=ref.token,
+                confidence_threshold=self.confidence_threshold, nms_radius=self.nms_radius,
+                x0=ref.x0, y0=ref.y0, orientation='lower-origin; y increases upward',
+                labels_definition='argmax of all confidence classes before threshold/NMS')
+        target.with_suffix('.npz.tmp').replace(target)
+        self.confidence_paths_by_token[ref.token] = target
+        self._confidence_cache.put(ref.token, maps['labels'])
+
+    def _confidence_for_token(self, token):
+        labels = self._confidence_cache.get(token)
+        if labels is None:
+            path = self.confidence_paths_by_token.get(token)
+            if path is None:
+                raise RuntimeError('Run Detect to generate the confidence map')
+            with np.load(path) as stored:
+                labels = stored['labels']
+            self._confidence_cache.put(token, labels)
+        return labels
 
     def _masks_for_token(self, token):
         if not self.make_masks:
@@ -1677,6 +1732,7 @@ class BrowserState:
         show_shape: bool = True,
         show_center: bool = False,
         show_masks: bool = False,
+        show_confidence: bool = False,
         smooth_mode: str = "none",
         smooth_sigma: float = 1.0,
         smooth_radius: int = 1,
@@ -1690,10 +1746,15 @@ class BrowserState:
         snr_filter: bool = False,
         snr_method: str = "ap2",
         snr_threshold: float = 5.0,
+        mask_filter: bool = False,
+        mask_pred_iou: float = .8,
+        mask_stability: float = .9,
     ) -> bytes:
         use_input = bool(input_image or input_shape)
         if detect and token in self.detect_rows_by_token:
             rows = self._snr_filtered_rows(token, snr_method, snr_threshold) if bool(snr_filter) else self.detect_rows_by_token[token]
+            if mask_filter:
+                rows = self._mask_filtered_rows(token, rows, mask_pred_iou, mask_stability)
             if use_input:
                 scaled = self._scaled_input_for_token(token)
                 if show_shape:
@@ -1721,8 +1782,10 @@ class BrowserState:
                     )
                     if show_center:
                         arr = _draw_centers_on_uint8(arr, rows)
+                if show_confidence:
+                    arr = confidence_overlay_uint8(arr, self._confidence_for_token(token))
                 if show_masks:
-                    arr = self._mask_overlay(arr, token, rows if snr_filter else None)
+                    arr = self._mask_overlay(arr, token, rows if snr_filter or mask_filter else None)
                 return _png_bytes(arr)
             image = _display_filter_image(
                 self._detection_image_for_ref(self.ref_by_token[token]),
@@ -1757,8 +1820,10 @@ class BrowserState:
                 )
                 if show_center:
                     arr = _draw_centers_on_uint8(arr, rows)
+            if show_confidence:
+                arr = confidence_overlay_uint8(arr, self._confidence_for_token(token))
             if show_masks:
-                arr = self._mask_overlay(arr, token, rows if snr_filter else None)
+                arr = self._mask_overlay(arr, token, rows if snr_filter or mask_filter else None)
             return _png_bytes(arr)
         if input_image or input_shape:
             return _png_bytes(
@@ -1860,6 +1925,7 @@ class BrowserState:
         *,
         mask_sink: dict[str, Any] | None = None,
     ) -> dict[str, int]:
+        started = time.perf_counter()
         refs_by_key = refs_by_key or self._refs_by_tile_slot()
         pending: list[tuple[str, int, dict[str, FrameRef]]] = []
         for tile_id, frame_slot in slots:
@@ -1872,6 +1938,9 @@ class BrowserState:
                 continue
             pending.append((tile_id, frame_slot, {band: per_band[band] for band in bands}))
         if pending:
+            total = sum(len(item[2]) for item in pending)
+            completed = 0
+            self._set_detect_progress("loading_model", completed=0, total=total, started=started)
             device = torch.device(self.device_name)
             grouped: dict[tuple[str, ...], list[tuple[str, int, dict[str, FrameRef]]]] = {}
             for item in pending:
@@ -1888,6 +1957,7 @@ class BrowserState:
                 for start in range(0, len(group_items), self.detect_batch_size):
                     chunk = group_items[start : start + self.detect_batch_size]
                     try:
+                        self._set_detect_progress("preparing_inputs", completed=completed, total=total, started=started)
                         raw_by_sample: list[list[np.ndarray]] = []
                         scaled_by_sample = []
                         refs = [per_band[band] for _, _, per_band in chunk for band in bands]
@@ -1897,13 +1967,18 @@ class BrowserState:
                             raw_by_sample.append([value[0] for value in sample])
                             scaled_by_sample.append([value[1] for value in sample])
                         tensor = torch.from_numpy(np.stack(scaled_by_sample, axis=0).astype(np.float32, copy=False))
+                        self._set_detect_progress("inference", completed=completed, total=total, started=started)
                         outputs = infer_cellect(model=model, image_tensor=tensor, device=device, amp=self.amp)
+                        self._set_detect_progress("decoding_masks", completed=completed, total=total, started=started)
                         for sample_idx, (_tile_id, _frame_slot, per_band) in enumerate(chunk):
                             sample_outputs = self._select_sample_outputs(outputs, sample_idx)
                             for band_idx, band in enumerate(bands):
                                 ref = per_band[band]
+                                band_outputs = select_band_outputs(sample_outputs, band_idx)
+                                self._store_confidence(band_outputs, ref,
+                                    np.isfinite(raw_by_sample[sample_idx][band_idx]))
                                 rows = detection_rows(
-                                    select_band_outputs(sample_outputs, band_idx),
+                                    band_outputs,
                                     threshold=self.confidence_threshold,
                                     nms_radius=self.nms_radius,
                                     confidence_score=self.confidence_score,
@@ -1913,7 +1988,7 @@ class BrowserState:
                                     height=ref.height,
                                     valid_mask=np.isfinite(raw_by_sample[sample_idx][band_idx]),
                                 )
-                                masks = self._store_masks(model, select_band_outputs(sample_outputs, band_idx), rows, ref)
+                                masks = self._store_masks(model, band_outputs, rows, ref)
                                 if mask_sink is not None and masks is not None:
                                     mask_sink[ref.token] = masks
                                 self.detect_rows_by_token[ref.token] = rows
@@ -1931,6 +2006,8 @@ class BrowserState:
                                     clip_threshold=self.clip_threshold,
                                     draw_centers=self.shape_overlay_centers,
                                 )
+                                completed += 1
+                                self._set_detect_progress("decoding_masks", completed=completed, total=total, started=started)
                     except Exception as exc:
                         chunk_ids = ", ".join(f"{tile_id}/slot{slot + 1}" for tile_id, slot, _ in chunk)
                         message = f"detection failed for bands {bands} on {chunk_ids}: {type(exc).__name__}: {exc}"
@@ -1938,6 +2015,7 @@ class BrowserState:
                         print(f"WARNING: {message}", flush=True)
                         traceback.print_exc()
         total_images = 0
+        requested_images = 0
         total_detections = 0
         for tile_id, frame_slot in slots:
             per_band = refs_by_key.get((tile_id, frame_slot), {})
@@ -1945,9 +2023,39 @@ class BrowserState:
             bands = [band for band in self._bands_for_patch(patch) if band in per_band]
             if not bands:
                 continue
-            total_images += len(bands)
+            requested_images += len(bands)
+            total_images += sum(per_band[band].token in self.detect_rows_by_token for band in bands)
             total_detections += sum(len(self.detect_rows_by_token.get(per_band[band].token, ())) for band in bands)
-        return {"n_images": total_images, "n_detections": total_detections}
+        failed = requested_images - total_images
+        self._set_detect_progress("failed" if failed else "done", completed=total_images,
+                                  total=requested_images, started=started)
+        return {"n_images": total_images, "n_detections": total_detections,
+                "n_failed_images": failed, "elapsed_seconds": time.perf_counter() - started,
+                "errors": self.warnings[-3:] if failed else []}
+
+    def _set_detect_progress(self, stage: str, **fields) -> None:
+        # Separate from the inference lock: HTTP polling must stay responsive.
+        if not hasattr(self, "_detect_progress_lock"):
+            self._detect_progress_lock = threading.Lock()
+        progress = dict(stage=stage, **fields)
+        with self._detect_progress_lock:
+            self._detect_progress = progress
+        elapsed = time.perf_counter() - fields.get("started", time.perf_counter())
+        line = (f"[detect] stage={stage} images={fields.get('completed', 0)}/"
+                f"{fields.get('total', 0)} elapsed={elapsed:.2f}s")
+        print(line, flush=True)
+        session = getattr(self, "session_dir", None)
+        if session is not None:
+            with (session / "detect.log").open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+
+    def detect_status(self) -> dict[str, Any]:
+        with self._detect_progress_lock:
+            progress = dict(self._detect_progress)
+        started = progress.pop("started", None)
+        if started is not None:
+            progress["elapsed_seconds"] = time.perf_counter() - started
+        return progress
 
     def detect_page(self, page_index: int) -> dict[str, Any]:
         refs_by_key = self._refs_by_tile_slot()
@@ -1968,7 +2076,7 @@ class BrowserState:
         return path
 
     def _export_ref(self, ref: FrameRef, detect_rows: list[dict[str, Any]], masks: Any,
-                    write_png: bool) -> tuple[dict[str, Any], dict[str, float]]:
+                    write_png: bool, confidence_view=None) -> tuple[dict[str, Any], dict[str, float]]:
         """CPU-only export of one candidate; masks are pinned by the producer."""
         started = last = time.perf_counter()
         timings: dict[str, float] = {}
@@ -1994,6 +2102,16 @@ class BrowserState:
         kron_snr_png_path = out_dir / f"{stem}_kron_snr_overlay.png"
         detect_csv_path = out_dir / f"{stem}_detections.csv"
         mask_png_path = out_dir / f"{stem}_mask_overlay.png"
+        confidence_source = getattr(self, 'confidence_paths_by_token', {}).get(ref.token)
+        confidence_npz_path = out_dir / f'{stem}_confidence.npz'
+        confidence_png_path = out_dir / f'{stem}_confidence_overlay.png'
+        if confidence_source is not None:
+            shutil.copyfile(confidence_source, confidence_npz_path)
+            if write_png:
+                confidence_png_path.write_bytes(self.image_png(ref.token, detect=True,
+                    show_shape=False, show_confidence=True,
+                    **confidence_display_options(confidence_view)))
+        mark('confidence')
         if write_png:
             Image.fromarray(display_gray(image), mode="L").convert("RGB").save(png_path)
         fieldnames = sorted({key for item in detect_rows for key in item}) if detect_rows else [
@@ -2065,6 +2183,10 @@ class BrowserState:
             "kron_snr_png_path": str(kron_snr_png_path) if write_png else "",
             "detect_csv_path": str(detect_csv_path),
             "mask_png_path": str(mask_png_path) if write_png and masks is not None else "",
+            "confidence_npz_path": str(confidence_npz_path) if confidence_source is not None else "",
+            "confidence_png_path": str(confidence_png_path) if write_png and confidence_source is not None else "",
+            "confidence_view": confidence_display_options(confidence_view),
+            "confidence_classes": {str(k): v for k, v in {0:'background (transparent)', 1:'blue', 2:'green', 3:'yellow', 4:'red'}.items()},
             "export_subdir": str(out_dir),
             "n_detections": len(detect_rows),
             "inference_parameters": self._inference_parameters(),
@@ -2086,7 +2208,8 @@ class BrowserState:
         with self._export_progress_lock:
             self._export_progress.update(changes)
 
-    def export_selected(self, write_png: bool = True, *, workers: int | None = None) -> dict[str, Any]:
+    def export_selected(self, write_png: bool = True, *, workers: int | None = None,
+                        confidence_view=None) -> dict[str, Any]:
         workers = self.export_workers if workers is None else int(workers)
         if workers < 1:
             raise ValueError("export workers must be at least 1")
@@ -2166,7 +2289,8 @@ class BrowserState:
                     for index, ref, rows, masks in jobs:
                         while len(pending) >= 2 * workers:
                             collect_done(block=True)
-                        future = pool.submit(self._export_ref, ref, rows, masks, write_png)
+                        future = pool.submit(self._export_ref, ref, rows, masks, write_png,
+                                             confidence_view)
                         pending[future] = (index, ref)
                         collect_done()
                     # Only the bounded queue retains this chunk's masks.

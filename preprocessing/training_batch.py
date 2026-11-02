@@ -58,6 +58,11 @@ def plan(args):
             if args.jwst_bands and job['band'] not in args.jwst_bands:continue
             if args.abell_parent and job['name'] not in args.abell_parent:continue
             check_source(doc['signature']['source'],job['source'])
+            if getattr(args,'use_uncover',False):
+                from .utils.uncover_labels import coverage_on_grid
+                h=fits.getheader(Path(job['output'])/'training_half_4096.fits')
+                if not coverage_on_grid(args.uncover_detection,h,(h['NAXIS2'],h['NAXIS1']),
+                    cache_root=Path(args.output_root)/'abell'/'uncover_coverage').any():continue
             rows.append(dict(kind='abell',name=f'abell_{job["band"]}_{job["name"]}',job=job))
     products=Path(args.hsc_products_root)
     for kind,source_kind in [('hsc_half','half_coadd'),('hsc_noisy','noisy')]:
@@ -330,7 +335,8 @@ def run_job(args,row):
                str(Path(row['source']['catalog_root'])/'COSMOSWeb_mastercatalog_v1.1.fits'),args.paths['cosmos']['gaia_fits']]
     elif row['kind']=='abell':
         job=row['job']
-        paths=[job['source'],job['grid_reference'],str(Path(job['output'])/'background_mask.npz'),args.abell_catalog,args.abell_gaia]
+        paths=[job['source'],job['grid_reference'],str(Path(job['output'])/'background_mask.npz'),
+               args.uncover_catalog if getattr(args,'use_uncover',False) else args.abell_catalog,args.abell_gaia]
     else:
         from .utils.image_level import _coadd_image_path,_refit_csv_path
         from .utils.inputs import _band_catalog_path
@@ -354,6 +360,9 @@ def run_job(args,row):
     if row['kind'] in ('abell','cosmos'):
         from .utils.jwst_star_psf import star_policy
         signature['jwst_star_protection']=star_policy()
+    if row['kind']=='abell':
+        from .abell_zarr import uncover_signature
+        signature['uncover']=uncover_signature(args,row['job']['band'])
     if row['kind'] in ('hsc_half','hsc_noisy'):
         signature['hsc_background_method']=getattr(args,'hsc_background_method','sextractor')
         signature['hsc_half_lsst_background_source']=getattr(args,'hsc_half_lsst_background_source','training')

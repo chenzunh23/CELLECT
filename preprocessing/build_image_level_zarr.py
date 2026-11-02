@@ -293,7 +293,7 @@ def write_classified_patch(task: StoreTask, image: np.ndarray, labels: PatchLabe
                            origin=(0, 0), *, cosmos_catalog=None, image_wcs=None,
                            provenance=None, input_source: ImageInput | None = None,
                            tile_specs=None, valid_mask=None, input_valid_mask=None, max_invalid_fraction=None,
-                           scaled_image_chw=None, include_large_sources=True) -> dict[str, object]:
+                           scaled_image_chw=None, include_large_sources=True, supervision_mask=None) -> dict[str, object]:
     """Write already classified sources without rerunning HSC source filters.
 
     COSMOS callers supply the catalog and full-image WCS to generate isolated
@@ -307,6 +307,8 @@ def write_classified_patch(task: StoreTask, image: np.ndarray, labels: PatchLabe
     GT). Optional input_valid_mask includes enclosed, repaired holes: they stay
     visible and can carry existing confidence positives, but gain no new
     background, shape, or segmentation truth merely from interpolation.
+    supervision_mask additionally bounds all labels (including repaired-hole
+    confidence positives) without erasing observed encoder context outside it.
     """
     if input_source is not None:
         task = bind_task(task, input_source)
@@ -348,6 +350,11 @@ def write_classified_patch(task: StoreTask, image: np.ndarray, labels: PatchLabe
             raise ValueError('model-valid pixels must have finite prepared intensities')
         if valid_mask is None:
             raise ValueError('input validity requires the original observed valid mask')
+    if supervision_mask is not None:
+        supervision_mask=np.asarray(supervision_mask,bool)
+        if supervision_mask.shape!=image.shape:raise ValueError('supervision mask/image shape mismatch')
+        valid_mask=np.isfinite(image) if valid_mask is None else valid_mask
+        valid_mask=valid_mask&supervision_mask
     if max_invalid_fraction is not None:
         from preprocessing.utils.large_sources import valid_tile_specs
         valid_mask=np.isfinite(image) if valid_mask is None else valid_mask
@@ -431,6 +438,7 @@ def write_classified_patch(task: StoreTask, image: np.ndarray, labels: PatchLabe
         if valid_mask is not None:
             v=_crop(valid_mask,spec.x0,spec.y0,origin,h)
             context = v if input_valid_mask is None else _crop(input_valid_mask,spec.x0,spec.y0,origin,h)
+            domain=np.ones(v.shape,bool) if supervision_mask is None else _crop(supervision_mask,spec.x0,spec.y0,origin,h)
             # The trainer uses band_valid_mask specifically for mask losses
             # and IoU calibration. Interpolated flux must not become mask GT.
             # Encoder inputs and confidence positives have separate validity.
@@ -438,8 +446,8 @@ def write_classified_patch(task: StoreTask, image: np.ndarray, labels: PatchLabe
             images[i,0,...,~context]=0
             # Repaired intensities are usable context. Only existing positive
             # center cores gain confidence supervision; never invent negatives.
-            positive_fill = context & ~v & (target['confidence'] > 0)
-            confidence_valid = (v & context) | positive_fill
+            positive_fill = context & ~v & (target['confidence'] > 0) & domain
+            confidence_valid = ((v & context) | positive_fill) & domain
             target['confidence'][~confidence_valid]=0
             target['conf_weight'][~confidence_valid]=0
             target['shape_weight'][~v]=0
@@ -451,7 +459,7 @@ def write_classified_patch(task: StoreTask, image: np.ndarray, labels: PatchLabe
                                       ('shape_centers',['shape_values','shape_classes','shape_ids','shape_weights'])]:
                 centers=target[center_key]
                 xy=np.clip(np.floor(centers+.5).astype(int),0,h-1)
-                center_valid = context if center_key == 'strict_centers' else (v & context)
+                center_valid = (context & domain) if center_key == 'strict_centers' else (v & context)
                 keep=center_valid[xy[:,1],xy[:,0]]
                 if center_key in ('source_centers','shape_centers') and labels.star_protection_sources:
                     # The PSF shape prior comes from Gaia + a simulation,
@@ -574,6 +582,7 @@ def write_classified_patch(task: StoreTask, image: np.ndarray, labels: PatchLabe
             "nan_input_policy": ('repaired_context_positive_centers_v1' if input_valid_mask is not None else 'observed_only'),
             "nan_fill_policy": 'enclosed_source_ring_only_v2' if input_valid_mask is not None else 'caller_defined',
             "band_valid_mask_semantics": "observed_science_for_mask_losses",
+            "supervision_domain": "caller_coverage_intersection" if supervision_mask is not None else "observed_science",
             "tile_coverage_policy": "original_observed_valid_pixels",
             "stride": int(task.stride),
             "source_export_mode": "preprocessing_v3",
@@ -820,6 +829,19 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument('--sex-back-size', type=int, default=64)
     parser.add_argument('--sex-grow', type=int, default=0)
     parser.add_argument('--abell-catalog', default='/data/shared/jwst_foundation/catalog/detect/field_ra3p573_dec-30p376_det_cat.fits')
+    parser.add_argument('--use-uncover','--use_uncover',action=argparse.BooleanOptionalAction,default=False,
+                        help='Abell training only: native UNCOVER labels and finite-detection coverage; evaluation coadd discovery is unchanged')
+    upaths=paths['abell']
+    parser.add_argument('--uncover-catalog',default=upaths.get('uncover_catalog','/home/czh23/fits/UNCOVER_DR3_LW_SUPER_catalog.fits'))
+    parser.add_argument('--uncover-detection',default=upaths.get('uncover_detection','/data/czh23/JWST/UNCOVER/UNCOVER_DR3_DETECTION.fits'))
+    parser.add_argument('--uncover-segmentation',default=upaths.get('uncover_segmentation','/data/czh23/JWST/UNCOVER/UNCOVER_DR3_SEGMAP.fits'))
+    parser.add_argument('--uncover-model-root',default=upaths.get('uncover_model_root','/data/czh23/JWST/UNCOVER/models'),
+                        help='Directory containing official per-band *_fXXXX_bcgs_models.fits[.gz]; never use a different band model')
+    parser.add_argument('--uncover-no-kron-snr',type=float,default=3.)
+    parser.add_argument('--uncover-risk-no-kron-snr',type=float,default=5.)
+    parser.add_argument('--uncover-risk-bright-mag',type=float,default=22.,help='Current-band native catalog AB magnitude; valid Kron required')
+    parser.add_argument('--uncover-risk-sigma',type=float,default=3.)
+    parser.add_argument('--uncover-reject-untrusted',action=argparse.BooleanOptionalAction,default=True)
     parser.add_argument('--abell-gaia', default='/home/czh23/CELLECT/output/gaia_dr3_abell2744.fits')
     parser.add_argument('--abell-background-root', default='/data/czh23/JWST/lsst_background_masks/jwst/default/Abell2744/group_00')
     parser.add_argument("--data-root", default=paths['hsc']['data_root'])
@@ -923,6 +945,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument("--missing-image-policy", default="skip", choices=["skip", "error"])
     args = parser.parse_args(argv)
+    if not 0<=args.jwst_max_invalid_fraction<=1:parser.error('--jwst-max-invalid-fraction must be in [0,1]')
+    if args.use_uncover:
+        from preprocessing.utils.uncover_labels import UncoverSnrConfig
+        try:
+            UncoverSnrConfig(args.uncover_no_kron_snr,args.uncover_risk_no_kron_snr,
+                args.uncover_reject_untrusted,args.uncover_risk_bright_mag)
+            if not np.isfinite(args.uncover_risk_sigma) or args.uncover_risk_sigma<=0:raise ValueError('UNCOVER risk sigma must be positive')
+        except ValueError as exc:parser.error(str(exc))
     from preprocessing.utils.confidence import validate_confidence
     try:
         validate_confidence(args.confidence_mode, args.confidence_fwhm_min,

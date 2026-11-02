@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "random_samples_per_dataset": 16,
+  "report_cohorts": true,
+  "datasets": {
+    "abell": {
+      "random_samples": 0,
+      "probes": [
+        {"id": "halo_F444W_xm01ym01_x4y2", "cohort": "abell_halo_red", "description": "红端光晕", "patch": "x-01_y-01", "band": "F444W", "dataset_source": "half_coadd", "grid": [4, 2], "grid_size": 512, "selection": "overlap", "max_tiles": 2},
+        {"id": "halo_F444W_xm01ym01_x2y4", "cohort": "abell_halo_red", "description": "红端光晕", "patch": "x-01_y-01", "band": "F444W", "dataset_source": "half_coadd", "grid": [2, 4], "grid_size": 512, "selection": "overlap", "max_tiles": 2},
+        {"id": "halo_F277W_xp00ym01_x1y6", "cohort": "abell_halo_red", "description": "红端光晕", "patch": "x+00_y-01", "band": "F277W", "dataset_source": "half_coadd", "grid": [1, 6], "grid_size": 512, "selection": "overlap", "max_tiles": 2},
+        {"id": "halo_F356W_xm01yp00_x3y6", "cohort": "abell_halo_red", "description": "红端光晕", "patch": "x-01_y+00", "band": "F356W", "dataset_source": "half_coadd", "grid": [3, 6], "grid_size": 512, "selection": "overlap", "max_tiles": 2},
+        {"id": "neighbors_F115W_xp00ym01_x0y4", "cohort": "abell_small_neighbors", "description": "大源附近的小源", "patch": "x+00_y-01", "band": "F115W", "dataset_source": "half_coadd", "grid": [0, 4], "grid_size": 512, "selection": "overlap", "max_tiles": 2},
+        {"id": "neighbors_F150W_xp00ym01_x1y5", "cohort": "abell_small_neighbors", "description": "大源附近的小源", "patch": "x+00_y-01", "band": "F150W", "dataset_source": "half_coadd", "grid": [1, 5], "grid_size": 512, "selection": "overlap", "max_tiles": 2},
+        {"id": "star_F150W_xp00yp01_x2y1", "cohort": "abell_star", "description": "恒星", "patch": "x+00_y+01", "band": "F150W", "dataset_source": "half_coadd", "grid": [2, 1], "grid_size": 512, "selection": "overlap", "max_tiles": 2},
+        {"id": "flat_F480M_xp00yp01_x2y4", "cohort": "abell_flat_fp", "description": "较平坦但明显过检", "patch": "x+00_y+01", "band": "F480M", "dataset_source": "half_coadd", "grid": [2, 4], "grid_size": 512, "selection": "overlap", "max_tiles": 2}
+      ]
+    },
+    "cosmos": {"random_samples": 16},
+    "hsc": {"random_samples": 16}
+  }
+}

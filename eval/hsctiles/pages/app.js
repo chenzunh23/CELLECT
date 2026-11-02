@@ -1,6 +1,7 @@
 let state = null;
 let page = 0;
 let busy = false;
+let startBusy = false;
 let optionsCache = null;
 let selectedDataset = 'hsc_raw';
 let showDetect = false;
@@ -10,6 +11,7 @@ let imageVersion = 0;
 let viewShape = true;
 let viewCenter = false;
 let viewMasks = false;
+let viewConfidence = false;
 let viewInvert = false;
 let smoothEnabled = false;
 let smoothMode = 'gaussian';
@@ -35,6 +37,7 @@ async function fetchJson(url, options) {
 function setStatus(text, isError=false) {
   // Page/image loading may finish during export; keep export progress visible.
   if (exportBusy && !isError && !String(text).startsWith('Export')) return;
+  if (detectBusy && !isError && !/^(Detect|Running CELLECT)/.test(String(text))) return;
   const el = document.getElementById('status');
   el.textContent = text;
   el.className = isError ? 'status error' : 'status';
@@ -146,6 +149,7 @@ function imageUrl(c) {
   const inputMode = window.ScaleControls && ScaleControls.isInputMode();
   if (window.ScaleControls) params.push(...ScaleControls.params());
   if (window.SnrControls) params.push(...SnrControls.params());
+  if (window.MaskControls) params.push(...MaskControls.params());
   if (inputMode) params.push('input=1');
   if (smoothEnabled) {
     params.push(`smooth_mode=${encodeURIComponent(smoothMode)}`);
@@ -158,6 +162,7 @@ function imageUrl(c) {
     params.push(`shape=${viewShape ? 1 : 0}`);
     params.push(`center=${viewCenter ? 1 : 0}`);
     params.push(`masks=${viewMasks ? 1 : 0}`);
+    params.push(`confidence=${typeof viewConfidence !== 'undefined' && viewConfidence ? 1 : 0}`);
     if (inputMode) params.push('input_shape=1');
   }
   params.push(`v=${imageVersion}`);
@@ -167,7 +172,9 @@ function imageUrl(c) {
 function updateViewMenu() {
   const inputMode = window.ScaleControls && ScaleControls.isInputMode();
   const snrEnabled = window.SnrControls && SnrControls.isEnabled();
-  const states = {inputScaling: inputMode, shape: viewShape, center: viewCenter, masks: viewMasks, snrFilter: snrEnabled, invert: viewInvert, smooth: smoothEnabled};
+  const maskEnabled = window.MaskControls && MaskControls.isEnabled();
+  const states = {inputScaling: inputMode, shape: viewShape, center: viewCenter, masks: viewMasks, confidence: viewConfidence, snrFilter: snrEnabled, maskFilter: maskEnabled, invert: viewInvert, smooth: smoothEnabled};
+  document.getElementById('confidenceLegend').classList.toggle('hidden', !viewConfidence || !showDetect);
   for (const item of document.querySelectorAll('.viewItem')) {
     const key = item.dataset.view;
     item.querySelector('.viewCheck').textContent = states[key] ? '✓' : '';
@@ -179,10 +186,12 @@ function resetViewDefaults() {
   viewShape = true;
   viewCenter = false;
   viewMasks = false;
+  viewConfidence = false;
   viewInvert = false;
   smoothEnabled = false;
   if (window.ScaleControls) ScaleControls.reset();
   if (window.SnrControls) SnrControls.reset();
+  if (window.MaskControls) MaskControls.reset();
   updateViewMenu();
 }
 
@@ -201,9 +210,19 @@ async function toggleViewItem(key) {
     if (!showDetect) { setStatus('Run Detect to view masks.'); return; }
     viewMasks = !viewMasks;
   }
+  if (key === 'confidence') {
+    if (!showDetect) { setStatus('Run Detect to view confidence.'); return; }
+    viewConfidence = !viewConfidence;
+  }
   if (key === 'snrFilter') {
     if (window.SnrControls) {
       SnrControls.open();
+      return;
+    }
+  }
+  if (key === 'maskFilter') {
+    if (window.MaskControls) {
+      MaskControls.open();
       return;
     }
   }
@@ -223,7 +242,8 @@ function viewStatusText() {
     : 'off';
   const scaleText = window.ScaleControls ? ScaleControls.statusText() : 'default';
   const snrText = window.SnrControls ? SnrControls.statusText() : 'snr=off';
-  return `View: scale=${scaleText}, ${snrText}, shape=${viewShape ? 'on' : 'off'}, center=${viewCenter ? 'on' : 'off'}, masks=${viewMasks ? 'on' : 'off'}, invert=${viewInvert ? 'on' : 'off'}, smooth=${smoothText}.`;
+  const maskText = window.MaskControls ? MaskControls.statusText() : 'mask filter=off';
+  return `View: scale=${scaleText}, ${snrText}, ${maskText}, shape=${viewShape ? 'on' : 'off'}, center=${viewCenter ? 'on' : 'off'}, masks=${viewMasks ? 'on' : 'off'}, confidence=${viewConfidence ? 'on' : 'off'}, invert=${viewInvert ? 'on' : 'off'}, smooth=${smoothText}.`;
 }
 
 function candidateCell(c) {
@@ -306,6 +326,7 @@ async function refreshState(updateTitle=true) {
 }
 
 async function startBrowser() {
+  if (startBusy) return;
   const cfg = activeDatasetOptions();
   if (!cfg || !cfg.enabled) {
     setStatus('Selected dataset is not available yet.', true);
@@ -328,13 +349,21 @@ async function startBrowser() {
     tiles_per_page: tilesPageRaw ? Number(tilesPageRaw) : null,
     all_tiles: maxTiles
   };
-  setStatus('Building browser state...');
-  await fetchJson('/api/start', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
-  page = 0;
-  showDetect = false;
-  resetViewDefaults();
-  await refreshState();
-  await loadPage(0);
+  startBusy = true;
+  document.getElementById('startButton').disabled = true;
+  try {
+    setStatus('Building browser state...');
+    await fetchJson('/api/start', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+    page = 0;
+    showDetect = false;
+    resetViewDefaults();
+    await refreshState();
+    await loadPage(0);
+  } finally {
+    startBusy = false;
+    const currentCfg = activeDatasetOptions();
+    document.getElementById('startButton').disabled = !currentCfg || !currentCfg.enabled;
+  }
 }
 
 function viewData() {
@@ -540,27 +569,51 @@ async function detectPage() {
     return;
   }
   detectBusy = true;
+  const detectSession = state.session_name;
   document.getElementById('detect').disabled = true;
   document.getElementById('detect').textContent = 'Detecting...';
   document.getElementById('viewButton').disabled = true;
   setStatus('Running CELLECT detection on the current page...');
+  let polling = false;
+  const timer = setInterval(async () => {
+    if (polling) return;
+    polling = true;
+    try {
+      const progress = await fetchJson('/api/detect_status');
+      if (detectBusy && !['idle', 'done', 'failed'].includes(progress.stage)) {
+        const label = {loading_model: 'loading model', preparing_inputs: 'reading / scaling inputs',
+          inference: 'model inference', decoding_masks: 'decoding masks'}[progress.stage] || progress.stage;
+        setStatus(`Detecting ... ${label}: ${progress.completed}/${progress.total} images, ${Math.round(progress.elapsed_seconds || 0)} s elapsed.`);
+      }
+    } catch (_) { /* The main detection request reports errors. */ }
+    finally { polling = false; }
+  }, 1500);
   try {
     const result = await fetchJson('/api/detect_page', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({page})
+      body: JSON.stringify({page, session_name: detectSession})
     });
+    if (result.n_images === 0 && result.n_failed_images > 0) {
+      throw new Error(`Detection failed: ${(result.errors || []).join(' | ')}`);
+    }
     showDetect = true;
     imageVersion += 1;
-    setStatus(`Detected current page: ${result.n_images} images, ${result.n_detections} detections.`);
     if (window.SnrControls && SnrControls.isEnabled()) {
       await SnrControls.prepare();
     }
     await refreshState(false);
+    if (detectSession && state.session_name !== detectSession) {
+      showDetect = false;
+      throw new Error('Browser session changed in another tab. Reload this page and run Detect again.');
+    }
     await loadPage(page, true);
+    const failureText = result.n_failed_images ? ` Failed images: ${result.n_failed_images}. ${(result.errors || []).join(' | ')}` : '';
+    setStatus(`Detected current page: ${result.n_images} images, ${result.n_detections} detections.${failureText}`, Boolean(result.n_failed_images));
   } catch (err) {
     setStatus(String(err), true);
   } finally {
+    clearInterval(timer);
     detectBusy = false;
     document.getElementById('detect').disabled = false;
     document.getElementById('detect').textContent = showDetect ? 'Hide Detect' : 'Detect';
@@ -596,13 +649,25 @@ async function exportSelected() {
     finally { polling = false; }
   }, 2000);
   try {
+    const confidenceView = {};
+    if (typeof window !== 'undefined' && window.ScaleControls) {
+      for (const entry of ScaleControls.params()) {
+        const split = entry.indexOf('=');
+        confidenceView[decodeURIComponent(entry.slice(0, split))] = decodeURIComponent(entry.slice(split + 1));
+      }
+      confidenceView.input_image = ScaleControls.isInputMode();
+      confidenceView.invert_background = viewInvert;
+      confidenceView.smooth_mode = smoothEnabled ? smoothMode : 'none';
+      confidenceView.smooth_sigma = smoothSigma;
+      confidenceView.smooth_radius = smoothRadius;
+    }
     const result = await fetchJson('/api/export', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({write_png: true, workers})
+      body: JSON.stringify({write_png: true, workers, ...(Object.keys(confidenceView).length ? {confidence_view: confidenceView} : {})})
     });
     const timing = Number.isFinite(result.elapsed_seconds) ? ` in ${result.elapsed_seconds.toFixed(1)} s (${result.workers} workers)` : '';
-    setStatus(`Exported ${result.n_exported} raw frames and ${result.n_detections} detections${timing} to ${result.out_dir}; mask PNGs use normal ZScale.`);
+    setStatus(`Exported ${result.n_exported} raw frames and ${result.n_detections} detections${timing} to ${result.out_dir}; confidence overlay uses current scaling; mask PNGs use normal ZScale.`);
   } finally {
     exportBusy = false;
     clearInterval(timer);
@@ -666,7 +731,7 @@ for (const id of ['pixelXInput', 'pixelYInput']) {
   });
 }
 document.getElementById('back').onclick = () => showMenu();
-document.getElementById('detect').onclick = () => detectPage();
+document.getElementById('detect').onclick = () => detectPage().catch(err => setStatus(String(err), true));
 document.getElementById('viewButton').onclick = (event) => {
   event.stopPropagation();
   document.getElementById('viewDropdown').classList.toggle('hidden');
@@ -707,6 +772,18 @@ if (window.SnrControls) {
     currentPage: () => page,
     detectActive: () => showDetect,
     statusText: viewStatusText,
+    reload: async () => {
+      updateViewMenu();
+      setStatus(viewStatusText());
+      await loadPage(page, true);
+    }
+  });
+}
+if (window.MaskControls) {
+  MaskControls.init({
+    currentState: () => state,
+    setStatus,
+    detectActive: () => showDetect,
     reload: async () => {
       updateViewMenu();
       setStatus(viewStatusText());

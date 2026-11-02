@@ -32,6 +32,55 @@ class FakeDecoder:
 
 
 class FastFitsAndMasksTests(unittest.TestCase):
+    def test_selected_mask_quality_stability_and_valid_pixels(self):
+        class Decoder:
+            patch_size=8
+            def forward_sam_masks(self, embeds, indices, points, boxes, **kwargs):
+                low=torch.full((3,2,16,16),-3.)
+                low[0,1,4,2:11]=3.;low[0,1,4,11]=.5  # 9/10 stable.
+                low[2,1,6,2:12]=3.;low[2,1,8,8]=.5  # Ignore invalid fringe.
+                return low,torch.tensor([[.1,.8],[.1,.9],[.1,1.2]])
+        rows=[dict(x=8.,y=8.,major=2.,minor=1.,theta=0.) for _ in range(3)]
+        valid=np.ones((16,16),bool);valid[8,8]=False
+        masks=decode_masks(Decoder(),{'image_embeddings':torch.zeros(1,1,2,2)},rows,
+            device=torch.device('cpu'),width=16,height=16,chunk_size=3,valid_mask=valid)
+        np.testing.assert_allclose(masks['selected_pred_iou'],[.8,.9,1.2])
+        np.testing.assert_allclose(masks['stability_score'],[.9,0,1])
+        np.testing.assert_array_equal(masks['selected_area'],[10,0,10])
+        np.testing.assert_array_equal(masks['row_indices'],[0,2])
+
+    def test_mask_filter_boundaries_raw_scores_and_cached_selection(self):
+        state=object.__new__(BrowserState)
+        values=[(.8,.9,10),(.79,1.,10),(1.,.89,10),(10.,1.,10),(1.,1.,0),(np.nan,1.,10)]
+        rows=[dict(x=float(i),y=2.,mask_pred_iou=float(np.float32(a)),
+                   mask_stability=float(np.float32(b)),mask_area=c) for i,(a,b,c) in enumerate(values)]
+        state.detect_rows_by_token={'t':rows}
+        state._masks_for_token=Mock(side_effect=AssertionError('Unexpected inference'))
+        self.assertEqual(state._mask_filtered_rows('t',rows),[rows[0],rows[3]])
+        snr_rows=[dict(r,snr=12.) for r in rows[:3]]
+        self.assertEqual(state._mask_filtered_rows('t',snr_rows),[snr_rows[0]])
+        self.assertEqual(len(state.detect_rows_by_token['t']),6)
+        for a,b in [(np.nan,.9),(.8,float('inf')),(-.1,.9),(.8,1.1)]:
+            with self.assertRaises(ValueError):state._mask_filtered_rows('t',rows,a,b)
+
+    def test_mask_and_snr_filters_share_shape_and_mask_selection(self):
+        from eval.hsctiles import browser_core
+        state=object.__new__(BrowserState)
+        rows=[dict(x=float(i+4),y=6.,major=2.,minor=1.,theta=0.,
+                   mask_pred_iou=a,mask_stability=b,mask_area=10) for i,(a,b) in enumerate([(.9,.95),(.7,1.),(.95,.8)])]
+        state.detect_rows_by_token={'t':rows};state._snr_filtered_rows=lambda *args:[dict(r) for r in rows[:2]]
+        state.ref_by_token={'t':Mock()};state._detection_image_for_ref=lambda ref:np.ones((16,16))
+        state._scaled_input_for_token=lambda token:np.ones((3,16,16))
+        state.scaling_mode='log_lupton';state.clip_threshold=5.
+        state._mask_overlay=Mock(side_effect=lambda image,token,selected:image)
+        for input_image in [False,True]:
+            with patch.object(browser_core,'_display_input_shape_overlay_uint8',return_value=np.zeros((16,16,3),np.uint8)) as raw, \
+                 patch.object(browser_core,'_input_shape_overlay_uint8',return_value=np.zeros((16,16,3),np.uint8)) as scaled:
+                state.image_png('t',detect=True,input_image=input_image,show_masks=True,snr_filter=True,mask_filter=True)
+                used=(scaled if input_image else raw).call_args.args[1]
+                self.assertEqual([r['x'] for r in used],[4.])
+                self.assertEqual(state._mask_overlay.call_args.args[2],used)
+
     def test_cache_is_bounded(self):
         cache=ArrayCache(10)
         cache.put('a',np.zeros(6,np.uint8));cache.put('b',np.zeros(6,np.uint8))

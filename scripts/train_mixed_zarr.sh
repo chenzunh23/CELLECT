@@ -48,6 +48,7 @@ common=(--mode "$MODE" --data-format zarr --root "$ROOT" --bands all --checkpoin
   --zarr-random-image-batches --zarr-chunk-local-batches --zarr-worker-owned-chunks
   --zarr-shuffle-within-chunk
   --batch-size "${BATCH_SIZE:-20}" --num-workers "${WORKERS:-4}"
+  --loader-start-method "${LOADER_START_METHOD:-spawn}"
   --pin-memory --persistent-workers --prefetch-factor 2 --seed "${SEED:-7}"
   --device cuda --amp bf16
   --model-variant sam_per_band --sam-model-type "$SAM_MODEL_TYPE" --sam-checkpoint "$SAM_CKPT"
@@ -55,7 +56,7 @@ common=(--mode "$MODE" --data-format zarr --root "$ROOT" --bands all --checkpoin
   --no-sam-decoder-film --no-sam-encoder-style-prompt
   --style-prompt-dim 32 --style-adapter-dim 32
   --style-router-temperature 1 --style-router-loss-weight 0.1
-  --sam-compile --sam-compile-backend inductor --sam-compile-mode default
+  --sam-compile-backend inductor --sam-compile-mode default
   --lr "${LR:-0.0000707}" --sam-encoder-lr "${ENCODER_LR:-0.00001414}"
   --weight-decay 0.1 --sam-warmup-ratio 0
   --sam-lr-drop-fractions 0.7 0.9 --sam-lr-drop-gamma 0.1
@@ -96,9 +97,28 @@ common=(--mode "$MODE" --data-format zarr --root "$ROOT" --bands all --checkpoin
   --mask-outside-kron-scale 1.5 --mask-area-ratio-lower 0.05 --mask-area-ratio-upper 2
   --mask-min-area-px 6 --mask-max-area-ratio 0.8 
   --ddp-static-graph off --ddp-progress-step-mode global --ddp-timeout-minutes 60
-  --wandb-project Astro_CELLECT2D_SAM --wandb-log-interval 10
+  --wandb-project Astro_DEBUG --wandb-log-interval 10
   --wandb-run-name "${WANDB_RUN_NAME:-cellect_${SAM_MODEL_TYPE}_pred_iou_1002}"
   --wandb-mode "${WANDB_MODE:-online}")
+case "${SAM_COMPILE:-1}" in
+  1|on|true) common+=(--sam-compile) ;;
+  0|off|false) common+=(--no-sam-compile) ;;
+  *) echo 'SAM_COMPILE must be 1/0, on/off, or true/false' >&2; exit 1 ;;
+esac
+case "${ADAM_STATE_LOG:-0}" in
+  1|on|true) common+=(--adam-state-log --adam-state-log-interval "${ADAM_STATE_LOG_INTERVAL:-100}") ;;
+  0|off|false) ;;
+  *) echo 'ADAM_STATE_LOG must be 1/0, on/off, or true/false' >&2; exit 1 ;;
+esac
+if [[ ${GRADIENT_DEBUG:-0} == 1 || -n ${GRADIENT_DEBUG_PROBES:-} ]]; then
+  common+=(--gradient-debug
+    --gradient-debug-interval "${GRADIENT_DEBUG_INTERVAL:-500}"
+    --gradient-debug-samples-per-dataset "${GRADIENT_DEBUG_SAMPLES:-2}"
+    --gradient-debug-batch-size "${GRADIENT_DEBUG_BATCH_SIZE:-1}")
+  if [[ -n ${GRADIENT_DEBUG_PROBES:-} ]]; then
+    common+=(--gradient-debug-probes "$GRADIENT_DEBUG_PROBES")
+  fi
+fi
 # Keep old runs unchanged unless explicitly enabled. A new PromptIR checkpoint
 # is auto-detected when PROMPT_IR is unset; PROMPT_IR=0 explicitly disables it.
 if [[ -n ${PROMPT_IR:-} ]]; then

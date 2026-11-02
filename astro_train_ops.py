@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from utils.detection_metadata import sample_band_name, valid_predictions
+from utils.hang_debug import watch_training_hangs
 
 import json
 import math
@@ -330,6 +331,17 @@ def clear_sam_encoder_grads(model: nn.Module) -> int:
     if not isinstance(encoder, nn.Module):
         return 0
     return _clear_module_grads(encoder)
+
+
+def clear_sam_mask_grads(model: nn.Module) -> int:
+    """Skip AdamW decay, momentum and step advancement on inactive mask steps.
+
+    Keep DDP's zero-valued forward anchors, but remove the gradients they create
+    after backward. This also applies to interval-skipped mask updates.
+    """
+    base = unwrap_model(model)
+    return sum(_clear_module_grads(module) for name in ("prompt_encoder", "mask_decoder")
+               if isinstance(module := getattr(base, name, None), nn.Module))
 
 
 def clear_named_optimizer_group_grads(optimizer: torch.optim.Optimizer, group_name: str) -> int:
@@ -2789,6 +2801,7 @@ def _update_detection_totals(
             _accumulate_link_metrics(link_metrics_total, item_metrics)
 
 
+@watch_training_hangs
 def run_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -2830,6 +2843,8 @@ def run_epoch(
     freeze_sam_encoder: bool = False,
     mask_loss_interval: int = 1,
     mask_loss_interval_scale: bool = True,
+    gradient_debugger=None,
+    adam_state_logger=None,
 ) -> Dict[str, float]:
     training = optimizer is not None
     model.train(training)
@@ -2869,6 +2884,7 @@ def run_epoch(
     debug_start = int(debug_batch_start)
     debug_end = int(debug_batch_end) if int(debug_batch_end) >= 0 else debug_start
     debug_enabled = debug_start >= 0
+    watchdog = getattr(gradient_debugger, 'watchdog', None)
 
     def _sync_debug(active: bool) -> None:
         if active and device.type == "cuda":
@@ -2883,6 +2899,8 @@ def run_epoch(
         return f" mem_alloc={allocated:.2f}GiB mem_reserved={reserved:.2f}GiB mem_peak={peak:.2f}GiB"
 
     def _phase_debug(active: bool, label: str, seconds: float) -> None:
+        if watchdog is not None:
+            watchdog.mark('after_' + label)
         if active:
             print(
                 f"[debug-batch][rank={rank}] epoch={epoch_index} batch={batch_idx} "
@@ -2959,6 +2977,9 @@ def run_epoch(
         unit="global-batch",
     )
     for batch_idx, batch in enumerate(loader):
+        if watchdog is not None:
+            watchdog.mark('data_received', epoch=int(epoch_index), batch=int(batch_idx),
+                          names=[str(n) for n in batch.get('name', [])][:4])
         optimizer_step = int(global_step_start) // step_scale + int(batch_idx) + 1
         current_step = int(global_step_start) + (int(batch_idx) + 1) * step_scale
         debug_this_batch = debug_enabled and debug_start <= int(batch_idx) <= debug_end
@@ -3106,12 +3127,57 @@ def run_epoch(
                 clear_sam_proposal_grads(base_model)
             if freeze_sam_encoder:
                 clear_sam_encoder_grads(base_model)
+            if not mask_active:
+                clear_sam_mask_grads(base_model)
             _sync_debug(debug_this_batch)
             t_backward = time.perf_counter()
             _phase_debug(debug_print, "backward", t_backward - t_extra_loss)
             optimizer.step()
+            if adam_state_logger is not None:
+                adam_state_logger.maybe_log(base_model, optimizer,
+                    optimizer_step=optimizer_step, iteration=current_step,
+                    epoch=epoch_index, mask_active=mask_active)
             if scheduler_step is not None:
                 scheduler_step()
+            if gradient_debugger is not None and optimizer_step % gradient_debugger.interval == 0:
+                if watchdog is not None:
+                    watchdog.mark('gradient_probe')
+                def probe_losses(probe_model, probe_batch):
+                    probe_image = probe_batch['image'].to(device=device, dtype=torch.float32)
+                    with _autocast_context(device, amp_dtype):
+                        probe_outputs = model_forward_with_batch_context(probe_model, probe_image, probe_batch)
+                        proposal = dense_losses_any(probe_outputs, probe_batch, weights=weights,
+                            device=device, center_radius_px=center_radius_px)['total']
+                        if triplet_enabled:
+                            proposal = proposal + weights.triplet_outer_weight * embedding_triplet_loss(
+                                probe_outputs, probe_batch, loss_fn=triplet_loss_fn,
+                                max_sources_per_group=triplet_max_sources_per_group, negative_scope=triplet_negative_scope)
+                        for enabled, module_name, mode in ((ex_enabled,'EX','ex'),(en_enabled,'EN','en')):
+                            if enabled and hasattr(probe_model,module_name) and (mode!='ex' or probe_image.shape[1]>1):
+                                proposal = proposal + weights.matcher_outer_weight * vectorized_matcher_classification_loss(
+                                    getattr(probe_model,module_name),probe_outputs,probe_batch,mode=mode,
+                                    candidate_count=matcher_candidate_count,offset_scale=center_radius_px,
+                                    band_pairs=ex_band_pairs if mode=='ex' else None,
+                                    max_anchors_per_band=matcher_max_anchors_per_band)
+                        mask = proposal.new_zeros(())
+                        probe_stats = {'mask_outer_weight':float(effective_mask_outer_weight),
+                                       'mask_interval_scale':float(mask_weight_scale),'mask_active':float(mask_active)}
+                        if mask_active:
+                            probe_masks = sam_prompt_mask_losses(probe_model,probe_outputs,probe_batch,
+                                weights=weights,device=device,epoch_index=epoch_index,threshold=threshold,
+                                nms_radius=nms_radius,confidence_score=confidence_score,
+                                use_ordinal_expectation=use_ordinal_expectation,
+                                debug_ordinal_expectation=debug_ordinal_expectation,
+                                center_refinement=center_refinement,center_refinement_radius=center_refinement_radius,
+                                ellipse_sigma=ellipse_sigma,detect_centers_fn=detect_centers_tensors)
+                            mask = float(effective_mask_outer_weight)*float(mask_weight_scale)*probe_masks['total']
+                            for key in ('prompts','gt_prompts','pred_prompts','supervised_prompts'):
+                                probe_stats['mask_'+key]=float(probe_masks[key].detach())
+                    return {'proposal_loss':proposal,'mask_loss':mask,'stats':probe_stats}
+                frozen = (('decoder.',) if freeze_sam_proposal else ()) + (('encoder.',) if freeze_sam_encoder else ())
+                gradient_debugger.maybe_probe(base_model,optimizer,optimizer_step=optimizer_step,
+                    iteration=current_step,epoch=epoch_index,device=device,loss_fn=probe_losses,
+                    frozen_prefixes=frozen)
             _sync_debug(debug_this_batch)
             t_step = time.perf_counter()
             _phase_debug(debug_print, "step", t_step - t_backward)
@@ -3228,6 +3294,8 @@ def run_epoch(
             local_metrics["epoch"] = float(epoch_index)
             local_metrics["iteration"] = float(current_step)
             iteration_log_fn(local_metrics, current_step)
+        if watchdog is not None:
+            watchdog.mark('before_progress_update')
         progress.update(step_scale)
         _sync_debug(debug_this_batch)
         t_done = time.perf_counter()
@@ -3244,6 +3312,8 @@ def run_epoch(
                 flush=True,
             )
         data_wait_start = time.perf_counter()
+        if watchdog is not None:
+            watchdog.mark('waiting_for_next_batch', next_batch=int(batch_idx)+1)
     progress.close()
     if distributed and dist.is_available() and dist.is_initialized():
         keys = list(sums.keys())

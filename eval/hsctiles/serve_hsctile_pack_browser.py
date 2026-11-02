@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -72,6 +73,16 @@ def _resolve_checkpoint_path(path: Path) -> Path:
     return path
 
 
+def _configure_threaded_warnings() -> None:
+    # Astropy's warning logger scans the live sys.modules dictionary to find
+    # each warning's origin. Concurrent imports can raise RuntimeError during
+    # that scan and turn an ordinary WCS warning into a failed tile selection.
+    # Keep warnings visible through Python's standard warning handler instead.
+    from astropy import log
+    if log.warnings_logging_enabled():
+        log.disable_warnings_logging()
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "HscPackBrowser/1.0"
 
@@ -83,7 +94,7 @@ class Handler(BaseHTTPRequestHandler):
         return state
 
     def log_message(self, format: str, *args: Any) -> None:
-        print(f"{self.address_string()} - {format % args}")
+        print(f"{self.address_string()} - {format % args}", flush=True)
 
     def _send_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -159,6 +170,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(state.state_payload() if state is not None else {"started": False})
             elif parsed.path == "/api/export_status":
                 self._send_json(self.state.export_status())
+            elif parsed.path == "/api/detect_status":
+                self._send_json(self.state.detect_status())
             elif parsed.path == "/api/page":
                 page = int(parse_qs(parsed.query).get("page", ["0"])[0])
                 self._send_json(self.state.page_payload(page))
@@ -240,6 +253,7 @@ class Handler(BaseHTTPRequestHandler):
                     show_shape=show_shape,
                     show_center=show_center,
                     show_masks=query.get("masks", ["0"])[0] in {"1", "true", "yes"},
+                    show_confidence=query.get("confidence", ["0"])[0] in {"1", "true", "yes"},
                     smooth_mode=smooth_mode,
                     smooth_sigma=smooth_sigma,
                     smooth_radius=smooth_radius,
@@ -253,6 +267,9 @@ class Handler(BaseHTTPRequestHandler):
                     snr_filter=query.get("snr_filter", ["0"])[0] in {"1", "true", "yes"},
                     snr_method=query.get("snr_method", ["ap2"])[0],
                     snr_threshold=snr_threshold,
+                    mask_filter=query.get("mask_filter", ["0"])[0] in {"1", "true", "yes"},
+                    mask_pred_iou=float(query.get("mask_pred_iou", ["0.8"])[0]),
+                    mask_stability=float(query.get("mask_stability", ["0.9"])[0]),
                 )
                 elapsed = time.perf_counter() - image_started
                 if elapsed >= 1:
@@ -277,8 +294,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             payload = self._read_json()
             if parsed.path == "/api/start":
-                self.server.start_browser(payload)  # type: ignore[attr-defined]
-                self._send_json(self.state.state_payload())
+                state = self.server.start_browser(payload)  # type: ignore[attr-defined]
+                self._send_json(state.state_payload())
             elif parsed.path == "/api/set_patch":
                 self.state.set_patch(str(payload["patch"]))
                 self._send_json(self.state.state_payload())
@@ -289,8 +306,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.state.set_selected([str(token) for token in tokens], bool(payload.get("selected", True)))
                 self._send_json(self.state.state_payload())
             elif parsed.path == "/api/detect_page":
-                page = int(payload.get("page", 0))
-                self._send_json(self.state.detect_page(page))
+                self._send_json(self.server.detect_page(payload))  # type: ignore[attr-defined]
             elif parsed.path == "/api/prepare_snr":
                 page = int(payload.get("page", 0))
                 method = str(payload.get("method", "ap2"))
@@ -311,7 +327,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"selection_csv": str(path), "n_selected": len(self.state.selected), "n_mask_images": len(mask_paths), "mask_paths": mask_paths})
             elif parsed.path == "/api/export":
                 result = self.state.export_selected(write_png=bool(payload.get("write_png", True)),
-                                                    workers=payload.get("workers"))
+                                                    workers=payload.get("workers"),
+                                                    confidence_view=payload.get("confidence_view"))
                 self._send_json(result)
             else:
                 self._send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
@@ -321,9 +338,11 @@ class Handler(BaseHTTPRequestHandler):
 
 class Server(ThreadingHTTPServer):
     def __init__(self, addr: tuple[str, int], args: argparse.Namespace) -> None:
+        _configure_threaded_warnings()
         super().__init__(addr, Handler)
         self.args = args
         self.browser_state: BrowserState | None = None
+        self._session_lock = threading.Lock()
         self._data_quality_preview: DataQualityPreview | None = None
 
     @property
@@ -508,7 +527,33 @@ class Server(ThreadingHTTPServer):
             "by_dataset": by_dataset,
         }
 
-    def start_browser(self, payload: dict[str, Any]) -> None:
+    def start_browser(self, payload: dict[str, Any]) -> BrowserState:
+        # A second Go (including from another tab) must not replace the state
+        # while it is being built or while Detect writes results to that state.
+        if not self._session_lock.acquire(blocking=False):
+            raise RuntimeError("Browser initialization or detection is already running; wait for it to finish.")
+        try:
+            self._start_browser(payload)
+            return self.browser_state
+        finally:
+            self._session_lock.release()
+
+    def detect_page(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self._session_lock.acquire(blocking=False):
+            raise RuntimeError("Browser initialization or detection is already running; wait for it to finish.")
+        try:
+            state = self.browser_state
+            if state is None:
+                raise RuntimeError("Start the browser before detection.")
+            expected = payload.get("session_name")
+            if expected and expected != state.session_name:
+                raise RuntimeError("Browser session changed in another tab. Reload this page before detecting.")
+            result = state.detect_page(int(payload.get("page", 0)))
+            return {**result, "session_name": state.session_name}
+        finally:
+            self._session_lock.release()
+
+    def _start_browser(self, payload: dict[str, Any]) -> None:
         dataset = str(payload.get("dataset") or self.args.dataset)
         if dataset not in ({"hsc_raw", "sitian", "hsc_image", "ztf"} | JWST_DATASETS):
             raise NotImplementedError(f"{dataset_label(dataset)} is a placeholder")
@@ -750,7 +795,8 @@ def main() -> None:
                 "export_dir": str(Path(args.export_dir).expanduser().resolve()),
             },
             indent=2,
-        )
+        ),
+        flush=True,
     )
     try:
         server.serve_forever()

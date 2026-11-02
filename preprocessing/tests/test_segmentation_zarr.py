@@ -35,6 +35,28 @@ def task(root):
 
 
 class SegmentationZarrTests(unittest.TestCase):
+    def test_catalog_domain_masks_labels_without_erasing_image_context(self):
+        from preprocessing.utils.inputs import TileSpec
+        lab=labels();lab.source_ids=np.array([100,200]);lab.label_classes=np.array([1,1])
+        lab.geom_x=np.array([0.,12.]);lab.geom_y=np.array([8.,12.])
+        lab.geom_major=lab.geom_minor=np.array([2.,2.]);lab.geom_theta=np.zeros(2)
+        lab.strict_x=np.array([0.,1.]);lab.strict_y=np.array([8.,8.]);lab.strict_ids=np.array([999,998])
+        domain=np.ones((32,32),bool);domain[:,0]=False
+        observed=np.ones((32,32),bool);observed[8,1]=False
+        with tempfile.TemporaryDirectory() as td,patch('preprocessing.build_image_level_zarr._scale_image_chw',side_effect=lambda image,task:image[None]):
+            result=write_classified_patch(task(td),np.ones((32,32),np.float32),lab,
+                tile_specs=[TileSpec('one',0,0,16)],valid_mask=observed,input_valid_mask=np.ones((32,32),bool),
+                supervision_mask=domain,max_invalid_fraction=.1)
+            group=zarr.open_group(result['output'],mode='r')
+            self.assertTrue(np.all(group['images'][0,0,:, :,0]==1))
+            self.assertFalse(group['band_valid_mask'][0,0,:,0].any())
+            self.assertFalse(group['band_confidence'][0,0,:,0].any())
+            self.assertFalse(group['band_conf_weight'][0,0,:,0].any())
+            self.assertEqual(set(group['strict_center_only_ids'][:]),{998})
+            self.assertEqual(set(group['source_ids'][:]),{200})
+            self.assertGreater(group['band_confidence'][0,0,8,1],0)
+            self.assertEqual(group.attrs['supervision_domain'],'caller_coverage_intersection')
+
     def test_tiling_preserves_global_ids_and_origin(self):
         lab = labels()
         lab.segmentation_ids = np.zeros((32,32), np.int32)

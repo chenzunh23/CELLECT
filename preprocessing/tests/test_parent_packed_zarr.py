@@ -18,6 +18,19 @@ def only_names(batch):
 
 
 class ParentPackingTests(unittest.TestCase):
+ def test_empty_rebuild_removes_stale_store_only_after_success(self):
+  from preprocessing.utils.parent_zarr import ParentStoreAssembly
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td);assembly=ParentStoreAssembly(task(root/'zarr'),root/'scratch')
+   old=assembly.output;old.mkdir(parents=True);(old/'.zattrs').write_text('{}')
+   other=old.with_name('another.zarr');other.mkdir()
+   for suffix in ('_manifest.json','_tile_filter.json'):Path(str(old)+suffix).write_text('{}')
+   self.assertIsNone(assembly.finish())
+   self.assertFalse(old.exists());self.assertTrue(other.exists())
+   self.assertFalse(Path(str(old)+'_manifest.json').exists())
+   self.assertFalse(Path(str(old)+'_tile_filter.json').exists())
+   self.assertFalse(assembly.scratch.exists())
+
  def test_merge_and_sampling(self):
   with tempfile.TemporaryDirectory() as td,patch('preprocessing.build_image_level_zarr._scale_image_chw',side_effect=lambda image,task:image[None]):
    root=Path(td);lab=labels();lab.source_ids=np.array([100]);lab.label_classes=np.array([1]);lab.geom_x=lab.geom_y=np.array([8.]);lab.geom_major=lab.geom_minor=np.array([3.]);lab.geom_theta=np.zeros(1)

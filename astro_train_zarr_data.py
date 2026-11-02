@@ -308,6 +308,7 @@ class ZarrChunkBatchIterableDataset(IterableDataset):
         shuffle_within_chunk: bool = True,
         equalize_replicas: bool = False,
         augment: bool = False,
+        multiprocessing_context: str | None = None,
         **dataset_kwargs,
     ) -> None:
         super().__init__()
@@ -323,7 +324,9 @@ class ZarrChunkBatchIterableDataset(IterableDataset):
         self.sample_dataset = ZarrCutoutDataset(self.records, augment=augment, **dataset_kwargs)
         self._chunks = _build_zarr_record_chunks(self.records)
         self._preserve_parent_tails = self.drop_last and _new_parent_tail_policy(self.records)
-        self._epoch = mp.Value("i", 0)
+        # The epoch semaphore must come from the same context as DataLoader.
+        # A fork-context SemLock cannot be passed to spawned worker processes.
+        self._epoch = mp.get_context(multiprocessing_context).Value("i", 0)
 
     def set_epoch(self, epoch: int) -> None:
         with self._epoch.get_lock():

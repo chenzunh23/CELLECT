@@ -1,0 +1,46 @@
+Adam 状态记录与 mask warmup（2026-11-02）
+
+启用
+在原有 scripts/train_mixed_zarr.sh 命令前增加：
+ADAM_STATE_LOG=1 ADAM_STATE_LOG_INTERVAL=100
+默认不记录；开启后默认每 100 次 optimizer.step 记录一次。
+Python 参数：--adam-state-log --adam-state-log-interval 100。
+不依赖 GRADIENT_DEBUG，也不依赖 --wandb-log-interval；无需额外 forward/backward。
+
+输出
+当前训练 W&B run 下 adam/encoder/*、adam/proposal_decoder/*、adam/mask_decoder/*。
+本地 OUT/adam_state/metrics.jsonl；W&B 不可用或关闭时仍记录本地文件。
+仅 rank 0 统计其同步后的参数/优化器状态，不增加分布式 collective。
+每 100 batch 是每 100 次优化器更新；双卡界面若用 global-batch 计数，对应间隔 200。
+JSONL 同时记录 optimizer_step、网页/训练 iteration、epoch_index（从 0 开始）及 mask_active。
+
+模块范围
+encoder：encoder.*，包括 neck 及放在 encoder 内的适配模块。
+proposal_decoder：decoder.*，包括 source heads、PromptIR 和图像条件分支。
+mask_decoder：mask_decoder.* + prompt_encoder.*。
+仅统计优化器中的参数，不含固定 buffers 或 EX/EN matcher；不同大小模块同时提供 norm 和 RMS。
+
+主要指标
+parameter_norm / parameter_rms：参数的 L2 范数和 RMS。
+gradient_norm / gradient_rms：本次更新所用梯度；RMS 分母为 grad 非 None 的参数元素数。
+exp_avg_norm / exp_avg_rms：Adam 一阶动量；RMS 分母为已有状态的参数元素数。
+exp_avg_sq_mean / exp_avg_sq_max：二阶矩均值和最大值。
+sqrt_exp_avg_sq_rms：sqrt(mean(exp_avg_sq))，不是 mean(sqrt(exp_avg_sq))。
+bias_corrected_exp_avg_norm / bias_corrected_sqrt_exp_avg_sq_rms：按各参数自身 step 去偏后的对应统计。
+adaptive_step_norm / adaptive_step_rms：根据本次更新后的 m、v、step 和本次 LR 重建的 Adam 自适应更新幅度，支持 AMSGrad。
+adaptive_step_to_weight_ratio：上述更新 L2 / 本次参与更新的参数 L2。
+该更新量不含 AdamW 解耦权重衰减，也不是通过快照测得的完整参数差；参数范数取更新后值。
+step_min / step_max：已有状态参数的最小/最大 Adam step；无状态时为 0。
+initialized_fraction：已有 Adam 状态的参数元素比例。
+active_fraction：本次 grad 非 None 的参数元素比例。
+lr_min / lr_max：模块中各参数组的 LR 范围，可反映 PromptIR 独立 LR。
+grad=None 的参数不计入本次更新，但已有的动量仍会被统计；不会因为记录而创建优化器状态。
+这是汇总指标，不上传逐参数张量，也不保存可精确恢复训练的完整 optimizer checkpoint。
+
+mask warmup 修复
+DDP 的零值 forward 连接保留，以维持参数发现与同步行为。
+在 backward 完成后、optimizer.step 前，当 mask_loss 未开启或本次按间隔跳过时，
+将 prompt_encoder/mask_decoder 参数的 grad 设为 None。
+这样 AdamW 跳过其权重衰减、已有动量更新以及 step 累计；mask 正式开启时照常训练。
+此修复始终生效，与是否开启 Adam 状态记录无关。
+不会自动恢复旧 checkpoint 中已经衰减的权重或已经累计的优化器状态。

@@ -37,8 +37,10 @@
             </div>
             <button class="viewItem" data-view="shape"><span class="viewCheck"></span><span>Shape</span></button>
             <button class="viewItem" data-view="masks"><span class="viewCheck"></span><span>Show Masks</span></button>
+            <button class="viewItem" data-view="confidence"><span class="viewCheck"></span><span>Show Confidence</span></button>
             <button class="viewItem" data-view="center"><span class="viewCheck"></span><span>Center</span></button>
             <button class="viewItem" data-view="snrFilter"><span class="viewCheck"></span><span>SNR Filter</span></button>
+            <button class="viewItem" data-view="maskFilter"><span class="viewCheck"></span><span>Mask Filter</span></button>
             <button class="viewItem" data-view="invert"><span class="viewCheck"></span><span>Invert</span></button>
             <button class="viewItem" data-view="smooth"><span class="viewCheck"></span><span>Smooth</span></button>
           </div>
@@ -103,6 +105,10 @@
       </div>
     </section>
     <p class="status" id="status"></p>
+    <p id="confidenceLegend" class="hidden" style="font-size:13px">Confidence (pixel argmax, before threshold / NMS):
+      <span style="color:#2673ff">■ 1</span> · <span style="color:#00f259">■ 2</span> ·
+      <span style="color:#ffd90d">■ 3</span> · <span style="color:#ff0d1a">■ 4</span> · 0 transparent
+    </p>
     <div class="grid" id="grid"></div>
   </main>
   <div id="searchOverlay" class="modalOverlay hidden">
@@ -182,6 +188,32 @@
       </div>
     </div>
   </div>
+  <div id="maskFilterOverlay" class="modalOverlay hidden">
+    <div class="smoothModal">
+      <div class="modalHeader">
+        <h2>Mask Filter</h2>
+        <button id="closeMaskFilter" title="Close">Close</button>
+      </div>
+      <div class="snrModalFields">
+        <div class="snrRow maskFilterRow">
+          <label for="maskPredIouInput">Pred IoU</label>
+          <input id="maskPredIouRange" type="range" min="0" max="1" step="0.01" value="0.8">
+          <input id="maskPredIouInput" type="number" min="0" max="1" step="0.01" value="0.8">
+        </div>
+        <div class="snrRow maskFilterRow">
+          <label for="maskStabilityInput">Stability</label>
+          <input id="maskStabilityRange" type="range" min="0" max="1" step="0.01" value="0.9">
+          <input id="maskStabilityInput" type="number" min="0" max="1" step="0.01" value="0.9">
+        </div>
+      </div>
+      <p class="modalStatus">Keep detections passing both thresholds. Shape, Center and Masks use the same selection.</p>
+      <p id="maskFilterStatus" class="modalStatus"></p>
+      <div class="modalActions">
+        <button id="maskFilterOffButton">Off</button>
+        <button class="primary" id="applyMaskFilterButton">Apply</button>
+      </div>
+    </div>
+  </div>
   <div id="scaleOverlay" class="modalOverlay hidden">
     <div class="scaleModal">
       <div class="modalHeader">
@@ -217,6 +249,7 @@
   </div>
   <script src="/pages/scale_controls.js"></script>
   <script src="/pages/snr_controls.js"></script>
+  <script src="/pages/mask_controls.js"></script>
   <script src="/pages/app.js"></script>
 </body>
 </html>

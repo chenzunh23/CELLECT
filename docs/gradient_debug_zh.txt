@@ -1,0 +1,110 @@
+训练梯度诊断（可选，默认关闭）
+
+固定区域与场景配置：见 configs/gradient_debug/README_zh.txt 和 abell_scenes.json。
+GRADIENT_DEBUG_PROBES=配置路径（或 --gradient-debug-probes）启用自选探针；
+默认记录原有数据集指标和各场景cohort指标，full不会重复计入cohort。
+
+在原训练命令前增加：
+  GRADIENT_DEBUG=1 GRADIENT_DEBUG_INTERVAL=500 GRADIENT_DEBUG_SAMPLES=2 \
+    GRADIENT_DEBUG_BATCH_SIZE=1 bash scripts/train_mixed_zarr.sh
+
+原有 ROOT、OUT、TRAIN_FILE、VAL_FILE、NPROC、学习率等环境变量照常保留。
+Python CLI 对应：
+  --gradient-debug
+  --gradient-debug-interval 500
+  --gradient-debug-samples-per-dataset 2
+  --gradient-debug-batch-size 1
+
+W&B：同一 project 下新建关联 run，group=gradient_debug，名称为
+<训练 run 名>-gradient_debug。训练 run 的全局 wandb.log 不会被切换。
+W&B disabled 或初始化失败时，仍写 OUT/gradient_debug/metrics.jsonl。
+失败记录写 errors.jsonl，诊断失败不会修改 optimizer 或终止正常训练。
+诊断 W&B run 关闭 console 捕获，仅主训练 run 捕获终端输出，避免重复包装 stdout/stderr。
+
+挂起定位：启用 gradient debug 后，默认连续 120 秒没有训练阶段进展时，
+直接向 OUT/gradient_debug/hang_stacks/rank<RANK>_pid<PID>.log 写入阶段、
+batch 和所有 Python 线程堆栈，不依赖 ptrace 或终端输出。
+--gradient-debug-hang-timeout 可调整秒数，<=0 关闭。监控从第一批数据到达后启动，
+独立于 --debug-batch-start/end 的打印窗口；无法覆盖尚未到达第一批的数据等待，
+或持续持有 GIL、不允许 Python 监控线程运行的底层调用。
+worker-owned Zarr loader 的 worker 也注册 SIGUSR2 堆栈处理器，必要时可对这些
+worker 执行 kill -USR2 <PID>，写入同目录 worker 日志；仅限已加载此处理器的进程。
+正常训练进展会重置计时，正常阶段不写堆栈。
+
+2026-11-01 挂起根因已定位：fork 的 rank0 worker 在 batch 序列化线程中，
+因 GC 触发继承的 W&B ServiceApi weakref finalizer，卡在 api_cleanup_request
+的 Future.result()；worker 不再发出 batch，主进程停在 DataLoader.__next__。
+因此训练 DataLoader 默认改用 spawn（--loader-start-method / LOADER_START_METHOD）。
+Zarr shared epoch Value 同时使用相同 multiprocessing context，保持 persistent
+workers 跨 epoch 的 shuffle 更新。WORKERS=4 可以保留；WORKERS=0 也可绕过该问题。
+此问题与模型 loss 或 compile 无直接关系；关闭 W&B console 捕获不能解决继承的 finalizer。
+
+数据分组：根据训练 records 的路径/元数据识别 hsc、cosmos、abell；
+其余记为 other。HSC 的 coadd/half/noisy 在同一 hsc 组。
+每组固定随机选择 N 个训练样本，首次加载后的增广与标签缓存固定；
+使用当前模型权重、当前 loss 权重、mask warmup、GT/pred prompt curriculum，
+以及当前 mask interval/scale 规则，在 eval 模式下求梯度。
+eval 只关闭 dropout 等随机行为，仍启用 autograd。
+诊断在 optimizer 更新之后执行，未做下一次 optimizer 更新。
+
+每个数据集记录三种梯度贡献：
+  proposal_loss：dense loss（confidence、shape 等，含其原有权重）；
+                 若启用其它 source/embedding/matcher loss，也计入。
+  mask_loss：mask 各分量原有加权和，再乘有效外层 mask 权重和 interval scale。
+  total：proposal_loss 梯度 + mask_loss 梯度。
+mask 未开启的阶段/iteration 会显示 mask 梯度为零，夹角无定义。
+
+参数范围：
+  mask：prompt_encoder + mask_decoder，包含 IoU prediction head；
+  proposal_decoder：source decoder，包含 PromptIR（若启用）；
+  encoder：共享 image encoder；
+  proposal：encoder + proposal_decoder；
+  full_model：全部参数块。
+仅统计 requires_grad、optimizer LR>0、且未被训练阶段清除梯度的参数。
+因此 source decoder 冻结、encoder 冻结或 LR=0 会反映到参数数量与梯度中。
+
+W&B 的主要指标示例：
+  gradient_debug/mask/total/norm/abell
+  gradient_debug/proposal/total/norm/abell
+  gradient_debug/proposal/mask_loss/norm/abell
+  gradient_debug/proposal/proposal_loss/norm/abell
+  gradient_debug/proposal/total/abell__cosmos/cosine
+  gradient_debug/proposal/total/abell__cosmos/angle_deg
+  gradient_debug/proposal/mask_vs_proposal/abell/angle_deg
+  gradient_debug/encoder/mask_vs_proposal/abell/angle_deg
+  gradient_debug/mask/total/abell__full/angle_deg
+
+angle_deg = acos(dot(g1,g2)/(norm(g1)*norm(g2)))，单位度。
+<90 度方向一致，>90 度表示局部一阶冲突。零范数的角度没有意义：
+defined=0 时不写 cosine/angle_deg，不能将缺值解释为 90 度。
+计算使用全部所选参数的真实梯度，不使用随机投影或梯度草图。
+记录的是 loss 梯度，不是 Adam 动量/预条件后的更新方向。
+
+full 的定义：
+  g_full = sum_d [训练 records 中该数据集的比例 * 该组探针的平均梯度]。
+这是按训练记录占比加权的完整混合数据集梯度估计；默认 N=2 不表示
+遍历了完整语料，也不一定等于某个混合 training minibatch 的精确梯度。
+归一化按 probe microbatch 的实际 loss 实现，再按样本数求组内平均。
+这很重要，因为 mask 的 per-source 分母与 training batch size 有关。
+data/* 指标保存各组样本数、record 数、占比、mask prompt 数和有效 mask 权重；
+JSONL 保存探针样本路径/波段，便于检查样本代表性。
+
+GRADIENT_DEBUG_SAMPLES=0 / --gradient-debug-samples-per-dataset 0：
+每次诊断在固定模型权重上遍历所有训练 records，计算对应 microbatch
+目标的全量均值梯度。计算量接近额外训练遍历，建议单卡专项诊断使用；
+DDP 下其余 ranks 会等待，耗时必须小于 process-group timeout。
+
+开销与隔离：
+默认每 500 次 optimizer update 检查一次，每组 2 张，依次使用 microbatch=1。
+每个 probe 额外求 proposal/mask 两路梯度，GPU 开销受 microbatch 与源数影响；
+真实梯度转存 CPU 后求点积，CPU 内存随参数量与数据集数增加。
+ViT-L 全参数诊断可能需要数 GB CPU 内存；增大 interval 可减少时间开销。
+DDP 仅 rank0 在原始 module 上运行探针，其余 ranks 通过 barrier 等待。
+不调用 DDP forward，不往 Parameter.grad 累积，不更新参数/optimizer，
+恢复原模型 train/eval 状态与 Python/NumPy/Torch RNG；只使用当前 GPU RNG。
+
+验证：
+tests/test_gradient_debug.py：精确梯度方向、混合梯度、零角度、样本缓存、
+冻结/LR=0、随机状态与 .grad 隔离，以及真实 run_epoch hook 下训练更新等价。
+tests/test_gradient_debug_ddp.py：两个 CPU/Gloo ranks 诊断后继续 DDP 更新，
+确认未触发诊断梯度的 DDP collectives、参数分歧或残留 .grad。

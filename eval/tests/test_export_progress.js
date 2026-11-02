@@ -11,7 +11,7 @@ const document = {getElementById(id) {
 let finish, poll;
 let progress = {stage: 'preparing', completed: 0, total: 8, workers: 4, elapsed_seconds: 5};
 const context = vm.createContext({
-  document, exportBusy: false, state: {n_selected: 8},
+  document, exportBusy: false, detectBusy: false, state: {n_selected: 8},
   fetchJson(url, options) {
     if (url === '/api/export_status') return Promise.resolve(progress);
     assert.deepEqual(JSON.parse(options.body), {write_png: true, workers: 4});
