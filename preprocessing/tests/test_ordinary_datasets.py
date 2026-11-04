@@ -9,7 +9,8 @@ from preprocessing.ordinary_common import OrdinaryInput, classify_ordinary_sourc
 from preprocessing.ordinary_a2744 import A2744OrdinaryConfig
 from preprocessing.meas_processing import classify_catalog_basics
 from preprocessing.utils.geometry import EllipseGeometry
-from preprocessing.snr import apply_remeasured_aperture_snr, remeasure_aperture_snr
+from preprocessing.snr import (SnrConfig, SnrThresholds, classify_snr, thresholds_from_args,
+    apply_remeasured_aperture_snr, remeasure_aperture_snr)
 
 
 def sources(x, a=None, flags=None, mag=None, snr=None, model=None, star=None):
@@ -30,6 +31,62 @@ def classify(data, dataset, **kwargs):
 
 
 class OrdinaryDatasetTests(unittest.TestCase):
+    def test_configurable_snr_preserves_dataset_classes_and_boundaries(self):
+        from preprocessing.ordinary_cosmos import CosmosOrdinaryConfig
+        values=np.array([4.99,5.,5.01,6.99,7.,7.01,np.nan,np.inf])
+        np.testing.assert_array_equal(classify_snr(values,is_narrow_band=False),
+            ['ignore','ignore','weak_shape','weak_shape','weak_shape','clean','ignore','ignore'])
+        data=sources(np.arange(len(values))*30,snr=values)
+        np.testing.assert_array_equal(classify(data,'cosmos').labels.source_class,
+            [3,3,4,4,1,1,3,3])
+        np.testing.assert_array_equal(classify(data,'a2744',config=A2744OrdinaryConfig(1)).labels.source_class,
+            [3,2,2,2,1,1,3,3])
+        old=SnrThresholds(3,5)
+        np.testing.assert_array_equal(classify(sources([0,30,60],snr=[3,4,5]),'cosmos',
+            config=CosmosOrdinaryConfig(snr_thresholds=old)).labels.source_class,[3,4,1])
+        np.testing.assert_array_equal(classify(sources([0,30,60],snr=[3,4,5]),'a2744',
+            config=A2744OrdinaryConfig(1,snr_thresholds=old)).labels.source_class,[2,2,1])
+        np.testing.assert_array_equal(classify_snr(np.array([3.,4.,5.]),is_narrow_band=False,
+            config=SnrConfig(broad_ignore_snr_max=3,broad_weak_shape_snr_max=5)),
+            ['ignore','weak_shape','weak_shape'])
+        np.testing.assert_array_equal(classify_snr(np.array([5.,6.,8.,9.]),is_narrow_band=True),
+            ['ignore','weak_shape','weak_shape','clean'])
+
+    def test_snr_cli_dataset_overrides_and_invalid_bounds(self):
+        from preprocessing.build_image_level_zarr import parse_args, _make_tasks
+        args=parse_args(['--output-root','/tmp/snr_config_test','--snr-ignore-threshold','4','--snr-weak-threshold','6',
+                         '--cosmos-snr-ignore-threshold','5','--cosmos-snr-weak-threshold','8'])
+        self.assertEqual(thresholds_from_args(args,'hsc'),SnrThresholds(4,6))
+        self.assertEqual(thresholds_from_args(args,'abell'),SnrThresholds(4,6))
+        self.assertEqual(thresholds_from_args(args,'cosmos'),SnrThresholds(5,8))
+        # Check the production task serialization, not just argument parsing.
+        import tempfile
+        from pathlib import Path
+        from preprocessing.training_batch import task_for
+        with tempfile.TemporaryDirectory() as tmp:
+            image=Path(tmp)/'coadd.fits';image.touch()
+            production=parse_args(['--output-root',tmp,'--patches','4,5','--bands','HSC-I',
+                '--dataset-sources','coadd','--hsc-snr-ignore-threshold','6',
+                '--hsc-snr-weak-threshold','9','--narrow-snr-weak-threshold','10'])
+            with patch('preprocessing.build_image_level_zarr._coadd_image_path',return_value=image):
+                tasks=_make_tasks(production)
+            self.assertEqual(len(tasks),1)
+            for task in (tasks[0],task_for(production,band='HSC-I')):
+                self.assertEqual((task.snr_ignore_threshold,task.snr_weak_threshold),(6,9))
+                self.assertEqual((task.narrow_snr_ignore_threshold,task.narrow_snr_weak_threshold),(5,10))
+        for bounds in ((7,5),(-1,5),(5,5),(np.nan,7),(5,np.inf)):
+            with self.assertRaises(ValueError):SnrThresholds(*bounds)
+
+    def test_low_snr_neighbor_does_not_demote_cosmos_with_new_lower_cut(self):
+        out=classify(sources([50,53],a=[10,2],snr=[10,4]),'cosmos')
+        np.testing.assert_array_equal(out.labels.source_class,[1,3])
+
+    def test_aperture_snr_uses_custom_bounds_without_promoting_strict_sources(self):
+        data=sources([0,30,60],snr=[100]*3)
+        out=classify(data,'a2744',config=A2744OrdinaryConfig(1,snr_thresholds=SnrThresholds(6,9)),
+            aperture_measurement=dict(snr=[5.99,6,9],trusted=[True]*3))
+        np.testing.assert_array_equal(out.labels.source_class,[3,4,1])
+
     def test_area_containment_matches_hsc(self):
         from preprocessing.utils.containment import area_fraction, boundary_fraction
         from preprocessing.ordinary_hsc import _contained_fraction
@@ -58,7 +115,7 @@ class OrdinaryDatasetTests(unittest.TestCase):
         def measure(image, geom, **kwargs):
             np.testing.assert_array_equal(np.isfinite(geom.x), [True, True, True, False])
             self.assertEqual(kwargs['radius'], 10)
-            return dict(snr=np.array([2., 4., 2., np.nan]), trusted=np.array([True, True, True, False]))
+            return dict(snr=np.array([2., 6., 2., np.nan]), trusted=np.array([True, True, True, False]))
         with patch('preprocessing.ordinary_a2744.remeasure_aperture_snr', side_effect=measure):
             result = classify(data, 'a2744', config=A2744OrdinaryConfig(1), image=np.ones((200, 200)))
         np.testing.assert_array_equal(result.labels.source_class, [3, 4, 3, 3])
@@ -91,7 +148,7 @@ class OrdinaryDatasetTests(unittest.TestCase):
                        'pu_refit_aperture_pixel_count': [10, 10, 10, 10, 1]})
         with patch('preprocessing.ordinary_hsc.compute_kron_ellipse', return_value=data.geometry):
             out = hsc(table, np.ones(5, bool), SourceLabels.empty(5),
-                      is_narrow_band=False, snr=np.array([2, 4, 6, np.nan, -1]))
+                      is_narrow_band=False, snr=np.array([2, 6, 8, np.nan, -1]))
         np.testing.assert_array_equal(out.labels.source_class, [3, 2, 1, 3, 4])
 
     def test_cosmos_categories_not_bits_and_photometry(self):
@@ -130,7 +187,7 @@ class OrdinaryDatasetTests(unittest.TestCase):
         self.assertTrue(np.isnan(measure(raw, h, 0, 0, 3, 2, 0, 7)['own_fill']))
 
     def test_star_not_promoted_by_photometry_or_snr(self):
-        data = sources([0, 30, 60], star=[True]*3, snr=[10, 2, 5])
+        data = sources([0, 30, 60], star=[True]*3, snr=[10, 2, 6])
         np.testing.assert_array_equal(classify(data, "cosmos").labels.source_class, [4, 3, 4])
 
     def test_low_snr_neighbor_cannot_demote_cosmos(self):
@@ -163,12 +220,12 @@ class OrdinaryDatasetTests(unittest.TestCase):
         np.testing.assert_array_equal(out.labels.source_class, [3, 1, 1])
 
     def test_snr_applies_to_strict_candidates(self):
-        data = sources(np.arange(5)*30, flags=[0]*5, snr=[-1, 2.99, 3, 5, np.nan])
+        data = sources(np.arange(5)*30, flags=[0]*5, snr=[-1, 4.99, 5, 7, np.nan])
         labels = SourceLabels.empty(5)
         labels.assign(np.ones(5, bool), C.STRICT_CENTER_ONLY, 'containment_candidate')
         out = classify_ordinary_sources(data, np.ones(5, bool), labels, dataset='a2744', config=A2744OrdinaryConfig(1))
         np.testing.assert_array_equal(out.labels.source_class, [3, 3, 4, 4, 3])
-        apply_remeasured_aperture_snr(out, data.mag, dict(snr=[100, 100, -2, 4, 100], trusted=[False]*5))
+        apply_remeasured_aperture_snr(out, data.mag, dict(snr=[100, 100, -2, 6, 100], trusted=[False]*5))
         np.testing.assert_array_equal(out.labels.source_class, [3, 3, 3, 4, 3])
 
     def test_a2744_flag_ignore_cannot_suppress_or_revive(self):

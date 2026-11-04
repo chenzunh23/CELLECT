@@ -52,7 +52,7 @@ from preprocessing.meas_processing import MeasProcessingConfig, classify_meas_ba
 from preprocessing.ordinary import OrdinaryConfig, label_ordinary_sources
 from preprocessing.refit import RefitConfig, attach_refit_geometry, compute_kron_ellipse
 from preprocessing.region_filling import fill_dense_regions
-from preprocessing.snr import SnrConfig, compute_snr_for_sample
+from preprocessing.snr import SnrConfig, SnrThresholds, compute_snr_for_sample, thresholds_from_args
 from preprocessing.utils.catalog import source_ids
 from preprocessing.zarr_writing import ImageLevelTrainingBatch, write_training_image_level_zarr
 from preprocessing.utils.image_level import (
@@ -136,6 +136,16 @@ def _classify_patch(task: StoreTask, image: np.ndarray, image_header: fits.Heade
                                  # The FITS origin is only used for global tile IDs;
                                  # subtracting it here marks every refit as no-data.
                                  image=image, origin=(0, 0))
+    snr_config = SnrConfig(
+        broad_ignore_snr_max=task.snr_ignore_threshold,
+        broad_weak_shape_snr_max=task.snr_weak_threshold,
+        narrow_ignore_snr_max=task.narrow_snr_ignore_threshold,
+        narrow_weak_shape_snr_max=task.narrow_snr_weak_threshold,
+        noncoadd_method=task.snr_method,
+        missing_noncoadd_policy=task.missing_noncoadd_policy,
+        denoised_fits_root=task.denoised_fits_root,
+        coadd_weight_root=task.coadd_weight_root,
+    )
     snr = compute_snr_for_sample(
         table,
         dataset_source=task.dataset_source,
@@ -145,12 +155,7 @@ def _classify_patch(task: StoreTask, image: np.ndarray, image_header: fits.Heade
         group=task.group if task.dataset_source != "coadd" else None,
         image_fits=(coadd_image_fits if task.dataset_source == "coadd" else _variant_image_path(task.denoised_fits_root, task.patch, task.group, task.band, task.dataset_source, task.tract)),
         coadd_image_fits=coadd_image_fits,
-        config=SnrConfig(
-            noncoadd_method=task.snr_method,
-            missing_noncoadd_policy=task.missing_noncoadd_policy,  # type: ignore[arg-type]
-            denoised_fits_root=task.denoised_fits_root,
-            coadd_weight_root=task.coadd_weight_root,
-        ),
+        config=snr_config,
     )
     ordinary = label_ordinary_sources(
         table,
@@ -159,7 +164,7 @@ def _classify_patch(task: StoreTask, image: np.ndarray, image_header: fits.Heade
         is_narrow_band=_is_narrow_band(task.band),
         snr=snr.snr if snr is not None else None,
         config=OrdinaryConfig(),
-        snr_config=SnrConfig(),
+        snr_config=snr_config,
         refit_config=RefitConfig(),
     )
     stage.labels = ordinary.labels
@@ -285,6 +290,8 @@ def _build_store(task: StoreTask) -> dict[str, object]:
     return write_classified_patch(task, prepared.image, labels, origin,
         valid_mask=prepared.finite_mask, input_valid_mask=prepared.input_valid_mask, provenance={
         "image_fits": str(image_fits), "coadd_image_fits": str(coadd_image_fits),
+        "snr_thresholds": dict(ignore_below=task.snr_ignore_threshold,weak_below=task.snr_weak_threshold,
+            narrow_ignore_below=task.narrow_snr_ignore_threshold,narrow_weak_below=task.narrow_snr_weak_threshold),
         "refit_csv": str(_refit_csv_path(task.refit_root, task.tract, task.band, task.patch)),
     })
 
@@ -620,6 +627,7 @@ def _parse_patches(values: Sequence[str]) -> list[str]:
 
 
 def _make_tasks(args: argparse.Namespace) -> list[StoreTask]:
+    snr_thresholds = thresholds_from_args(args, 'hsc')
     patches = _parse_patches(args.patches)
     data_root = Path(args.data_root).expanduser().resolve()
     coadd_fits_root = Path(args.coadd_fits_root).expanduser().resolve() if args.coadd_fits_root else data_root
@@ -702,6 +710,10 @@ def _make_tasks(args: argparse.Namespace) -> list[StoreTask]:
                             cluster_centroid_match_pixels=float(args.cluster_centroid_match_pixels),
                             gaia_bright_mag_threshold=float(args.gaia_bright_mag_threshold),
                             snr_method=str(args.snr_method),
+                            snr_ignore_threshold=snr_thresholds.ignore_below,
+                            snr_weak_threshold=snr_thresholds.weak_below,
+                            narrow_snr_ignore_threshold=args.narrow_snr_ignore_threshold,
+                            narrow_snr_weak_threshold=args.narrow_snr_weak_threshold,
                             missing_noncoadd_policy=str(args.missing_noncoadd_policy),
                             subtract_bright_object_from_background=bool(args.subtract_bright_object_from_background),
                             image_variant_background_source=str(args.image_variant_background_source),
@@ -767,6 +779,10 @@ def _make_tasks(args: argparse.Namespace) -> list[StoreTask]:
                             cluster_centroid_match_pixels=float(args.cluster_centroid_match_pixels),
                             gaia_bright_mag_threshold=float(args.gaia_bright_mag_threshold),
                             snr_method=str(args.snr_method),
+                            snr_ignore_threshold=snr_thresholds.ignore_below,
+                            snr_weak_threshold=snr_thresholds.weak_below,
+                            narrow_snr_ignore_threshold=args.narrow_snr_ignore_threshold,
+                            narrow_snr_weak_threshold=args.narrow_snr_weak_threshold,
                             missing_noncoadd_policy=str(args.missing_noncoadd_policy),
                             subtract_bright_object_from_background=bool(args.subtract_bright_object_from_background),
                             image_variant_background_source=str(args.image_variant_background_source),
@@ -927,6 +943,18 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--cluster-centroid-match-pixels", type=float, default=10.0)
     parser.add_argument("--gaia-bright-mag-threshold", type=float, default=18.0)
     parser.add_argument("--snr-method", default="auto", choices=["auto", "variance", "weight", "none"])
+    parser.add_argument("--snr-ignore-threshold", type=float, default=5.0,
+                        help="Lower SNR label cutoff; dataset-specific boundary conventions are retained.")
+    parser.add_argument("--snr-weak-threshold", type=float, default=7.0,
+                        help="Upper SNR cutoff for weak supervision (COSMOS: strict center only).")
+    for dataset in ('hsc', 'cosmos', 'abell'):
+        for name in ('ignore', 'weak'):
+            parser.add_argument(f"--{dataset}-snr-{name}-threshold", type=float, default=None,
+                                help=f"Override --snr-{name}-threshold for {dataset} only.")
+    parser.add_argument("--narrow-snr-ignore-threshold", type=float, default=5.0,
+                        help="HSC narrow-band lower cutoff, independent of broad-band/JWST cuts.")
+    parser.add_argument("--narrow-snr-weak-threshold", type=float, default=8.0,
+                        help="HSC narrow-band upper weak-shape cutoff.")
     parser.add_argument("--missing-noncoadd-policy", default="fallback_coadd", choices=["fallback_coadd", "none", "error"])
     parser.add_argument(
         "--image-variant-background-source",
@@ -945,12 +973,19 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument("--missing-image-policy", default="skip", choices=["skip", "error"])
     args = parser.parse_args(argv)
+    try:
+        for dataset in (None, 'hsc', 'cosmos', 'abell'):
+            thresholds_from_args(args, dataset)
+        SnrThresholds(args.narrow_snr_ignore_threshold, args.narrow_snr_weak_threshold)
+    except ValueError as exc:
+        parser.error(str(exc))
     if not 0<=args.jwst_max_invalid_fraction<=1:parser.error('--jwst-max-invalid-fraction must be in [0,1]')
     if args.use_uncover:
         from preprocessing.utils.uncover_labels import UncoverSnrConfig
         try:
             UncoverSnrConfig(args.uncover_no_kron_snr,args.uncover_risk_no_kron_snr,
-                args.uncover_reject_untrusted,args.uncover_risk_bright_mag)
+                args.uncover_reject_untrusted,args.uncover_risk_bright_mag,
+                thresholds=thresholds_from_args(args, 'abell'))
             if not np.isfinite(args.uncover_risk_sigma) or args.uncover_risk_sigma<=0:raise ValueError('UNCOVER risk sigma must be positive')
         except ValueError as exc:parser.error(str(exc))
     from preprocessing.utils.confidence import validate_confidence

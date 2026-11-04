@@ -220,6 +220,7 @@ def _init_wandb_or_disable(
     wandb.define_metric("lr/iteration/*", step_metric="iteration")
     wandb.define_metric("lr/epoch/*", step_metric="epoch")
     wandb.define_metric("val/epoch/*", step_metric="epoch")
+    wandb.define_metric("detection/val/*", step_metric="epoch")
     wandb.define_metric("train/epoch/*", step_metric="epoch")
     wandb.define_metric("adam/*", step_metric="iteration")
     return run
@@ -2918,7 +2919,7 @@ def main() -> None:
                         for band, metrics in buckets.items():
                             for key, value in metrics.items():
                                 if isinstance(value, (int, float)):
-                                    epoch_payload[f"val/detection/{band}/{key}"] = float(value)
+                                    epoch_payload[f"detection/val/{band}/{key}"] = float(value)
                     wandb.log(epoch_payload, step=int(global_step))
                 ckpt = _checkpoint_payload(
                     model,

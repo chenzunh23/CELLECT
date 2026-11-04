@@ -5,6 +5,7 @@ from ..image_processing import prepare_image, build_bright_components, BrightReg
 from ..meas_processing import classify_catalog_basics
 from ..ordinary_common import OrdinaryInput, classify_ordinary_sources
 from ..ordinary_a2744 import A2744OrdinaryConfig, protect_ignored_children
+from ..snr import SnrThresholds
 from ..bright_label import project_gaia_rows
 from ..bright_label_jwst import JWSTBrightConfig, label_bright_sources
 from ..region_filling import fill_dense_regions
@@ -20,7 +21,7 @@ def star_footprint(prepared, bright, gaia_rows):
 
 
 def classify_reference(reference, header, catalog, gaia, background, band, *, training_background=None,
-                       bright_image=None, bright_header=None):
+                       bright_image=None, bright_header=None, snr_thresholds=SnrThresholds()):
     """Select ordinary sources on full coadd; optionally build bright on half.
 
     Formal Zarr callers supply the aligned training half image for bright,
@@ -66,7 +67,8 @@ def classify_reference(reference, header, catalog, gaia, background, band, *, tr
     linear=prepared.image.copy();linear[~prepared.finite_mask]=np.nan
     from .jwst_star_psf import star_policy
     ordinary_config=A2744OrdinaryConfig(PSF_FWHM_ARCSEC[band]/.03,image_shape=reference.shape,
-                                      star_mask_mag_min=star_policy()['star_mask_faint_mag_min'])
+                                      star_mask_mag_min=star_policy()['star_mask_faint_mag_min'],
+                                      snr_thresholds=snr_thresholds)
     ordinary=classify_ordinary_sources(data,basics.after_b_basic,basics.labels,dataset='a2744',
         config=ordinary_config,
         image=linear,excluded_mask=bright.astype(bool)|stars,star_footprint=stars,sky_mask=background)
@@ -81,7 +83,8 @@ def classify_reference(reference, header, catalog, gaia, background, band, *, tr
         while protect_ignored_children(data, ordinary, ordinary_config).any():
             measurement = ordinary.diagnostics.get('aperture_measurement')
             if measurement is not None:
-                apply_remeasured_aperture_snr(ordinary, data.mag, measurement, mag_min=None)
+                apply_remeasured_aperture_snr(ordinary, data.mag, measurement, mag_min=None,
+                                              thresholds=snr_thresholds)
     restricted=np.isin(components,result.restricted_fallback_component_ids) if len(result.restricted_fallback_component_ids) else None
     ignored=np.isin(components,result.ordinary_ignore_component_ids) if len(result.ordinary_ignore_component_ids) else None
     labels=PatchLabels(table,np.empty(reference.shape,np.uint8),result.labels.source_class.copy(),geom.x,geom.y,geom.major,geom.minor,
@@ -109,6 +112,6 @@ def classify_reference(reference, header, catalog, gaia, background, band, *, tr
         np.asarray(catalog['KRON_RADIUS']*catalog['A_IMAGE'],float),
         np.asarray(catalog['KRON_RADIUS']*catalog['B_IMAGE'],float),
         np.deg2rad(np.asarray(catalog['THETA_IMAGE'],float)))
-    return labels,dict(sources=len(table),bright_source='training_half_coadd' if bright_image is not None else 'full_reference',
+    return labels,dict(sources=len(table),snr_thresholds=dict(ignore_below=snr_thresholds.ignore_below,weak_below=snr_thresholds.weak_below),bright_source='training_half_coadd' if bright_image is not None else 'full_reference',
                        classes={str(k):int(v) for k,v in zip(*np.unique(labels.label_classes,return_counts=True))},
                        star_protection=labels.star_protection_policy)

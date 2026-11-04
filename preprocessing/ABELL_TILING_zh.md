@@ -13,7 +13,8 @@ Python 增加 `--use-uncover`（别名 `--use_uncover`）；不指定时仍走�
 - `UNCOVER_DETECTION`、`UNCOVER_SEGMENTATION`：`/data/czh23/JWST/UNCOVER/` 下的两份官方图。
 - `UNCOVER_MODEL_ROOT`：默认 `/data/czh23/JWST/UNCOVER/models`；每个波段必须有对应的 `*_fXXXX_bcgs_models.fits[.gz]`，不跨波段借用，缺失时报错。
 - `JWST_MAX_INVALID_FRACTION=0.10`：每个普通/大源 512 样本中，`NaN/NO DATA ∪ 无 UNCOVER 覆盖` 超过 10% 就删除。重叠无效部分只计一次；4096 parent 不按整块 10% 一刀删除。
-- `UNCOVER_NO_KRON_SNR=3`、`UNCOVER_RISK_NO_KRON_SNR=5`：区外/模型风险区内无 Kron 中心阈值。
+- `SNR_IGNORE_THRESHOLD=5`、`SNR_WEAK_THRESHOLD=7`：普通源 SNR 下限/弱监督上限，传给 `--snr-ignore-threshold` / `--snr-weak-threshold`。
+- `UNCOVER_NO_KRON_SNR=3`、`UNCOVER_RISK_NO_KRON_SNR=5`：区外/模型风险区内无 Kron 的附加中心阈值；实际取它与普通源下限的较大值，默认两处均为 5。
 - `UNCOVER_RISK_BRIGHT_MAG=22`：使用**当前波段**的 `f_<band>/e_<band>`，AB ZP=28.9；有有效 Kron 的亮源仅跳过 risk/untrusted 剔除，不绕过 bad flag、真正低 SNR 等条件。
 
 覆盖以官方 detection 的有限像素定义，通过 WCS 最近邻投影，不把 seg=0 当作覆盖。
@@ -23,8 +24,8 @@ Python 增加 `--use-uncover`（别名 `--use_uncover`）；不指定时仍走�
 模型按自身 WCS 像素面积从通量换成 MJy/sr，再投影到公共网格；FILTER/PUPIL 必须对应当前波段。
 风险区为模型超过 `UNCOVER_RISK_SIGMA × 原始 FULL 空背景 MAD sigma` 后扩张半径 10 像素，并限制在 UNCOVER 覆盖内；sigma 的背景像素排除原有 HALF 亮区和 Gaia 足迹。
 全部源仅在原始 FULL 测量一次孔径 SNR、空孔径噪声和 trusted，沿用原始多尺度 SExtractor sky、亮区/Gaia 排除，不再生成模型残差背景或混用残差噪声。
-有效 Kron 且本波段 AB<22 的源仍可跳过风险区 untrusted 剔除；无 Kron 风险区阈值仍为 5，区外为 3；有形状的 3–5 源仍为 weak shape，<3 ignore。
-全部原始星表条目重测，包括 low-SNR flag 条目；3≤SNR<5 在有形状时为 weak shape，无 Kron 仍按中心阈值处理。
+有效 Kron 且本波段 AB<22 的源仍可跳过风险区 untrusted 剔除，但不能绕过可配置的数值 SNR 下限。
+全部原始星表条目重测，包括 low-SNR flag 条目。2026-11-03 起默认 SNR<5 或非有限进入 ignore；5≤SNR<7 在几何规则允许时为 weak shape；SNR≥7 通过 SNR 分类，但不提升已因嵌套等规则成为 strict 的源。无 Kron 源达到有效中心阈值后仍仅保留中心，不生成形状。
 亮区回退中心、Gaia 判定/PSF 理论 Kron、独立大源补充的原函数继续复用。无 Kron 的 seg 只用于保护源像素不成为背景，不补造 Kron。
 
 ```bash
@@ -36,6 +37,9 @@ bash /home/czh23/CELLECT/preprocessing/run_abell_preprocessing.sh
 ```
 
 混合数据入口 `--training-batch` 同样接受这些 CLI 参数，仅对 Abell 生效。
+通用 SNR CLI 参数同时用于 HSC、COSMOS 和 Abell；`--hsc-snr-ignore-threshold` / `--hsc-snr-weak-threshold`、`--cosmos-snr-ignore-threshold` / `--cosmos-snr-weak-threshold`、`--abell-snr-ignore-threshold` / `--abell-snr-weak-threshold` 可以逐数据集覆盖通用值。下限必须非负，且严格小于上限，两者必须有限。
+各数据集原有测量和类别含义保留：HSC 宽带 `(下限,上限]` 为 weak shape，大面积源的 SNR≤8 弱形状规则不变；COSMOS 的 SNR≤下限为 ignore、`(下限,上限)` 为 strict center only，邻源嵌套资格同步使用下限；Abell 星表及 UNCOVER 使用 `[下限,上限)` 为 weak shape，原 foundation 的孔径复测弱源仍按原逻辑降为 strict center only。
+HSC 窄带仍默认 5/8，可通过 `--narrow-snr-ignore-threshold` / `--narrow-snr-weak-threshold` 单独调节。恢复原宽带/JWST 规则可传 `--snr-ignore-threshold 3 --snr-weak-threshold 5`。阈值写入生产完成签名和 Zarr 属性；已有 Zarr 不会自动修改，需重新生成。
 输入文件时间戳、模型、覆盖、星表、阈值和策略版本进入完成签名，改变开关或参数不会复用旧标签。
 每个 parent 的 `complete.json` / `reference_uncover.json` 记录模型、波段测光字段、风险区比例、`model_subtraction=none` 及原始 FULL 测量方式。
 策略版本为 `uncover_native_abell_v5_raw_full_snr_model_risk_only`，旧 v4 完成签名不会误命中；沿用同一输出根目录即可覆盖旧 Zarr，已完成的 v5 可断点续跑。

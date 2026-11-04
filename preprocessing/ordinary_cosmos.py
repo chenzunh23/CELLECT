@@ -5,7 +5,7 @@ import numpy as np
 from .labels import SourceClass as C
 from .ordinary_common import start_ordinary, retained, downgrade
 from .utils.containment import nearby_pairs, boundary_fraction
-from .snr import apply_candidate_snr
+from .snr import SnrThresholds, apply_candidate_snr
 
 
 @dataclass(frozen=True)
@@ -16,6 +16,7 @@ class CosmosOrdinaryConfig:
     containment_fraction: float = 0.995
     fill_bright_mag_max: float = 25.5
     fill_ratio_min: float = 0.1
+    snr_thresholds: SnrThresholds = SnrThresholds()
 
 
 def label_ordinary_sources(data, candidate, labels, *, config=CosmosOrdinaryConfig(), image=None, valid_mask=None):
@@ -39,7 +40,7 @@ def label_ordinary_sources(data, candidate, labels, *, config=CosmosOrdinaryConf
     result.snapshot("photometry")
     contained = np.zeros(len(data.mag), dtype=bool)
     # Low-SNR sources cannot demote a neighbor that survives the final SNR step.
-    eligible = retained(result) & np.isfinite(data.snr) & (data.snr > 3)
+    eligible = retained(result) & np.isfinite(data.snr) & (data.snr > config.snr_thresholds.ignore_below)
     geom = data.geometry
     for i, j in nearby_pairs(geom, eligible):
         if contained[i] or contained[j]:
@@ -57,7 +58,8 @@ def label_ordinary_sources(data, candidate, labels, *, config=CosmosOrdinaryConf
                     & np.isfinite(fill) & (fill >= 0) & (fill < config.fill_ratio_min))
         downgrade(result, low_fill, C.STRICT_CENTER_ONLY, "cosmos_bright_low_fill")
     result.snapshot("bright_fill")
-    apply_candidate_snr(result, data.snr, weak_class=C.STRICT_CENTER_ONLY, ignore_inclusive=True)
+    apply_candidate_snr(result, data.snr, weak_class=C.STRICT_CENTER_ONLY, ignore_inclusive=True,
+                        thresholds=config.snr_thresholds)
     result.diagnostics.update(bright_low_fill=low_fill, segmentation_fill_available=fill is not None)
     result.diagnostics.update(warn_ignore=warn, star_mask=star, photometry_ignore=phot_ignore,
                               photometry_center=phot_center, dmag=diff, containment_center=contained)

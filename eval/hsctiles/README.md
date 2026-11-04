@@ -396,3 +396,15 @@ the bright P00000/zg source at local (389,325) changed from -1306.733 to
 8569.946. These are background-limited SNR values, without source Poisson noise.
 The HSC and JWST defaults are unchanged. Remove any explicit
 `--snr-aperture-diameter-arcsec 2` when restarting to use the new ZTF default.
+# HSC 独立 coadd 与原始网格（2026-11-03）
+
+在原有 server 命令中增加 `--dataset hsc_image --hsc-sources coadd --hsc-grid-mode fits`，
+即可脱离训练 Zarr 的保留范围和 stride，从原始 FITS 以 512 像素步长选块；
+`x000_y000` 起点是 patch FITS 数组的 `(0,0)`，边缘不足 512 的部分以 NaN 补齐。
+`--hsc-coadd-profile half` 读取 `/data/czh23/Subaru_products/half_coadd`，
+`--hsc-coadd-profile official` 读取 `/data/shared/Subaru` 的 full coadd。
+这里只做 coadd 推理，不加入 noisy/denoised，也不重建训练标签。
+继续看 Zarr 保存的小块时用 `--hsc-grid-mode zarr`；现在识别最新 `half_coadd` 目录，
+`--hsc-image-root` 可以指向 mixed Zarr 根目录或其 `hsc` 子目录。
+更改这些参数后需重启 server。
+

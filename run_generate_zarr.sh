@@ -31,7 +31,7 @@ args=(--training-batch --training-kinds "${kinds[@]}"
   --background-root "$BACKGROUND_ROOT"
   --hsc-products-root "$HSC_PRODUCTS_ROOT" --hsc-background-method sextractor-precomputed
   --output-root "$OUT" --workers "$ZARR_WORKERS"
-  --confidence-mode psf-ee --tile-size 512 --stride 368 --chunk-tiles "$CHUNK_TILES"
+  --confidence-mode "${CONFIDENCE_MODE:-psf-ee}" --tile-size 512 --stride 368 --chunk-tiles "$CHUNK_TILES"
   --clip-threshold 5 --bright-threshold 5 --bright-dilation 2
   --image-scaling-mode zscore-log-lupton-rgb --image-scaling-scope patch
   --bright-mask-mode log-lupton --jwst-max-invalid-fraction 0.10)
@@ -43,6 +43,10 @@ fi
 # Resolve the actual final CLI output path (including a forwarded --output-root)
 # before opening the lock or logs. This also rejects malformed CLI arguments.
 OUT=$("$PYTHON" -c 'from preprocessing.build_image_level_zarr import parse_args; import sys; from pathlib import Path; print(Path(parse_args(sys.argv[1:]).output_root).resolve())' "${args[@]}" "$@")
+if [[ -f "$OUT/DIAGNOSTIC_ONLY.json" ]]; then
+  echo "Refusing to overwrite preserved diagnostic products: $OUT" >&2
+  exit 1
+fi
 mkdir -p "$OUT/logs"
 exec 9>"$OUT/logs/generation.lock"
 flock -n 9 || { echo "Zarr generation already running in $OUT" >&2; exit 1; }

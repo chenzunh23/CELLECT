@@ -92,6 +92,8 @@ class HscImageAccess:
         coadd_fits_root: Path = DEFAULT_HSC_COADD_FITS_ROOT,
         noisy_fits_root: Path = DEFAULT_HSC_NOISY_FITS_ROOT,
         denoised_fits_root: Path = DEFAULT_HSC_DENOISED_FITS_ROOT,
+        sources: tuple[str, ...] | list[str] | None = None,
+        grid_mode: str = "zarr",
     ) -> None:
         self.root = Path(root).expanduser().resolve()
         self.tract = str(tract)
@@ -101,6 +103,12 @@ class HscImageAccess:
         self.coadd_fits_root = Path(coadd_fits_root).expanduser().resolve()
         self.noisy_fits_root = Path(noisy_fits_root).expanduser().resolve()
         self.denoised_fits_root = Path(denoised_fits_root).expanduser().resolve()
+        self.sources = tuple(SOURCE_ORDER if sources is None else sources)
+        if not self.sources or any(s not in SOURCE_ORDER for s in self.sources):
+            raise ValueError(f"HSC sources must be selected from {SOURCE_ORDER}")
+        if grid_mode not in {"zarr", "fits"}:
+            raise ValueError("HSC grid_mode must be zarr or fits")
+        self.grid_mode = grid_mode
         self._index: dict[tuple[str, str, str, str], _Store] | None = None
         self._readers: dict[str, PatchZarrReader] = {}
         self._tiles: dict[tuple[str, str], list[TileRow]] = {}
@@ -112,9 +120,13 @@ class HscImageAccess:
     def _scan(self) -> dict[tuple[str, str, str, str], _Store]:
         if self._index is not None:
             return self._index
+        if self.grid_mode == "fits":
+            self._index = self._scan_fits()
+            return self._index
         index: dict[tuple[str, str, str, str], _Store] = {}
-        base = self.root / "image_level"
-        if not base.is_dir():
+        candidates = [self.root / "image_level", self.root / "hsc" / "image_level", self.root]
+        base = next((p for p in candidates if any((p / s).is_dir() for s in (*SOURCE_ORDER, "half_coadd"))), None)
+        if base is None:
             self._index = index
             return index
         for path in base.glob("*/*/*.zarr"):
@@ -122,7 +134,8 @@ class HscImageAccess:
             if len(rel) != 3:
                 continue
             source, band, filename = rel
-            if source not in SOURCE_ORDER:
+            source = "coadd" if source == "half_coadd" else source
+            if source not in self.sources:
                 continue
             stem = Path(filename).stem
             patch = stem.split("__", 1)[0]
@@ -137,6 +150,30 @@ class HscImageAccess:
                 pass
             index[(source, band, patch, group)] = _Store(source, band, patch, group, path)
         self._index = index
+        return index
+
+    def _scan_fits(self) -> dict[tuple[str, str, str, str], _Store]:
+        """Discover files without reading pixels or requiring any training Zarr."""
+        index = {}
+        for source, root in (("coadd", self.coadd_fits_root), ("noisy", self.noisy_fits_root)):
+            if source not in self.sources:
+                continue
+            base = root / self.tract if (root / self.tract).is_dir() else root
+            for band in DEFAULT_HSC_IMAGE_BANDS:
+                patterns = (f"*/warp_half-{band}-{self.tract}-*-0.fits", f"*/calexp-{band}-{self.tract}-*.fits") if source == "coadd" else (f"*/warp_8-{band}-{self.tract}-*.fits",)
+                for pattern in patterns:
+                    for path in sorted((base / band).glob(pattern)):
+                        patch = path.parent.name
+                        group = "" if source == "coadd" else _group_label(path.stem.rsplit("-", 1)[-1])
+                        index.setdefault((source, band, patch, group), _Store(source, band, patch, group, path))
+        if "denoised" in self.sources:
+            for path in sorted(self.denoised_fits_root.glob("patch_*/group_*/*/denoised.fits")):
+                band = path.parent.name
+                if band not in DEFAULT_HSC_IMAGE_BANDS:
+                    continue
+                patch = path.parents[2].name.removeprefix("patch_").replace("_", ",")
+                group = _group_label(path.parents[1].name)
+                index[("denoised", band, patch, group)] = _Store("denoised", band, patch, group, path)
         return index
 
     def _reader(self, store: _Store) -> PatchZarrReader:
@@ -300,6 +337,17 @@ class HscImageAccess:
         if not stores:
             raise FileNotFoundError(f"no image-level zarr for {band} {patch}")
         store = stores[0]
+        if self.grid_mode == "fits":
+            from astropy.io import fits
+            with fits.open(store.path, memmap=True, ignore_missing_end=True) as hdus:
+                header = next(h.header for h in hdus if isinstance(h, (fits.PrimaryHDU, fits.ImageHDU, fits.CompImageHDU)) and h.header.get("NAXIS") == 2)
+                width, height = int(header["NAXIS1"]), int(header["NAXIS2"])
+            rows = [TileRow(i, f"x{x // self.tile_size:03d}_y{y // self.tile_size:03d}",
+                            x, y, x + self.tile_size, y + self.tile_size)
+                    for i, (x, y) in enumerate((x, y) for y in range(0, height, self.tile_size)
+                                               for x in range(0, width, self.tile_size))]
+            self._tiles[key] = rows
+            return rows
         reader = self._reader(store)
         x0 = reader.read_full_small("tile_x0").astype(np.int32, copy=False)
         y0 = reader.read_full_small("tile_y0").astype(np.int32, copy=False)
@@ -322,8 +370,13 @@ class HscImageAccess:
         cache_key = (store.source, store.band, store.patch, store.group)
         mapping = self._sample_by_tile.get(cache_key)
         if mapping is None:
-            rows = self._tile_table(store.band, store.patch)
-            mapping = {row.tile_id: row.tile_index for row in rows}
+            if self.grid_mode == "fits":
+                mapping = {row.tile_id: row.tile_index for row in self._tile_table(store.band, store.patch)}
+            else:
+                reader = self._reader(store)
+                xs, ys = reader.read_full_small("tile_x0"), reader.read_full_small("tile_y0")
+                names = _decode_fixed_utf8(reader.read_full_small("tile_name")) if reader.has_array("tile_name") else [""] * len(xs)
+                mapping = {_tile_id_from_name(names[i], int(x), int(y), i): i for i, (x, y) in enumerate(zip(xs, ys))}
             self._sample_by_tile[cache_key] = mapping
         if tile_id not in mapping:
             raise KeyError(f"{tile_id} not present in {store.source} {store.band} {store.patch} {store.group}")
@@ -438,12 +491,16 @@ class HscImageAccess:
         return np.asarray(arr, dtype=np.float32)
 
     def read_frame(self, ref: FrameRef) -> np.ndarray:
+        if self.grid_mode == "fits":
+            return self.read_detection_frame(ref)
         try:
             return self.read_detection_frame(ref)
         except Exception:
             return self._read_zarr_frame(ref)
 
     def input_fits_path(self, ref: FrameRef) -> Path:
+        if self.grid_mode == "fits":
+            return Path(ref.pack_path)
         source = str(ref.dataset).split(":", 1)[-1] if ":" in str(ref.dataset) else "coadd"
         group = _group_label(str(ref.visit or 0))
         band = str(ref.band)
@@ -476,12 +533,24 @@ class HscImageAccess:
 
     def read_detection_frame(self, ref: FrameRef) -> np.ndarray:
         path = self.input_fits_path(ref)
-        full, header, _ = read_fits_image(path)
         width = int(ref.width)
         height = int(ref.height)
-        local_x0, local_y0 = crop_origin_for_image(full, header, x0=int(ref.x0), y0=int(ref.y0), width=width, height=height)
-        crop, valid = crop_or_pad(full, x0=local_x0, y0=local_y0, width=width, height=height, inference_size=self.tile_size)
-        crop = np.where(valid, crop, np.nan).astype(np.float32, copy=False)
+        if self.grid_mode == "fits":
+            from astropy.io import fits
+            local_x0, local_y0 = int(ref.x0), int(ref.y0)
+            crop = np.full((height, width), np.nan, dtype=np.float32)
+            with fits.open(path, memmap=True, ignore_missing_end=True) as hdus:
+                hdu = next(h for h in hdus if isinstance(h, (fits.PrimaryHDU, fits.ImageHDU, fits.CompImageHDU)) and h.header.get("NAXIS") == 2)
+                header = hdu.header.copy()
+                x1 = min(local_x0 + width, int(header["NAXIS1"]))
+                y1 = min(local_y0 + height, int(header["NAXIS2"]))
+                if x1 > local_x0 and y1 > local_y0:
+                    crop[:y1-local_y0, :x1-local_x0] = hdu.section[local_y0:y1, local_x0:x1]
+        else:
+            full, header, _ = read_fits_image(path)
+            local_x0, local_y0 = crop_origin_for_image(full, header, x0=int(ref.x0), y0=int(ref.y0), width=width, height=height)
+            crop, valid = crop_or_pad(full, x0=local_x0, y0=local_y0, width=width, height=height, inference_size=self.tile_size)
+            crop = np.where(valid, crop, np.nan).astype(np.float32, copy=False)
         from preprocessing.image_processing import prepare_image, ImagePreparationConfig
         from astropy.wcs import WCS
         ch = header.copy()

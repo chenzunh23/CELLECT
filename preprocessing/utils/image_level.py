@@ -67,6 +67,10 @@ class StoreTask:
     confidence_fwhm_min: float = 1.6
     confidence_fwhm_max: float = 8.0
     confidence_fwhm_pixels: float | None = None
+    snr_ignore_threshold: float = 5.0
+    snr_weak_threshold: float = 7.0
+    narrow_snr_ignore_threshold: float = 5.0
+    narrow_snr_weak_threshold: float = 8.0
 
 
 @dataclass

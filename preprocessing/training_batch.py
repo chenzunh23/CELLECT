@@ -22,6 +22,7 @@ from .utils.large_sources import large_source_specs, crop_padded, valid_tile_spe
 from .utils.parent_scaling import fit_parent_rgb, apply_parent_rgb
 from .utils.background_tiles import cosmos_region, abell_region, read_mask, check_source
 from .image_processing import prepare_image
+from .snr import thresholds_from_args, snr_policy_from_args
 
 
 def task_for(args, **kwargs):
@@ -32,6 +33,10 @@ def task_for(args, **kwargs):
     values.update(tile_size=512,stride=368,overwrite=True,max_tiles=args.max_tiles,tract=args.tract,
                   group='',patch='',band='',dataset_source='coadd',confidence_mode='psf-ee')
     values.update(kwargs)
+    if values['band'].startswith(('HSC-', 'NB')):
+        cuts=thresholds_from_args(args,'hsc')
+        values.update(snr_ignore_threshold=cuts.ignore_below,snr_weak_threshold=cuts.weak_below,
+                      confidence_mode=getattr(args,'confidence_mode','psf-ee'))
     return StoreTask(**values)
 
 
@@ -118,7 +123,8 @@ def cosmos_parent(args,row):
     halo=256;ox,oy=px-halo,py-halo;size=4096+2*halo
     raw,valid,header,hard_bad=read_window(source,ox,oy,size,return_hard_bad=True)
     sky,bgmeta=cosmos_region(row['background'],source.image_fits,ox,oy,size,size)
-    labels=classify_window(raw,header,catalog,catalog_path,gaia,sky,source.band)
+    labels=classify_window(raw,header,catalog,catalog_path,gaia,sky,source.band,
+        snr_thresholds=thresholds_from_args(args,'cosmos'))
     core=raw[halo:halo+4096,halo:halo+4096]
     if not np.isfinite(core).any():return dict(status='empty',outputs=[])
     prep=prepare_image(raw,header=header,protected_invalid_mask=hard_bad)
@@ -132,7 +138,7 @@ def cosmos_parent(args,row):
     task=task_for(args,output_root=root/'zarr'/'cosmos'/f'proposal_{source.proposal}',
         tract=f'COSMOS_{source.proposal}',patch=patch,band=source.band,stride=512,
         image_log_a=1000.,bright_log_a=1000.,clip_threshold=5.)
-    provenance=dict(dataset='cosmos',proposal=source.proposal,pointing=source.patch,
+    provenance=dict(dataset='cosmos',snr_thresholds=snr_policy_from_args(args,'cosmos'),proposal=source.proposal,pointing=source.patch,
         split_group=source.split_group,parent_id=f'P{source.patch}',parent_bounds=[px,py,px+4096,py+4096],
         image_fits=str(source.image_fits),quality_mask_npz=str(source.quality_mask_npz),
         sky_wcs_header=header_info(source.image_fits)[0].tostring(sep='\n'),
@@ -164,7 +170,8 @@ def cosmos_parent(args,row):
         raw,valid,ch,hard_bad=read_window(source,cx,cy,4096,return_hard_bad=True)
         if np.count_nonzero(valid[1792:2304,1792:2304])<(1-args.jwst_max_invalid_fraction)*512**2:continue
         sky,bgmeta=cosmos_region(row['background'],source.image_fits,cx,cy,4096,4096)
-        lab=classify_window(raw,ch,catalog,catalog_path,gaia,sky,source.band)
+        lab=classify_window(raw,ch,catalog,catalog_path,gaia,sky,source.band,
+            snr_thresholds=thresholds_from_args(args,'cosmos'))
         stask=replace(part_task,patch=patch+'_'+spec.name.split('_')[1])
         metadata={**provenance,'sample_kind':'large_source','stamp_bounds':[spec.x0,spec.y0,spec.x1,spec.y1],
             'label_window':[cx,cy,cx+4096,cy+4096], 'labels_generated_independently':True,
@@ -226,7 +233,6 @@ def hsc_job(args,row):
     from .build_image_level_zarr import _classify_patch,write_classified_patch
     from .utils.image_level import _coadd_image_path,_read_image_header_origin,_read_fits_quality_mask
     from .utils.jwst_background_sextractor import aggressive_sextractor_background,AggressiveSkyConfig
-    from .utils.hsc_psf_ee import measure_psf
     root=Path(args.output_root);band=row['band'];patch=row['patch'];path=Path(row['source'])
     source_kind='half_coadd' if row['kind']=='hsc_half' else 'noisy'
     reference=_coadd_image_path(Path(args.data_root),band,args.tract,patch)
@@ -257,9 +263,11 @@ def hsc_job(args,row):
         receipt=json.loads((folder/'complete.json').read_text())
         check_source(receipt['signature']['source'],path)
         bgpath=folder/'background_mask.npz';sky=read_mask(bgpath)
-    psfpath=root/'psf_ee'/band/f'{patch}.json'
-    measure_psf(reference,psfpath)
-    task=replace(task,confidence_config_path=str(psfpath))
+    if task.confidence_mode == 'psf-ee':
+        from .utils.hsc_psf_ee import measure_psf
+        psfpath=root/'psf_ee'/band/f'{patch}.json'
+        measure_psf(reference,psfpath)
+        task=replace(task,confidence_config_path=str(psfpath))
     labels=_classify_patch(task,image,header,origin,reference,background_override=sky)
     from .utils.hsc_quality import hsc_training_tile_quality
     specs=make_tile_specs(parent_origin=origin,image_shape=(image.shape[1],image.shape[0]),
@@ -273,7 +281,7 @@ def hsc_job(args,row):
         protected_invalid_mask=~valid & np.isfinite(image))
     return write_classified_patch(task,prepared.image,labels,origin,tile_specs=specs,valid_mask=valid,
         input_valid_mask=prepared.input_valid_mask,max_invalid_fraction=.10,
-        provenance=dict(dataset='hsc',image_fits=str(path),reference_fits=str(reference),
+        provenance=dict(dataset='hsc',snr_thresholds=snr_policy_from_args(args,'hsc'),image_fits=str(path),reference_fits=str(reference),
             background_mask=str(bgpath),
             background_method=('LSST on matching training input' if background_method=='lsst'
                                else 'SExtractor on matching training input'),
@@ -356,7 +364,8 @@ def run_job(args,row):
     stamps=[dict(path=str(Path(p).resolve()),bytes=Path(p).stat().st_size,mtime_ns=Path(p).stat().st_mtime_ns) for p in paths if p]
     signature=dict(job=row,inputs=stamps,code=digest.hexdigest(),chunk_tiles=args.chunk_tiles,parent_packed_stamps=True,max_tiles=args.max_tiles,large_only=args.large_only,
         cross_boundary_only=args.cross_boundary_only,large_limit=args.large_limit,
-        max_invalid_fraction=args.jwst_max_invalid_fraction)
+        max_invalid_fraction=args.jwst_max_invalid_fraction,
+        snr_thresholds=snr_policy_from_args(args,'hsc' if row['kind'].startswith('hsc') else row['kind']))
     if row['kind'] in ('abell','cosmos'):
         from .utils.jwst_star_psf import star_policy
         signature['jwst_star_protection']=star_policy()
@@ -366,6 +375,9 @@ def run_job(args,row):
     if row['kind'] in ('hsc_half','hsc_noisy'):
         signature['hsc_background_method']=getattr(args,'hsc_background_method','sextractor')
         signature['hsc_half_lsst_background_source']=getattr(args,'hsc_half_lsst_background_source','training')
+        signature['hsc_confidence']={name:getattr(args,name,None) for name in (
+            'confidence_mode','confidence_config_path','confidence_fwhm_min',
+            'confidence_fwhm_max','confidence_fwhm_pixels')}
     if receipt.exists() and not args.overwrite:
         previous=json.loads(receipt.read_text())
         if previous.get('signature')==signature and all(Path(p).exists() and Path(p+'_manifest.json').exists() for p in previous['result'].get('outputs',[])):
@@ -383,6 +395,8 @@ def run_job(args,row):
 def run(args):
     if args.tile_size!=512:raise ValueError('This training recipe requires 512-pixel stamps')
     root=Path(args.output_root);root.mkdir(parents=True,exist_ok=True)
+    if (root/'DIAGNOSTIC_ONLY.json').exists():
+        raise ValueError(f'Refusing to overwrite preserved diagnostic products: {root}')
     rows=plan(args)
     append=getattr(args,'append',False)
     inventory=rows

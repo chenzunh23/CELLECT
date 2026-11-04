@@ -19,7 +19,7 @@ from scipy.spatial import cKDTree
 from ..labels import SourceClass as C, SourceLabels, DenseLabel
 from ..ordinary_common import OrdinaryInput, DatasetOrdinaryResult, retained, downgrade
 from ..ordinary_a2744 import A2744OrdinaryConfig, source_containment
-from ..snr import apply_candidate_snr
+from ..snr import SnrThresholds, apply_candidate_snr
 from .geometry import EllipseGeometry, ellipse_axes_from_moments
 from .area_filter import area_filter_masks
 from .no_data import center_no_data
@@ -144,18 +144,19 @@ class UncoverSnrConfig:
     contaminated_no_kron_min_snr: float = 5.
     reject_untrusted_in_contaminated: bool = True
     risk_bright_mag_max: float | None = 22.
+    thresholds: SnrThresholds = SnrThresholds()
 
     def __post_init__(self):
         if not (np.isfinite(self.no_kron_min_snr) and np.isfinite(self.contaminated_no_kron_min_snr)
-                and self.no_kron_min_snr >= 3 and self.contaminated_no_kron_min_snr >= 3):
-            raise ValueError('No-Kron SNR thresholds must be finite and >= 3')
+                and self.no_kron_min_snr >= 0 and self.contaminated_no_kron_min_snr >= 0):
+            raise ValueError('No-Kron SNR thresholds must be finite and >= 0')
         if self.risk_bright_mag_max is not None and not np.isfinite(self.risk_bright_mag_max):
             raise ValueError('Bright risk exemption must be a finite AB magnitude or None')
 
 
 def apply_uncover_measured_snr(result, measurement, has_kron, *, config=UncoverSnrConfig(),
                               contaminated=None,band_magnitude=None):
-    """All retained classes obey <3 ignore, [3,5) weak; never invent shape.
+    """All retained classes obey configured ignore/weak cuts; never invent shape.
 
     Existing strict geometry/containment decisions remain strict. Native
     flag_lowsnr is provenance, not a second hard cut or a class cap. Untrusted
@@ -170,8 +171,9 @@ def apply_uncover_measured_snr(result, measurement, has_kron, *, config=UncoverS
     if any(a.shape != result.candidate.shape for a in (snr,trusted,has,risk,bandmag)):
         raise ValueError('UNCOVER SNR/source length mismatch')
     tested=retained(result).copy()
-    threshold=np.where(risk,config.contaminated_no_kron_min_snr,config.no_kron_min_snr)
-    numerical_bad=~np.isfinite(snr)|(snr<3)
+    threshold=np.maximum(config.thresholds.ignore_below,
+        np.where(risk,config.contaminated_no_kron_min_snr,config.no_kron_min_snr))
+    numerical_bad=~np.isfinite(snr)|(snr<config.thresholds.ignore_below)
     no_kron_bad=(~has)&(snr<threshold)
     bright=np.zeros(snr.shape,bool) if config.risk_bright_mag_max is None else (
         has&np.isfinite(bandmag)&(bandmag<config.risk_bright_mag_max))
@@ -179,7 +181,7 @@ def apply_uncover_measured_snr(result, measurement, has_kron, *, config=UncoverS
     downgrade(result,numerical_bad,C.ORDINARY_IGNORE,'uncover_measured_snr_ignore')
     downgrade(result,no_kron_bad,C.ORDINARY_IGNORE,'uncover_no_kron_snr_ignore')
     downgrade(result,untrusted_bad,C.ORDINARY_IGNORE,'uncover_model_region_snr_bad')
-    weak=retained(result)&(snr>=3)&(snr<5)
+    weak=retained(result)&(snr>=config.thresholds.ignore_below)&(snr<config.thresholds.weak_below)
     downgrade(result,weak,C.WEAK_SHAPE,'uncover_measured_snr_weak')
     result.diagnostics.update(aperture_snr=snr,aperture_snr_trusted=trusted,
         aperture_snr_tested=tested,aperture_snr_ignore=tested&(numerical_bad|no_kron_bad|untrusted_bad),
@@ -279,7 +281,7 @@ def classify_ordinary(data, table, has_kron, *, config, image=None, sky_mask=Non
     if config.enable_catalog_snr and not remeasuring:
         # A catalog fallback is only used when no image/measurement exists.
         # Never pre-reject sources before an independent band remeasurement.
-        apply_candidate_snr(result,data.snr)
+        apply_candidate_snr(result,data.snr,thresholds=snr_config.thresholds)
     result.diagnostics['catalog_snr_applied']=bool(config.enable_catalog_snr and not remeasuring)
     result.snapshot('SNR_catalog')
     if star_footprint is not None and config.enable_star_mask:
@@ -451,8 +453,9 @@ def classify_reference(reference, header, catalog, gaia, background, band, *,
         extra_strict_centers=len(labels.strict_x),star_protection=labels.star_protection_policy,
         stages={k:{C(int(c)).name:int(n) for c,n in zip(*np.unique(v,return_counts=True))} for k,v in ordinary.stages.items()},
         missing_kron_policy='Only valid centers and magnitudes + available A conditions; no invented ellipse/area. Official segments only exclude background.',
-        catalog_snr_policy='All catalog centers remeasured on FULL, including flag_lowsnr and already ignored/dropped rows. Native catalog SNR/flag does not pre-cut or cap classes. Measured <3/nonfinite ignore; [3,5) weak shape where geometry permits; no-Kron remains strict above its configurable threshold.',
-        snr_config=dict(no_kron_min_snr=snr_config.no_kron_min_snr,
+        catalog_snr_policy=f'All catalog centers remeasured on FULL, including flag_lowsnr and already ignored/dropped rows. Native catalog SNR/flag does not pre-cut or cap classes. Measured <{snr_config.thresholds.ignore_below:g}/nonfinite ignore; [{snr_config.thresholds.ignore_below:g},{snr_config.thresholds.weak_below:g}) weak shape where geometry permits; no-Kron remains strict above max(general lower bound, configured no-Kron threshold).',
+        snr_config=dict(ignore_below=snr_config.thresholds.ignore_below,weak_below=snr_config.thresholds.weak_below,
+            no_kron_min_snr=snr_config.no_kron_min_snr,
             contaminated_no_kron_min_snr=snr_config.contaminated_no_kron_min_snr,
             reject_untrusted_in_contaminated=snr_config.reject_untrusted_in_contaminated,
             risk_bright_mag_max=snr_config.risk_bright_mag_max,

@@ -6,6 +6,8 @@ from astropy.wcs import WCS
 from astropy.wcs.utils import proj_plane_pixel_scales
 from ..meas_processing import classify_catalog_basics
 from ..ordinary_common import OrdinaryInput, classify_ordinary_sources
+from ..ordinary_cosmos import CosmosOrdinaryConfig
+from ..snr import SnrThresholds
 from ..bright_label_jwst import JWSTBrightConfig, label_bright_sources
 from ..region_filling import fill_dense_regions
 from ..labels import SourceLabels
@@ -26,7 +28,8 @@ def load_catalog(path, band):
         return Table({k: np.array((gal if k in gal.names else phot)[k]) for k in names})
 
 
-def classify_window(raw, header, catalog, catalog_path, gaia, background, band):
+def classify_window(raw, header, catalog, catalog_path, gaia, background, band, *,
+                    snr_thresholds=SnrThresholds()):
     if gaia is not None and 'ref_epoch' not in gaia.colnames:
         gaia=gaia.copy();gaia['ref_epoch']=2016.
     w = WCS(header).celestial
@@ -53,7 +56,8 @@ def classify_window(raw, header, catalog, catalog_path, gaia, background, band):
     keep = basics.after_b_basic & ~basics.nan_center_ignore
     data.segmentation_fill_ratio = cosmos_fill_ratios(geom, np.asarray(tab['id']), w, catalog_path,
                                                      selected=keep & (data.mag<25.5))
-    ordinary = classify_ordinary_sources(data, keep, basics.labels, dataset='cosmos')
+    ordinary = classify_ordinary_sources(data, keep, basics.labels, dataset='cosmos',
+        config=CosmosOrdinaryConfig(snr_thresholds=snr_thresholds))
     bright = label_bright_sources(data, ordinary.labels, image_shape=raw.shape, image_header=header,
         gaia_table=gaia,source_ids=np.asarray(tab['id']),
         config=JWSTBrightConfig('cosmos',scale,PSF_FWHM_ARCSEC[band],gaia_reference_epoch=2016.))

@@ -820,6 +820,8 @@ def make_access(dataset_id: str, args: argparse.Namespace, tract: str):
             coadd_fits_root=path_arg("hsc_coadd_fits_root", DEFAULT_HSC_COADD_FITS_ROOT),
             noisy_fits_root=path_arg("hsc_noisy_fits_root", DEFAULT_HSC_NOISY_FITS_ROOT),
             denoised_fits_root=path_arg("hsc_denoised_fits_root", DEFAULT_HSC_DENOISED_FITS_ROOT),
+            sources=getattr(args, "hsc_sources", None),
+            grid_mode=getattr(args, "hsc_grid_mode", "zarr"),
         )
     if dataset_id == "sitian":
         return MessierAccess(Path(args.messier_root), tract, selection_mode=str(args.messier_tile_mode))

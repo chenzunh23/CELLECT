@@ -22,6 +22,8 @@ from .utils.inputs import _band_catalog_path
 from .utils.jwst_background_local import METHOD
 from .utils.jwst_star_psf import ASSET, star_asset, star_policy
 from .utils.source_weights import source_area_weight_policy
+from .snr import (snr_policy_from_args, resolve_coadd_weight_csv,
+    read_product_group_weight_summary, resolve_product_effective_count_path)
 
 
 def required(path):
@@ -102,13 +104,29 @@ def check(args):
             folder = Path(job['output'])
             background_receipt(folder/'complete.json', job['source'])
             required(folder/'background_mask.npz'); required(folder/'training_half_4096.fits')
-            required(job['grid_reference']); required(args.abell_catalog); required(args.abell_gaia)
+            required(job['grid_reference']); required(args.abell_gaia)
+            if args.use_uncover:
+                from .abell_zarr import uncover_signature
+                policy = uncover_signature(args, job['band'])
+                for asset in policy['assets']:
+                    required(asset['path'])
+            else:
+                required(args.abell_catalog)
             checked.add(folder/'complete.json')
         else:
             required(row['source']); required(args.gaia_fits)
             reference = required(_coadd_image_path(Path(args.data_root),row['band'],args.tract,row['patch']))
             required(_refit_csv_path(Path(args.refit_root),args.tract,row['band'],row['patch']))
             required(_band_catalog_path(Path(args.data_root),row['band'],args.tract,row['patch']))
+            if args.snr_method == 'weight':
+                # A legacy warp-only CSV cannot identify the selected product.
+                # Reject it before generation instead of silently using FULL AP2.
+                weights = required(resolve_coadd_weight_csv(args.coadd_weight_root,row['band'],row['patch']))
+                collection = 'half_coadd' if kind == 'hsc_half' else 'noisy'
+                read_product_group_weight_summary(weights,dataset_source=collection,
+                    group=row['group'],image_fits=row['source'])
+                required(resolve_product_effective_count_path(args.hsc_products_root,
+                    band=row['band'],patch=row['patch'],group=row['group'],dataset_source=collection))
             if args.hsc_background_method == 'sextractor-precomputed':
                 mask, receipt = precomputed_hsc_background(args,row)
                 background_receipt(receipt,row['source']); required(mask)
@@ -119,9 +137,10 @@ def check(args):
                 required(mask)
             else:
                 raise ValueError('Use sextractor-precomputed or explicitly select lsst; no silent background regeneration')
-            # HSC confidence radii are measured from persisted PSFs in LSST.
-            from .utils.hsc_psf_ee import ASSET as hsc_asset
-            required(document(str(hsc_asset))['lsst_setup'])
+            if args.confidence_mode == 'psf-ee':
+                # Manhattan cores do not require PSF extraction or LSST setup.
+                from .utils.hsc_psf_ee import ASSET as hsc_asset
+                required(document(str(hsc_asset))['lsst_setup'])
     if jwst_bands:
         config, _ = star_asset()
         ee, _ = confidence_asset('psf-ee')
@@ -135,6 +154,7 @@ def check(args):
         if 'tests' not in path.parts:
             digest.update(path.read_bytes())
     return dict(arguments=vars(args), parent_jobs=dict(counts), selected_jobs=len(rows),
+        snr_policies={dataset:snr_policy_from_args(args,dataset) for dataset in ('hsc','cosmos','abell')},
         checked_background_products=len(checked), background_recipe=recipe,
         dense_region_weights=asdict(LabelWeights()), source_area_weights=source_area_weight_policy(),
         weak_shape_training='source_center shape weight = area weight * training --center-only-shape-factor (default 0.2); not baked into Zarr',

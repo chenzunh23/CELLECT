@@ -9,6 +9,7 @@ from preprocessing.ordinary_a2744 import A2744OrdinaryConfig
 from preprocessing.utils.geometry import EllipseGeometry
 from preprocessing.utils.uncover_labels import (adapt_catalog,classify_ordinary,UncoverSnrConfig,
     band_photometry,project_product,coverage_on_grid,training_coverage,model_for_band)
+from preprocessing.snr import SnrThresholds
 
 
 def make_input(n):
@@ -33,16 +34,17 @@ class UncoverTests(unittest.TestCase):
                 ' from preprocessing.build_image_level_zarr import parse_args\n'+
                 ' from pathlib import Path\n'+
                 ' a=parse_args(sys.argv[4:])\n'+
-                ' Path(os.environ["CAPTURE_ARGV"]).write_text(json.dumps(dict(workers=a.workers,use_uncover=a.use_uncover,background_root=a.background_root,stage=a.abell_stage,no_kron=a.uncover_no_kron_snr,risk_no_kron=a.uncover_risk_no_kron_snr)))\n')
+                ' Path(os.environ["CAPTURE_ARGV"]).write_text(json.dumps(dict(workers=a.workers,use_uncover=a.use_uncover,background_root=a.background_root,stage=a.abell_stage,no_kron=a.uncover_no_kron_snr,risk_no_kron=a.uncover_risk_no_kron_snr,snr_ignore=a.snr_ignore_threshold,snr_weak=a.snr_weak_threshold)))\n')
             stub.chmod(0o755)
             env={**os.environ,'JWST_PYTHON':str(stub),'OUTPUT_ROOT':str(root/'out'),
                  'CAPTURE_ARGV':str(capture),'ZARR_WORKERS':'64','ABELL_STAGE':'zarr','USE_UNCOVER':'1',
-                 'BACKGROUND_ROOT':'/test/background with spaces','UNCOVER_NO_KRON_SNR':'3','UNCOVER_RISK_NO_KRON_SNR':'5'}
+                 'BACKGROUND_ROOT':'/test/background with spaces','UNCOVER_NO_KRON_SNR':'3','UNCOVER_RISK_NO_KRON_SNR':'5',
+                 'SNR_IGNORE_THRESHOLD':'6','SNR_WEAK_THRESHOLD':'9'}
             p=subprocess.run(['bash',str(repo/'preprocessing/run_abell_preprocessing.sh')],env=env,
                              text=True,capture_output=True,timeout=30)
             self.assertEqual(p.returncode,0,p.stdout+p.stderr)
             actual=json.loads(capture.read_text())
-            self.assertEqual(actual,dict(workers=64,use_uncover=True,background_root=env['BACKGROUND_ROOT'],stage='zarr',no_kron=3.,risk_no_kron=5.))
+            self.assertEqual(actual,dict(workers=64,use_uncover=True,background_root=env['BACKGROUND_ROOT'],stage='zarr',no_kron=3.,risk_no_kron=5.,snr_ignore=6.,snr_weak=9.))
             self.assertIn('[abell-run] COMMAND ',p.stdout)
 
     def test_scheduler_heartbeat_and_task_failure_logs(self):
@@ -195,11 +197,21 @@ class UncoverTests(unittest.TestCase):
         r=classify_ordinary(d,t,has,config=self.config(),aperture_measurement=self.measurement([10]*6))
         np.testing.assert_array_equal(r.labels.source_class,[C.DROPPED,C.ORDINARY_IGNORE,C.STRICT_CENTER_ONLY,C.ORDINARY_IGNORE,C.CLEAN,C.CLEAN])
         self.assertTrue(np.isnan(d.geometry.major[:3]).all())
-    def test_remeasured_snr_3_5_overrides_native_low_flag(self):
+    def test_remeasured_snr_5_7_overrides_native_low_flag(self):
         d,t,has=make_input(5);t['flag_lowsnr'][:3]=1;d.snr[:3]=1.
-        r=classify_ordinary(d,t,has,config=self.config(),aperture_measurement=self.measurement([2.9,3.,8.,4.,5.]))
+        r=classify_ordinary(d,t,has,config=self.config(),aperture_measurement=self.measurement([4.9,5.,8.,6.,7.]))
         np.testing.assert_array_equal(r.labels.source_class,[C.ORDINARY_IGNORE,C.WEAK_SHAPE,C.CLEAN,C.WEAK_SHAPE,C.CLEAN])
         self.assertFalse(r.diagnostics['catalog_snr_applied'])
+
+    def test_custom_uncover_cutoffs_preserve_missing_kron_and_native_bad_flags(self):
+        d,t,has=make_input(6);has[3:5]=False;t['flag_artifact'][5]=1
+        t['flag_lowsnr'][:]=1
+        r=classify_ordinary(d,t,has,config=self.config(),
+            aperture_measurement=self.measurement([5.99,6.,9.,5.99,6.,100.]),
+            snr_config=UncoverSnrConfig(thresholds=SnrThresholds(6,9)))
+        np.testing.assert_array_equal(r.labels.source_class,
+            [C.ORDINARY_IGNORE,C.WEAK_SHAPE,C.CLEAN,C.ORDINARY_IGNORE,C.STRICT_CENTER_ONLY,C.ORDINARY_IGNORE])
+        np.testing.assert_array_equal(r.diagnostics['no_kron_snr_threshold'],np.full(6,6.))
 
     def test_no_kron_3_and_5_thresholds_and_untrusted_region(self):
         d,t,has=make_input(6);has[:]=False
@@ -208,7 +220,7 @@ class UncoverTests(unittest.TestCase):
         m['trusted'][4]=False
         risk=np.zeros((160,300),bool);risk[:,100:240]=True
         r=classify_ordinary(d,t,has,config=self.config(),aperture_measurement=m,
-            snr_contaminated_mask=risk)
+            snr_contaminated_mask=risk,snr_config=UncoverSnrConfig(thresholds=SnrThresholds(3,5)))
         np.testing.assert_array_equal(r.labels.source_class,[C.ORDINARY_IGNORE,C.STRICT_CENTER_ONLY,
             C.ORDINARY_IGNORE,C.STRICT_CENTER_ONLY,C.ORDINARY_IGNORE,C.STRICT_CENTER_ONLY])
         r=classify_ordinary(d,t,has,config=self.config(),aperture_measurement=m,
@@ -228,13 +240,13 @@ class UncoverTests(unittest.TestCase):
         np.testing.assert_array_equal(r.labels.source_class,[C.DROPPED,C.ORDINARY_IGNORE,C.CLEAN,C.CLEAN])
 
     def test_measured_low_snr_applies_even_when_untrusted(self):
-        d,t,has=make_input(3);m=self.measurement([2.5,4.,np.nan]);m['trusted'][:]=False
+        d,t,has=make_input(3);m=self.measurement([2.5,6.,np.nan]);m['trusted'][:]=False
         r=classify_ordinary(d,t,has,config=self.config(),aperture_measurement=m)
         np.testing.assert_array_equal(r.labels.source_class,[C.ORDINARY_IGNORE,C.WEAK_SHAPE,C.ORDINARY_IGNORE])
 
     def test_bright_inband_exemption_only_bypasses_risk_untrusted_gate(self):
         d,t,has=make_input(7);has[2]=False;t['flag_artifact'][3]=1
-        m=self.measurement([100.,100.,100.,100.,2.,4.,100.]);m['trusted'][:]=False
+        m=self.measurement([100.,100.,100.,100.,2.,6.,100.]);m['trusted'][:]=False
         risk=np.ones((180,400),bool)
         mag=np.array([19.5,22.,19.,19.,19.,19.,np.nan])
         r=classify_ordinary(d,t,has,config=self.config(),aperture_measurement=m,

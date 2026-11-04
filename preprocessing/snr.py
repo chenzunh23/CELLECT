@@ -19,18 +19,52 @@ from .utils.catalog import magnitude_from_flux, source_xy
 SnrClass = Literal["clean", "weak_shape", "ignore"]
 
 
-def apply_candidate_snr(result, snr, *, weak_class=None, ignore_inclusive=False):
-    """JWST 3/5 cuts applied to every surviving candidate, never upgrading it."""
+@dataclass(frozen=True)
+class SnrThresholds:
+    """Lower rejection and upper weak-supervision bounds (dataset semantics apply)."""
+
+    ignore_below: float = 5.0
+    weak_below: float = 7.0
+
+    def __post_init__(self):
+        if not (np.isfinite(self.ignore_below) and np.isfinite(self.weak_below)
+                and 0 <= self.ignore_below < self.weak_below):
+            raise ValueError("SNR thresholds must be finite and satisfy 0 <= ignore < weak")
+
+
+def thresholds_from_args(args, dataset=None):
+    """Resolve common CLI bounds, optionally overridden for one dataset."""
+    values = []
+    for name, default in (("ignore", 5.0), ("weak", 7.0)):
+        value = getattr(args, f"{dataset}_snr_{name}_threshold", None) if dataset else None
+        if value is None:
+            value = getattr(args, f"snr_{name}_threshold", default)
+        values.append(float(value))
+    return SnrThresholds(*values)
+
+
+def snr_policy_from_args(args, dataset):
+    cuts = thresholds_from_args(args, dataset)
+    policy = dict(ignore_below=cuts.ignore_below, weak_below=cuts.weak_below)
+    if dataset == "hsc":
+        policy.update(narrow_ignore_below=getattr(args, "narrow_snr_ignore_threshold", 5.0),
+                      narrow_weak_below=getattr(args, "narrow_snr_weak_threshold", 8.0))
+    return policy
+
+
+def apply_candidate_snr(result, snr, *, weak_class=None, ignore_inclusive=False,
+                        thresholds=SnrThresholds()):
+    """Apply configurable JWST cuts to surviving candidates, never upgrading."""
     from .labels import SourceClass as C
     from .ordinary_common import downgrade, retained
     snr = np.asarray(snr, dtype=float)
     if snr.shape != result.candidate.shape:
         raise ValueError("SNR length mismatch")
     weak_class = C.WEAK_SHAPE if weak_class is None else weak_class
-    low = (snr <= 3) if ignore_inclusive else (snr < 3)
+    low = (snr <= thresholds.ignore_below) if ignore_inclusive else (snr < thresholds.ignore_below)
     ignored = retained(result) & (~np.isfinite(snr) | low)
     downgrade(result, ignored, C.ORDINARY_IGNORE, "ordinary_snr_ignore")
-    weak = retained(result) & (snr < 5)
+    weak = retained(result) & (snr < thresholds.weak_below)
     downgrade(result, weak, weak_class, "ordinary_snr_candidate")
     result.diagnostics.update(snr=snr, snr_ignore=ignored, snr_weak=weak)
     result.snapshot("snr")
@@ -46,11 +80,12 @@ def remeasure_aperture_snr(image, geometry, *, sky_mask=None, excluded_mask=None
         box=background_box, min_sky_apertures=min_sky_apertures)
 
 
-def apply_remeasured_aperture_snr(result, mag, measurement, *, mag_min=22.0):
+def apply_remeasured_aperture_snr(result, mag, measurement, *, mag_min=22.0,
+                                  thresholds=SnrThresholds()):
     """Recheck faint sources including untrusted strict-center candidates.
 
     For clean/weak candidates retain the conservative trusted-only rule. For
-    strict-center candidates, missing or SNR<3 is rejection, not an exemption.
+    strict-center candidates, missing or below-lower-bound SNR is rejection.
     """
     from .labels import SourceClass as C
     from .ordinary_common import downgrade, retained
@@ -64,9 +99,9 @@ def apply_remeasured_aperture_snr(result, mag, measurement, *, mag_min=22.0):
         test &= np.isfinite(mag) & (mag > mag_min)
     strict = test & result.labels.mask(C.STRICT_CENTER_ONLY)
     apply = test & (trusted | strict)
-    ignored = apply & (~np.isfinite(snr) | (snr < 3))
+    ignored = apply & (~np.isfinite(snr) | (snr < thresholds.ignore_below))
     downgrade(result, ignored, C.ORDINARY_IGNORE, "aperture_snr_ignore")
-    center = apply & ~ignored & (snr < 5)
+    center = apply & ~ignored & (snr < thresholds.weak_below)
     downgrade(result, center, C.STRICT_CENTER_ONLY, "aperture_snr_center")
     result.diagnostics.update(aperture_snr=snr, aperture_snr_trusted=trusted,
                               aperture_snr_ignore=ignored, aperture_snr_center=center,
@@ -82,8 +117,8 @@ class SnrConfig:
     ap2_flux_column: str = "base_CircularApertureFlux_6_0_instFlux"
     ap2_err_column: str = "base_CircularApertureFlux_6_0_instFluxErr"
     zeropoint: float = 27.0
-    broad_ignore_snr_max: float = 3.0
-    broad_weak_shape_snr_max: float = 5.0
+    broad_ignore_snr_max: float = 5.0
+    broad_weak_shape_snr_max: float = 7.0
     narrow_ignore_snr_max: float = 5.0
     narrow_weak_shape_snr_max: float = 8.0
     area_weak_shape_min: float = 500.0
@@ -96,6 +131,10 @@ class SnrConfig:
     coadd_weight_root: Path = Path("/data/czh23/2026-06-21_171607_hsc_metadata_warp_n2n_epoch006_full-all-warp-weights")
     denoised_fits_root: Path = Path("/data/czh23/denoised_fits")
     valid_coadd_weights_only: bool = False
+
+    def __post_init__(self):
+        SnrThresholds(self.broad_ignore_snr_max, self.broad_weak_shape_snr_max)
+        SnrThresholds(self.narrow_ignore_snr_max, self.narrow_weak_shape_snr_max)
 
 
 @dataclass

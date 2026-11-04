@@ -416,6 +416,8 @@ class Server(ThreadingHTTPServer):
             coadd_fits_root=Path(self.args.hsc_coadd_fits_root),
             noisy_fits_root=Path(self.args.hsc_noisy_fits_root),
             denoised_fits_root=Path(self.args.hsc_denoised_fits_root),
+            sources=getattr(self.args, "hsc_sources", None),
+            grid_mode=getattr(self.args, "hsc_grid_mode", "zarr"),
         )
         hsc_image_bands = hsc_image_access.available_bands() or list(DEFAULT_HSC_IMAGE_BANDS)
         hsc_image_default_bands = ["HSC-G", "HSC-I", "HSC-Y"] # [band for band in DEFAULT_HSC_IMAGE_BANDS if band in hsc_image_bands]
@@ -428,7 +430,11 @@ class Server(ThreadingHTTPServer):
         )
         by_dataset["hsc_image"] = {
             "id": "hsc_image",
-            "label": "HSC coadd/noisy/denoised",
+            "label": (f"HSC {'full' if self.args.hsc_coadd_profile == 'official' else 'half'} coadd"
+                      if getattr(self.args, "hsc_sources", None) == ["coadd"] else "HSC coadd/noisy/denoised"),
+            "grid_mode": getattr(self.args, "hsc_grid_mode", "zarr"),
+            "sources": getattr(self.args, "hsc_sources", None),
+            "coadd_profile": self.args.hsc_coadd_profile,
             "enabled": bool(hsc_image_patches and hsc_image_bands),
             "reason": "" if bool(hsc_image_patches and hsc_image_bands) else "not found",
             "tract": str(self.args.tract),
@@ -587,6 +593,8 @@ class Server(ThreadingHTTPServer):
                     coadd_fits_root=Path(self.args.hsc_coadd_fits_root),
                     noisy_fits_root=Path(self.args.hsc_noisy_fits_root),
                     denoised_fits_root=Path(self.args.hsc_denoised_fits_root),
+                    sources=getattr(self.args, "hsc_sources", None),
+                    grid_mode=getattr(self.args, "hsc_grid_mode", "zarr"),
                 ).available_patches([str(v) for v in self.args.bands])[:1]
             else:
                 patches = [str(v) for v in self.args.patches]
@@ -643,6 +651,10 @@ def main() -> None:
     parser.add_argument("--root", "--data-root", dest="root", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--hsc-image-root", type=Path, default=DEFAULT_HSC_IMAGE_ROOT)
     parser.add_argument("--hsc-coadd-profile", choices=("half", "official", "custom"), default="half")
+    parser.add_argument("--hsc-sources", nargs="+", choices=("coadd", "noisy", "denoised"), default=None,
+                        help="Restrict HSC variants, e.g. --hsc-sources coadd. Coadd pixels come from --hsc-coadd-profile.")
+    parser.add_argument("--hsc-grid-mode", choices=("zarr", "fits"), default="zarr",
+                        help="zarr: saved training tiles; fits: native patch-local 512px grid, independent of Zarr coverage.")
     parser.add_argument("--hsc-weight-root", type=Path, default=None, help="Legacy HSC weight root used for both coadd and variants unless more specific roots are set.")
     parser.add_argument("--hsc-coadd-weight-root", type=Path, default=None)
     parser.add_argument("--hsc-variant-weight-root", type=Path, default=None)
@@ -781,6 +793,8 @@ def main() -> None:
                 "data_root": str(Path(args.root).expanduser().resolve()),
                 "hsc_image_root": str(Path(args.hsc_image_root).expanduser().resolve()),
                 "hsc_coadd_profile": str(args.hsc_coadd_profile),
+                "hsc_sources": args.hsc_sources,
+                "hsc_grid_mode": args.hsc_grid_mode,
                 "hsc_weight_root": str(Path(args.hsc_weight_root).expanduser().resolve()),
                 "hsc_coadd_weight_root": str(Path(args.hsc_coadd_weight_root).expanduser().resolve()),
                 "hsc_variant_weight_root": str(Path(args.hsc_variant_weight_root).expanduser().resolve()),

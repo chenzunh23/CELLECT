@@ -6,7 +6,7 @@ from scipy.spatial import cKDTree
 from .labels import SourceClass as C
 from .ordinary_common import start_ordinary, retained, downgrade
 from .utils.containment import nearby_pairs, area_fraction, pixel_iou, mask_sample_fraction
-from .snr import apply_candidate_snr, apply_remeasured_aperture_snr, remeasure_aperture_snr
+from .snr import SnrThresholds, apply_candidate_snr, apply_remeasured_aperture_snr, remeasure_aperture_snr
 
 
 @dataclass(frozen=True)
@@ -24,6 +24,7 @@ class A2744OrdinaryConfig:
     enable_catalog_snr: bool = True
     enable_aperture_snr: bool = True
     enable_star_mask: bool = True
+    snr_thresholds: SnrThresholds = SnrThresholds()
 
 
 def flag_priority(flag):
@@ -169,7 +170,7 @@ def label_ordinary_sources(data, candidate, labels, *, config: A2744OrdinaryConf
         source_containment(data, result, config)
     result.snapshot("containment")
     if config.enable_catalog_snr:
-        apply_candidate_snr(result, data.snr)
+        apply_candidate_snr(result, data.snr, thresholds=config.snr_thresholds)
     else:
         result.snapshot("snr")
     if star_footprint is not None:
@@ -196,7 +197,8 @@ def label_ordinary_sources(data, candidate, labels, *, config: A2744OrdinaryConf
             aperture_measurement = remeasure_aperture_snr(image, measurement_geom, sky_mask=sky_mask,
                 excluded_mask=excluded_mask, radius=config.aperture_radius)
     if aperture_measurement is not None and config.enable_aperture_snr:
-        apply_remeasured_aperture_snr(result, data.mag, aperture_measurement, mag_min=config.aperture_mag_min)
+        apply_remeasured_aperture_snr(result, data.mag, aperture_measurement, mag_min=config.aperture_mag_min,
+                                      thresholds=config.snr_thresholds)
     elif config.enable_aperture_snr:
         pending = retained(result)
         if config.aperture_mag_min is not None:
@@ -212,7 +214,8 @@ def label_ordinary_sources(data, candidate, labels, *, config: A2744OrdinaryConf
         # parents must also pass the existing strict aperture-SNR policy.
         while protect_ignored_children(data, result, config).any():
             if aperture_measurement is not None and config.enable_aperture_snr:
-                apply_remeasured_aperture_snr(result, data.mag, aperture_measurement, mag_min=config.aperture_mag_min)
+                apply_remeasured_aperture_snr(result, data.mag, aperture_measurement, mag_min=config.aperture_mag_min,
+                                              thresholds=config.snr_thresholds)
         result.snapshot('ignore_child_protection')
     result.diagnostics.update(psf_small=small, close_brighter=close)
     return result

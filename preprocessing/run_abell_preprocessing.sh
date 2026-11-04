@@ -43,6 +43,8 @@ UNCOVER_RISK_BRIGHT_MAG="${UNCOVER_RISK_BRIGHT_MAG:-22}"
 UNCOVER_RISK_SIGMA="${UNCOVER_RISK_SIGMA:-3}"
 UNCOVER_REJECT_UNTRUSTED="${UNCOVER_REJECT_UNTRUSTED:-1}"
 JWST_MAX_INVALID_FRACTION="${JWST_MAX_INVALID_FRACTION:-0.10}"
+SNR_IGNORE_THRESHOLD="${SNR_IGNORE_THRESHOLD:-5}"
+SNR_WEAK_THRESHOLD="${SNR_WEAK_THRESHOLD:-7}"
 uncover_args=(--no-use-uncover)
 if [[ "$USE_UNCOVER" == 1 ]]; then
   uncover_args=(--use-uncover --uncover-catalog "$UNCOVER_CATALOG"
@@ -55,7 +57,7 @@ if [[ "$USE_UNCOVER" == 1 ]]; then
   fi
 fi
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
-progress "START output=$OUTPUT_ROOT stage=$ABELL_STAGE use_uncover=$USE_UNCOVER cutout_workers=$CUTOUT_WORKERS zarr_workers=$ZARR_WORKERS"
+progress "START output=$OUTPUT_ROOT stage=$ABELL_STAGE use_uncover=$USE_UNCOVER snr_ignore=$SNR_IGNORE_THRESHOLD snr_weak=$SNR_WEAK_THRESHOLD cutout_workers=$CUTOUT_WORKERS zarr_workers=$ZARR_WORKERS"
 mkdir -p "$OUTPUT_ROOT/logs"
 # Prevent two schedulers from writing the same grid/stores concurrently.
 exec 9>"$OUTPUT_ROOT/.scheduler.lock"
@@ -64,6 +66,7 @@ cd "$REPO_ROOT"
 # Arrays preserve the complete argv when options are edited across lines.
 # A missing shell continuation must never silently drop catalog/worker flags.
 common_args=(--datasets abell --output-root "$OUTPUT_ROOT"
+  --snr-ignore-threshold "$SNR_IGNORE_THRESHOLD" --snr-weak-threshold "$SNR_WEAK_THRESHOLD"
   --jwst-max-invalid-fraction "$JWST_MAX_INVALID_FRACTION" "${uncover_args[@]}")
 if [[ "$ABELL_STAGE" == all || "$ABELL_STAGE" == cutouts ]]; then
 stage=cutouts

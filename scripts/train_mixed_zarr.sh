@@ -97,7 +97,7 @@ common=(--mode "$MODE" --data-format zarr --root "$ROOT" --bands all --checkpoin
   --mask-outside-kron-scale 1.5 --mask-area-ratio-lower 0.05 --mask-area-ratio-upper 2
   --mask-min-area-px 6 --mask-max-area-ratio 0.8 
   --ddp-static-graph off --ddp-progress-step-mode global --ddp-timeout-minutes 60
-  --wandb-project Astro_DEBUG --wandb-log-interval 10
+  --wandb-project Astro_CELLECT2D_SAM --wandb-log-interval 10
   --wandb-run-name "${WANDB_RUN_NAME:-cellect_${SAM_MODEL_TYPE}_pred_iou_1002}"
   --wandb-mode "${WANDB_MODE:-online}")
 case "${SAM_COMPILE:-1}" in
