@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import json
+import os
 import re
+import tempfile
+import threading
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +16,7 @@ import numpy as np
 
 from astro_train_zarr_data import PatchZarrReader
 
-from eval.eval_utils import crop_or_pad, crop_origin_for_image, read_fits_image
+from eval.eval_utils import crop_or_pad, crop_origin_for_image, read_fits_image, ltv_image_origin
 
 from .base import FrameRef, TileRow, patch_sort_key
 
@@ -84,7 +89,7 @@ class HscImageAccess:
 
     def __init__(
         self,
-        root: Path,
+        root: Path = DEFAULT_HSC_IMAGE_ROOT,
         tract: str = "9813",
         weight_root: Path | None = DEFAULT_HSC_WEIGHT_ROOT,
         coadd_weight_root: Path | None = None,
@@ -93,7 +98,9 @@ class HscImageAccess:
         noisy_fits_root: Path = DEFAULT_HSC_NOISY_FITS_ROOT,
         denoised_fits_root: Path = DEFAULT_HSC_DENOISED_FITS_ROOT,
         sources: tuple[str, ...] | list[str] | None = None,
-        grid_mode: str = "zarr",
+        grid_mode: str = "fits",
+        tile_stride: int = 368,
+        cutout_plan: Path | None = None,
     ) -> None:
         self.root = Path(root).expanduser().resolve()
         self.tract = str(tract)
@@ -109,6 +116,21 @@ class HscImageAccess:
         if grid_mode not in {"zarr", "fits"}:
             raise ValueError("HSC grid_mode must be zarr or fits")
         self.grid_mode = grid_mode
+        if self.grid_mode == 'fits':
+            self.root = {'coadd':self.coadd_fits_root, 'noisy':self.noisy_fits_root,
+                'denoised':self.denoised_fits_root}[self.sources[0]]
+        self.tile_stride = int(tile_stride)
+        if not 0 < self.tile_stride <= self.tile_size:
+            raise ValueError(f'HSC tile stride must be between 1 and {self.tile_size}')
+        self._plan_config = dict(tract=self.tract, tile_size=self.tile_size, tile_stride=self.tile_stride,
+            sources=list(self.sources), coadd_fits_root=str(self.coadd_fits_root),
+            noisy_fits_root=str(self.noisy_fits_root), denoised_fits_root=str(self.denoised_fits_root))
+        plan_key = hashlib.sha256(json.dumps(self._plan_config, sort_keys=True).encode()).hexdigest()[:16]
+        self.cutout_plan = Path(cutout_plan).expanduser().resolve() if cutout_plan is not None else (
+            Path.home() / '.cache/cellect/hsc_fits_plans' / f'{plan_key}.json')
+        self._fits_metadata: dict[str, dict] = {}
+        self._plan_grids: dict[str, dict] = {}
+        self._scan_lock = threading.RLock()
         self._index: dict[tuple[str, str, str, str], _Store] | None = None
         self._readers: dict[str, PatchZarrReader] = {}
         self._tiles: dict[tuple[str, str], list[TileRow]] = {}
@@ -121,12 +143,20 @@ class HscImageAccess:
         if self._index is not None:
             return self._index
         if self.grid_mode == "fits":
-            self._index = self._scan_fits()
+            with self._scan_lock:
+                if self._index is None:
+                    index = self._scan_fits()
+                    self._prepare_fits_plan(index)
+                    self._index = index
             return self._index
         index: dict[tuple[str, str, str, str], _Store] = {}
         candidates = [self.root / "image_level", self.root / "hsc" / "image_level", self.root]
         base = next((p for p in candidates if any((p / s).is_dir() for s in (*SOURCE_ORDER, "half_coadd"))), None)
         if base is None:
+            legacy = self.root / self.tract / 'coadd'
+            if legacy.is_dir():
+                raise ValueError('Legacy multi-band patch Zarr is not an image-level band store. '
+                    'Use --hsc-grid-mode fits to read FITS without Zarr, or select a newer image-level Zarr root.')
             self._index = index
             return index
         for path in base.glob("*/*/*.zarr"):
@@ -151,6 +181,75 @@ class HscImageAccess:
             index[(source, band, patch, group)] = _Store(source, band, patch, group, path)
         self._index = index
         return index
+
+    def _prepare_fits_plan(self, index):
+        """Cache only headers and a reusable grid; never read SCI/labels/Zarr."""
+        from astropy.io import fits
+        from preprocessing.utils.inputs import edge_aligned_starts
+        previous = {};cached = None
+        try:
+            cached = json.loads(self.cutout_plan.read_text())
+            if cached.get('schema_version') == 1 and cached.get('config') == self._plan_config:
+                previous = {row['path']: row for row in cached.get('files', [])}
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        files, grids = [], {}
+        for store in index.values():
+            path = store.path
+            stat = path.stat()
+            fingerprint = dict(size_bytes=stat.st_size, mtime_ns=stat.st_mtime_ns)
+            row = previous.get(str(path), {})
+            if row.get('fingerprint') != fingerprint:
+                with fits.open(path, memmap=True, ignore_missing_end=True) as hdus:
+                    candidates = [i for i, h in enumerate(hdus)
+                        if isinstance(h, (fits.PrimaryHDU, fits.ImageHDU, fits.CompImageHDU))
+                        and h.header.get('NAXIS') == 2]
+                    if not candidates:
+                        raise ValueError(f'No 2D science image in {path}')
+                    hdu_index = next((i for i in candidates if hdus[i].name.upper() in ('SCI', 'IMAGE')), candidates[0])
+                    header = hdus[0].header.copy();header.update(hdus[hdu_index].header)
+                row = dict(path=str(path), fingerprint=fingerprint, hdu=hdu_index,
+                    shape_yx=[int(header['NAXIS2']), int(header['NAXIS1'])],
+                    origin_xy=list(ltv_image_origin(header)))
+            row = {**row, 'source':store.source, 'band':store.band, 'patch':store.patch, 'group':store.group}
+            height, width = row['shape_yx'];ox, oy = row['origin_xy']
+            geometry = [height, width, ox, oy, self.tile_size, self.tile_stride]
+            grid_id = hashlib.sha256(json.dumps(geometry).encode()).hexdigest()[:16]
+            row['grid_id'] = grid_id
+            if grid_id not in grids:
+                xs = edge_aligned_starts(width, self.tile_size, self.tile_stride)
+                ys = edge_aligned_starts(height, self.tile_size, self.tile_stride)
+                # Preserve coverage for images only slightly larger than a tile.
+                if xs[0] > 0:xs.insert(0, 0)
+                if ys[0] > 0:ys.insert(0, 0)
+                tiles = [asdict(TileRow(i, f'x{col:03d}_y{r:03d}', ox+x, oy+y,
+                    ox+x+self.tile_size, oy+y+self.tile_size))
+                    for i, (r, col, x, y) in enumerate(
+                        (r, col, x, y) for r, y in enumerate(ys) for col, x in enumerate(xs))]
+                grids[grid_id] = dict(shape_yx=[height,width], origin_xy=[ox,oy], tiles=tiles)
+            files.append(row)
+        plan = dict(schema_version=1, dataset='hsc_image', config=self._plan_config,
+            coordinate_system='zero-based HSC tract pixels; local array coordinates subtract origin_xy',
+            files=files, grids=grids)
+        if plan != cached:
+            self.cutout_plan.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix=self.cutout_plan.name+'.', dir=self.cutout_plan.parent)
+            try:
+                with os.fdopen(fd, 'w') as handle:json.dump(plan, handle, ensure_ascii=False, indent=2);handle.write('\n')
+                os.replace(tmp, self.cutout_plan)
+            finally:
+                if os.path.exists(tmp):os.unlink(tmp)
+            print(f'[hsc-cutout-plan] files={len(files)} grids={len(grids)} '
+                  f'tile_size={self.tile_size} stride={self.tile_stride} path={self.cutout_plan}', flush=True)
+        self._fits_metadata = {row['path']:row for row in files}
+        self._plan_grids = grids
+
+    def prepare_cutout_plan(self):
+        if self.grid_mode != 'fits':
+            raise ValueError('FITS cutout planning requires --hsc-grid-mode fits')
+        self._scan()
+        return dict(path=str(self.cutout_plan), files=len(self._fits_metadata), grids=len(self._plan_grids),
+            tiles=sum(len(g['tiles']) for g in self._plan_grids.values()))
 
     def _scan_fits(self) -> dict[tuple[str, str, str, str], _Store]:
         """Discover files without reading pixels or requiring any training Zarr."""
@@ -216,7 +315,7 @@ class HscImageAccess:
         key = (source, band, patch, "" if source == "coadd" else _group_label(group))
         store = self._scan().get(key)
         if store is None:
-            raise FileNotFoundError(f"missing {source} zarr for {band} {patch} {group}")
+            raise FileNotFoundError(f"missing {source} {self.grid_mode} image for {band} {patch} {group}")
         return store
 
     def _resolve_weight_csv(self, root: Path | None, band: str, patch: str) -> Path | None:
@@ -335,17 +434,11 @@ class HscImageAccess:
             return cached
         stores = self._stores(band=band, patch=patch)
         if not stores:
-            raise FileNotFoundError(f"no image-level zarr for {band} {patch}")
+            raise FileNotFoundError(f"no {self.grid_mode} image for {band} {patch}")
         store = stores[0]
         if self.grid_mode == "fits":
-            from astropy.io import fits
-            with fits.open(store.path, memmap=True, ignore_missing_end=True) as hdus:
-                header = next(h.header for h in hdus if isinstance(h, (fits.PrimaryHDU, fits.ImageHDU, fits.CompImageHDU)) and h.header.get("NAXIS") == 2)
-                width, height = int(header["NAXIS1"]), int(header["NAXIS2"])
-            rows = [TileRow(i, f"x{x // self.tile_size:03d}_y{y // self.tile_size:03d}",
-                            x, y, x + self.tile_size, y + self.tile_size)
-                    for i, (x, y) in enumerate((x, y) for y in range(0, height, self.tile_size)
-                                               for x in range(0, width, self.tile_size))]
+            meta = self._fits_metadata[str(store.path)]
+            rows = [TileRow(**tile) for tile in self._plan_grids[meta['grid_id']]['tiles']]
             self._tiles[key] = rows
             return rows
         reader = self._reader(store)
@@ -443,7 +536,7 @@ class HscImageAccess:
                 target = _group_label(str(visit))
                 specs = [spec for spec in specs if spec[0] == "coadd" or spec[1] == target]
         if not specs:
-            raise FileNotFoundError(f"no zarr slots for {band} {patch}")
+            raise FileNotFoundError(f"no {self.grid_mode} slots for {band} {patch}")
         if int(frame_slot) < 0 or int(frame_slot) >= len(specs):
             raise FileNotFoundError(f"slot {frame_slot} is not present for {band} {patch}")
         source, group = specs[int(frame_slot)]
@@ -457,7 +550,8 @@ class HscImageAccess:
         weight = self.weight_for(source, band, patch, group)
         return FrameRef(
             token=token,
-            root=str(self.root),
+            root=str({'coadd':self.coadd_fits_root, 'noisy':self.noisy_fits_root,
+                'denoised':self.denoised_fits_root}[source] if self.grid_mode == 'fits' else self.root),
             tract=self.tract,
             patch=patch,
             band=band,
@@ -537,15 +631,19 @@ class HscImageAccess:
         height = int(ref.height)
         if self.grid_mode == "fits":
             from astropy.io import fits
-            local_x0, local_y0 = int(ref.x0), int(ref.y0)
+            self._scan()
+            meta = self._fits_metadata[str(path)]
+            ox, oy = meta['origin_xy']
+            local_x0, local_y0 = int(ref.x0)-ox, int(ref.y0)-oy
             crop = np.full((height, width), np.nan, dtype=np.float32)
-            with fits.open(path, memmap=True, ignore_missing_end=True) as hdus:
-                hdu = next(h for h in hdus if isinstance(h, (fits.PrimaryHDU, fits.ImageHDU, fits.CompImageHDU)) and h.header.get("NAXIS") == 2)
-                header = hdu.header.copy()
-                x1 = min(local_x0 + width, int(header["NAXIS1"]))
-                y1 = min(local_y0 + height, int(header["NAXIS2"]))
-                if x1 > local_x0 and y1 > local_y0:
-                    crop[:y1-local_y0, :x1-local_x0] = hdu.section[local_y0:y1, local_x0:x1]
+            with fits.open(path, memmap=False, ignore_missing_end=True) as hdus:
+                hdu = hdus[meta['hdu']]
+                header = hdus[0].header.copy();header.update(hdu.header)
+                xa, ya = max(0,local_x0), max(0,local_y0)
+                x1 = min(local_x0 + width, int(header['NAXIS1']))
+                y1 = min(local_y0 + height, int(header['NAXIS2']))
+                if x1 > xa and y1 > ya:
+                    crop[ya-local_y0:y1-local_y0, xa-local_x0:x1-local_x0] = hdu.section[ya:y1, xa:x1]
         else:
             full, header, _ = read_fits_image(path)
             local_x0, local_y0 = crop_origin_for_image(full, header, x0=int(ref.x0), y0=int(ref.y0), width=width, height=height)
@@ -556,5 +654,7 @@ class HscImageAccess:
         ch = header.copy()
         if 'CRPIX1' in ch: ch['CRPIX1'] -= local_x0
         if 'CRPIX2' in ch: ch['CRPIX2'] -= local_y0
+        if 'LTV1' in ch: ch['LTV1'] -= local_x0
+        if 'LTV2' in ch: ch['LTV2'] -= local_y0
         return prepare_image(crop[:height, :width], header=ch, source_path=path if WCS(ch).has_celestial else None,
             config=ImagePreparationConfig(input_unit='native')).image

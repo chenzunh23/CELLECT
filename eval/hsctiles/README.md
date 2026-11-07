@@ -37,6 +37,56 @@ CUDA_VISIBLE_DEVICES=0 python eval/hsctiles/eval_hsctile_pack.py \
 
 ## Interactive Browser
 
+All browser instances now share a lightweight entry at `http://127.0.0.1:8800/`.
+Keep using distinct `--port` values for independent experiments; each new browser
+automatically registers and starts/reuses the portal. For example, browsers on
+8787 and 8813 are accessible at `/browser/8787/` and `/browser/8813/` on port 8800.
+Different tabs retain their own backend, including Detect, masks, SNR, exports,
+and data-quality pages. The portal does not load a model or use a GPU.
+
+Forward **only remote port 8800** using the VS Code Ports panel, then use its
+Forwarded Address in a local browser. The workspace settings enable automatic
+forwarding and restoring previous forwards. VS Code may choose a different
+local port if 8800 is occupied; use the address shown in the Ports panel.
+An existing SSH/VS Code connection still carries the traffic: listening on
+`0.0.0.0` alone does not create a connection from a personal computer.
+
+If using ordinary SSH instead of VS Code, put the following in the **personal
+computer's** `~/.ssh/config`, under the existing host entry. It reuses each normal
+SSH login instead of requiring one extra terminal/tunnel per experiment:
+
+```sshconfig
+Host opus
+    HostName 101.6.89.15
+    Port 8210
+    User czh23
+    LocalForward 127.0.0.1:8800 127.0.0.1:8800
+```
+
+Previously running browser processes can be registered without restarting them:
+
+```bash
+python eval/hsctiles/browser_portal.py --backend '8787=sky_1104 epoch21'
+```
+
+This foreground command starts the portal; it is needed only if no portal is
+already running. If it is already running, register an old process from the
+repository root without starting a second portal:
+
+```bash
+python -c "from eval.hsctiles.browser_portal import register_backend; register_backend(8813, 'another experiment')"
+```
+
+Registration and portal logs live in `~/.cache/cellect/browser_portal/`.
+The default portal listens only on loopback and only proxies registered local
+ports. It stays alive when one experiment closes. A stopped backend gives an
+explicit 502 error; it cannot silently switch to another experiment.
+Use `--portal-port 0` to disable auto-registration/startup, or choose another
+shared port with `--portal-port PORT` for all instances.
+Changing backend code requires restarting that backend; the portal can proxy
+already running older browsers without restart. HTTP/API/image URLs are
+translated at the portal; raw FITS paths and image bytes remain unchanged.
+
 FITS loading uses `--image-workers 4` concurrent CPU readers by default.
 `--scaling-workers 2` separately limits expensive input-scaling work (including
 4096-parent statistics). Add these options to the existing server command and
@@ -399,12 +449,48 @@ The HSC and JWST defaults are unchanged. Remove any explicit
 # HSC 独立 coadd 与原始网格（2026-11-03）
 
 在原有 server 命令中增加 `--dataset hsc_image --hsc-sources coadd --hsc-grid-mode fits`，
-即可脱离训练 Zarr 的保留范围和 stride，从原始 FITS 以 512 像素步长选块；
-`x000_y000` 起点是 patch FITS 数组的 `(0,0)`，边缘不足 512 的部分以 NaN 补齐。
+即可脱离训练 Zarr 的保留范围，从原始 FITS 选块；
+2026-11-04 起默认使用 512 像素大小、368 步长及边缘对齐，具体清单与坐标见下节。
 `--hsc-coadd-profile half` 读取 `/data/czh23/Subaru_products/half_coadd`，
 `--hsc-coadd-profile official` 读取 `/data/shared/Subaru` 的 full coadd。
 这里只做 coadd 推理，不加入 noisy/denoised，也不重建训练标签。
 继续看 Zarr 保存的小块时用 `--hsc-grid-mode zarr`；现在识别最新 `half_coadd` 目录，
 `--hsc-image-root` 可以指向 mixed Zarr 根目录或其 `hsc` 子目录。
 更改这些参数后需重启 server。
+
+## HSC 默认现场切片与独立清单（2026-11-04）
+
+HSC image 模式现在默认 `--hsc-grid-mode fits`，不读取任何训练 Zarr。
+`direct_zarr_v2_0711/9813/coadd/<patch>.zarr` 的多波段 patch 格式与当前
+image-level 单波段扫描格式不同；不要再将它作为默认浏览索引。
+FITS 模式下 `--hsc-image-root` 不参与文件发现或切片。
+
+每个 patch 使用 512×512、stride 368 的预处理网格，最后一行/列对齐边缘。
+标准 4200×4200 patch 有 11×11 块；例如 patch 4,5 的
+`x010_y007` 即 r07/c10，tract 坐标 `(19588,22476)`，FITS 数组坐标 `(3688,2576)`。
+小于 512 的图像用 NaN 补齐。FITS 模式不会应用训练时的删块规则，
+因此可浏览训练中被剔除或未写入 Zarr 的网格。
+
+清单只包含 FITS 路径、SCI HDU、尺寸、LTV 原点、文件大小/mtime 和网格坐标；
+不包含科学像素或标签。默认在 `~/.cache/cellect/hsc_fits_plans/` 按配置保存，
+可用 `--hsc-cutout-plan` 指定路径。重新打开时检查文件大小和 mtime，
+新文件或修改过的文件会刷新表头；不同 coadd profile/stride 的默认缓存互相独立。
+查看/推理时按清单现场读取 bounded FITS section，应用当前 `--scaling-mode`
+及 clip/log/Lupton 参数；统计量使用该 512×512 切片，与原 HSC browser 一致。
+这不会按旧 Zarr 已缩放像素重复缩放，也不会写出新的 Zarr。
+
+仅生成清单，不启动服务或加载 checkpoint：
+
+```bash
+cd /home/czh23/CELLECT/eval
+python hsctiles/serve_hsctile_pack_browser.py --hsc-coadd-profile official \
+  --hsc-cutout-plan /home/czh23/analysis/2026-11/2026-11-04/hsc_browser_fits_plan/official.json \
+  --prepare-hsc-plan-only
+```
+
+在原启动命令中增加 `--dataset hsc_image --hsc-coadd-profile official` 使用 full coadd；
+使用 half coadd 则指定 `--hsc-coadd-profile half`（默认）。
+`--hsc-sources coadd` 只看 coadd，省略则同时发现 noisy/denoised。
+需要旧的 image-level Zarr 保留块索引时显式使用 `--hsc-grid-mode zarr`；
+这不支持 v2 的多波段 patch 存储格式。
 

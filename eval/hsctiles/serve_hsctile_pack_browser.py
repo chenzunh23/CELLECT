@@ -58,6 +58,9 @@ from eval.hsctiles.browser_core import (
     load_html,
 )
 from eval.hsctiles.data_quality_preview import DataQualityPreview, DEFAULT_DATA_QUALITY_BANDS
+from eval.hsctiles.browser_portal import (
+    DEFAULT_PORT as DEFAULT_PORTAL_PORT, ensure_portal, register_backend, unregister_backend,
+)
 
 
 def _resolve_checkpoint_path(path: Path) -> Path:
@@ -417,7 +420,9 @@ class Server(ThreadingHTTPServer):
             noisy_fits_root=Path(self.args.hsc_noisy_fits_root),
             denoised_fits_root=Path(self.args.hsc_denoised_fits_root),
             sources=getattr(self.args, "hsc_sources", None),
-            grid_mode=getattr(self.args, "hsc_grid_mode", "zarr"),
+            grid_mode=getattr(self.args, "hsc_grid_mode", "fits"),
+            tile_stride=getattr(self.args, 'hsc_tile_stride', 368),
+            cutout_plan=getattr(self.args, 'hsc_cutout_plan', None),
         )
         hsc_image_bands = hsc_image_access.available_bands() or list(DEFAULT_HSC_IMAGE_BANDS)
         hsc_image_default_bands = ["HSC-G", "HSC-I", "HSC-Y"] # [band for band in DEFAULT_HSC_IMAGE_BANDS if band in hsc_image_bands]
@@ -432,7 +437,9 @@ class Server(ThreadingHTTPServer):
             "id": "hsc_image",
             "label": (f"HSC {'full' if self.args.hsc_coadd_profile == 'official' else 'half'} coadd"
                       if getattr(self.args, "hsc_sources", None) == ["coadd"] else "HSC coadd/noisy/denoised"),
-            "grid_mode": getattr(self.args, "hsc_grid_mode", "zarr"),
+            "grid_mode": getattr(self.args, "hsc_grid_mode", "fits"),
+            "tile_stride": hsc_image_access.tile_stride,
+            "cutout_plan": str(hsc_image_access.cutout_plan) if hsc_image_access.grid_mode == 'fits' else None,
             "sources": getattr(self.args, "hsc_sources", None),
             "coadd_profile": self.args.hsc_coadd_profile,
             "enabled": bool(hsc_image_patches and hsc_image_bands),
@@ -594,7 +601,9 @@ class Server(ThreadingHTTPServer):
                     noisy_fits_root=Path(self.args.hsc_noisy_fits_root),
                     denoised_fits_root=Path(self.args.hsc_denoised_fits_root),
                     sources=getattr(self.args, "hsc_sources", None),
-                    grid_mode=getattr(self.args, "hsc_grid_mode", "zarr"),
+                    grid_mode=getattr(self.args, "hsc_grid_mode", "fits"),
+                    tile_stride=getattr(self.args, 'hsc_tile_stride', 368),
+                    cutout_plan=getattr(self.args, 'hsc_cutout_plan', None),
                 ).available_patches([str(v) for v in self.args.bands])[:1]
             else:
                 patches = [str(v) for v in self.args.patches]
@@ -653,8 +662,14 @@ def main() -> None:
     parser.add_argument("--hsc-coadd-profile", choices=("half", "official", "custom"), default="half")
     parser.add_argument("--hsc-sources", nargs="+", choices=("coadd", "noisy", "denoised"), default=None,
                         help="Restrict HSC variants, e.g. --hsc-sources coadd. Coadd pixels come from --hsc-coadd-profile.")
-    parser.add_argument("--hsc-grid-mode", choices=("zarr", "fits"), default="zarr",
-                        help="zarr: saved training tiles; fits: native patch-local 512px grid, independent of Zarr coverage.")
+    parser.add_argument("--hsc-grid-mode", choices=("zarr", "fits"), default="fits",
+                        help="fits (default): live FITS cutouts from a header-only grid plan; zarr: saved image-level training tile index.")
+    parser.add_argument('--hsc-tile-stride', type=int, default=368,
+                        help='FITS grid stride for 512px tiles; 368 matches preprocessing edge-aligned grids.')
+    parser.add_argument('--hsc-cutout-plan', type=Path, default=None,
+                        help='Header-only FITS/grid JSON cache; default ~/.cache/cellect/hsc_fits_plans/<configuration>.json.')
+    parser.add_argument('--prepare-hsc-plan-only', action='store_true',
+                        help='Write/refresh the FITS cutout plan and exit without starting a browser or loading a checkpoint.')
     parser.add_argument("--hsc-weight-root", type=Path, default=None, help="Legacy HSC weight root used for both coadd and variants unless more specific roots are set.")
     parser.add_argument("--hsc-coadd-weight-root", type=Path, default=None)
     parser.add_argument("--hsc-variant-weight-root", type=Path, default=None)
@@ -751,6 +766,8 @@ def main() -> None:
     parser.add_argument("--export-dir", type=Path, default=base / "interactive_selected" / stamp)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8788)
+    parser.add_argument("--portal-port", type=int, default=DEFAULT_PORTAL_PORT,
+                        help="Shared loopback browser entry port (default 8800); auto-started and shared by all instances. 0 disables it.")
     parser.add_argument("--run-name", type=str, default=f"")
     args = parser.parse_args()
     args.checkpoint = _resolve_checkpoint_path(args.checkpoint)
@@ -783,18 +800,41 @@ def main() -> None:
     if args.data_quality_denoised_fits_root is None:
         args.data_quality_denoised_fits_root = args.hsc_denoised_fits_root
 
+    if args.prepare_hsc_plan_only:
+        if args.hsc_grid_mode != 'fits':parser.error('--prepare-hsc-plan-only requires --hsc-grid-mode fits')
+        access = make_access('hsc_image', args, str(args.tract))
+        print(json.dumps(access.prepare_cutout_plan(), indent=2), flush=True)
+        return
+
     server = Server((args.host, args.port), args)
     host, port = server.server_address[:2]
+    portal_url = None
+    portal_token = None
+    if args.portal_port and args.portal_port != port:
+        try:
+            checkpoint = Path(args.checkpoint).expanduser().resolve()
+            label = str(args.run_name).strip() or f"{checkpoint.parent.name} / {checkpoint.stem}"
+            portal_token = register_backend(port, label, pid=os.getpid(), checkpoint=str(checkpoint))
+            ensure_portal(args.portal_port)
+            portal_url = f"http://127.0.0.1:{args.portal_port}/browser/{port}/"
+            print(f"[browser-portal] {portal_url} (forward only port {args.portal_port})", flush=True)
+        except Exception as exc:
+            print(f"[browser-portal] unavailable: {exc}; direct browser remains available", flush=True)
+    elif args.portal_port == port:
+        print("[browser-portal] browser and portal need different ports; shared entry disabled", flush=True)
     print(
         json.dumps(
             {
-                "url": f"http://{host}:{port}/",
+                "url": f"http://{'127.0.0.1' if host == '0.0.0.0' else host}:{port}/",
+                "portal_url": portal_url,
                 "dataset": str(args.dataset),
                 "data_root": str(Path(args.root).expanduser().resolve()),
-                "hsc_image_root": str(Path(args.hsc_image_root).expanduser().resolve()),
+                "hsc_image_root": str(Path(args.hsc_image_root).expanduser().resolve()) if args.hsc_grid_mode == 'zarr' else None,
                 "hsc_coadd_profile": str(args.hsc_coadd_profile),
                 "hsc_sources": args.hsc_sources,
                 "hsc_grid_mode": args.hsc_grid_mode,
+                "hsc_tile_stride": args.hsc_tile_stride,
+                "hsc_cutout_plan": str(args.hsc_cutout_plan) if args.hsc_cutout_plan else 'automatic cache',
                 "hsc_weight_root": str(Path(args.hsc_weight_root).expanduser().resolve()),
                 "hsc_coadd_weight_root": str(Path(args.hsc_coadd_weight_root).expanduser().resolve()),
                 "hsc_variant_weight_root": str(Path(args.hsc_variant_weight_root).expanduser().resolve()),
@@ -817,6 +857,8 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        if portal_token:
+            unregister_backend(port, portal_token)
         server.server_close()
 
 

@@ -20,7 +20,7 @@ from astropy.table import Table
 from astropy.wcs import WCS
 
 from .image_processing import component_area_map, component_centroid_map
-from .utils.gaia import matching_radius_pixels, observation_time, propagated_gaia_radec
+from .utils.gaia import matching_radius_pixels, observation_time, propagated_gaia_radec, astrometric_evidence
 from .labels import SourceClass, SourceLabels
 from .refit import RefitConfig, compute_kron_ellipse
 from .utils.catalog import source_ids
@@ -39,7 +39,7 @@ class BrightLabelConfig:
     cluster_max_area: float = 10000.0
     cluster_source_match_pixels: float = 6.0
     cluster_centroid_match_pixels: float = 10.0
-    gaia_bright_mag_threshold: float = 18.0
+    gaia_bright_mag_threshold: float = 22.0
     pixel_scale_arcsec: float = 0.168
     gaia_source_match_arcsec: float | None = None
     gaia_centroid_match_arcsec: float | None = None
@@ -50,6 +50,7 @@ class BrightLabelConfig:
     blendedness_ignore_threshold: float = 0.5
     large_component_fast_center_only_source_min: int = 256
     add_unmatched_component_gaia_centers: bool = True
+    add_nested_bright_component_centers: bool = True
 
 
 @dataclass
@@ -229,16 +230,21 @@ def project_gaia_rows(
     *,
     image_shape: tuple[int, int] | None,
     image_header: fits.Header | None,
-    pixel_origin: int = 1,
+    pixel_origin: int = 0,
+    reference_epoch: float | None = None,
 ) -> list[dict[str, object]]:
     if gaia_table is None or len(gaia_table) == 0:
         return []
+    if reference_epoch is not None and 'ref_epoch' not in gaia_table.colnames:
+        gaia_table=gaia_table.copy();gaia_table['ref_epoch']=reference_epoch
+    reliable=astrometric_evidence(gaia_table,allow_absolute_motion=False)
+    moved=np.zeros(len(gaia_table),bool)
     if "x" in gaia_table.colnames and "y" in gaia_table.colnames:
         x = np.asarray(gaia_table["x"], dtype=np.float64)
         y = np.asarray(gaia_table["y"], dtype=np.float64)
     elif "ra" in gaia_table.colnames and "dec" in gaia_table.colnames and image_header is not None:
         wcs = WCS(image_header)
-        ra, dec, _moved = propagated_gaia_radec(gaia_table, observation_time(image_header))
+        ra, dec, moved = propagated_gaia_radec(gaia_table, observation_time(image_header))
         x, y = wcs.all_world2pix(ra, dec, pixel_origin)
     else:
         return []
@@ -260,6 +266,8 @@ def project_gaia_rows(
                 "source_id": int(sid[idx]),
                 "phot_g_mean_mag": finite_float(gmag[idx]),
                 "phot_rp_mean_mag": finite_float(gaia_table['phot_rp_mean_mag'][idx]) if 'phot_rp_mean_mag' in gaia_table.colnames else float('nan'),
+                "astrometric_evidence": bool(reliable[idx]),
+                "position_propagated": bool(moved[idx]),
                 "x": float(x[idx]),
                 "y": float(y[idx]),
             }
@@ -434,9 +442,9 @@ def synthetic_component_center_source(
 def final_label_to_source_class(label: str) -> SourceClass:
     if label == "clean":
         return SourceClass.CLEAN
-    if label in {"weak_shape", "center_only", "center_only_external"}:
+    if label in {"weak_shape", "center_only"}:
         return SourceClass.WEAK_SHAPE
-    if label == "strict_center_only":
+    if label in {"strict_center_only", "center_only_external"}:
         return SourceClass.STRICT_CENTER_ONLY
     if label == "restricted_bright_region":
         return SourceClass.RESTRICTED_BRIGHT_REGION
@@ -454,6 +462,10 @@ def classify_no_upper(
     config: BrightLabelConfig,
 ) -> tuple[list[dict[str, object]], dict[int, dict[str, object]], list[dict[str, object]], np.ndarray, np.ndarray]:
     del image_shape
+    # Gaia entries without stellar evidence are absent from label decisions.
+    gaia_rows=[row for row in gaia_rows if bool(row.get('astrometric_evidence',False))
+        and np.isfinite(finite_float(row.get('phot_g_mean_mag')))
+        and finite_float(row.get('phot_g_mean_mag'))<config.gaia_bright_mag_threshold]
     for source in sources:
         in_bad, mask_hit = center_in_quality_mask(source, quality_mask)
         source["center_bad_mask"] = mask_hit
@@ -528,330 +540,213 @@ def classify_no_upper(
 
 
 def classify_component_bright(
-    *,
-    sources: list[dict[str, object]],
-    gaia_rows: list[dict[str, object]],
-    component_labels: np.ndarray,
-    quality_mask: np.ndarray | None,
-    config: BrightLabelConfig,
+    *, sources: list[dict[str, object]], gaia_rows: list[dict[str, object]],
+    component_labels: np.ndarray, quality_mask: np.ndarray | None,
+    config: BrightLabelConfig, protected_component_ids=(),
 ) -> tuple[list[dict[str, object]], dict[int, dict[str, object]], list[dict[str, object]], np.ndarray]:
-    component_areas = component_area_map(component_labels)
-    component_centroids = component_centroid_map(component_labels)
-    by_component: dict[int, list[int]] = defaultdict(list)
-    gaia_by_component: dict[int, list[dict[str, object]]] = defaultdict(list)
-    for idx, source in enumerate(sources):
-        comp = component_at(component_labels, float(source["x"]), float(source["y"]), 0)
-        source["component_id"] = comp
-        source["component_area"] = component_areas.get(comp, 0)
-        in_bad, mask_hit = center_in_quality_mask(source, quality_mask)
-        source["center_bad_mask"] = mask_hit
-        source["center_in_bad_mask"] = in_bad
-        by_component[comp].append(idx)
-    for gaia in gaia_rows:
-        comp = component_at(component_labels, float(gaia["x"]), float(gaia["y"]), 0)
-        if comp > 0:
-            gaia_by_component[comp].append(gaia)
-        else:
-            gaia_by_component[0].append(gaia)
+    """HSC isolated-source policy followed by authoritative Gaia overrides.
 
-    component_meta: dict[int, dict[str, object]] = {}
-    pending_by_component: dict[int, list[int]] = defaultdict(list)
-    for idx, source in enumerate(sources):
-        if float(source["area"]) >= float(config.drop_area_max):
-            source["final_label"] = "ignore"
-            source["reason"] = f"dropped_large_area_ge_{config.drop_area_max:g}"
-            continue
-        comp = int(source["component_id"])
-        if comp <= 0:
-            pending_by_component[0].append(idx)
-            continue
-        source_is_galaxy = str(source.get("class")) == "galaxy"
-        has_bright_gaia = any(finite_float(row.get("phot_g_mean_mag"), float("inf")) <= config.gaia_bright_mag_threshold for row in gaia_by_component.get(comp, []))
-        if config.use_bad_mask_first_step and bool(source["center_in_bad_mask"]) and not source_is_galaxy and not has_bright_gaia:
-            source["final_label"] = "ignore"
-            source["reason"] = f"bad_mask_non_galaxy_no_bright_gaia:{source['center_bad_mask']}"
-            continue
-        pending_by_component[comp].append(idx)
-
-    cluster_rows: list[dict[str, object]] = []
-    next_cluster_id = 1
-    next_synthetic = 1
-    ordinary_ignore_components: set[int] = set()
-    synthetic_center_components: set[int] = set()
-
-    def bright_gaia_rows(comp: int) -> list[dict[str, object]]:
-        return [
-            gaia
-            for gaia in gaia_by_component.get(comp, [])
-            if finite_float(gaia.get("phot_g_mean_mag"), float("inf")) <= float(config.gaia_bright_mag_threshold)
-        ]
-
-    def add_unmatched_gaia_centers_for_component(
-        comp: int,
-        *,
-        cluster_id: int,
-        cluster_size: int,
-        used_gaia_keys: set[str],
-        reason: str,
-        match_mode: str,
-    ) -> int:
-        nonlocal next_synthetic
-        if not config.add_unmatched_component_gaia_centers:
-            return 0
-        added = 0
-        for gaia in sorted(
-            bright_gaia_rows(comp),
-            key=lambda row: (finite_float(row.get("phot_g_mean_mag"), float("inf")), finite_float(row.get("source_id"), 0.0)),
-        ):
-            key = gaia_row_key(gaia)
-            if key in used_gaia_keys:
-                continue
-            sources.append(
-                synthetic_gaia_source(
-                    gaia,
-                    comp=comp,
-                    component_area=component_areas.get(comp, 0),
-                    cluster_id=cluster_id,
-                    cluster_size=cluster_size,
-                    source_id_offset=next_synthetic,
-                    pixel_scale_arcsec=config.pixel_scale_arcsec,
-                    match_mode=match_mode,
-                    match_pixels=0.0,
-                    reason=reason,
-                )
-            )
-            used_gaia_keys.add(key)
-            next_synthetic += 1
-            added += 1
-        return added
-
-    for comp in sorted(pending_by_component):
-        component_meta[comp] = {
-            "component_id": comp,
-            "component_area": component_areas.get(comp, 0),
-            "hsc_source_count": len(pending_by_component[comp]),
-            "gaia_count": len(gaia_by_component.get(comp, [])),
-        }
-        if (
-            comp > 0
-            and config.large_component_fast_center_only_source_min > 0
-            and len(pending_by_component[comp]) >= config.large_component_fast_center_only_source_min
-        ):
-            cluster_id = next_cluster_id
-            next_cluster_id += 1
-            added = add_unmatched_gaia_centers_for_component(
-                comp,
-                cluster_id=cluster_id,
-                cluster_size=len(pending_by_component[comp]),
-                used_gaia_keys=set(),
-                reason="large_component_gaia_strict_center_only",
-                match_mode="large_component_membership",
-            )
-            component_meta[comp]["unmatched_component_gaia_added"] = added
-            for idx in pending_by_component[comp]:
-                sources[idx]["cluster_id"] = cluster_id
-                sources[idx]["cluster_size"] = len(pending_by_component[comp])
-                sources[idx]["final_label"] = "restricted_bright_region"
-                sources[idx]["reason"] = "large_bright_component_fast_restricted_fragment"
-            continue
-        clusters = cluster_sources(
-            pending_by_component[comp],
-            sources,
-            iou_threshold=config.cluster_iou_threshold,
-            max_center_distance=config.cluster_max_center_distance,
-            max_area=config.cluster_max_area,
-        )
-        gaia_by_cluster = assign_gaia_rows_to_clusters(
-            clusters,
-            sources,
-            gaia_by_component.get(comp, []),
-            source_match_pixels=config.cluster_source_match_pixels,
-            centroid_match_pixels=config.cluster_centroid_match_pixels,
-        )
-        used_gaia_keys = {
-            gaia_row_key(gaia)
-            for matches in gaia_by_cluster.values()
-            for gaia, _mode, _dist_pix in matches
-        }
-        component_meta[comp]["cluster_count"] = len(clusters)
-        component_is_singleton_cluster = comp > 0 and len(clusters) == 1 and len(clusters[0]) == 1
-        for cluster_pos, cluster in enumerate(clusters):
-            cluster_id = next_cluster_id
-            next_cluster_id += 1
-            for idx in cluster:
-                sources[idx]["cluster_id"] = cluster_id
-                sources[idx]["cluster_size"] = len(cluster)
-            cluster_finalized = False
-            matched_gaia = gaia_by_cluster.get(cluster_pos, [])
-            cluster_is_singleton_source = len(cluster) == 1
-            cluster_is_source_isolated = (
-                cluster_is_singleton_source
-                and not source_intersects_any(cluster[0], pending_by_component[comp], sources)
-            )
-            singleton_component_isolated = comp > 0 and component_is_singleton_cluster
-            no_component_isolated_source = comp <= 0 and cluster_is_source_isolated
-            bridged_component_isolated_source = (
-                comp > 0
-                and cluster_is_source_isolated
-                and not component_is_singleton_cluster
-            )
-            if not cluster_finalized and cluster_is_singleton_source and (
-                singleton_component_isolated
-                or no_component_isolated_source
-                or bridged_component_isolated_source
-            ):
-                only = sources[cluster[0]]
-                only_shape_ok = source_shape_usable(
-                    only,
-                    max_area=config.shape_max_area,
-                    max_axis_ratio=config.shape_axis_ratio_max,
-                )
-                comp_area = int(component_areas.get(comp, 0))
-                if comp <= 0:
-                    comp_area = int(round(float(only.get("area", 0.0))))
-                size_area = max(float(comp_area), float(only.get("area", 0.0)))
-                # A source can be entirely inside its own bright isophote.
-                # Containment in this image mask is not evidence of an
-                # unreliable source or shape, including in bridged components.
-                blendedness = source_blendedness(only)
-                high_blendedness = math.isfinite(blendedness) and blendedness > float(config.blendedness_ignore_threshold)
-                if high_blendedness and size_area < config.isolated_area_max:
-                    only["final_label"] = "ignore"
-                    only["reason"] = f"isolated_bright_source_blendedness_gt_{config.blendedness_ignore_threshold:g}_small_ignore"
-                    only["paint_ordinary_ignore"] = True
-                    cluster_finalized = True
-                elif high_blendedness:
-                    only["final_label"] = "ignore"
-                    if comp > 0 and comp in component_centroids and not component_touches_image_boundary(component_labels, comp):
-                        if comp not in synthetic_center_components:
-                            x, y = component_centroids[comp]
-                            sources.append(
-                                synthetic_component_center_source(
-                                    comp=comp,
-                                    component_area=int(component_areas.get(comp, 0)),
-                                    x=x,
-                                    y=y,
-                                    reason=f"blendedness_gt_{config.blendedness_ignore_threshold:g}_bright_component_geometric_center",
-                                )
-                            )
-                            synthetic_center_components.add(comp)
-                        only["reason"] = f"isolated_bright_source_blendedness_gt_{config.blendedness_ignore_threshold:g}_large_center_inserted"
+    Reliable means parallax or proper-motion SNR >=3. Gaia entries without
+    this evidence do not participate and never veto existing HSC labels.
+    High-blendedness candidates have no unrestricted geometric fallback.
+    The nested clean/weak exception is evaluated on the final dense targets.
+    """
+    areas=component_area_map(component_labels)
+    centroids=component_centroid_map(component_labels)
+    by_component=defaultdict(list); gaia_by_component=defaultdict(list)
+    original_count=len(sources); ambiguous=set(); ignored=set(); clusters_all=[]
+    meta={}; cluster_rows=[]; added=[]; seen_gaia=set()
+    for i,source in enumerate(sources):
+        comp=component_at(component_labels,float(source['x']),float(source['y']),0)
+        source.update(component_id=comp,component_area=areas.get(comp,0))
+        hit,reason=center_in_quality_mask(source,quality_mask)
+        source.update(center_in_bad_mask=hit,center_bad_mask=reason)
+        by_component[comp].append(i)
+        if source_blendedness(source)>config.blendedness_ignore_threshold:ambiguous.add(comp)
+    gaia=[row for row in gaia_rows if np.isfinite(finite_float(row.get('phot_g_mean_mag')))
+          and finite_float(row.get('phot_g_mean_mag'))<config.gaia_bright_mag_threshold
+          and bool(row.get('astrometric_evidence',False))]
+    for row in gaia:
+        comp=component_at(component_labels,float(row['x']),float(row['y']),0)
+        gaia_by_component[comp].append(row)
+    # First preserve usable isolated galaxies/shapes. Gaia overrides run after
+    # this decision, so a coincident stellar identification has priority.
+    for comp,indices in sorted(by_component.items()):
+        pending=[]
+        for i in indices:
+            if float(sources[i]['area'])>=config.drop_area_max:
+                sources[i].update(final_label='ignore',reason='dropped_large_area')
+            else:pending.append(i)
+        groups=([pending] if comp>0 and config.large_component_fast_center_only_source_min>0
+                and len(pending)>=config.large_component_fast_center_only_source_min else
+                cluster_sources(pending,sources,iou_threshold=config.cluster_iou_threshold,
+                    max_center_distance=config.cluster_max_center_distance,max_area=config.cluster_max_area))
+        meta[comp]=dict(component_id=comp,component_area=areas.get(comp,0),hsc_source_count=len(indices),cluster_count=len(groups))
+        for group in groups:
+            cluster_id=len(clusters_all)+1;clusters_all.append(group)
+            for i in group:
+                sources[i].update(cluster_id=cluster_id,cluster_size=len(group),
+                    final_label='ignore',reason='bright_cluster_no_reliable_gaia')
+            if len(group)==1 and not source_intersects_any(group[0],pending,sources):
+                source=sources[group[0]]
+                usable=source_shape_usable(source,max_area=config.shape_max_area,max_axis_ratio=config.shape_axis_ratio_max)
+                size=max(float(areas.get(comp,0)),float(source['area']))
+                high_blend=source_blendedness(source)>config.blendedness_ignore_threshold
+                if high_blend:
+                    source.update(final_label='ignore',reason='high_blendedness_requires_gaia')
+                elif usable:
+                    bridged=comp>0 and len(groups)>1
+                    if size<config.isolated_area_max and not bridged:
+                        source.update(final_label='clean',reason='single_cluster_small_bright_component_clean' if comp>0 else 'isolated_small_bright_source_clean')
+                    elif source.get('class','unknown')!='star':
+                        source.update(final_label='weak_shape',reason='single_cluster_large_bright_component_weak_shape' if comp>0 else 'isolated_bright_galaxy_weak_shape')
                     else:
-                        if comp > 0 and component_touches_image_boundary(component_labels, comp):
-                            ordinary_ignore_components.add(comp)
-                        only["reason"] = f"isolated_bright_source_blendedness_gt_{config.blendedness_ignore_threshold:g}_large_ignore"
-                    cluster_finalized = True
-                elif bridged_component_isolated_source and only_shape_ok:
-                    only["final_label"] = "center_only_external"
-                    only["reason"] = "isolated_cluster_in_bright_component_weak_shape"
-                    cluster_finalized = True
-                elif size_area < config.isolated_area_max and only_shape_ok:
-                    only["final_label"] = "clean"
-                    only["reason"] = "isolated_small_bright_source_clean" if comp <= 0 else "single_cluster_small_bright_component_clean"
-                    cluster_finalized = True
-                elif only_shape_ok:
-                    only["final_label"] = "center_only_external"
-                    only["reason"] = "isolated_bright_source_weak_shape" if comp <= 0 else "single_cluster_large_bright_component_weak_shape"
-                    cluster_finalized = True
-            if not cluster_finalized and matched_gaia:
-                for idx in cluster:
-                    sources[idx]["final_label"] = "restricted_bright_region"
-                    sources[idx]["reason"] = "gaia_matched_cluster_hsc_fragment_restricted"
-                for gaia, mode, dist_pix in sorted(matched_gaia, key=lambda item: (finite_float(item[0].get("phot_g_mean_mag"), float("inf")), item[2])):
-                    sources.append(
-                        synthetic_gaia_source(
-                            gaia,
-                            comp=comp,
-                            component_area=component_areas.get(comp, 0),
-                            cluster_id=cluster_id,
-                            cluster_size=len(cluster) + len(matched_gaia),
-                            source_id_offset=next_synthetic,
-                            pixel_scale_arcsec=config.pixel_scale_arcsec,
-                            match_mode=f"cluster_{mode}",
-                            match_pixels=dist_pix,
-                            reason="gaia_matched_cluster_strict_center_only",
-                        )
-                    )
-                    next_synthetic += 1
-                cluster_finalized = True
-            if not cluster_finalized:
-                for idx in cluster:
-                    sources[idx]["final_label"] = "ignore"
-                    sources[idx]["reason"] = "bright_cluster_no_gaia_match_ignore"
-                    if (
-                        comp > 0
-                        and cluster_is_singleton_source
-                        and cluster_is_source_isolated
-                        and float(sources[idx].get("area", 0.0)) < float(config.isolated_area_max)
-                    ):
-                        sources[idx]["paint_ordinary_ignore"] = True
-            cluster_rows.append(
-                {
-                    "cluster_id": cluster_id,
-                    "component_id": comp,
-                    "component_area": component_areas.get(comp, 0),
-                    "cluster_size": len(cluster),
-                    "source_ids": " ".join(str(sources[idx]["source_id"]) for idx in cluster),
-                }
-            )
-        if comp > 0:
-            cluster_id = next_cluster_id
-            added = add_unmatched_gaia_centers_for_component(
-                comp,
-                cluster_id=cluster_id,
-                cluster_size=len(gaia_by_component.get(comp, [])),
-                used_gaia_keys=used_gaia_keys,
-                reason="component_unmatched_gaia_strict_center_only",
-                match_mode="component_membership",
-            )
-            if added:
-                next_cluster_id += 1
-                component_meta[comp]["unmatched_component_gaia_added"] = added
+                        source.update(final_label='center_only_external',reason='isolated_bright_star_strict_center_only')
+            cluster_rows.append(dict(cluster_id=cluster_id,component_id=comp,component_area=areas.get(comp,0),
+                cluster_size=len(group),source_ids=' '.join(str(sources[i]['source_id']) for i in group)))
+    reliable=defaultdict(list)
+    for comp,rows in gaia_by_component.items():
+        if comp<=0:continue
+        for row in rows:
+            reliable[comp].append((row,'component_membership',0.))
+    # Gaia centers outside the bright mask retain the existing 6px/10px
+    # source/cluster matching, across all components; each Gaia matches once.
+    outside=gaia_by_component.get(0,[])
+    matches=assign_gaia_rows_to_clusters(clusters_all,sources,outside,
+        source_match_pixels=config.cluster_source_match_pixels,
+        centroid_match_pixels=config.cluster_centroid_match_pixels)
+    isolated_matches=[]
+    for group_index,rows in matches.items():
+        group=clusters_all[group_index];comp=int(sources[group[0]]['component_id'])
+        for row,mode,distance in rows:
+            if comp>0:
+                reliable[comp].append((row,mode,distance))
+            else:isolated_matches.append((group,row,mode,distance))
+    def insert(row,comp,mode,distance):
+        key=gaia_row_key(row)
+        if key in seen_gaia:return
+        seen_gaia.add(key)
+        added.append(synthetic_gaia_source(row,comp=comp,component_area=areas.get(comp,0),
+            cluster_id=0,cluster_size=len(by_component.get(comp,[])),source_id_offset=1,
+            pixel_scale_arcsec=config.pixel_scale_arcsec,match_mode=mode,match_pixels=distance,
+            reason='hsc_reliable_gaia_strict_center_only'))
+    for comp in sorted(reliable):
+        meta.setdefault(comp,dict(component_id=comp,component_area=areas.get(comp,0)))
+        meta[comp].update(reliable_gaia_count=len(reliable[comp]))
+        for i in by_component.get(comp,[]):
+            sources[i].update(final_label='restricted_bright_region',reason='hsc_gaia_replaced_fragment')
+        for row,mode,distance in reliable[comp]:insert(row,comp,mode,distance)
+    for group,row,mode,distance in isolated_matches:
+        for i in group:
+            sources[i].update(final_label='restricted_bright_region',reason='hsc_outside_gaia_replaced_fragment')
+        insert(row,0,mode,distance)
+    occupied=set(protected_component_ids)
+    occupied.update(int(row.get('component_id',0)) for row in sources+added
+        if row.get('final_label') in ('clean','weak_shape','center_only_external','strict_center_only','restricted_bright_region'))
     if config.add_empty_large_bright_component_centers:
-        supervised = {
-            int(source.get("component_id", 0))
-            for source in sources
-            if str(source.get("final_label", "")) in {"clean", "center_only_external", "strict_center_only", "restricted_bright_region"}
-        }
-        components_with_hsc_sources = {
-            int(source.get("component_id", 0))
-            for source in sources
-            if int(source.get("table_index", -1)) >= 0
-        }
-        for comp, area in sorted(component_areas.items()):
-            if comp <= 0 or comp in supervised or comp in components_with_hsc_sources:
-                continue
-            if comp not in component_centroids:
-                continue
-            if component_touches_image_boundary(component_labels, comp):
-                ordinary_ignore_components.add(int(comp))
-                meta = component_meta.setdefault(int(comp), {})
-                meta["component_id"] = int(comp)
-                meta["component_area"] = int(area)
-                meta["edge_component_ignore"] = True
-                continue
-            if area < config.empty_large_bright_component_area_min:
-                ordinary_ignore_components.add(int(comp))
-                meta = component_meta.setdefault(int(comp), {})
-                meta["component_id"] = int(comp)
-                meta["component_area"] = int(area)
-                meta["empty_small_component_ignore"] = True
-                continue
-            added = add_unmatched_gaia_centers_for_component(
-                comp, cluster_id=next_cluster_id, cluster_size=0,
-                used_gaia_keys=set(), reason="empty_component_gaia_strict_center_only",
-                match_mode="component_membership",
-            )
-            if added:
-                next_cluster_id += 1
-                component_meta.setdefault(comp, {})["empty_component_gaia_added"] = added
-                continue
-            x, y = component_centroids[comp]
-            if comp not in synthetic_center_components:
-                sources.append(synthetic_component_center_source(comp=comp, component_area=int(area), x=x, y=y))
-                synthetic_center_components.add(comp)
-                component_meta.setdefault(comp, {})["added_empty_large_center"] = True
-    return sources, component_meta, cluster_rows, np.asarray(sorted(ordinary_ignore_components), dtype=np.int32)
+        for comp,area in sorted(areas.items()):
+            if comp<=0 or comp in occupied or comp in ignored:continue
+            # No guessed center for ambiguous blends.
+            if comp in ambiguous:
+                ignored.add(comp);continue
+            if by_component.get(comp) and all(sources[i].get('class','unknown')!='star' for i in by_component[comp]):
+                ignored.add(comp);continue
+            if component_touches_image_boundary(component_labels,comp) or area<=config.empty_large_bright_component_area_min:
+                ignored.add(comp);continue
+            x,y=centroids[comp]
+            added.append(synthetic_component_center_source(comp=comp,component_area=int(area),x=x,y=y,
+                reason='hsc_unmatched_large_component_geometric_center'))
+            meta.setdefault(comp,{})['added_empty_large_center']=True
+    sources.extend(added)
+    return sources,meta,cluster_rows,np.asarray(sorted(ignored),np.int32)
+
+
+def restore_nested_bright_centers(labels, component_labels, *,
+                                 config=BrightLabelConfig(), max_major_pixels=100.):
+    """Protect real bright peaks nested in nonstellar HSC clean/weak targets.
+
+    This exception restores confidence points only. It never changes dense
+    pixels or parent shapes, and never uses a Gaia PSF as an enclosing parent.
+    A complete detected component must lie inside one adopted HSC clean/weak
+    ellipse and the final clean/weak raster, with no existing center in/near it.
+    """
+    from scipy import ndimage
+    from scipy.spatial import cKDTree
+    from .labels import DenseLabel
+    radius=float(config.cluster_source_match_pixels)
+    policy=dict(definition_id='hsc_nested_clean_weak_bright_centers_v1',
+        parent='nonstellar HSC clean or weak shape; unknown follows galaxy; exclude Gaia PSF rows',
+        containment='entire detected bright component inside one adopted parent ellipse and final clean/weak dense region',
+        min_center_separation_pixels=radius,label='strict center only; no child shape or PSF',
+        preserves='parent Kron and dense raster unchanged',enabled=config.add_nested_bright_component_centers,
+        centers_added=0,centers_total=len(labels.table.meta.get('hsc_nested_bright_sources',[])))
+    previous=list(labels.table.meta.get('hsc_nested_bright_sources',[]))
+    labels.table.meta['hsc_nested_bright_policy']=policy
+    labels.table.meta['hsc_nested_bright_sources']=previous
+    if not config.add_nested_bright_component_centers:return labels
+    components=np.asarray(component_labels)
+    if components.shape!=labels.dense.shape:raise ValueError('Bright-component/dense shape mismatch')
+    n=len(labels.label_classes)
+    ext=(np.ma.asarray(labels.table['base_ClassificationExtendedness_value'],dtype=float).filled(np.nan)
+         if 'base_ClassificationExtendedness_value' in labels.table.colnames else np.full(n,np.nan))
+    model=(np.ma.asarray(labels.table['gaia_psf_model'],dtype=bool).filled(False)
+           if 'gaia_psf_model' in labels.table.colnames else np.zeros(n,bool))
+    valid=np.isfinite(labels.geom_x+labels.geom_y+labels.geom_major+labels.geom_minor+labels.geom_theta)
+    valid &= (labels.geom_major>0)&(labels.geom_minor>0)
+    parents=np.flatnonzero(np.isin(labels.label_classes,[SourceClass.CLEAN,SourceClass.WEAK_SHAPE])&valid&~model&(~np.isfinite(ext)|(ext>.5)))
+    if not len(parents):return labels
+    active=valid&np.isin(labels.label_classes,[SourceClass.CLEAN,SourceClass.WEAK_SHAPE,SourceClass.STRICT_CENTER_ONLY])
+    centers=np.r_[np.c_[labels.geom_x[active],labels.geom_y[active]],np.c_[labels.strict_x,labels.strict_y]]
+    centers=centers[np.isfinite(centers).all(axis=1)]
+    tree=cKDTree(centers)
+    occupied={component_at(components,float(x),float(y),0) for x,y in centers}
+    occupied.discard(0)
+    ids=set(map(int,labels.strict_ids))|set(map(int,labels.source_ids))
+    boxes=ndimage.find_objects(components);done=set(occupied);added=[]
+    height,width=components.shape
+    for i in parents[np.argsort(labels.geom_major[parents]*labels.geom_minor[parents],kind='stable')]:
+        a,b=float(labels.geom_major[i]),float(labels.geom_minor[i]);theta=float(labels.geom_theta[i])
+        if max_major_pixels is not None:
+            scale=min(1.,float(max_major_pixels)/max(a,b));a*=scale;b*=scale
+        x,y=float(labels.geom_x[i]),float(labels.geom_y[i])
+        ys,xs=ellipse_bbox(x,y,a,b,theta,components.shape)
+        for cid in map(int,np.unique(components[ys,xs])):
+            if cid<=0 or cid in done:continue
+            sl=boxes[cid-1]
+            if sl is None:continue
+            if sl[0].start<ys.start or sl[0].stop>ys.stop or sl[1].start<xs.start or sl[1].stop>xs.stop:continue
+            yy,xx=np.nonzero(components[sl]==cid);yy+=sl[0].start;xx+=sl[1].start
+            if not np.all(np.isin(labels.dense[yy,xx],[DenseLabel.CLEAN,DenseLabel.WEAK_SHAPE])):
+                done.add(cid);continue
+            parent=dict(x=x,y=y,major=a,minor=b,theta_deg=math.degrees(theta))
+            if not np.all(ellipse_contains_dict(parent,xx.astype(float),yy.astype(float))):continue
+            cx,cy=float(xx.mean()),float(yy.mean());ix,iy=int(math.floor(cx+.5)),int(math.floor(cy+.5))
+            if not (0<=ix<width and 0<=iy<height) or labels.dense[iy,ix] not in (DenseLabel.CLEAN,DenseLabel.WEAK_SHAPE):
+                done.add(cid);continue
+            distance=float(tree.query([cx,cy])[0])
+            if distance<=radius or any(math.hypot(cx-r['x'],cy-r['y'])<=radius for r in added):
+                done.add(cid);continue
+            synthetic=synthetic_component_center_source(comp=cid,component_area=len(xx),x=cx,y=cy,
+                reason='hsc_nested_bright_component_geometric_center')
+            sid=int(synthetic['source_id'])
+            if sid in ids:
+                done.add(cid);continue
+            added.append(dict(id=sid,x=cx,y=cy,component_id=cid,component_area_pixels=len(xx),
+                parent_id=int(labels.source_ids[i]),parent_class='clean' if labels.label_classes[i]==SourceClass.CLEAN else 'weak shape',nearest_existing_center_pixels=distance,
+                reason=synthetic['reason'],label='strict center only'))
+            ids.add(sid);done.add(cid)
+    if added:
+        old_count=len(labels.strict_x)
+        labels.strict_x=np.r_[labels.strict_x,np.array([r['x'] for r in added],np.float32)]
+        labels.strict_y=np.r_[labels.strict_y,np.array([r['y'] for r in added],np.float32)]
+        labels.strict_ids=np.r_[labels.strict_ids,np.array([r['id'] for r in added],np.int64)]
+        prior=np.zeros(old_count,bool) if labels.strict_is_gaia is None else labels.strict_is_gaia
+        labels.strict_is_gaia=np.r_[prior,np.zeros(len(added),bool)]
+    labels.table.meta['hsc_nested_bright_sources']=previous+added
+    policy['centers_added']=len(added)
+    policy['centers_total']=len(previous)+len(added)
+    print(f'[hsc-nested-bright] restored {len(added)} strict centers inside HSC clean/weak shapes',flush=True)
+    return labels
 
 
 def apply_bright_rows_to_labels(
@@ -1002,7 +897,7 @@ def label_bright_sources(
     config: BrightLabelConfig = BrightLabelConfig(),
     refit_config: RefitConfig = RefitConfig(),
 ) -> BrightLabelResult:
-    """Classify bright candidates with the v2 Gaia/component logic."""
+    """HSC bright policy with zero-based, epoch-propagated DR3 positions."""
 
     if not np.isfinite(config.pixel_scale_arcsec) or config.pixel_scale_arcsec <= 0:
         raise ValueError("pixel_scale_arcsec must be finite and positive")
@@ -1026,14 +921,19 @@ def label_bright_sources(
     elif quality_mask is not None:
         image_shape = np.asarray(quality_mask).shape
     if gaia_rows is None:
-        gaia_rows = project_gaia_rows(gaia_table, image_shape=image_shape, image_header=image_header)
-    if component_labels is not None and np.asarray(component_labels).size and int(np.max(component_labels)) > 0:
+        gaia_rows = project_gaia_rows(gaia_table, image_shape=image_shape, image_header=image_header,
+                                      pixel_origin=0,reference_epoch=2016.)
+    if component_labels is not None and np.asarray(component_labels).size:
+        geom=compute_kron_ellipse(table,refit_config)
+        positive=np.isin(labels.source_class,[SourceClass.CLEAN,SourceClass.WEAK_SHAPE,SourceClass.STRICT_CENTER_ONLY]) & ~candidate
+        protected={component_at(component_labels,geom.x[i],geom.y[i],0) for i in np.flatnonzero(positive & np.isfinite(geom.x+geom.y))}
         sources, component_meta, cluster_rows, ordinary_ignore_components = classify_component_bright(
             sources=sources,
             gaia_rows=gaia_rows,
             component_labels=np.asarray(component_labels, dtype=np.int32),
             quality_mask=quality_mask,
             config=config,
+            protected_component_ids=protected,
         )
     else:
         sources, component_meta, cluster_rows, _mask, _labels = classify_no_upper(
@@ -1049,6 +949,14 @@ def label_bright_sources(
         labels,
         n_table_rows=len(table),
     )
+    if len(ordinary_ignore_components):
+        # Entire rejected components must stay ignore even when an ordinary
+        # catalog source would otherwise repaint a positive dense shape there.
+        geom=compute_kron_ellipse(table,refit_config)
+        comps=np.array([component_at(component_labels,x,y,0) if np.isfinite(x+y) else 0
+                        for x,y in zip(geom.x,geom.y)])
+        veto=np.isin(comps,ordinary_ignore_components)&~np.isin(labels.source_class,[SourceClass.DROPPED,SourceClass.STRICT_IGNORE])
+        labels.assign(veto,SourceClass.ORDINARY_IGNORE,'hsc_rejected_bright_component')
     return BrightLabelResult(
         labels=labels,
         strict_center_x=strict_x,

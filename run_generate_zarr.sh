@@ -15,6 +15,9 @@
 # Weak shape: confidence region=1, shape reliability controlled by training
 # --center-only-shape-factor (default .2). Confidence-region weights come from
 # preprocessing/labels.py and are printed by preflight (STAR_WINGS currently .2).
+# HSC SNR: half-coadd keeps catalog AP2; noisy uses weights/coverage relative to
+# the matching half product. Missing metadata fails; full calexp is not the SNR anchor.
+# Set HSC_WEIGHT_ROOT to override the product warp_weights directory.
 set -euo pipefail
 PROJECT_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd "$PROJECT_ROOT"
@@ -23,6 +26,7 @@ BASE=${BASE:-/data/czh23/analysis/$(date +%Y-%m/%Y-%m-%d)}
 OUT=${OUT:-$BASE/training_zarr_gaia_star_wings}
 BACKGROUND_ROOT=${BACKGROUND_ROOT:-/data/czh23/analysis/2026-10/2026-10-19/background_sextractor15_half}
 HSC_PRODUCTS_ROOT=${HSC_PRODUCTS_ROOT:-/data/czh23/Subaru_products}
+HSC_WEIGHT_ROOT=${HSC_WEIGHT_ROOT:-$HSC_PRODUCTS_ROOT/warp_weights}
 ZARR_WORKERS=${ZARR_WORKERS:-8}
 CHUNK_TILES=${CHUNK_TILES:-20}
 read -r -a kinds <<< "${TRAINING_KINDS:-hsc_half hsc_noisy abell cosmos}"
@@ -30,6 +34,7 @@ export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_TH
 args=(--training-batch --training-kinds "${kinds[@]}"
   --background-root "$BACKGROUND_ROOT"
   --hsc-products-root "$HSC_PRODUCTS_ROOT" --hsc-background-method sextractor-precomputed
+  --coadd-weight-root "$HSC_WEIGHT_ROOT" --snr-method auto --missing-noncoadd-policy error
   --output-root "$OUT" --workers "$ZARR_WORKERS"
   --confidence-mode "${CONFIDENCE_MODE:-psf-ee}" --tile-size 512 --stride 368 --chunk-tiles "$CHUNK_TILES"
   --clip-threshold 5 --bright-threshold 5 --bright-dilation 2

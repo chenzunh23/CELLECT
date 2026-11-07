@@ -18,6 +18,8 @@ class RegionFillingConfig:
 
     Full source ellipses exclude background; only clean/weak dense shapes are
     truncated, preserving their axis ratios. DROPPED sources have no coverage.
+    HSC disables restricted_source_geometry so restricted rows contribute no
+    ellipse, including no background exclusion; only their bright masks paint.
     """
 
     class_priority: tuple[DenseLabel, ...] = (
@@ -30,6 +32,7 @@ class RegionFillingConfig:
         DenseLabel.ORDINARY_IGNORE,
     )
     max_major_pixels: float | None = 100.0
+    restricted_source_geometry: bool = True
 
 
 def fill_dense_regions(
@@ -72,7 +75,12 @@ def fill_dense_regions(
         dense[np.asarray(background_mask, dtype=bool)] = int(DenseLabel.BACKGROUND)
     # All non-dropped shapes erase background at their ORIGINAL size. Clean and
     # weak cores are restored below; their truncated outskirts stay ignore.
-    for idx in np.flatnonzero(valid & ~labels.mask(SourceClass.DROPPED)):
+    exclude_background = valid & ~labels.mask(SourceClass.DROPPED)
+    if not config.restricted_source_geometry:
+        # HSC restricted rows defer to the detected bright-component mask.
+        # Their untrusted fragment Kron must neither add a region nor erase sky.
+        exclude_background &= ~labels.mask(SourceClass.RESTRICTED_BRIGHT_REGION)
+    for idx in np.flatnonzero(exclude_background):
         paint_ellipse(dense, float(geom.x[idx]), float(geom.y[idx]),
                       float(geom.major[idx]), float(geom.minor[idx]), float(geom.theta[idx]),
                       int(DenseLabel.ORDINARY_IGNORE))
@@ -99,6 +107,8 @@ def fill_dense_regions(
             continue
         if dense_label == DenseLabel.RESTRICTED_BRIGHT_REGION and restricted_fallback_mask is not None:
             dense[np.asarray(restricted_fallback_mask, dtype=bool)] = int(dense_label)
+        if dense_label == DenseLabel.RESTRICTED_BRIGHT_REGION and not config.restricted_source_geometry:
+            continue
         source_class = class_by_label.get(dense_label)
         if source_class is None:
             continue

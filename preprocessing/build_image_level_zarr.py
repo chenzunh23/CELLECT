@@ -36,14 +36,13 @@ from preprocessing.bright_ap2 import BrightAp2Config, classify_bright_ap2
 from preprocessing.bright_label import (
     BrightLabelConfig,
     label_bright_sources,
-    unsupervised_seeded_component_centers,
 )
 from preprocessing.image_processing import (
     BrightRegionConfig,
     build_bright_components,
     prepare_image, ImagePreparationConfig,
 )
-from preprocessing.labels import SourceClass
+from preprocessing.labels import SourceClass, DenseLabel, SourceLabels
 from preprocessing.dataset_inputs import (
     ImageInput, load_paths, discover_cosmos, discover_abell, hsc_input,
     header_info, load_image as load_registered_image, bind_task,
@@ -51,7 +50,7 @@ from preprocessing.dataset_inputs import (
 from preprocessing.meas_processing import MeasProcessingConfig, classify_meas_basics
 from preprocessing.ordinary import OrdinaryConfig, label_ordinary_sources
 from preprocessing.refit import RefitConfig, attach_refit_geometry, compute_kron_ellipse
-from preprocessing.region_filling import fill_dense_regions
+from preprocessing.region_filling import fill_dense_regions, RegionFillingConfig
 from preprocessing.snr import SnrConfig, SnrThresholds, compute_snr_for_sample, thresholds_from_args
 from preprocessing.utils.catalog import source_ids
 from preprocessing.zarr_writing import ImageLevelTrainingBatch, write_training_image_level_zarr
@@ -177,6 +176,12 @@ def _classify_patch(task: StoreTask, image: np.ndarray, image_header: fits.Heade
         refit_config=RefitConfig(),
     )
     gaia = Table.read(task.gaia_fits) if task.gaia_fits is not None and task.gaia_fits.exists() else None
+    if gaia is not None:
+        from .utils.gaia import hsc_observation_epoch
+        epoch=hsc_observation_epoch(bright_input_path,coadd_image_fits)
+        image_header=image_header.copy();image_header['MJD-AVG']=epoch['mjd_utc']
+        table.meta['hsc_gaia_epoch']=epoch
+        table.meta['hsc_gaia_catalog']=str(task.gaia_fits)
     bright = label_bright_sources(
         table,
         bright_ap2.candidate,
@@ -194,37 +199,6 @@ def _classify_patch(task: StoreTask, image: np.ndarray, image_header: fits.Heade
         ),
         refit_config=RefitConfig(),
     )
-    seed_components = bright_ap2.component_id[np.asarray(stage.bright_candidate, dtype=bool)]
-    fallback_x, fallback_y, fallback_ids, fallback_component_ids = unsupervised_seeded_component_centers(
-        table,
-        bright.labels,
-        components,
-        seed_component_ids=seed_components,
-        catalog_component_ids=seed_components,
-        existing_strict_component_ids=bright.strict_center_component_id,
-        min_area=float(BrightLabelConfig().empty_seeded_bright_component_area_min),
-        component_search_radius=int(BrightAp2Config().component_search_radius),
-        refit_config=RefitConfig(),
-    )
-    if fallback_x.size:
-        bright.strict_center_x = np.concatenate([bright.strict_center_x, fallback_x]).astype(np.float64)
-        bright.strict_center_y = np.concatenate([bright.strict_center_y, fallback_y]).astype(np.float64)
-        bright.strict_center_source_id = np.concatenate([bright.strict_center_source_id, fallback_ids]).astype(np.int64)
-        bright.strict_center_reason = np.concatenate(
-            [
-                bright.strict_center_reason,
-                np.full(fallback_x.shape, "seeded_bright_component_no_supervised_center", dtype=object),
-            ]
-        )
-        bright.strict_center_component_id = np.concatenate([bright.strict_center_component_id, fallback_component_ids]).astype(np.int32)
-        bright.restricted_fallback_component_ids = np.unique(
-            np.concatenate([bright.restricted_fallback_component_ids, fallback_component_ids]).astype(np.int32)
-        )
-        bright.ordinary_ignore_component_ids = np.setdiff1d(
-            np.asarray(bright.ordinary_ignore_component_ids, dtype=np.int32),
-            np.asarray(fallback_component_ids, dtype=np.int32),
-            assume_unique=False,
-        ).astype(np.int32)
     background = (_background_for_task(task, image.shape, origin)
                   if background_override is None else np.asarray(background_override, bool))
     restricted_fallback_mask = None
@@ -245,22 +219,19 @@ def _classify_patch(task: StoreTask, image: np.ndarray, image_header: fits.Heade
         component_ids = component_ids[component_ids > 0]
         if component_ids.size:
             ordinary_ignore_mask = np.isin(np.asarray(components, dtype=np.int32), component_ids)
-    dense = fill_dense_regions(
-        table,
-        bright.labels,
-        image.shape,
-        background_mask=background,
-        bright_region_mask=bright_region,
-        quality_ignore_mask=quality,
-        restricted_fallback_mask=restricted_fallback_mask,
-        ordinary_ignore_mask=ordinary_ignore_mask,
-        ordinary_ignore_source_mask=bright.ordinary_ignore_source_mask,
-        refit_config=RefitConfig(),
-    )
     geom = compute_kron_ellipse(table, RefitConfig())
-    return PatchLabels(
+    table['classification_reason'] = np.asarray(bright.labels.reason, str)
+    if snr is not None:
+        table['classification_snr'] = np.asarray(snr.snr, float)
+        table['classification_snr_t_eff'] = np.asarray(snr.t_eff, float)
+        factors = np.sqrt(snr.t_eff[np.isfinite(snr.t_eff)])
+        table.meta['hsc_snr'] = dict(method=snr.method, **snr.details,
+            factor_quantiles=np.quantile(factors, [0, .5, 1]).tolist() if factors.size else [],
+            snr_classes={name: int(np.count_nonzero(snr.snr_class == name))
+                         for name in ('ignore', 'weak_shape', 'clean')})
+    result = PatchLabels(
         table=table,
-        dense=dense,
+        dense=np.empty((0, 0), dtype=np.uint8),
         label_classes=bright.labels.source_class.copy(),
         geom_x=geom.x.astype(np.float32),
         geom_y=geom.y.astype(np.float32),
@@ -273,6 +244,27 @@ def _classify_patch(task: StoreTask, image: np.ndarray, image_header: fits.Heade
         strict_ids=bright.strict_center_source_id.astype(np.int64),
         strict_is_gaia=np.array(["gaia" in str(r) for r in bright.strict_center_reason], bool),
     )
+    from preprocessing.utils.hsc_psf_ee import apply_star_priors
+    from preprocessing.utils.geometry import EllipseGeometry
+    apply_star_priors(result, reference=coadd_image_fits, image_path=bright_input_path,
+        components=components, center_components=bright.strict_center_component_id,
+        output_root=task.output_root/'hsc_star_psf'/task.band/task.patch)
+    # PSF rows have explicit native geometry, not measured HSC refit columns.
+    geometry=EllipseGeometry(result.geom_x,result.geom_y,result.geom_major,result.geom_minor,
+        result.geom_theta,np.pi*result.geom_major*result.geom_minor)
+    region_config=RegionFillingConfig(restricted_source_geometry=False)
+    result.dense = fill_dense_regions(
+        result.table, SourceLabels(result.label_classes, np.full(len(result.table),'',object)),
+        image.shape, geometry=geometry, background_mask=background,
+        bright_region_mask=bright_region, quality_ignore_mask=quality,
+        restricted_fallback_mask=restricted_fallback_mask,
+        ordinary_ignore_mask=ordinary_ignore_mask, refit_config=RefitConfig(),
+        config=region_config)
+    from preprocessing.bright_label import restore_nested_bright_centers
+    restore_nested_bright_centers(result,components,
+        config=BrightLabelConfig(cluster_source_match_pixels=float(task.cluster_source_match_pixels)),
+        max_major_pixels=region_config.max_major_pixels)
+    return result
 
 
 def _build_store(task: StoreTask) -> dict[str, object]:
@@ -322,6 +314,8 @@ def write_classified_patch(task: StoreTask, image: np.ndarray, labels: PatchLabe
         provenance = {**(provenance or {}), **input_source.to_dict()}
         if input_source.dataset in ('abell','cosmos') and max_invalid_fraction is None:
             max_invalid_fraction=.10
+    if 'hsc_snr' in labels.table.meta:
+        provenance = {**(provenance or {}), 'hsc_snr': labels.table.meta['hsc_snr']}
     if image.shape != labels.dense.shape:
         raise ValueError("image and dense target shapes must match")
     if cosmos_catalog is not None:
@@ -597,8 +591,13 @@ def write_classified_patch(task: StoreTask, image: np.ndarray, labels: PatchLabe
             "confidence_config": confidence_config,
             "source_area_weight_policy": source_area_weight_policy(),
             "segmentation_policy": labels.segmentation_policy,
-            "jwst_star_protection": labels.star_protection_policy,
-            "jwst_star_sources": labels.star_protection_sources,
+            **({"hsc_star_protection": labels.star_protection_policy,
+                "hsc_star_sources": labels.star_protection_sources,
+                "hsc_nested_bright_policy": labels.table.meta.get('hsc_nested_bright_policy'),
+                "hsc_nested_bright_sources": labels.table.meta.get('hsc_nested_bright_sources')}
+               if task.band.startswith(('HSC-', 'NB')) else
+               {"jwst_star_protection": labels.star_protection_policy,
+                "jwst_star_sources": labels.star_protection_sources}),
         },
         source_centers=_cat(centers_flat, 2, np.float32),
         source_ids=_cat(ids_flat, None, np.int64),
@@ -941,8 +940,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--bright-anscombe-scale", type=float, default=1000.0)
     parser.add_argument("--cluster-source-match-pixels", type=float, default=6.0)
     parser.add_argument("--cluster-centroid-match-pixels", type=float, default=10.0)
-    parser.add_argument("--gaia-bright-mag-threshold", type=float, default=18.0)
-    parser.add_argument("--snr-method", default="auto", choices=["auto", "variance", "weight", "none"])
+    parser.add_argument("--gaia-bright-mag-threshold", type=float, default=22.0)
+    parser.add_argument("--snr-method", default="auto", choices=["auto", "variance", "weight", "none"],
+                        help="HSC: half-coadd keeps AP2 SNR; auto/weight scales noisy relative to half product weights and coverage. Explicit variance also uses half as reference.")
     parser.add_argument("--snr-ignore-threshold", type=float, default=5.0,
                         help="Lower SNR label cutoff; dataset-specific boundary conventions are retained.")
     parser.add_argument("--snr-weak-threshold", type=float, default=7.0,
@@ -955,7 +955,7 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="HSC narrow-band lower cutoff, independent of broad-band/JWST cuts.")
     parser.add_argument("--narrow-snr-weak-threshold", type=float, default=8.0,
                         help="HSC narrow-band upper weak-shape cutoff.")
-    parser.add_argument("--missing-noncoadd-policy", default="fallback_coadd", choices=["fallback_coadd", "none", "error"])
+    parser.add_argument("--missing-noncoadd-policy", default="error", choices=["fallback_coadd", "none", "error"])
     parser.add_argument(
         "--image-variant-background-source",
         default="auto",

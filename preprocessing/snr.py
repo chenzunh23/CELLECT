@@ -111,7 +111,13 @@ def apply_remeasured_aperture_snr(result, mag, measurement, *, mag_min=22.0,
 
 @dataclass(frozen=True)
 class SnrConfig:
-    """SNR thresholds and metadata roots used by ordinary-source filtering."""
+    """Ordinary-source SNR cuts with the training HALF product as depth anchor.
+
+    By design, catalog AP2 SNR is kept unchanged for half-coadd. Noisy SNR is
+    predicted relative to half, preserving the catalog's approximately 2x
+    exposure advantage for both products. This is a depth proxy, not new
+    photometry or a correction of half AP2 SNR to its absolute exposure time.
+    """
 
     enable: bool = True
     ap2_flux_column: str = "base_CircularApertureFlux_6_0_instFlux"
@@ -126,10 +132,10 @@ class SnrConfig:
     aperture_radius: float = 6.0
     cap_t_max: float = 1.0
     noncoadd_method: Literal["auto", "variance", "weight", "none"] = "auto"
-    missing_noncoadd_policy: Literal["fallback_coadd", "none", "error"] = "fallback_coadd"
+    missing_noncoadd_policy: Literal["fallback_coadd", "none", "error"] = "error"
     variance_unit_scale: float = 1.0
-    coadd_weight_root: Path = Path("/data/czh23/2026-06-21_171607_hsc_metadata_warp_n2n_epoch006_full-all-warp-weights")
-    denoised_fits_root: Path = Path("/data/czh23/denoised_fits")
+    coadd_weight_root: Path = Path("/data/czh23/Subaru_products/warp_weights")
+    denoised_fits_root: Path = Path("/data/czh23/Subaru_products")
     valid_coadd_weights_only: bool = False
 
     def __post_init__(self):
@@ -426,7 +432,7 @@ def read_product_group_weight_summary(
                 row_image = row.get("product_image_mask_fits", "")
                 if row_image and str(Path(row_image).resolve()) != image_path:
                     continue
-            elif group_num is not None:
+            if group_num is not None:
                 try:
                     if int(str(row.get("group_num", "")).strip()) != group_num:
                         continue
@@ -479,6 +485,7 @@ def resolve_product_effective_count_path(
         return old
 
     product_dirs = [
+        root,
         root / str(band) / str(patch),
         root / "9813" / str(band) / str(patch),
         root / _product_collection_name(dataset_source) / "9813" / str(band) / str(patch),
@@ -502,6 +509,8 @@ def predicted_snr_from_weight_ratio(
     selected_weight_sum: float,
     selected_weight_count: float,
     local_effective_count: np.ndarray,
+    reference_effective_count: np.ndarray | None = None,
+    reference_weight_count: float | None = None,
     config: SnrConfig = SnrConfig(),
 ) -> tuple[np.ndarray, np.ndarray]:
     coadd_snr = np.asarray(coadd_snr, dtype=np.float64)
@@ -520,11 +529,123 @@ def predicted_snr_from_weight_ratio(
         coverage = local_effective_count / float(selected_weight_count)
         ok = np.isfinite(coverage) & (coverage > 0.0)
         t_eff[ok] = global_t * np.minimum(coverage[ok], 1.0)
+        if reference_effective_count is not None:
+            if reference_weight_count is None or reference_weight_count <= 0:
+                raise ValueError("positive half-coadd input count is required")
+            reference_coverage = np.asarray(reference_effective_count, float) / reference_weight_count
+            ok &= np.isfinite(reference_coverage) & (reference_coverage > 0)
+            t_eff[~ok] = np.nan
+            t_eff[ok] /= np.minimum(reference_coverage[ok], 1.0)
         if float(config.cap_t_max) > 0.0:
             t_eff = np.minimum(t_eff, float(config.cap_t_max))
         snr_ok = ok & np.isfinite(coadd_snr) & (coadd_snr > 0.0) & np.isfinite(t_eff) & (t_eff >= 0.0)
         snr[snr_ok] = coadd_snr[snr_ok] * np.sqrt(t_eff[snr_ok])
     return snr.astype(np.float32), t_eff.astype(np.float32)
+
+
+def resolve_half_coadd_image(root: Path | str, image_fits: Path | str,
+                            band: str, patch: str) -> Path:
+    """Find the matching training half product, never the full catalog calexp."""
+    image = Path(image_fits).resolve()
+    if 'half_coadd' in image.parts:
+        return image
+    root = Path(root)
+    # Actual product path supplies the tract; avoid selecting a different tract.
+    tract = image.parent.parent.parent.name
+    folder = root / 'half_coadd' / tract / band / patch
+    matches = sorted(folder.glob(f'warp_half-{band}-*-{patch}-0.fits'))
+    if len(matches) != 1:
+        raise FileNotFoundError(f'Expected one half-coadd reference in {folder}, found {len(matches)}')
+    return matches[0]
+
+
+def half_product_weight_summary(weight_csv, *, product_root, image_fits, band, patch):
+    """Read half weights from product CSV, or its original exact-product manifest.
+
+    Some exported CSVs (e.g. HSC-Y 4,5) omit the half rows. The generation
+    manifest is authoritative for that product; summing unrelated noisy rows
+    or using full-coadd weights would silently change the SNR convention.
+    """
+    try:
+        summary = read_product_group_weight_summary(weight_csv,
+            dataset_source='half_coadd', group=0, image_fits=image_fits)
+        return {**summary, 'metadata_paths': [str(weight_csv)]}
+    except ValueError:
+        pass
+    matches = []
+    root = Path(product_root)
+    for path in sorted((root / '_runs').glob(f'*/analysis_summaries/{patch}/half/{band}/*summary.json')):
+        doc = json.loads(path.read_text())
+        outputs = doc.get('product_outputs') or doc.get('outputs', {})
+        product = outputs.get('product_image_mask_fits')
+        if not product or Path(product).resolve() != Path(image_fits).resolve():
+            continue
+        manifest = Path(doc['input_manifest'])
+        if not manifest.exists() and '_runs' in manifest.parts:
+            manifest = root.joinpath(*manifest.parts[manifest.parts.index('_runs'):])
+        inputs = json.loads(manifest.read_text())
+        rows = inputs['selected_inputs']
+        weights = np.asarray([float(row['weight']) for row in rows])
+        if (not len(weights) or not np.all(np.isfinite(weights) & (weights > 0))
+                or int(doc['n_inputs']) != len(weights)
+                or len({row['visit'] for row in rows}) != len(weights)
+                or inputs.get('band') != band or inputs.get('patch') != patch):
+            raise ValueError(f'Invalid half-coadd weight manifest: {manifest}')
+        matches.append(dict(selected_weight_sum=float(weights.sum()),
+            selected_weight_count=float(len(weights)), selected_weight_min=float(weights.min()),
+            selected_weight_max=float(weights.max()), group_index=0.,
+            metadata_paths=[str(path), str(manifest)]))
+    if not matches:
+        raise ValueError(f'No half-coadd weights for {image_fits}; CSV and original manifests checked')
+    if len({(r['selected_weight_sum'], r['selected_weight_count']) for r in matches}) != 1:
+        raise ValueError(f'Conflicting half-coadd manifests for {image_fits}')
+    return matches[0]
+
+
+def weight_ratio_inputs(*, band, patch, group, image_fits, config=SnrConfig()):
+    """Resolve and validate metadata for half/noisy SNR, without reading pixels."""
+    csv_path = resolve_coadd_weight_csv(config.coadd_weight_root, band, patch)
+    half_image = resolve_half_coadd_image(config.denoised_fits_root, image_fits, band, patch)
+    half = half_product_weight_summary(csv_path, product_root=config.denoised_fits_root,
+                                     image_fits=half_image, band=band, patch=patch)
+    target = read_product_group_weight_summary(csv_path, dataset_source='noisy',
+                                              group=group, image_fits=image_fits)
+    target_map = resolve_product_effective_count_path(Path(image_fits).parent,
+        band=band, patch=patch, group=group, dataset_source='noisy')
+    half_map = resolve_product_effective_count_path(half_image.parent,
+        band=band, patch=patch, group=0, dataset_source='half_coadd')
+    paths = list(dict.fromkeys([str(csv_path), str(half_image), str(target_map),
+                              str(half_map), *half['metadata_paths']]))
+    for path in paths:
+        if not Path(path).is_file() or not Path(path).stat().st_size:
+            raise FileNotFoundError(f'Missing SNR metadata: {path}')
+    return dict(reference='half_coadd', half_image_fits=str(half_image),
+        coadd_weight_csv=str(csv_path), coadd_weight_sum=half['selected_weight_sum'],
+        coadd_weight_count=int(half['selected_weight_count']), **target,
+        effective_count_fits=str(target_map), half_effective_count_fits=str(half_map),
+        metadata_paths=paths)
+
+
+def hsc_snr_job_metadata(args, row):
+    """Shared preflight/receipt policy and all external SNR dependencies."""
+    policy = dict(reference='half_coadd', method=args.snr_method,
+        missing_policy=args.missing_noncoadd_policy,
+        formula='catalog_AP2_SNR * sqrt(min(1, (W_noisy/W_half)*(f_noisy/f_half)))',
+        coverage='6-pixel aperture mean effective_count / selected_input_count',
+        metadata_paths=[])
+    if row['kind'] == 'hsc_half' or args.snr_method == 'none':
+        return policy
+    if args.snr_method in ('auto', 'weight'):
+        inputs = weight_ratio_inputs(band=row['band'], patch=row['patch'], group=row['group'],
+            image_fits=row['source'], config=SnrConfig(coadd_weight_root=Path(args.coadd_weight_root),
+                denoised_fits_root=Path(args.hsc_products_root)))
+        policy['inputs'] = inputs
+        policy['metadata_paths'] = inputs['metadata_paths']
+    else:
+        half = resolve_half_coadd_image(args.hsc_products_root, row['source'], row['band'], row['patch'])
+        policy['formula'] = 'catalog_AP2_SNR * sqrt(min(1, variance_half/variance_noisy))'
+        policy['metadata_paths'] = [str(half)]
+    return policy
 
 
 def compute_weight_ratio_snr(
@@ -537,69 +658,23 @@ def compute_weight_ratio_snr(
     image_fits: Path | str | None = None,
     config: SnrConfig = SnrConfig(),
 ) -> SnrResult:
-    coadd = ap2_snr(table, config=config)
-    weight_csv = resolve_coadd_weight_csv(config.coadd_weight_root, band, patch)
-    group_dir = resolve_variant_group_dir(config.denoised_fits_root, patch, group, band)
-    half_weight_sum, half_weight_count = read_coadd_weight_sum(
-        weight_csv,
-        valid_only=config.valid_coadd_weights_only,
-        product_collection="half_coadd",
-    )
-    if half_weight_count <= 0:
-        half_weight_sum, half_weight_count = read_coadd_weight_sum(
-            weight_csv,
-            valid_only=config.valid_coadd_weights_only,
-            coadd_label="half",
-        )
-    if half_weight_count <= 0:
-        half_weight_sum, half_weight_count = read_coadd_weight_sum(weight_csv, valid_only=config.valid_coadd_weights_only)
-    meta_path = group_dir / "meta.json"
-    if meta_path.exists():
-        group_weights = read_group_weight_summary(meta_path)
-        effective_path = group_dir / "effective_count.fits"
-    else:
-        group_weights = read_product_group_weight_summary(
-            weight_csv,
-            dataset_source=dataset_source,
-            group=group,
-            image_fits=image_fits,
-        )
-        effective_path = resolve_product_effective_count_path(
-            config.denoised_fits_root,
-            band=band,
-            patch=patch,
-            group=group,
-            dataset_source=dataset_source,
-        )
-    effective_count, effective_origin = read_fits_plane(effective_path, "IMAGE")
-    x, y = source_xy(table)
-    off_y, off_x = circular_aperture_offsets(float(config.aperture_radius))
-    local_effective = np.full(len(table), np.nan, dtype=np.float32)
-    for idx in range(len(table)):
-        if np.isfinite(x[idx]) and np.isfinite(y[idx]):
-            local_effective[idx] = mean_map_value_at(effective_count, effective_origin, float(x[idx]), float(y[idx]), off_y, off_x)
+    if dataset_source != "noisy" or image_fits is None:
+        raise ValueError("half-relative weight scaling requires an actual noisy image")
+    details = weight_ratio_inputs(band=band, patch=patch, group=group,
+                                 image_fits=image_fits, config=config)
+    local = []
+    for key in ('effective_count_fits', 'half_effective_count_fits'):
+        count, origin = read_fits_plane(details[key], "IMAGE")
+        local.append(mean_variance_at_sources(count, origin, table, config=config))
     snr, t_eff = predicted_snr_from_weight_ratio(
-        coadd,
-        coadd_weight_sum=half_weight_sum,
-        selected_weight_sum=float(group_weights["selected_weight_sum"]),
-        selected_weight_count=float(group_weights["selected_weight_count"]),
-        local_effective_count=local_effective,
-        config=config,
-    )
-    return SnrResult(
-        snr=snr,
-        snr_class=np.asarray([], dtype="U16"),
-        t_eff=t_eff,
-        method="weight",
-        details={
-            "coadd_weight_csv": str(weight_csv),
-            "coadd_weight_sum": float(half_weight_sum),
-            "coadd_weight_count": int(half_weight_count),
-            "group_dir": str(group_dir),
-            "effective_count_fits": str(effective_path),
-            **group_weights,
-        },
-    )
+        ap2_snr(table, config=config),
+        coadd_weight_sum=details['coadd_weight_sum'],
+        selected_weight_sum=details['selected_weight_sum'],
+        selected_weight_count=details['selected_weight_count'],
+        local_effective_count=local[0], reference_effective_count=local[1],
+        reference_weight_count=details['coadd_weight_count'], config=config)
+    return SnrResult(snr=snr, snr_class=np.asarray([], dtype="U16"),
+        t_eff=t_eff, method="weight_half_relative", details=details)
 
 
 def compute_variance_scaled_snr(
@@ -640,19 +715,25 @@ def compute_snr_for_sample(
         return None
     source = str(dataset_source or "coadd").lower()
     base = ap2_snr(table, config=config)
-    if source == "coadd":
+    if source in {"coadd", "half", "half_coadd"}:
         return SnrResult(
             snr=base.astype(np.float32),
             snr_class=classify_snr(base, is_narrow_band=is_narrow_band, config=config),
             t_eff=np.ones(len(table), dtype=np.float32),
-            method="coadd_ap2",
-            details={},
+            method="half_coadd_ap2" if source != "coadd" else "coadd_ap2",
+            details={"reference": "half_coadd" if source != "coadd" else "catalog",
+                     "catalog_snr_policy": "unchanged"},
         )
 
     errors: list[str] = []
-    if config.noncoadd_method in {"auto", "variance"} and image_fits is not None and coadd_image_fits is not None:
+    # Auto uses product weights. Explicit variance scaling also uses HALF,
+    # never the full calexp that is retained for catalog/WCS lookup.
+    if config.noncoadd_method == "variance" and image_fits is not None:
         try:
-            result = compute_variance_scaled_snr(table, image_fits=image_fits, coadd_image_fits=coadd_image_fits, config=config)
+            half_image = resolve_half_coadd_image(config.denoised_fits_root, image_fits, band, patch)
+            result = compute_variance_scaled_snr(table, image_fits=image_fits, coadd_image_fits=half_image, config=config)
+            result.method = "variance_half_relative"
+            result.details["reference"] = "half_coadd"
             result.snr_class = classify_snr(result.snr, is_narrow_band=is_narrow_band, config=config)
             return result
         except Exception as exc:

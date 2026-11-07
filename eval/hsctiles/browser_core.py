@@ -812,7 +812,7 @@ def make_access(dataset_id: str, args: argparse.Namespace, tract: str):
         return HscRawAccess(Path(args.root), tract)
     if dataset_id == "hsc_image":
         return HscImageAccess(
-            Path(args.hsc_image_root),
+            path_arg('hsc_image_root', Path('/data/czh23/direct_zarr_v4_anscombe')),
             tract,
             weight_root=path_arg("hsc_weight_root", DEFAULT_HSC_WEIGHT_ROOT),
             coadd_weight_root=path_arg("hsc_coadd_weight_root", DEFAULT_HSC_WEIGHT_ROOT),
@@ -821,7 +821,9 @@ def make_access(dataset_id: str, args: argparse.Namespace, tract: str):
             noisy_fits_root=path_arg("hsc_noisy_fits_root", DEFAULT_HSC_NOISY_FITS_ROOT),
             denoised_fits_root=path_arg("hsc_denoised_fits_root", DEFAULT_HSC_DENOISED_FITS_ROOT),
             sources=getattr(args, "hsc_sources", None),
-            grid_mode=getattr(args, "hsc_grid_mode", "zarr"),
+            grid_mode=getattr(args, "hsc_grid_mode", "fits"),
+            tile_stride=getattr(args, 'hsc_tile_stride', 368),
+            cutout_plan=getattr(args, 'hsc_cutout_plan', None),
         )
     if dataset_id == "sitian":
         return MessierAccess(Path(args.messier_root), tract, selection_mode=str(args.messier_tile_mode))

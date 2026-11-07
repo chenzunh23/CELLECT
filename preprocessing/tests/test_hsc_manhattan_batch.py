@@ -37,8 +37,9 @@ class HscManhattanBatchTests(unittest.TestCase):
                 self.assertEqual(resolve_confidence(t)['mode'], 'manhattan')
                 self.assertEqual((t.snr_ignore_threshold,t.snr_weak_threshold), (3.,5.))
                 self.assertEqual((t.narrow_snr_ignore_threshold,t.narrow_snr_weak_threshold), (3.,5.))
-        # This is an HSC ablation; JWST production stays PSF-EE.
-        self.assertEqual(task_for(a, band='F444W').confidence_mode, 'psf-ee')
+        # Explicit modes now apply to JWST too; normal JWST defaults stay EE.
+        self.assertEqual(task_for(a, band='F444W').confidence_mode, 'manhattan')
+        self.assertEqual(task_for(args('/tmp/test', 'psf-ee'),band='F444W').confidence_mode, 'psf-ee')
         self.assertEqual(task_for(args('/tmp/test', 'psf-ee'),band='HSC-I').confidence_mode, 'psf-ee')
 
     def test_written_hsc_targets_use_original_painter_and_record_mode(self):

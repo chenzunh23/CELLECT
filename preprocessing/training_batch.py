@@ -22,7 +22,7 @@ from .utils.large_sources import large_source_specs, crop_padded, valid_tile_spe
 from .utils.parent_scaling import fit_parent_rgb, apply_parent_rgb
 from .utils.background_tiles import cosmos_region, abell_region, read_mask, check_source
 from .image_processing import prepare_image
-from .snr import thresholds_from_args, snr_policy_from_args
+from .snr import thresholds_from_args, snr_policy_from_args, hsc_snr_job_metadata
 
 
 def task_for(args, **kwargs):
@@ -31,7 +31,8 @@ def task_for(args, **kwargs):
         value=values.get(name)
         values[name]=Path(value) if value else None
     values.update(tile_size=512,stride=368,overwrite=True,max_tiles=args.max_tiles,tract=args.tract,
-                  group='',patch='',band='',dataset_source='coadd',confidence_mode='psf-ee')
+                  group='',patch='',band='',dataset_source='coadd',
+                  confidence_mode=getattr(args,'confidence_mode','psf-ee'))
     values.update(kwargs)
     if values['band'].startswith(('HSC-', 'NB')):
         cuts=thresholds_from_args(args,'hsc')
@@ -286,6 +287,11 @@ def hsc_job(args,row):
             background_method=('LSST on matching training input' if background_method=='lsst'
                                else 'SExtractor on matching training input'),
             bright_source='training_image',bright_image_fits=str(path),
+            hsc_gaia_epoch=labels.table.meta.get('hsc_gaia_epoch'),
+            hsc_gaia_catalog=labels.table.meta.get('hsc_gaia_catalog'),
+            hsc_bright_policy='hsc_gaia_g22_reliable_only_sat_ee95_unknown_as_galaxy_nested_clean_weak_centers_v5',
+            hsc_restricted_dense_policy='detected_bright_components_only; no restricted-source Kron painting or sky erasure',
+            hsc_unknown_policy='same as galaxy; reliable Gaia override retained',
             hsc_background_method=background_method,
             hsc_half_lsst_background_source=getattr(args,'hsc_half_lsst_background_source','training'),
             hsc_quality_policy='0827_bad_score_edge0p1',hsc_bad_score_threshold=.13,
@@ -320,7 +326,7 @@ def abell_job(args,row):
             values=reproject_tile(hd[image_hdu(hd)].data,WCS(h).celestial,rh)
         write_tile(reference,values,rh,source=source.reference_fits)
     from copy import copy
-    aa=copy(args);aa.output_root=str(root);aa.confidence_mode='psf-ee'
+    aa=copy(args);aa.output_root=str(root)
     aa.zarr_output_root=str(Path(args.output_root)/'zarr'/'abell')
     aa.overwrite=True  # The outer receipt validates code and inputs for this runner.
     r=dict(tile,band=band,patch=job['name'],training_fits=str(Path(job['output'])/'training_half_4096.fits'),
@@ -338,6 +344,7 @@ def run_job(args,row):
         if 'tests' not in p.parts:digest.update(p.read_bytes())
     digest.update((Path(__file__).parent.parent/'data_filtering/sam_input_scaling.py').read_bytes())
     paths=[]
+    snr_metadata = None
     if row['kind']=='cosmos':
         paths=[row['source']['image_fits'],row['source']['quality_mask_npz'],row['background'],
                str(Path(row['source']['catalog_root'])/'COSMOSWeb_mastercatalog_v1.1.fits'),args.paths['cosmos']['gaia_fits']]
@@ -351,6 +358,8 @@ def run_job(args,row):
         paths=[row['source'],str(_coadd_image_path(Path(args.data_root),row['band'],args.tract,row['patch'])),
                str(_refit_csv_path(Path(args.refit_root),args.tract,row['band'],row['patch'])),
                str(_band_catalog_path(Path(args.data_root),row['band'],args.tract,row['patch'])),args.gaia_fits]
+        snr_metadata = hsc_snr_job_metadata(args, row)
+        paths.extend(snr_metadata['metadata_paths'])
         if getattr(args,'hsc_background_method','sextractor')=='lsst':
             from .utils.hsc_background import resolve_training_lsst_background
             bgpath,bgreceipt=resolve_training_lsst_background(args,row)
@@ -369,10 +378,14 @@ def run_job(args,row):
     if row['kind'] in ('abell','cosmos'):
         from .utils.jwst_star_psf import star_policy
         signature['jwst_star_protection']=star_policy()
+        signature['jwst_confidence']={name:getattr(args,name,None) for name in (
+            'confidence_mode','confidence_config_path','confidence_fwhm_min',
+            'confidence_fwhm_max','confidence_fwhm_pixels')}
     if row['kind']=='abell':
         from .abell_zarr import uncover_signature
         signature['uncover']=uncover_signature(args,row['job']['band'])
     if row['kind'] in ('hsc_half','hsc_noisy'):
+        signature['hsc_snr'] = snr_metadata
         signature['hsc_background_method']=getattr(args,'hsc_background_method','sextractor')
         signature['hsc_half_lsst_background_source']=getattr(args,'hsc_half_lsst_background_source','training')
         signature['hsc_confidence']={name:getattr(args,name,None) for name in (

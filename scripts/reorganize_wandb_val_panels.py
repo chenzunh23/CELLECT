@@ -14,8 +14,10 @@ from collections import Counter
 import copy
 from datetime import datetime, timezone
 import hashlib
+import inspect
 import json
 from pathlib import Path
+from numbers import Real
 import re
 import sys
 from urllib.parse import parse_qs, unquote, urlparse
@@ -89,7 +91,7 @@ def new_panel(metric, section_name, x_axis, template=None):
     if section_name in ('detection', 'val/epoch'):
         panel['config']['xAxis'] = x_axis
     elif not template:
-        panel['config']['xAxis'] = 'iteration' if '/iteration/' in metric else x_axis
+        panel['config']['xAxis'] = 'iteration' if '/iteration/' in metric or metric.startswith('adam/') else x_axis
     panel['config'].setdefault('chartTitle', metric_group(metric)[1])
     return panel
 
@@ -98,7 +100,30 @@ def new_section(name):
     return dict(__id__='section-' + sha(name)[:16], name=name, type='flow',
         isOpen=name != 'detection', isPanelsAuto=False,
         flowConfig=dict(snapToColumns=True, columnsPerPage=3, rowsPerPage=2),
-        panels=[], localPanelSettings=dict(xAxis='epoch'))
+        panels=[], localPanelSettings=dict(xAxis='iteration' if name=='adam' else 'epoch'))
+
+
+def repair_adam_spec(spec, available_metrics):
+    """Restore missing Adam charts only; retain every other layout field."""
+    result=copy.deepcopy(spec);host=result.get('section',result)
+    bank=host.get('panelBankConfig')
+    if not isinstance(bank,dict) or not isinstance(bank.get('sections',[]),list):
+        raise ValueError('Unsupported layout: no section.panelBankConfig.sections')
+    sections=bank.setdefault('sections',[])
+    represented={m for section in sections for panel in section.get('panels',[]) for m in panel_metrics(panel)}
+    keys={m for m in available_metrics if m.startswith('adam/')}
+    missing=keys-represented
+    if missing:
+        section=next((s for s in sections if s.get('name')=='adam'),None)
+        if section is None:section=new_section('adam');sections.append(section)
+        section.setdefault('panels',[]).extend(new_panel(m,'adam','iteration') for m in sorted(missing))
+        section['isPanelsAuto']=False;section.pop('defaultName',None)
+        section['isOpen']=True
+        section.setdefault('localPanelSettings',{}).setdefault('xAxis','iteration')
+    return result,dict(changed=result!=spec,repair_adam_only=True,
+        available_adam_metrics=len(keys),added_adam_charts=len(missing),
+        section_counts={s.get('name',''):len(s.get('panels',[])) for s in sections},
+        reason='only missing Adam charts restored; all non-Adam layout state retained')
 
 
 def transform_spec(spec, available_metrics, x_axis='epoch'):
@@ -182,7 +207,7 @@ before that switch, rather than dropping other automatic chart families.
             identifier = panel.get('__id__')
             # Preserve opaque UI customizations on untouched panels. Overrides
             # for moved panels must not undo the new metrics/placement.
-            if identifier and identifier.startswith('valsplit-'):
+            if identifier and identifier.startswith('valsplit-') and any(metric_group(m)[0] for m in metrics):
                 keys = [identifier, '__custom_panel__:' + identifier, *metrics]
                 for key in keys:
                     if isinstance(overrides, dict):overrides.pop(key, None)
@@ -295,7 +320,21 @@ def run_references(view, run_ids):
 def metric_keys(run):
     values = getattr(run, 'summary_metrics', None)
     if values is None:values = run.summary._json_dict
-    return {k for k, value in values.items() if isinstance(value, (int, float)) and not isinstance(value, bool)}
+    keys={k for k,value in values.items() if isinstance(value,Real) and not isinstance(value,bool)}
+    # A metric can exist in history without a final summary value. Run listing
+    # metadata normally includes this catalog; never fetch full history here.
+    history=getattr(run,'__dict__',{}).get('_attrs',{}).get('historyKeys',{})
+    if isinstance(history,str):
+        try:history=json.loads(history)
+        except ValueError:history={}
+    catalog=history.get('keys',{}) if isinstance(history,dict) else {}
+    if isinstance(catalog,dict):
+        for key,description in catalog.items():
+            if not isinstance(description,dict):continue
+            types={description.get('type')} if isinstance(description.get('type'),str) else set()
+            types.update(v.get('type') for v in (description.get('typeCounts') or []) if isinstance(v,dict) and isinstance(v.get('type'),str))
+            if types & {'number','numeric','int','float'}:keys.add(key)
+    return keys
 
 
 def backup_record(folder, record, before, after):
@@ -307,10 +346,18 @@ def backup_record(folder, record, before, after):
     return directory
 
 
+def runs_with_metrics(api, path, **kwargs):
+    """Batch summary/history-key metadata instead of fetching each run lazily."""
+    if 'lazy' in inspect.signature(api.runs).parameters:
+        kwargs['lazy'] = False
+    return api.runs(path, **kwargs)
+
+
 def process(api, config, output, apply=False):
     owner = config.get('username') or api.viewer.username
     print(f'[layout-owner] username={owner!r} (layout creator, not project entity)', flush=True)
     since = config.get('since', '2026-09-01')
+    until = config.get('until')
     date_filter = {'$gte': since}
     if config.get('until'):date_filter['$lt'] = config['until']
     scope = config.get('scope', 'both')
@@ -319,9 +366,9 @@ def process(api, config, output, apply=False):
     results = [];projects = [];seen = set()
     for address in config['project_urls']:
         entity, project = project_address(address)
-        print(f'[runs] {entity}/{project} createdAt >= {since}', flush=True)
+        print(f'[runs] {entity}/{project} createdAt >= {since}' + (f' and < {until}' if until else ' (no end date)'), flush=True)
         selected = []
-        for run in api.runs(f'{entity}/{project}', filters={'createdAt':date_filter}, per_page=50):
+        for run in runs_with_metrics(api, f'{entity}/{project}', filters={'createdAt':date_filter}, per_page=50):
             if config.get('run_name_regex') and not re.search(config['run_name_regex'], run.name):continue
             selected.append(dict(id=run.id, name=run.name, metrics=sorted(metric_keys(run))))
         save(output/(sha([entity,project])[:12]+'_selected_runs.json'), selected)
@@ -332,6 +379,21 @@ def process(api, config, output, apply=False):
             print('[skip] no runs in date/name selection', flush=True);continue
         print(f'[runs] selected={len(by_run)}; discovering saved layouts', flush=True)
         union = set().union(*by_run.values())
+        project_other_metrics=set()
+        # A project workspace is shared even if its run table currently selects
+        # a handful of old runs. Freezing it using only those runs hides Adam
+        # and other metric families first logged outside the date/name filter.
+        if 'project-view' in config.get('view_types',['run-view','project-view']):
+            project_run_count=0
+            for run in runs_with_metrics(api, f'{entity}/{project}',per_page=50):
+                project_run_count+=1
+                project_other_metrics.update(k for k in metric_keys(run) if not metric_group(k)[0])
+                if project_run_count%25==0:
+                    print(f'[workspace-metrics] scanned={project_run_count}; '
+                          f'adam={sum(k.startswith("adam/") for k in project_other_metrics)}',flush=True)
+            save(output/(sha([entity,project])[:12]+'_project_nonval_metrics.json'),sorted(project_other_metrics))
+            print(f'[workspace-metrics] all project runs={project_run_count}; nonval={len(project_other_metrics)}; '
+                  f'adam={sum(k.startswith("adam/") for k in project_other_metrics)}',flush=True)
         matched_runs = set();counts = Counter();shared = 0;discovery_errors = {}
         inventory = []; skipped = Counter()
         for kind in config.get('view_types', ['run-view', 'project-view']):
@@ -358,17 +420,21 @@ def process(api, config, output, apply=False):
                 if names and view['name'] not in names:skip('workspace_name_mismatch');continue
                 if not regex.search(view.get('displayName') or view['name']):skip('view_name_regex_mismatch');continue
                 references = run_references(view, set(by_run))
-                is_shared = not references
+                is_shared = kind=='project-view' or not references
                 if scope == 'runs' and is_shared:skip('scope_requires_run_reference');continue
                 if scope == 'shared' and not is_shared:skip('scope_requires_shared_layout');continue
                 seen.add(identity)
                 metrics = union if is_shared else set().union(*(by_run[r] for r in references))
+                if kind=='project-view':metrics=metrics|project_other_metrics
                 before = decode_spec(view)
                 record = dict(entity=entity, project=project, view_type=kind, view=view,
                     run_ids=sorted(references), shared_layout=is_shared,
                     note='Shared layouts may affect runs outside the date filter too' if is_shared else '')
                 try:
-                    after, change = transform_spec(before, metrics, config.get('x_axis', 'epoch'))
+                    if config.get('repair_adam_only'):
+                        after,change=repair_adam_spec(before,metrics)
+                    else:
+                        after, change = transform_spec(before, metrics, config.get('x_axis', 'epoch'))
                     record['change'] = change
                     directory = backup_record(output, record, before, after)
                     if apply and change['changed']:
@@ -381,8 +447,10 @@ def process(api, config, output, apply=False):
                         record['status'] = 'applied_verified'
                     elif apply:record['status'] = 'unchanged'
                     save(directory/'record.json', record)
-                    matched_runs.update(references);shared += int(is_shared)
+                    if not is_shared:matched_runs.update(references)
+                    shared += int(is_shared)
                     print(f'[{record["status"]}] {kind} {view.get("displayName") or view["name"]}: '
+                          f'adam added={change.get("added_adam_charts",0)} '
                           f'detection={change.get("detection_charts",0)} val/epoch={change.get("epoch_charts",0)}',flush=True)
                 except Exception as exc:
                     record['status']='error';record['error']=str(exc)
@@ -440,14 +508,18 @@ def main():
     parser.add_argument('--config',type=Path,default=DEFAULT_CONFIG)
     parser.add_argument('--project-url',action='append',help='Override configured projects; repeat for multiple projects')
     parser.add_argument('--since',help='Override createdAt start, e.g. 2026-09-01')
+    parser.add_argument('--until',help='Override exclusive end date; use none to include later runs')
     parser.add_argument('--username',help='Layout creator username, not entity/team; use @me for logged-in account')
     parser.add_argument('--apply',action='store_true',help='Save the planned layout changes remotely')
+    parser.add_argument('--repair-adam-only',action='store_true',help='Only add missing Adam charts; preserve val/detection and every other layout setting')
     parser.add_argument('--restore',type=Path,help='Preview/restore previously applied backups')
     parser.add_argument('--output-dir',type=Path,help='Local backup directory; otherwise a timestamped directory')
     args=parser.parse_args()
     config=json.loads(args.config.read_text())
     if args.project_url:config['project_urls']=args.project_url
     if args.since:config['since']=args.since
+    if args.until:config['until']=None if args.until.lower()=='none' else args.until
+    if args.repair_adam_only:config['repair_adam_only']=True
     if args.username is not None:config['username']=None if args.username=='@me' else args.username
     if config.get('scope','both') not in ('both','runs','shared'):parser.error('scope must be both/runs/shared')
     if not args.restore and any('YOUR_' in p for p in config.get('project_urls',[])):

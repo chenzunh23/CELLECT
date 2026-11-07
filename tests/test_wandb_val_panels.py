@@ -31,6 +31,86 @@ def sections(spec):return {s['name']:s for s in spec['section']['panelBankConfig
 
 
 class PanelMigrationTests(unittest.TestCase):
+    def test_run_metadata_is_batched_when_sdk_supports_it(self):
+        calls=[]
+        def runs(path, *, lazy=True, **kwargs):
+            calls.append((path,lazy,kwargs));return []
+        wb.runs_with_metrics(types.SimpleNamespace(runs=runs),'me/proj',per_page=50)
+        self.assertEqual(calls,[('me/proj',False,{'per_page':50})])
+
+    def test_adam_only_repair_keeps_every_other_layout_field(self):
+        source=layout([panel('val/detection/F444W/recall')])
+        source['section']['panelBankConfig']['sections'].append(dict(
+            name='adam',__id__='original-adam',isPanelsAuto=True,defaultName='adam',isOpen=False,panels=[]))
+        out,report=wb.repair_adam_spec(source,{'adam/encoder/gradient_norm','val/epoch/loss'})
+        self.assertEqual(sections(out)['val'],sections(source)['val'])
+        for key in ('runSets','settings','workspaceSettings'):
+            self.assertEqual(out['section'][key],source['section'][key])
+        self.assertEqual(sections(out)['adam']['__id__'],'original-adam')
+        self.assertEqual(sections(out)['adam']['panels'][0]['config']['xAxis'],'iteration')
+        self.assertEqual(sections(out)['adam']['localPanelSettings']['xAxis'],'iteration')
+        self.assertEqual(report['added_adam_charts'],1)
+        again,report=wb.repair_adam_spec(out,{'adam/encoder/gradient_norm'})
+        self.assertEqual(again,out);self.assertFalse(report['changed'])
+
+    def test_adam_only_repair_does_not_duplicate_custom_or_hidden_charts(self):
+        source=layout([panel('adam/encoder/gradient_norm','my-adam')])
+        out,report=wb.repair_adam_spec(source,{'adam/encoder/gradient_norm'})
+        self.assertEqual(out,source);self.assertFalse(report['changed'])
+
+    def test_materialized_adam_axis_and_unrelated_overrides_survive_normal_migration(self):
+        out,_=wb.transform_spec(layout(),{'val/epoch/loss','adam/encoder/parameter_norm'})
+        p=sections(out)['adam']['panels'][0]
+        self.assertEqual(p['config']['xAxis'],'iteration')
+        bank=out['section']['panelBankConfig'];bank['panelConfigOverrides'][p['__id__']]={'logY':True}
+        again,_=wb.transform_spec(out,{'val/epoch/loss','adam/encoder/parameter_norm'})
+        self.assertEqual(again['section']['panelBankConfig']['panelConfigOverrides'][p['__id__']],{'logY':True})
+
+    def test_history_numeric_keys_are_used_even_without_final_summary(self):
+        run=types.SimpleNamespace(summary_metrics={'loss':2.,'bool':True})
+        run._attrs={'historyKeys':json.dumps({'keys':{
+            'adam/encoder/gradient_norm':{'type':'number'},
+            'adam/mask_decoder/parameter_norm':{'typeCounts':[{'type':'number','count':2}]},
+            'image':{'type':'image'},'null':{'typeCounts':None}}})}
+        self.assertEqual(wb.metric_keys(run),{'loss','adam/encoder/gradient_norm','adam/mask_decoder/parameter_norm'})
+
+    def test_project_view_visible_old_runs_do_not_hide_new_adam_metrics(self):
+        source=layout([panel('val/epoch/loss')])
+        source['section']['runSets'][0]['filters']={'run':'old12345'}
+        source['section']['panelBankConfig']['sections'].append(dict(name='adam',isPanelsAuto=True,panels=[]))
+        view=dict(id='workspace',name='saved',spec=json.dumps(source),user={'username':'me'})
+        old=types.SimpleNamespace(id='old12345',name='old',summary_metrics={'val/epoch/loss':1.})
+        new=types.SimpleNamespace(id='new12345',name='new',summary_metrics={'adam/encoder/gradient_norm':2.,'val/epoch/new_metric':3.})
+        calls=[]
+        def runs(*a,**kw):
+            calls.append(kw)
+            return [old] if 'filters' in kw else [old,new]
+        api=types.SimpleNamespace(viewer=types.SimpleNamespace(username='me'),runs=runs)
+        cfg=dict(project_urls=['me/proj'],view_types=['project-view'],until='2026-11-03')
+        with tempfile.TemporaryDirectory() as tmp,patch.object(wb,'views',return_value=iter([view])):
+            wb.process(api,cfg,Path(tmp))
+            after=json.loads(next(Path(tmp).glob('*/after.json')).read_text())
+            self.assertEqual(panel_metrics:=wb.panel_metrics(sections(after)['adam']['panels'][0]),['adam/encoder/gradient_norm'])
+            targets={m for s in sections(after).values() for p in s['panels'] for m in wb.panel_metrics(p)}
+            self.assertNotIn('val/epoch/new_metric',targets)
+            report=json.loads((Path(tmp)/'report.json').read_text())['projects'][0]
+            self.assertEqual(report['shared_layouts_processed'],1)
+            self.assertEqual(report['explicit_run_layouts_matched'],0)
+            self.assertEqual(calls[0]['filters']['createdAt']['$lt'],'2026-11-03')
+            self.assertNotIn('filters',calls[1])
+
+    def test_adam_repair_process_does_not_reorganize_validation_again(self):
+        source=layout([panel('val/detection/F444W/recall')])
+        view=dict(id='workspace',name='saved',spec=json.dumps(source),user={'username':'me'})
+        run=types.SimpleNamespace(id='abc12345',name='new',summary_metrics={'adam/encoder/parameter_norm':1.})
+        api=types.SimpleNamespace(viewer=types.SimpleNamespace(username='me'),runs=lambda *a,**kw:[run])
+        with tempfile.TemporaryDirectory() as tmp,patch.object(wb,'views',return_value=iter([view])):
+            wb.process(api,dict(project_urls=['me/proj'],view_types=['project-view'],repair_adam_only=True),Path(tmp))
+            after=json.loads(next(Path(tmp).glob('*/after.json')).read_text())
+            self.assertEqual(sections(after)['val'],sections(source)['val'])
+            self.assertNotIn('detection',sections(after))
+            self.assertEqual(len(sections(after)['adam']['panels']),1)
+
     def test_auto_metrics_are_materialized_and_old_new_detection_share_chart(self):
         source=layout()
         out,report=wb.transform_spec(source,{

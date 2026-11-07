@@ -77,6 +77,30 @@ class DenseTests(unittest.TestCase):
                   ordinary_ignore_mask=mask)
         self.assertTrue(mask.all())
 
+    def test_restricted_hsc_geometry_does_not_paint_or_erase_background(self):
+        bright=np.zeros((301,301),bool);bright[145:155,145:155]=True
+        config=RegionFillingConfig(restricted_source_geometry=False)
+        for radius in (10,140,100000):
+            dense=self.fill([C.RESTRICTED_BRIGHT_REGION],[radius],restricted_fallback_mask=bright,config=config)
+            np.testing.assert_array_equal(dense,np.where(bright,D.RESTRICTED_BRIGHT_REGION,D.BACKGROUND))
+
+    def test_restricted_hsc_rows_without_component_have_no_dense_geometry(self):
+        dense=self.fill([C.RESTRICTED_BRIGHT_REGION],[140],
+                        config=RegionFillingConfig(restricted_source_geometry=False))
+        self.assertTrue(np.all(dense==D.BACKGROUND))
+
+    def test_default_retains_other_dataset_restricted_geometry(self):
+        dense=self.fill([C.RESTRICTED_BRIGHT_REGION],[140])
+        self.assertEqual(dense[150,270],D.RESTRICTED_BRIGHT_REGION)
+
+    def test_restricted_hsc_component_still_yields_to_valid_shapes(self):
+        bright=np.zeros((301,301),bool);bright[140:161,140:221]=True
+        dense=self.fill([C.RESTRICTED_BRIGHT_REGION,C.WEAK_SHAPE],[140,20],
+            restricted_fallback_mask=bright,config=RegionFillingConfig(restricted_source_geometry=False))
+        self.assertEqual(dense[150,150],D.WEAK_SHAPE)
+        self.assertEqual(dense[150,210],D.RESTRICTED_BRIGHT_REGION)
+        self.assertEqual(dense[150,270],D.BACKGROUND)
+
     def test_invalid_cap(self):
         with self.assertRaises(ValueError):
             self.fill([C.CLEAN], [10], config=RegionFillingConfig(max_major_pixels=0))
