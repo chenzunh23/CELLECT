@@ -24,7 +24,31 @@ from .geometry import EllipseGeometry, ellipse_axes_from_moments
 from .area_filter import area_filter_masks
 from .no_data import center_no_data
 
-POLICY_VERSION='uncover_native_abell_v5_raw_full_snr_model_risk_only'
+POLICY_VERSION='uncover_native_abell_v8_verified_blue_postprocess'
+DEFAULT_BLUE_CATALOG=Path(__file__).resolve().parents[1]/'assets/abell_verified_blue_centers_v1.fits'
+
+
+def blue_candidates_on_window(path, header, shape, *, margin=20.):
+    """Project a verified sky catalog; parent-local coordinates are never reused.
+
+    A small exterior margin supplies nuisance neighbors near stamp edges.
+    Membership for actual insertion is checked against the final image/DQ.
+    Catalog flags copied through nearest matching are deliberately not used.
+    """
+    table=Table.read(path)
+    required={'ra','dec','debug_id','blue_candidate','F115W_snr','F150W_snr','F200W_snr'}
+    if not required.issubset(table.colnames):
+        raise ValueError(f'Invalid verified BLUE catalog, missing {sorted(required-set(table.colnames))}: {path}')
+    x,y=WCS(header).celestial.world_to_pixel_values(table['ra'],table['dec'])
+    keep=np.isfinite(x)&np.isfinite(y)&(x>=-margin)&(y>=-margin)&(x<shape[1]+margin)&(y<shape[0]+margin)
+    table=table[keep];table['x']=x[keep];table['y']=y[keep]
+    if len(np.unique(table['debug_id']))!=len(table):raise ValueError('Verified BLUE debug IDs must be unique')
+    selected=np.asarray(table['blue_candidate'],bool)
+    for band in ('F115W','F150W','F200W'):
+        snr=np.asarray(table[band+'_snr'],float)
+        if np.any(selected&(~np.isfinite(snr)|(snr<4))):
+            raise ValueError(f'Verified BLUE selection must pass all three bands at SNR>=4: {path}')
+    return table
 
 
 def project_product(path, header, shape, *, mode='coverage'):
@@ -145,6 +169,10 @@ class UncoverSnrConfig:
     reject_untrusted_in_contaminated: bool = True
     risk_bright_mag_max: float | None = 22.
     thresholds: SnrThresholds = SnrThresholds()
+    kron_other_fraction_max: float = .30
+    native_psf_review: bool = True
+    native_psf_snr_min: float = 4.
+    native_psf_moment_max_arcsec: float = .10
 
     def __post_init__(self):
         if not (np.isfinite(self.no_kron_min_snr) and np.isfinite(self.contaminated_no_kron_min_snr)
@@ -152,6 +180,12 @@ class UncoverSnrConfig:
             raise ValueError('No-Kron SNR thresholds must be finite and >= 0')
         if self.risk_bright_mag_max is not None and not np.isfinite(self.risk_bright_mag_max):
             raise ValueError('Bright risk exemption must be a finite AB magnitude or None')
+        if not np.isfinite(self.kron_other_fraction_max) or not 0 <= self.kron_other_fraction_max <= 1:
+            raise ValueError('Kron neighbor fraction must be in [0, 1]; 1 disables demotion')
+        if not np.isfinite(self.native_psf_snr_min) or self.native_psf_snr_min<0:
+            raise ValueError('Native PSF SNR cutoff must be finite and nonnegative')
+        if not np.isfinite(self.native_psf_moment_max_arcsec) or self.native_psf_moment_max_arcsec<=0:
+            raise ValueError('Native compact moment radius must be finite and positive')
 
 
 def apply_uncover_measured_snr(result, measurement, has_kron, *, config=UncoverSnrConfig(),
@@ -161,14 +195,19 @@ def apply_uncover_measured_snr(result, measurement, has_kron, *, config=UncoverS
     Existing strict geometry/containment decisions remain strict. Native
     flag_lowsnr is provenance, not a second hard cut or a class cap. Untrusted
     measurements are additionally rejected inside a supplied model/region mask,
-    except valid-Kron sources bright in this band. This exception does not
+    except valid-Kron sources bright in this band, capped at weak shape. This exception does not
     bypass numerical SNR cuts, native bad flags or missing-geometry decisions.
     """
     snr=np.asarray(measurement['snr'],float);trusted=np.asarray(measurement['trusted'],bool)
+    # Older externally supplied measurements have only the noise-trust flag.
+    # New measurements explicitly report whether any aperture background
+    # block fell back to a global pedestal. Numeric SNR is never recomputed.
+    background_trusted=np.asarray(measurement.get('background_trusted',trusted),bool)
+    effective_trusted=trusted&background_trusted
     has=np.asarray(has_kron,bool)
     risk=np.zeros(snr.shape,bool) if contaminated is None else np.asarray(contaminated,bool)
     bandmag=np.full(snr.shape,np.nan) if band_magnitude is None else np.asarray(band_magnitude,float)
-    if any(a.shape != result.candidate.shape for a in (snr,trusted,has,risk,bandmag)):
+    if any(a.shape != result.candidate.shape for a in (snr,trusted,background_trusted,has,risk,bandmag)):
         raise ValueError('UNCOVER SNR/source length mismatch')
     tested=retained(result).copy()
     threshold=np.maximum(config.thresholds.ignore_below,
@@ -177,18 +216,281 @@ def apply_uncover_measured_snr(result, measurement, has_kron, *, config=UncoverS
     no_kron_bad=(~has)&(snr<threshold)
     bright=np.zeros(snr.shape,bool) if config.risk_bright_mag_max is None else (
         has&np.isfinite(bandmag)&(bandmag<config.risk_bright_mag_max))
-    untrusted_bad=risk&~trusted&config.reject_untrusted_in_contaminated&~bright
+    risk_untrusted=risk&~effective_trusted&config.reject_untrusted_in_contaminated
+    untrusted_bad=risk_untrusted&~bright
     downgrade(result,numerical_bad,C.ORDINARY_IGNORE,'uncover_measured_snr_ignore')
     downgrade(result,no_kron_bad,C.ORDINARY_IGNORE,'uncover_no_kron_snr_ignore')
     downgrade(result,untrusted_bad,C.ORDINARY_IGNORE,'uncover_model_region_snr_bad')
     weak=retained(result)&(snr>=config.thresholds.ignore_below)&(snr<config.thresholds.weak_below)
     downgrade(result,weak,C.WEAK_SHAPE,'uncover_measured_snr_weak')
+    bright_exempt=tested&risk_untrusted&bright&~numerical_bad&~no_kron_bad
+    downgrade(result,bright_exempt,C.WEAK_SHAPE,'uncover_model_region_bright_weak')
     result.diagnostics.update(aperture_snr=snr,aperture_snr_trusted=trusted,
+        aperture_background_trusted=background_trusted,aperture_snr_effective_trusted=effective_trusted,
         aperture_snr_tested=tested,aperture_snr_ignore=tested&(numerical_bad|no_kron_bad|untrusted_bad),
-        aperture_snr_weak=weak,snr_bad=~np.isfinite(snr)|~trusted,
+        aperture_snr_weak=weak|bright_exempt,snr_bad=~np.isfinite(snr)|~effective_trusted,
         snr_contaminated_region=risk,no_kron_snr_threshold=threshold,
-        snr_risk_bright_exempt=tested&risk&~trusted&bright&~numerical_bad&~no_kron_bad)
+        snr_risk_bright_exempt=bright_exempt)
     result.snapshot('aperture_snr')
+
+
+def kron_segmentation_quality(geometry, source_ids, source_classes, segmentation, *, other_fraction_max=.30):
+    """Retained neighbors' segment pixels / ALL rasterized Kron pixels.
+
+    Evaluate all sources against one frozen set of non-ignore IDs, so results
+    never depend on catalog order. Count the full ellipse, including pixels
+    outside the parent image, in the denominator; cropping must not inflate
+    contamination. Integer segment IDs are already on this parent's WCS grid.
+    """
+    if not np.isfinite(other_fraction_max) or not 0 <= other_fraction_max <= 1:
+        raise ValueError('Kron neighbor fraction must be in [0, 1]')
+    ids=np.asarray(source_ids,np.int64);classes=np.asarray(source_classes)
+    seg=np.asarray(segmentation)
+    if seg.ndim!=2 or ids.shape!=geometry.x.shape or classes.shape!=ids.shape:
+        raise ValueError('Kron segmentation/source geometry mismatch')
+    active=(ids>0)&np.isin(classes,[int(C.CLEAN),int(C.WEAK_SHAPE),int(C.STRICT_CENTER_ONLY)])
+    retained_pixels=np.isin(seg,ids[active])&(seg>0)
+    evaluated=active&geometry.valid()
+    total=np.zeros(len(ids),np.int64);visible=total.copy();other=total.copy()
+    fraction=np.full(len(ids),np.nan)
+    for i in np.flatnonzero(evaluated):
+        x,y,a,b,t=(float(v[i]) for v in (geometry.x,geometry.y,geometry.major,geometry.minor,geometry.theta))
+        c,s=np.cos(t),np.sin(t)
+        aa=c*c/(a*a)+s*s/(b*b);bb=c*s*(1/(a*a)-1/(b*b))
+        yr=np.hypot(a*s,b*c)
+        # Solve the ellipse's x interval for every integer y, without allocating
+        # a potentially huge off-image bounding box. Pixel centers define area.
+        rows=np.arange(int(np.ceil(y-yr-1e-10)),int(np.floor(y+yr+1e-10))+1,dtype=np.int64)
+        dy=rows-y
+        half=np.sqrt(np.maximum(0.,(1.-(dy/yr)**2)/aa))
+        mid=x-bb*dy/aa
+        left=np.ceil(mid-half-1e-10).astype(np.int64)
+        right=np.floor(mid+half+1e-10).astype(np.int64)
+        total[i]=np.maximum(0,right-left+1).sum()
+        onimage=(rows>=0)&(rows<seg.shape[0])
+        for row,lo,hi in zip(rows[onimage],left[onimage],right[onimage]):
+            lo=max(0,int(lo));hi=min(seg.shape[1]-1,int(hi))
+            if hi<lo:continue
+            visible[i]+=hi-lo+1
+            other[i]+=np.count_nonzero(retained_pixels[row,lo:hi+1]&(seg[row,lo:hi+1]!=ids[i]))
+        if total[i]>0:fraction[i]=other[i]/total[i]
+    return dict(kron_pixel_count=total,kron_visible_pixel_count=visible,
+        kron_other_seg_pixel_count=other,kron_other_seg_fraction=fraction,
+        kron_seg_evaluated=evaluated,kron_other_seg_bad=evaluated&(fraction>other_fraction_max))
+
+
+def add_blue_compact_centers(labels, candidates, band, *, core_snr=None,
+                             red_min_snr=4., dedup_pixels=2., scope=''):
+    """Use verified BLUE positions for duplicates; append missing strict centers.
+
+    Input must be the verified BLUE candidate table, never red-only detections.
+    Short-wave bands accept the supplied BLUE selection; long-wave bands also
+    require signed, measured fixed-PSF core SNR >= red_min_snr. Spatial matching
+    is to actual retained centers, not nearest-UNCOVER-ID hints. Existing clean,
+    weak and strict classes retain their class and ellipse axes, but matching
+    centers move to the BLUE position. The old coordinates/ID remain auditable.
+    Multiple nearby old positives merge; BLUE-to-BLUE duplicates keep the
+    highest three-band minimum SNR, deterministically. No seg-ownership gate.
+    """
+    from .jwst_background import PSF_FWHM_ARCSEC
+    if band not in PSF_FWHM_ARCSEC:raise ValueError(f'Unknown NIRCam band: {band}')
+    if not np.isfinite(red_min_snr) or red_min_snr<0 or dedup_pixels<0:
+        raise ValueError('Invalid compact-center thresholds')
+    n=len(candidates);blue=np.asarray(candidates['blue_candidate'],bool)
+    x,y=np.asarray(candidates['x'],float),np.asarray(candidates['y'],float)
+    snr=np.full(n,np.nan) if core_snr is None else np.asarray(core_snr,float)
+    if snr.shape!=(n,):raise ValueError('Compact SNR length mismatch')
+    shortwave=int(band[1:4])<=212
+    eligible=blue&np.isfinite(x)&np.isfinite(y)
+    h,w=labels.dense.shape
+    eligible&=(x>=0)&(y>=0)&(x<w)&(y<h)
+    ix=np.clip(np.floor(np.nan_to_num(x)+.5).astype(int),0,w-1)
+    iy=np.clip(np.floor(np.nan_to_num(y)+.5).astype(int),0,h-1)
+    eligible&=labels.dense[iy,ix]!=int(DenseLabel.STRICT_IGNORE)
+    if not shortwave:eligible&=np.isfinite(snr)&(snr>=red_min_snr)
+    # These are independently verified BLUE peaks. Any UNCOVER flag columns
+    # copied by nearest-neighbor matching are only hints, not source identities
+    # (and -1 means unmatched); they cannot veto this supplemental branch.
+    # Existing native rows keep their own ordinary flag decisions unchanged.
+    retained_native=np.isin(labels.label_classes,[C.CLEAN,C.WEAK_SHAPE,C.STRICT_CENTER_ONLY])
+    xy=np.c_[labels.geom_x[retained_native],labels.geom_y[retained_native]]
+    xy=np.r_[xy,np.c_[labels.strict_x,labels.strict_y]]
+    xy=xy[np.isfinite(xy).all(axis=1)]
+    native_indices=np.flatnonzero(retained_native)
+    native_xy=np.c_[labels.geom_x[native_indices],labels.geom_y[native_indices]]
+    oldextra=len(labels.strict_x)
+    allxy=np.r_[native_xy,np.c_[labels.strict_x,labels.strict_y]]
+    finite_old=np.isfinite(allxy).all(axis=1)
+    tree=cKDTree(allxy[finite_old]) if finite_old.any() else None
+    oldmap=np.flatnonzero(finite_old);claimed=np.zeros(len(allxy),bool)
+    extra_keep=np.ones(oldextra,bool)
+    duplicate=np.zeros(n,bool);added=[];newids=[];accepted=[];moves=[];merged=[]
+    status=np.full(n,'not_eligible',dtype='U40');status[eligible]='eligible'
+    source_id=np.zeros(n,np.int64);matched_native=np.full(n,-1,np.int64)
+    score=np.zeros(n)
+    if all(b+'_snr' in candidates.colnames for b in ('F115W','F150W','F200W')):
+        score=np.min(np.array([np.asarray(candidates[b+'_snr'],float) for b in ('F115W','F150W','F200W')]),axis=0)
+        score=np.nan_to_num(score,nan=-np.inf)
+    ids=np.asarray(candidates['debug_id'],np.int64)
+    order=np.flatnonzero(eligible)
+    order=order[np.lexsort((ids[order],-score[order]))]
+    if hasattr(labels,'table'):
+        for key,value in [('center_before_blue_x',labels.geom_x),('center_before_blue_y',labels.geom_y)]:
+            if key not in labels.table.colnames:labels.table[key]=np.array(value,copy=True)
+        if 'center_blue_debug_id' not in labels.table.colnames:labels.table['center_blue_debug_id']=np.full(len(labels.geom_x),-1,np.int64)
+        if 'center_replaced_by_blue' not in labels.table.colnames:labels.table['center_replaced_by_blue']=np.zeros(len(labels.geom_x),bool)
+        if 'center_duplicate_merged' not in labels.table.colnames:labels.table['center_duplicate_merged']=np.zeros(len(labels.geom_x),bool)
+    scope_id=int.from_bytes(hashlib.sha256(scope.encode()).digest()[:4],'big')
+    for i in order:
+        if any(np.hypot(x[i]-x[j],y[i]-y[j])<=dedup_pixels for j in accepted):
+            duplicate[i]=True;status[i]='duplicate_blue';continue
+        near=[] if tree is None else [int(oldmap[k]) for k in tree.query_ball_point([x[i],y[i]],dedup_pixels)]
+        near=[k for k in near if not claimed[k]]
+        if near:
+            near.sort(key=lambda k:(float(np.hypot(*(allxy[k]-[x[i],y[i]]))),k))
+            primary=near[0];claimed[near]=True
+            if primary<len(native_indices):
+                j=int(native_indices[primary]);ox,oy=float(labels.geom_x[j]),float(labels.geom_y[j])
+                labels.geom_x[j]=x[i];labels.geom_y[j]=y[i]
+                source_id[i]=labels.source_ids[j];matched_native[i]=j
+                status[i]='recentered_native'
+                if hasattr(labels,'table'):
+                    labels.table['center_blue_debug_id'][j]=ids[i]
+                    labels.table['center_replaced_by_blue'][j]=True
+            else:
+                j=primary-len(native_indices);ox,oy=float(labels.strict_x[j]),float(labels.strict_y[j])
+                labels.strict_x[j]=x[i];labels.strict_y[j]=y[i]
+                source_id[i]=labels.strict_ids[j];status[i]='recentered_extra'
+            moves.append(dict(source_id=int(source_id[i]),debug_id=int(ids[i]),old_x=ox,old_y=oy,
+                x=float(x[i]),y=float(y[i]),kind=str(status[i])))
+            for k in near[1:]:
+                if k<len(native_indices):
+                    j=int(native_indices[k]);labels.label_classes[j]=int(C.ORDINARY_IGNORE)
+                    if hasattr(labels,'table'):
+                        labels.table['center_duplicate_merged'][j]=True
+                        if 'classification_reason' in labels.table.colnames:
+                            reasons=np.asarray(labels.table['classification_reason'],dtype='U128')
+                            reasons[j]='uncover_blue_duplicate_merged';labels.table['classification_reason']=reasons
+                    oldid=int(labels.source_ids[j])
+                else:
+                    j=k-len(native_indices);extra_keep[j]=False;oldid=int(labels.strict_ids[j])
+                merged.append(dict(source_id=oldid,kept_id=int(source_id[i]),debug_id=int(ids[i])))
+            accepted.append(i);continue
+        added.append(i)
+        accepted.append(i);status[i]='added_strict'
+        debug_id=int(ids[i])
+        if not 0<=debug_id<1_000_000:raise ValueError('Compact debug ID must be in [0,1000000)')
+        newids.append(-8_000_000_000_000_000-scope_id*1_000_000-debug_id)
+    added=np.asarray(added,int);newids=np.asarray(newids,np.int64)
+    labels.strict_x=np.r_[labels.strict_x[extra_keep],x[added]];labels.strict_y=np.r_[labels.strict_y[extra_keep],y[added]]
+    labels.strict_ids=np.r_[labels.strict_ids[extra_keep],newids]
+    oldgaia=np.zeros(oldextra,bool) if labels.strict_is_gaia is None else labels.strict_is_gaia
+    labels.strict_is_gaia=np.r_[oldgaia[extra_keep],np.zeros(len(added),bool)]
+    if not shortwave:status[blue&(~np.isfinite(snr)|(snr<red_min_snr))]='red_psf_snr_below_threshold'
+    source_id[added]=newids
+    return dict(blue_candidates=int(blue.sum()),eligible=int(eligible.sum()),
+        existing_centers=len(moves),recentered=len(moves),merged_old=len(merged),
+        duplicate_blue=int(duplicate.sum()),added=int(len(added)),shortwave=shortwave,
+        red_min_snr=float(red_min_snr),dedup_pixels=float(dedup_pixels),
+        status=status,source_id=source_id,matched_native_index=matched_native,
+        center_moves=moves,merged_old_sources=merged)
+
+
+def refine_uncover_compact_sources(labels, reference, header, band, *,
+        config=UncoverSnrConfig(),candidates=None,core_snr=None,
+        red_min_snr=4.,dedup_pixels=2.,scope='',sky_mask=None,rms=None,
+        noise_factor=None,native_pixel_scale=.04,audit_source_ids=(),progress=None):
+    """Recenter once, review original compact sources, then repaint targets.
+
+    The original aperture cuts remain in force. This adds a risk-zone PSF
+    veto, not a PSF replacement for photometry of resolved galaxies. BLUE
+    segmentation ownership/containment is deliberately not introduced here.
+    """
+    from .jwst_star_psf import measure_fixed_psf_core,empirical_core_rms,calibrate_core_noise
+    from ..region_filling import fill_dense_regions
+    old_dense=labels.dense.copy();compact=None
+    if candidates is not None:
+        compact=add_blue_compact_centers(labels,candidates,band,core_snr=core_snr,
+            red_min_snr=red_min_snr,dedup_pixels=dedup_pixels,scope=scope)
+    n=len(labels.label_classes);table=labels.table
+    def column(name,default,dtype=float):
+        return np.asarray(np.ma.filled(table[name],default),dtype=dtype) if name in table.colnames else np.full(n,default,dtype=dtype)
+    a,b=column('a_image',np.nan),column('b_image',np.nan)
+    moment=np.sqrt(np.where((a>0)&(b>0),a*b,np.nan))*native_pixel_scale
+    small=np.isfinite(moment)&(moment<=config.native_psf_moment_max_arcsec)
+    risk=column('snr_contaminated_region',False,bool)
+    gaia=column('gaia_psf_model',False,bool)
+    retained=np.isin(labels.label_classes,[C.CLEAN,C.WEAK_SHAPE,C.STRICT_CENTER_ONLY])
+    active=retained&small&risk&~gaia&config.native_psf_review
+    tested=(active|(np.isin(labels.source_ids,audit_source_ids)&small&risk&~gaia))&config.native_psf_review
+    snr=np.full(n,np.nan);chi2=np.full(n,np.nan);success=np.zeros(n,bool)
+    fitstatus=np.full(n,'not_tested',dtype='U32');neighbor_count=np.zeros(n,np.int16)
+    noise_audit={};used_factor=1. if noise_factor is None else float(noise_factor)
+    if tested.any():
+        if progress:progress('native_compact_fixed_psf',int(tested.sum()))
+        sky=np.isfinite(reference) if sky_mask is None else np.asarray(sky_mask,bool)&np.isfinite(reference)
+        if rms is None:rms=empirical_core_rms(reference,sky)
+        if noise_factor is None:used_factor,noise_audit=calibrate_core_noise(reference,rms,band,sky)
+        strong=retained&small&np.isfinite(column('catalog_band_snr',np.nan))&(column('catalog_band_snr',np.nan)>=7)
+        neighbor_xy=np.c_[labels.geom_x[strong],labels.geom_y[strong]]
+        if candidates is not None:
+            select=np.asarray(candidates['blue_candidate'],bool)
+            blue_xy=np.c_[np.asarray(candidates['x'],float)[select],np.asarray(candidates['y'],float)[select]]
+            blue_xy=blue_xy[np.isfinite(blue_xy).all(axis=1)]
+            if len(blue_xy):
+                if len(neighbor_xy):neighbor_xy=neighbor_xy[cKDTree(blue_xy).query(neighbor_xy)[0]>dedup_pixels]
+                neighbor_xy=np.r_[blue_xy,neighbor_xy]
+        neighbor_xy=neighbor_xy[np.isfinite(neighbor_xy).all(axis=1)]
+        tree=cKDTree(neighbor_xy) if len(neighbor_xy) else None
+        for j in np.flatnonzero(tested):
+            x,y=float(labels.geom_x[j]),float(labels.geom_y[j])
+            near=[] if tree is None else tree.query_ball_point([x,y],20.)
+            fit=measure_fixed_psf_core(reference,rms,x,y,band,
+                neighbor_xy=neighbor_xy[near],noise_factor=used_factor,neighbor_margin_pixels=8.)
+            snr[j]=fit['snr'];chi2[j]=fit['chi2'];success[j]=fit['success'];fitstatus[j]=fit['status']
+            neighbor_count[j]=fit['neighbor_count']
+    before=labels.label_classes.copy()
+    rejected=active&(~success|~np.isfinite(snr)|(snr<=config.native_psf_snr_min))
+    labels.label_classes[rejected]=int(C.ORDINARY_IGNORE)
+    reasons=column('classification_reason','',str).astype('U128')
+    reasons[rejected]='uncover_risk_compact_psf_snr_ignore'
+    table['classification_reason']=reasons
+    for key,value in dict(native_psf_moment_arcsec=moment,native_psf_compact=small,
+            native_psf_risk=risk,native_psf_tested=tested,native_psf_success=success,
+            native_psf_snr=snr,native_psf_chi2=chi2,native_psf_status=fitstatus,
+            native_psf_neighbors=neighbor_count,native_psf_ignored=rejected,
+            native_psf_x=labels.geom_x.copy(),native_psf_y=labels.geom_y.copy(),
+            class_before_native_psf=before,class_after_native_psf=labels.label_classes.copy()).items():
+        table[key]=value
+    if compact is not None:
+        for i in np.flatnonzero(compact['matched_native_index']>=0):
+            if rejected[compact['matched_native_index'][i]]:compact['status'][i]='recentered_native_psf_ignored'
+        labels.compact_center_audit=compact
+    # Repaint from the existing categorical masks: background, quality and
+    # star-wing provenance remain, while removed/moved native ellipses cannot
+    # leave stale positive pixels behind. No new segmentation masks are made.
+    geom=EllipseGeometry(labels.geom_x,labels.geom_y,labels.geom_major,labels.geom_minor,
+        labels.geom_theta,np.pi*labels.geom_major*labels.geom_minor)
+    labels.dense=fill_dense_regions(table,SourceLabels(labels.label_classes,np.full(n,'',object)),
+        old_dense.shape,geometry=geom,background_mask=old_dense==int(DenseLabel.BACKGROUND),
+        quality_ignore_mask=old_dense==int(DenseLabel.STRICT_IGNORE),
+        restricted_fallback_mask=old_dense==int(DenseLabel.RESTRICTED_BRIGHT_REGION),
+        ordinary_ignore_mask=np.isin(old_dense,[int(DenseLabel.UNLABELED),int(DenseLabel.ORDINARY_IGNORE)]),
+        star_wings_mask=old_dense==int(DenseLabel.STAR_WINGS))
+    labels.dense[old_dense==int(DenseLabel.STRICT_IGNORE)]=int(DenseLabel.STRICT_IGNORE)
+    table['center_ra'],table['center_dec']=WCS(header).celestial.pixel_to_world_values(labels.geom_x,labels.geom_y)
+    table['final_class']=labels.label_classes
+    compact_summary=None if compact is None else {k:v for k,v in compact.items()
+        if k not in ('status','source_id','matched_native_index')}
+    return dict(compact_centers=compact_summary,native_psf_review=dict(enabled=config.native_psf_review,
+        tested=int(tested.sum()),eligible=int(active.sum()),ignored=int(rejected.sum()),
+        failed_fits=int((active&~success).sum()),snr_ignore_inclusive=config.native_psf_snr_min,
+        moment_max_arcsec=config.native_psf_moment_max_arcsec,native_pixel_scale=native_pixel_scale,
+        noise_factor=used_factor,noise_audit=noise_audit,
+        selection='retained native compact sources in each band model-risk region; Gaia model rows excluded',
+        order='BLUE dedup/recenter first; PSF veto at final centers; repaint without new seg ownership checks'),
+        final_classes={C(int(k)).name:int(v) for k,v in zip(*np.unique(labels.label_classes,return_counts=True))},
+        extra_strict_centers=len(labels.strict_x))
 
 
 def adapt_catalog(catalog, header, shape, native_header, *, include_outside=False):
@@ -401,7 +703,8 @@ def classify_reference(reference, header, catalog, gaia, background, band, *,
     for name,values in ordinary.stages.items():table['class_after_'+name]=values
     measurement=ordinary.diagnostics['aperture_measurement']
     table['remeasured_aperture_snr']=measurement['snr'];table['aperture_snr_trusted']=measurement['trusted']
-    for key in ('snr_bad','snr_contaminated_region','no_kron_snr_threshold','snr_risk_bright_exempt'):
+    for key in ('snr_bad','snr_contaminated_region','no_kron_snr_threshold','snr_risk_bright_exempt',
+                'aperture_background_trusted','aperture_snr_effective_trusted'):
         table[key]=ordinary.diagnostics[key]
     for key in ('flux','aperture_pixels'):
         if key in measurement:table['remeasured_aperture_'+key]=measurement[key]
@@ -427,6 +730,33 @@ def classify_reference(reference, header, catalog, gaia, background, band, *,
     wings=apply_star_protection(labels,image=training,header=bright_header if bright_header is not None else header,
         gaia=gaia,band=band,pixel_scale=.03,footprint=stars,sky_mask=background,
         snr_image=linear,valid_mask=bp.finite_mask)
+    # Apply after bright/Gaia decisions: ignored/replaced catalog neighbors do
+    # not count. The official segmentation has no IDs for appended Gaia stars.
+    # Retain original ellipses as ignore coverage/audit, not shape supervision;
+    # fill_dense_regions already paints only clean/weak shapes, never strict.
+    segmentation_audit=dict(enabled=native_segmentation is not None,
+        other_fraction_max=snr_config.kron_other_fraction_max,
+        denominator='all integer pixel centers inside the full Kron ellipse, including off-parent pixels',
+        numerator='pixels assigned to other retained non-ignore native source IDs; frozen before simultaneous demotion')
+    if native_segmentation is not None:
+        if native_segmentation.shape!=reference.shape:raise ValueError('Projected UNCOVER segmentation shape mismatch')
+        if progress:progress('kron_neighbor_segmentation',len(table))
+        n=len(has)
+        quality=kron_segmentation_quality(g,labels.source_ids[:n],labels.label_classes[:n],
+            native_segmentation,other_fraction_max=snr_config.kron_other_fraction_max)
+        bad=quality['kron_other_seg_bad']
+        changed=bad&np.isin(labels.label_classes[:n],[int(C.CLEAN),int(C.WEAK_SHAPE)])
+        labels.label_classes[:n][changed]=int(C.STRICT_CENTER_ONLY)
+        reasons=np.asarray(labels.table['classification_reason'],dtype='U128')
+        reasons[np.flatnonzero(changed)]='uncover_kron_neighbor_segmentation'
+        labels.table['classification_reason']=reasons
+        for key,values in {**quality,'kron_other_seg_downgraded':changed}.items():
+            extra=len(labels.table)-n
+            fill=np.nan if values.dtype.kind=='f' else 0
+            labels.table[key]=np.r_[values,np.full(extra,fill,dtype=values.dtype)]
+        labels.table['class_after_kron_segmentation']=labels.label_classes.copy()
+        segmentation_audit.update(evaluated=int(quality['kron_seg_evaluated'].sum()),
+            above_threshold=int(bad.sum()),downgraded=int(changed.sum()))
     if progress:progress('dense_paint',len(labels.source_ids))
     ignored=np.isin(components,result.ordinary_ignore_component_ids) if len(result.ordinary_ignore_component_ids) else np.zeros(reference.shape,bool)
     if native_segmentation is not None:
@@ -459,9 +789,11 @@ def classify_reference(reference, header, catalog, gaia, background, band, *,
             contaminated_no_kron_min_snr=snr_config.contaminated_no_kron_min_snr,
             reject_untrusted_in_contaminated=snr_config.reject_untrusted_in_contaminated,
             risk_bright_mag_max=snr_config.risk_bright_mag_max,
+            risk_background_policy='original numeric flux/SNR unchanged; local-background fallback or old noise-untrusted rejects in risk; valid-Kron current-band AB<limit capped at weak',
             risk_bright_photometry=f'UNCOVER {flux_key}, AB ZP28.9, finite positive flux and error; valid Kron required',
             contaminated_region_enabled=snr_contaminated_mask is not None),
         snr_risk_bright_exempt_sources=int(np.sum(ordinary.diagnostics['snr_risk_bright_exempt'])),
+        kron_segmentation=segmentation_audit,
         containment_policy='Existing IoU>=0.8 / inner fraction>=0.8 rules; valid Kron and retained non-ignore only; no contains-ignore demotion.',
         training_reference='half-coadd image and sky for bright/dense; FULL coadd image/sky for SNR')
     return labels,summary

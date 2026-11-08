@@ -1,0 +1,26 @@
+{
+  "version": "threeblue4_verified_v1",
+  "created": "2026-11-08",
+  "sources": [
+    {
+      "parent": "x+00_y+00",
+      "path": "/home/czh23/analysis/2026-11/2026-11-08/abell_fixed_psf_compact_centers/x+00_y+00/F115W/blue_center_selection.fits",
+      "sha256": "1f45f4dacea9a59f4b65b85d15b27eca48dcd80648a7228a64a10db10e419a77",
+      "rows": 572
+    },
+    {
+      "parent": "x+01_y+00",
+      "path": "/home/czh23/analysis/2026-11/2026-11-08/abell_fixed_psf_compact_centers/x+01_y+00/F115W/blue_center_selection.fits",
+      "sha256": "cf768c3714689a430bb3aa6e36dca0f9800cb7c4d1cc2a726b5ac2a89b8fd1f8",
+      "rows": 1474
+    }
+  ],
+  "input_rows": 2046,
+  "merged_rows": 2019,
+  "dedup_pixels": 2.0,
+  "pixel_scale_arcsec": 0.03,
+  "selection": "three BLUE SNR>=4, existing compactness/position/model nucleus gates; BLUE candidates need not have red support",
+  "mapping": "origin_parent/origin_debug_id trace diagnostic C IDs; debug_id unique across both parents",
+  "coverage": "Only the two validated sky regions; this asset does not claim detection over the whole Abell mosaic",
+  "output_sha256": "a2083ad3d0707f47655c3d01e4db9b9067dfd0cdee44ee5da5230fbcff0ef636"
+}

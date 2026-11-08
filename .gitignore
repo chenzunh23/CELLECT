@@ -8,6 +8,7 @@ extradata/
 cutouts/
 reference_catalogs/
 **.fits
+!preprocessing/assets/abell_verified_blue_centers_v1.fits
 **.pickle
 **.zip*
 **.tar*

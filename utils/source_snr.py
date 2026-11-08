@@ -347,7 +347,13 @@ def clipped_median_std(values: np.ndarray, *, rounds: int = 2, sigma: float = 3.
     return float(np.median(cur)), float(std), int(cur.size)
 
 
-def block_background(image: np.ndarray, sky_mask: np.ndarray | None, *, box: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def block_background(image: np.ndarray, sky_mask: np.ndarray | None, *, box: int,
+                     return_reliability: bool = False):
+    """Original background estimates, optionally with an explicit local-fit mask.
+
+    A global fallback still supplies exactly the same numerical background, but
+    cannot establish a reliable local pedestal in a bright galaxy halo.
+    """
     arr = np.asarray(image, dtype=np.float32)
     finite = np.isfinite(arr)
     if sky_mask is None:
@@ -365,6 +371,7 @@ def block_background(image: np.ndarray, sky_mask: np.ndarray | None, *, box: int
     bg = np.full(arr.shape, global_med, dtype=np.float32)
     sigma_map = np.full(arr.shape, global_sigma, dtype=np.float32)
     count_map = np.zeros(arr.shape, dtype=np.int32)
+    local_reliable = np.zeros(arr.shape, dtype=bool) if return_reliability else None
     ny, nx = arr.shape
     box = int(max(box, 8))
     min_pix = max(64, box * box // 16)
@@ -374,11 +381,16 @@ def block_background(image: np.ndarray, sky_mask: np.ndarray | None, *, box: int
             x1 = min(nx, x0 + box)
             block_use = use[y0:y1, x0:x1]
             med, sig, count = clipped_median_std(arr[y0:y1, x0:x1][block_use], rounds=2, sigma=3.0)
-            if count < min_pix or not np.isfinite(med) or not np.isfinite(sig) or sig <= 0.0:
+            reliable = count >= min_pix and np.isfinite(med) and np.isfinite(sig) and sig > 0.0
+            if not reliable:
                 med, sig = global_med, global_sigma
             bg[y0:y1, x0:x1] = np.float32(med)
             sigma_map[y0:y1, x0:x1] = np.float32(sig)
             count_map[y0:y1, x0:x1] = int(count)
+            if return_reliability:
+                local_reliable[y0:y1, x0:x1] = reliable
+    if return_reliability:
+        return bg, sigma_map, count_map, local_reliable
     return bg, sigma_map, count_map
 
 
@@ -443,7 +455,7 @@ def measure_local_aperture_snr(image, x, y, *, major=None, minor=None,
         sky = finite & ~excluded & ~high
     else:
         sky = np.asarray(sky_mask, bool) & finite & ~excluded
-    background, _, bg_count = block_background(arr, sky, box=box)
+    background, _, bg_count, bg_reliable = block_background(arr, sky, box=box, return_reliability=True)
     residual = arr - background
     sigma_map, counts, _, expected_area = aperture_noise_by_block(
         residual, sky, radius=radius, box=box, min_sky_apertures=min_sky_apertures)
@@ -453,6 +465,7 @@ def measure_local_aperture_snr(image, x, y, *, major=None, minor=None,
         raise ValueError("source axes length mismatch")
     snr, flux = np.full(x.shape, np.nan, np.float32), np.full(x.shape, np.nan, np.float32)
     trusted, pixels = np.zeros(x.shape, bool), np.zeros(x.shape, np.int32)
+    background_trusted = np.zeros(x.shape, bool)
     h, w = arr.shape
     for i in np.flatnonzero(np.isfinite(x) & np.isfinite(y)):
         pad = int(math.ceil(radius)) + 2
@@ -478,7 +491,11 @@ def measure_local_aperture_snr(image, x, y, *, major=None, minor=None,
         # A fractional center changes the rasterized area relative to the integer kernel.
         complete = pixels[i] == np.count_nonzero(aperture)
         trusted[i] = complete and counts[yi, xi] >= min_sky_apertures and internal and np.isfinite(snr[i])
+        # Check every background block touched by the actual aperture. This
+        # metadata does not change flux, SNR, or the legacy noise-trust flag.
+        background_trusted[i] = complete and bool(np.all(bg_reliable[y0:y1, x0:x1][ap]))
     return dict(snr=snr, flux=flux, trusted=trusted, aperture_pixels=pixels,
+                background_trusted=background_trusted,
                 background=background, background_pixel_count=bg_count, sky_mask=sky,
                 aperture_sigma=sigma_map, sky_aperture_count=counts,
                 background_method="lsst_sky" if sky_mask is not None else "high_threshold_heuristic")

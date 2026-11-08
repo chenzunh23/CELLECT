@@ -59,6 +59,151 @@ def sample_template(band, dx, dy, pixel_scale, angle):
                                    (x*c+y*s)+item['center_x']],order=1,mode='constant',cval=0,prefilter=False)
 
 
+@lru_cache(maxsize=12)
+def _compact_template(band, pixel_scale, blur_sigma_pixels):
+    """Fixed library PSF; optional predeclared broadening, never fit per source."""
+    from scipy.ndimage import gaussian_filter
+    image,item=template(band)
+    if blur_sigma_pixels:
+        image=gaussian_filter(image,blur_sigma_pixels*pixel_scale/item['pixel_scale_arcsec'])
+    return image,item
+
+
+def pixel_integrated_psf(band, dx, dy, pixel_scale=.03, *, angle=0.,
+                         subsamples=6, blur_sigma_pixels=0.):
+    """Integrate OVERDIST fine-grid flux onto the requested output pixels.
+
+    Normalize by the complete library stamp, never the fitting cutout. This
+    approximate coadd PRF does not include a field/visit-dependent drizzle
+    kernel; template mismatch and correlated noise require separate checks.
+    Existing Gaia geometry/wing sampling is deliberately unchanged.
+    """
+    if pixel_scale<=0 or subsamples<1 or blur_sigma_pixels<0:
+        raise ValueError('Invalid PSF integration parameters')
+    image,item=_compact_template(band,float(pixel_scale),float(blur_sigma_pixels))
+    dx,dy=np.broadcast_arrays(np.asarray(dx,float),np.asarray(dy,float))
+    ratio=pixel_scale/item['pixel_scale_arcsec'];c,s=np.cos(angle),np.sin(angle)
+    result=np.zeros(dx.shape,float)
+    for oy in (np.arange(subsamples)+.5)/subsamples-.5:
+        for ox in (np.arange(subsamples)+.5)/subsamples-.5:
+            x,y=(dx+ox)*ratio,(dy+oy)*ratio
+            result+=map_coordinates(image,[(-x*s+y*c)+item['center_y'],
+                (x*c+y*s)+item['center_x']],order=1,mode='constant',cval=0.,prefilter=False)
+    return result*(ratio/subsamples)**2
+
+
+def measure_fixed_psf_core(image, rms, x, y, band, *, neighbor_xy=None,
+                           pixel_scale=.03, radius=12, angle=0.,
+                           blur_sigma_pixels=0., background_order=2,
+                           max_neighbors=8, noise_factor=1., return_models=False,
+                           neighbor_margin_pixels=0.):
+    """Signed forced PRF amplitude + simultaneous local sky/nearby PRFs.
+
+    Center, angle, width and neighbor positions are FIXED. No peak search or
+    positivity constraint. Covariance includes nuisance amplitudes and sky.
+    The reported SNR inflates formal errors for residual chi2 and an optional
+    blank-position noise factor (never reduces noise for chi2<1).
+    """
+    if background_order not in (1,2) or radius<4 or noise_factor<1:
+        raise ValueError('Invalid compact-core fit configuration')
+    image=np.asarray(image);rms=np.asarray(rms)
+    if image.shape!=rms.shape or image.ndim!=2:raise ValueError('Image/RMS mismatch')
+    fail=dict(success=False,snr=np.nan,snr_formal=np.nan,flux=np.nan,flux_error=np.nan,
+        chi2=np.nan,neighbor_count=0,fit_pixels=0,template_energy=np.nan,status='invalid_patch')
+    if not np.isfinite([x,y]).all():return fail
+    cx,cy=int(np.floor(x+.5)),int(np.floor(y+.5));h,w=image.shape
+    xa,xb=cx-radius,cx+radius+1;ya,yb=cy-radius,cy+radius+1
+    if xa<0 or ya<0 or xb>w or yb>h:return {**fail,'status':'edge'}
+    yy,xx=np.mgrid[ya:yb,xa:xb];dx,dy=xx-x,yy-y
+    data=np.asarray(image[ya:yb,xa:xb],float);err=np.asarray(rms[ya:yb,xa:xb],float)
+    good=np.isfinite(data)&np.isfinite(err)&(err>0)
+    if good.sum()<.9*good.size:return {**fail,'status':'incomplete_patch'}
+    sample=lambda nx,ny:pixel_integrated_psf(band,xx-nx,yy-ny,pixel_scale,
+        angle=angle,blur_sigma_pixels=blur_sigma_pixels)
+    core=sample(x,y);columns=[core];neighbors=[]
+    if neighbor_xy is not None:
+        xy=np.asarray(neighbor_xy,float).reshape(-1,2)
+        distance=np.hypot(xy[:,0]-x,xy[:,1]-y)
+        idx=np.flatnonzero(np.isfinite(distance)&(distance>=1.)&(distance<=radius+neighbor_margin_pixels))
+        for i in idx[np.argsort(distance[idx])][:max_neighbors]:
+            columns.append(sample(*xy[i]));neighbors.append(xy[i])
+    ncore=len(columns);qx,qy=dx/radius,dy/radius
+    columns.extend([np.ones_like(dx),qx,qy])
+    if background_order==2:columns.extend([qx*qx,qx*qy,qy*qy])
+    design=np.stack(columns,axis=-1);a=design[good]/err[good,None];b=data[good]/err[good]
+    coef,_,rank,_=np.linalg.lstsq(a,b,rcond=None)
+    if rank!=len(columns):return {**fail,'status':'rank_deficient'}
+    covariance=np.linalg.pinv(a.T@a)
+    error=float(np.sqrt(max(0.,covariance[0,0])))
+    if not np.isfinite(error) or error<=0:return {**fail,'status':'invalid_covariance'}
+    model=design@coef;residual=data-model
+    chi2=float(np.sum((residual[good]/err[good])**2)/max(1,good.sum()-len(columns)))
+    factor=max(1.,np.sqrt(chi2))*noise_factor
+    result=dict(success=True,snr=float(coef[0]/error/factor),snr_formal=float(coef[0]/error),
+        flux=float(coef[0]),flux_error=error*factor,chi2=chi2,neighbor_count=ncore-1,
+        fit_pixels=int(good.sum()),template_energy=float(core.sum()),status='ok',
+        noise_factor=float(noise_factor),residual_error_factor=float(max(1.,np.sqrt(chi2))))
+    if return_models:
+        result.update(data=data,core_model=coef[0]*core,
+            background_model=design[...,ncore:]@coef[ncore:],
+            neighbor_model=design[...,1:ncore]@coef[1:ncore],residual=residual,
+            bounds=[xa,xb,ya,yb],neighbors=np.asarray(neighbors).reshape(-1,2))
+    return result
+
+
+def empirical_core_rms(image, sky_mask, *, box=128):
+    """Raw FULL noise budget, never inferred from model-subtracted flux.
+
+    Robust source-masked mesh MAD; insufficient meshes fall back to finite
+    samples conservatively. Interpolate only the noise map, not science data.
+    """
+    from scipy import ndimage
+    from utils.source_snr import clipped_median_std
+    arr=np.asarray(image,np.float32);sky=np.asarray(sky_mask,bool)&np.isfinite(arr)
+    if sky.shape!=arr.shape:raise ValueError('PSF sky/image mismatch')
+    h,w=arr.shape;ny,nx=(h+box-1)//box,(w+box-1)//box
+    def mesh(values):
+        noise=np.full((ny,nx),np.nan,np.float32)
+        for iy in range(ny):
+            for ix in range(nx):
+                sl=np.s_[iy*box:min((iy+1)*box,h),ix*box:min((ix+1)*box,w)]
+                local=values[sl];sample=local[sky[sl]]
+                if len(sample)<128:sample=local[np.isfinite(local)]
+                if len(sample)<32:continue
+                _,sigma,_=clipped_median_std(sample,rounds=4,sigma=3.)
+                if np.isfinite(sigma) and sigma>0:noise[iy,ix]=sigma
+        good=np.isfinite(noise)&(noise>0)
+        if not good.any():raise ValueError('No usable raw FULL PSF noise samples')
+        nearest=ndimage.distance_transform_edt(~good,return_distances=False,return_indices=True)
+        noise[~good]=noise[tuple(nearest[:,~good])]
+        noise=ndimage.median_filter(noise,size=3,mode='nearest')
+        yy=(np.arange(h,dtype=np.float32)+.5)/box-.5
+        xx=(np.arange(w,dtype=np.float32)+.5)/box-.5
+        out=ndimage.map_coordinates(noise,np.broadcast_arrays(yy[:,None],xx[None,:]),order=1,mode='nearest')
+        return np.maximum(out,float(np.median(noise))*.5)
+    if not np.isfinite(arr).any():raise ValueError('No finite PSF reference')
+    filled=np.where(np.isfinite(arr),arr,np.nanmedian(arr))
+    return np.maximum(mesh(arr),mesh(filled-ndimage.gaussian_filter(filled,3.))).astype(np.float32)
+
+
+def calibrate_core_noise(image, rms, band, sky_mask, *, samples=100, seed=196):
+    """Empirical blank-position amplitude scatter; never decrease errors."""
+    from scipy import ndimage
+    valid=np.asarray(sky_mask,bool)&np.isfinite(image)
+    distance=ndimage.distance_transform_edt(valid)
+    h,w=valid.shape;rng=np.random.default_rng(seed);values=[]
+    if h<27 or w<27:return 1.,dict(blank_samples=0,status='window_too_small')
+    for _ in range(10000):
+        x=float(rng.uniform(13,w-13));y=float(rng.uniform(13,h-13))
+        if distance[int(y),int(x)]<9:continue
+        fit=measure_fixed_psf_core(image,rms,x,y,band)
+        if fit['success']:values.append(fit['snr_formal'])
+        if len(values)>=samples:break
+    if len(values)<20:return 1.,dict(blank_samples=len(values),status='insufficient_blank_controls')
+    v=np.asarray(values);median=float(np.median(v));sigma=float(1.4826*np.median(np.abs(v-median)))
+    return max(1.,sigma),dict(blank_samples=len(v),blank_snr_median=median,blank_snr_mad=sigma,status='ok')
+
+
 def fit_angle(image, center, band, pixel_scale):
     """Robust finite-wing fit; no scale, ellipticity, or spatial interpolation."""
     radius = int(np.ceil(1.5/pixel_scale))+2; h,w=image.shape
@@ -88,6 +233,32 @@ def fit_angle(image, center, band, pixel_scale):
         return dict(angle_rad=0.,correlation=0.,status='no_positive_amplitude')
     return dict(angle_rad=float(np.deg2rad(angles[j]%360)),correlation=scores[j][1],
                 status='rotation_only',fit_pixels=int(valid.sum()))
+
+
+def measure_fixed_psf_catalog(image, rms, band, candidates, *, noise_factor=1., progress=None):
+    """Force the current-band PSF at BLUE positions; never search red peaks.
+
+    Neighbors and fit configuration match the validated compact-center pilot.
+    The caller reuses the same RMS and blank-control inflation for native
+    source review, so the two branches have a single current-band noise scale.
+    """
+    from scipy.spatial import cKDTree
+    from astropy.table import Table
+    xy=np.c_[np.asarray(candidates['x'],float),np.asarray(candidates['y'],float)]
+    selected=np.asarray(candidates['blue_candidate'],bool)&np.isfinite(xy).all(axis=1)
+    neighbors=xy[selected];tree=cKDTree(neighbors) if len(neighbors) else None
+    rows=[];snr=np.full(len(candidates),np.nan)
+    h,w=image.shape
+    for i in np.flatnonzero(selected):
+        x,y=xy[i]
+        if not (0<=x<w and 0<=y<h):continue
+        near=tree.query_ball_point([x,y],12.)
+        fit=measure_fixed_psf_core(image,rms,x,y,band,neighbor_xy=neighbors[near],noise_factor=noise_factor)
+        snr[i]=fit['snr']
+        rows.append(dict(debug_id=int(candidates['debug_id'][i]),x=x,y=y,**fit))
+        if progress and len(rows)%100==0:progress('blue_fixed_psf',len(rows))
+    if progress:progress('blue_fixed_psf_complete',len(rows))
+    return snr,Table(rows=rows) if rows else Table(names=['debug_id','x','y','snr'],dtype=[np.int64,float,float,float])
 
 
 def star_policy():

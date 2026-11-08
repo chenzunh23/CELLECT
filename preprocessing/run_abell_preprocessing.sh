@@ -42,6 +42,15 @@ UNCOVER_RISK_NO_KRON_SNR="${UNCOVER_RISK_NO_KRON_SNR:-5}"
 UNCOVER_RISK_BRIGHT_MAG="${UNCOVER_RISK_BRIGHT_MAG:-22}"
 UNCOVER_RISK_SIGMA="${UNCOVER_RISK_SIGMA:-3}"
 UNCOVER_REJECT_UNTRUSTED="${UNCOVER_REJECT_UNTRUSTED:-1}"
+UNCOVER_KRON_OTHER_FRACTION="${UNCOVER_KRON_OTHER_FRACTION:-0.30}"
+UNCOVER_COMPACT_ROOT="${UNCOVER_COMPACT_ROOT:-}"
+# An explicit empty string disables the supplementary BLUE branch.
+UNCOVER_BLUE_CATALOG="${UNCOVER_BLUE_CATALOG-$REPO_ROOT/preprocessing/assets/abell_verified_blue_centers_v1.fits}"
+UNCOVER_COMPACT_RED_SNR="${UNCOVER_COMPACT_RED_SNR:-4}"
+UNCOVER_COMPACT_DEDUP_PIXELS="${UNCOVER_COMPACT_DEDUP_PIXELS:-2}"
+UNCOVER_NATIVE_PSF_REVIEW="${UNCOVER_NATIVE_PSF_REVIEW:-1}"
+UNCOVER_NATIVE_PSF_SNR="${UNCOVER_NATIVE_PSF_SNR:-4}"
+UNCOVER_NATIVE_PSF_MOMENT_MAX="${UNCOVER_NATIVE_PSF_MOMENT_MAX:-0.10}"
 JWST_MAX_INVALID_FRACTION="${JWST_MAX_INVALID_FRACTION:-0.10}"
 SNR_IGNORE_THRESHOLD="${SNR_IGNORE_THRESHOLD:-5}"
 SNR_WEAK_THRESHOLD="${SNR_WEAK_THRESHOLD:-7}"
@@ -51,13 +60,22 @@ if [[ "$USE_UNCOVER" == 1 ]]; then
     --uncover-detection "$UNCOVER_DETECTION" --uncover-segmentation "$UNCOVER_SEGMENTATION"
     --uncover-model-root "$UNCOVER_MODEL_ROOT" --uncover-no-kron-snr "$UNCOVER_NO_KRON_SNR"
     --uncover-risk-no-kron-snr "$UNCOVER_RISK_NO_KRON_SNR" --uncover-risk-bright-mag "$UNCOVER_RISK_BRIGHT_MAG"
-    --uncover-risk-sigma "$UNCOVER_RISK_SIGMA")
+    --uncover-risk-sigma "$UNCOVER_RISK_SIGMA" --uncover-kron-other-fraction "$UNCOVER_KRON_OTHER_FRACTION"
+    --uncover-blue-catalog "$UNCOVER_BLUE_CATALOG"
+    --uncover-compact-red-snr "$UNCOVER_COMPACT_RED_SNR" --uncover-compact-dedup-pixels "$UNCOVER_COMPACT_DEDUP_PIXELS"
+    --uncover-native-psf-snr "$UNCOVER_NATIVE_PSF_SNR" --uncover-native-psf-moment-max "$UNCOVER_NATIVE_PSF_MOMENT_MAX")
+  if [[ "$UNCOVER_NATIVE_PSF_REVIEW" == 0 ]]; then
+    uncover_args+=(--no-uncover-native-psf-review)
+  fi
   if [[ "$UNCOVER_REJECT_UNTRUSTED" == 0 ]]; then
     uncover_args+=(--no-uncover-reject-untrusted)
   fi
+  if [[ -n "$UNCOVER_COMPACT_ROOT" ]]; then
+    uncover_args+=(--uncover-compact-root "$UNCOVER_COMPACT_ROOT")
+  fi
 fi
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
-progress "START output=$OUTPUT_ROOT stage=$ABELL_STAGE use_uncover=$USE_UNCOVER snr_ignore=$SNR_IGNORE_THRESHOLD snr_weak=$SNR_WEAK_THRESHOLD cutout_workers=$CUTOUT_WORKERS zarr_workers=$ZARR_WORKERS"
+progress "START output=$OUTPUT_ROOT stage=$ABELL_STAGE use_uncover=$USE_UNCOVER snr_ignore=$SNR_IGNORE_THRESHOLD snr_weak=$SNR_WEAK_THRESHOLD blue_catalog=$UNCOVER_BLUE_CATALOG blue_dedup=$UNCOVER_COMPACT_DEDUP_PIXELS native_psf=$UNCOVER_NATIVE_PSF_REVIEW native_psf_snr=$UNCOVER_NATIVE_PSF_SNR cutout_workers=$CUTOUT_WORKERS zarr_workers=$ZARR_WORKERS"
 mkdir -p "$OUTPUT_ROOT/logs"
 # Prevent two schedulers from writing the same grid/stores concurrently.
 exec 9>"$OUTPUT_ROOT/.scheduler.lock"

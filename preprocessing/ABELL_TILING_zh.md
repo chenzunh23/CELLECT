@@ -1,5 +1,71 @@
 # Abell 共同 WCS、4096 父块与 512 训练样本
 
+## 已验证紧致源后处理（2026-11-08）
+
+`use_uncover` 正式流程在原有分类之后、Zarr 写出之前，默认执行
+`uncover_native_abell_v8_verified_blue_postprocess`。规则父块和独立大源中心窗口
+调用同一个入口；混合数据批次也走这个入口。
+
+1. 原孔径 SNR 5/7、各波段测光、flag、Gaia/亮区处理及既有 Kron 邻源分割占比
+   30% 规则保留。bCG 模型仍只定义风险区，FULL 测光与 HALF 输入均不减模型。
+2. 加载已验证的 BLUE 星表，将 RA/Dec 投影到当前波段/窗口。BLUE 要求
+   F115W/F150W/F200W 三波段各自 SNR≥4，并保留检测实验的紧致性、位置一致性、
+   模型核心排除等筛选。蓝端补 strict 中心；红端仅补本波段固定 PSF SNR≥4 的中心。
+   不加入只在红端发现的源。这里的 PSF≥4 是补中心条件，与下项原有源的≤4否决
+   条件不同，沿用批准的实验边界值。
+3. 与已保留源按 2 个输出像素（当前0.03″/pixel）去重，重复时使用 BLUE 中心，
+   保留原 ID 和椭圆半轴/方向，并记录旧中心。多个 BLUE 互距≤2时优先保留
+   三蓝端最低 SNR 更高者；可调整 `UNCOVER_COMPACT_DEDUP_PIXELS`。
+4. 换中心后，对所有波段风险区内原有的紧致 CLEAN/WEAK/STRICT 源进行本波段固定
+   PSF 复核。紧致性为原检测二阶矩圆化半径
+   `sqrt(a_image*b_image) × 原生检测像素尺度 ≤0.10″`，不是 Kron 半径。
+   原有源 PSF SNR≤4（含4）、非有限或拟合失败即降为 ignore；不提升原已 ignore/dropped
+   的源。亮源星等保护不绕过这项复核；Gaia 理论 PSF 行不进入该原有 UNCOVER 源分支。
+5. PSF 拟合在原始 FULL 上固定位置/形状，联合邻源振幅与局部二次背景；使用经验
+   per-pixel RMS 和空白位置噪声校准。红端 BLUE 测量与原有源复核复用同一噪声尺度。
+   被否决的原有源不会在本轮以重复 BLUE 中心重新插回。随后重画 dense 并交给原
+   Zarr writer；strict 只有 confidence 中心，不产生 Kron shape 正监督。
+
+本次没有新增分割归属/大源内部峰抑制，因此距原中心超过2像素的独立内部峰仍可能保留。
+
+默认候选是仓库内独立资产 `assets/abell_verified_blue_centers_v1.fits`，2019个天空中心，
+由两块已验证结果（x+00_y+00、x+01_y+00）合并去重而来；对应 JSON 记录输入哈希、
+选择条件和旧 C 编号映射。运行不 import analysis 目录脚本。该资产仅补充这两片
+已验证天区及与其相交的窗口，不声称已在 Abell 其余区域重新检测；原有源 PSF 复核
+则在所有处理区域生效。后续可用新验证的同格式天空星表替换它。
+
+默认配置在现有 `run_abell_preprocessing.sh`：
+
+```bash
+UNCOVER_BLUE_CATALOG=.../preprocessing/assets/abell_verified_blue_centers_v1.fits
+UNCOVER_COMPACT_RED_SNR=4
+UNCOVER_COMPACT_DEDUP_PIXELS=2
+UNCOVER_NATIVE_PSF_REVIEW=1
+UNCOVER_NATIVE_PSF_SNR=4
+UNCOVER_NATIVE_PSF_MOMENT_MAX=0.10
+```
+
+对应 CLI 为 `--uncover-blue-catalog`、`--uncover-compact-red-snr`、
+`--uncover-compact-dedup-pixels`、`--[no-]uncover-native-psf-review`、
+`--uncover-native-psf-snr`、`--uncover-native-psf-moment-max`。
+显式 `UNCOVER_BLUE_CATALOG=''` 可关闭新中心补充；原有源 PSF 复核仍开启。
+显式 `UNCOVER_COMPACT_ROOT` 可优先读取既有逐 parent/band 的已测 BLUE/PSF 表，
+缺少某表时回退到天空星表，而不漏掉该波段的补中心步骤。
+
+每个 `labels/<band>/<parent>/` 除原 sources.fits、reference_uncover.json 外，
+新增 `reference_blue_center_selection.fits`（投影位置、PSF、去重状态、保留源ID）、
+`reference_extra_strict_centers.fits`；红端现场测量另有
+`reference_blue_psf_measurements.fits`。大源独立窗口使用该源编号前缀的同类审计文件。
+日志明确打印投影、BLUE PSF、原有源 PSF 各阶段与最终新增/移动/否决数。
+策略版本、候选资产、阈值进入完成签名，旧版本标签不会被当作新版本缓存。
+
+本次仅接入和验证代码，没有启动正式 Zarr 生成。下次使用现有启动脚本即可：
+
+```bash
+ABELL_STAGE=zarr USE_UNCOVER=1 ZARR_WORKERS=4 \
+bash /home/czh23/CELLECT/preprocessing/run_abell_preprocessing.sh
+```
+
 ## UNCOVER 实验入口（2026-10-29）
 
 Python 增加 `--use-uncover`（别名 `--use_uncover`）；不指定时仍走原 foundation 星表。
@@ -42,7 +108,7 @@ bash /home/czh23/CELLECT/preprocessing/run_abell_preprocessing.sh
 HSC 窄带仍默认 5/8，可通过 `--narrow-snr-ignore-threshold` / `--narrow-snr-weak-threshold` 单独调节。恢复原宽带/JWST 规则可传 `--snr-ignore-threshold 3 --snr-weak-threshold 5`。阈值写入生产完成签名和 Zarr 属性；已有 Zarr 不会自动修改，需重新生成。
 输入文件时间戳、模型、覆盖、星表、阈值和策略版本进入完成签名，改变开关或参数不会复用旧标签。
 每个 parent 的 `complete.json` / `reference_uncover.json` 记录模型、波段测光字段、风险区比例、`model_subtraction=none` 及原始 FULL 测量方式。
-策略版本为 `uncover_native_abell_v5_raw_full_snr_model_risk_only`，旧 v4 完成签名不会误命中；沿用同一输出根目录即可覆盖旧 Zarr，已完成的 v5 可断点续跑。
+当前策略版本及后处理见上方2026-11-08说明；沿用同一输出根目录即可重建旧 Zarr，已完成的同版本、同参数任务可断点续跑。
 先构建临时 parent，成功后替换原 store；若重建结果零样本则删除旧 store，避免保留旧策略标签。旧的 `*_model_snr_background.*` 文件仅为历史缓存，不再读取。
 只规划可用 `--abell-plan-only --use-uncover`；完整生成需要所有选中波段的模型下载完成。
 

@@ -126,7 +126,7 @@ class OrdinaryDatasetTests(unittest.TestCase):
         x = np.array([64.948718211206, 64.0, 64.948718211206, 4.5])
         y = np.array([64.40723194147, 64.1, 64.40723194147, 64.5])
         expected = int(disk_kernel(16).sum())
-        background = (np.zeros_like(image), np.ones_like(image), np.full(image.shape, 100))
+        background = (np.zeros_like(image), np.ones_like(image), np.full(image.shape, 100), np.ones(image.shape,bool))
         noise = (np.ones_like(image), np.full(image.shape, 100), np.zeros_like(image), expected)
         with patch('utils.source_snr.block_background', return_value=background), \
              patch('utils.source_snr.aperture_noise_by_block', return_value=noise):

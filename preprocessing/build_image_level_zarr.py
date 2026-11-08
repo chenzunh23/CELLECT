@@ -857,6 +857,18 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument('--uncover-risk-bright-mag',type=float,default=22.,help='Current-band native catalog AB magnitude; valid Kron required')
     parser.add_argument('--uncover-risk-sigma',type=float,default=3.)
     parser.add_argument('--uncover-reject-untrusted',action=argparse.BooleanOptionalAction,default=True)
+    parser.add_argument('--uncover-kron-other-fraction',type=float,default=.30,
+                        help='Other retained source segment pixels / ALL Kron pixels; strictly greater demotes to strict center-only; 1 disables')
+    parser.add_argument('--uncover-compact-root',default=None,
+                        help='Optional verified BLUE/PSF measurements: ROOT/parent/band/blue_center_selection.fits; never red-only catalogs')
+    from preprocessing.utils.uncover_labels import DEFAULT_BLUE_CATALOG
+    parser.add_argument('--uncover-blue-catalog',default=str(DEFAULT_BLUE_CATALOG),
+                        help='Verified three-BLUE sky centers, projected into every band/window; empty string disables supplementation. Premeasured compact-root files take precedence.')
+    parser.add_argument('--uncover-compact-red-snr',type=float,default=4.)
+    parser.add_argument('--uncover-compact-dedup-pixels',type=float,default=2.)
+    parser.add_argument('--uncover-native-psf-review',action=argparse.BooleanOptionalAction,default=True)
+    parser.add_argument('--uncover-native-psf-snr',type=float,default=4.,help='Risk-zone compact native sources with PSF SNR <= this value become ignore')
+    parser.add_argument('--uncover-native-psf-moment-max',type=float,default=.10,help='Maximum native circularized moment radius in arcsec; not Kron radius')
     parser.add_argument('--abell-gaia', default='/home/czh23/CELLECT/output/gaia_dr3_abell2744.fits')
     parser.add_argument('--abell-background-root', default='/data/czh23/JWST/lsst_background_masks/jwst/default/Abell2744/group_00')
     parser.add_argument("--data-root", default=paths['hsc']['data_root'])
@@ -985,8 +997,17 @@ def parse_args(argv=None) -> argparse.Namespace:
         try:
             UncoverSnrConfig(args.uncover_no_kron_snr,args.uncover_risk_no_kron_snr,
                 args.uncover_reject_untrusted,args.uncover_risk_bright_mag,
-                thresholds=thresholds_from_args(args, 'abell'))
+                thresholds=thresholds_from_args(args, 'abell'),
+                kron_other_fraction_max=args.uncover_kron_other_fraction,
+                native_psf_review=args.uncover_native_psf_review,native_psf_snr_min=args.uncover_native_psf_snr,
+                native_psf_moment_max_arcsec=args.uncover_native_psf_moment_max)
             if not np.isfinite(args.uncover_risk_sigma) or args.uncover_risk_sigma<=0:raise ValueError('UNCOVER risk sigma must be positive')
+            if any(not np.isfinite(v) or v<0 for v in (args.uncover_compact_red_snr,args.uncover_compact_dedup_pixels)):
+                raise ValueError('UNCOVER compact SNR and dedup distance must be finite and nonnegative')
+            if args.uncover_compact_root and not Path(args.uncover_compact_root).is_dir():
+                raise ValueError('UNCOVER compact root does not exist')
+            if args.uncover_blue_catalog and not Path(args.uncover_blue_catalog).is_file():
+                raise ValueError(f'UNCOVER verified BLUE catalog does not exist: {args.uncover_blue_catalog}')
         except ValueError as exc:parser.error(str(exc))
     from preprocessing.utils.confidence import validate_confidence
     try:

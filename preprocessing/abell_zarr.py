@@ -31,11 +31,23 @@ def uncover_signature(args, band):
     from .utils.uncover_labels import model_for_band,POLICY_VERSION
     paths=[Path(args.uncover_catalog),Path(args.uncover_detection),Path(args.uncover_segmentation),
            model_for_band(args.uncover_model_root,band)]
+    compact_root=getattr(args,'uncover_compact_root',None)
+    blue_catalog=getattr(args,'uncover_blue_catalog',None)
+    if blue_catalog:paths.append(Path(blue_catalog))
+    compact_files=[] if not compact_root else sorted(Path(compact_root).glob(f'*/{band}/blue_center_selection.fits'))
     return dict(use_uncover=True,policy=POLICY_VERSION,snr_thresholds=snr_policy_from_args(args,'abell'),
         assets=[dict(path=str(p.resolve()),size=p.stat().st_size,mtime_ns=p.stat().st_mtime_ns) for p in paths],
         no_kron_snr=args.uncover_no_kron_snr,risk_no_kron_snr=args.uncover_risk_no_kron_snr,
         risk_bright_mag=args.uncover_risk_bright_mag,risk_sigma=args.uncover_risk_sigma,
         reject_untrusted=args.uncover_reject_untrusted,
+        kron_other_fraction_max=getattr(args,'uncover_kron_other_fraction',.30),
+        native_psf_review=dict(enabled=getattr(args,'uncover_native_psf_review',True),
+            snr_min=getattr(args,'uncover_native_psf_snr',4.),
+            moment_max_arcsec=getattr(args,'uncover_native_psf_moment_max',.10)),
+        compact_centers=dict(root=compact_root,red_min_snr=getattr(args,'uncover_compact_red_snr',4.),
+            blue_catalog=str(blue_catalog) if blue_catalog else None,
+            dedup_pixels=getattr(args,'uncover_compact_dedup_pixels',2.),
+            assets=[dict(path=str(p.resolve()),size=p.stat().st_size,mtime_ns=p.stat().st_mtime_ns) for p in compact_files]),
         model_use='current-band risk region only; raw FULL flux/noise/trust; HALF input/bright/Gaia unchanged',
         coverage_gate='fraction((not observed) OR (not finite native detection)) per 512 stamp',
         measurement_background='original raw FULL multiscale SExtractor sky minus HALF bright/Gaia footprint; no residual background')
@@ -64,13 +76,82 @@ def uncover_labels_for_window(args, reference, rheader, catalog, gaia, backgroun
     progress(f'[abell-uncover] {tag} stage=raw_FULL_aperture_SNR; model=risk_only; no subtraction')
     config=UncoverSnrConfig(args.uncover_no_kron_snr,args.uncover_risk_no_kron_snr,
         args.uncover_reject_untrusted,args.uncover_risk_bright_mag,
-        thresholds=thresholds_from_args(args, 'abell'))
+        thresholds=thresholds_from_args(args, 'abell'),
+        kron_other_fraction_max=getattr(args,'uncover_kron_other_fraction',.30),
+        native_psf_review=getattr(args,'uncover_native_psf_review',True),
+        native_psf_snr_min=getattr(args,'uncover_native_psf_snr',4.),
+        native_psf_moment_max_arcsec=getattr(args,'uncover_native_psf_moment_max',.10))
     labels,summary=classify_uncover(reference,rheader,catalog,gaia,background,band,
         native_header=native_header,training_background=training_sky,
         bright_image=prepared,bright_header=header,native_segmentation=segments,
         snr_config=config,snr_risk_model=normalized_model,
         snr_risk_sigma=args.uncover_risk_sigma,snr_risk_coverage=coverage,
         progress=lambda stage,n=0:print(f'[abell-uncover] {band} {prefix}: {stage} n={n}',flush=True))
+    compact_root=getattr(args,'uncover_compact_root',None)
+    candidates=None;compact_path=None;ready_measurement=False
+    rms=None;noise_factor=None;noise_audit={}
+    if compact_root:
+        parent=Path(audit).name
+        compact_path=Path(compact_root)/parent/band/'blue_center_selection.fits'
+        if compact_path.is_file():
+            candidates=Table.read(compact_path)
+            if candidates.meta.get('PSFBAND')!=band:
+                raise ValueError(f'Compact measurement band does not match {band}: {compact_path}')
+            ready_measurement=True
+            # Project RA/Dec into this exact window, including large centered
+            # stamps; never reuse the parent-local x/y in another cutout.
+            candidates['x'],candidates['y']=WCS(header).celestial.world_to_pixel_values(candidates['ra'],candidates['dec'])
+        else:
+            progress(f'[abell-uncover] {tag} no premeasured compact catalog; try verified sky catalog')
+    blue_catalog=getattr(args,'uncover_blue_catalog',None)
+    if candidates is None and blue_catalog:
+        from .utils.uncover_labels import blue_candidates_on_window
+        compact_path=Path(blue_catalog)
+        candidates=blue_candidates_on_window(compact_path,header,reference.shape)
+        candidates['fixed_psf_core_snr']=np.full(len(candidates),np.nan)
+        progress(f'[abell-uncover] {tag} stage=verified_BLUE_projection candidates={len(candidates)} catalog={compact_path}')
+        if int(band[1:4])>212 and len(candidates):
+            from .utils.jwst_star_psf import empirical_core_rms,calibrate_core_noise,measure_fixed_psf_catalog
+            progress(f'[abell-uncover] {tag} stage=BLUE_current_band_fixed_PSF')
+            sky=np.asarray(background,bool)&(segments==0)&np.isfinite(reference)
+            rms=empirical_core_rms(reference,sky)
+            noise_factor,noise_audit=calibrate_core_noise(reference,rms,band,sky)
+            snr,measurements=measure_fixed_psf_catalog(reference,rms,band,candidates,
+                noise_factor=noise_factor,
+                progress=lambda stage,n:progress(f'[abell-uncover] {tag} {stage} n={n}'))
+            candidates['fixed_psf_core_snr']=snr
+            measurements.write(Path(audit)/(prefix+'_blue_psf_measurements.fits'),overwrite=True)
+            candidates.meta['NOISEFAC']=noise_factor
+    if candidates is not None:
+        candidates.meta.update(PSFBAND=band,PSFREF='RAW_FULL',PSFMODE='premeasured' if ready_measurement else 'current_window',
+            DEDUP=getattr(args,'uncover_compact_dedup_pixels',2.))
+    if config.native_psf_review or candidates is not None:
+        from .utils.uncover_labels import refine_uncover_compact_sources
+        progress(f'[abell-uncover] {tag} stage=native_compact_PSF_review_and_BLUE_recenter')
+        updated=refine_uncover_compact_sources(labels,reference,rheader,band,config=config,
+            candidates=candidates,core_snr=None if candidates is None else candidates['fixed_psf_core_snr'],
+            red_min_snr=getattr(args,'uncover_compact_red_snr',4.),
+            dedup_pixels=getattr(args,'uncover_compact_dedup_pixels',2.),scope=Path(audit).name,
+            sky_mask=np.asarray(background,bool)&(segments==0),
+            rms=rms,noise_factor=noise_factor,
+            native_pixel_scale=float(np.sqrt(abs(np.linalg.det(WCS(native_header).celestial.pixel_scale_matrix)))*3600),
+            progress=lambda stage,n:progress(f'[abell-uncover] {tag} {stage} n={n}'))
+        summary.update(updated)
+        if noise_audit:summary['native_psf_review']['noise_audit']=noise_audit
+        if candidates is not None:
+            compact=labels.compact_center_audit
+            summary['compact_centers'].update(path=str(compact_path),premeasured=ready_measurement,
+                candidates_in_window=len(candidates))
+            candidates['supplement_status']=compact['status']
+            candidates['supplement_source_id']=compact['source_id']
+            candidates['matched_native_index']=compact['matched_native_index']
+            candidates.write(Path(audit)/(prefix+'_blue_center_selection.fits'),overwrite=True)
+        Table(dict(source_id=labels.strict_ids,x=labels.strict_x,y=labels.strict_y,
+            is_gaia=labels.strict_is_gaia)).write(Path(audit)/(prefix+'_extra_strict_centers.fits'),overwrite=True)
+        progress(f'[abell-uncover] {tag} END postprocess '
+            f'PSF_tested={updated["native_psf_review"]["tested"]} PSF_ignored={updated["native_psf_review"]["ignored"]} '
+            f'BLUE_recentered={0 if candidates is None else compact["recentered"]} '
+            f'BLUE_added={0 if candidates is None else compact["added"]}')
     summary.update(use_uncover=True,model=str(modelpath),model_band=band,
         model_use='risk region only',model_subtraction='none',
         measurement_reference='original raw FULL',model_noise='original raw FULL blank-aperture noise and trust',
