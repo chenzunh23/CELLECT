@@ -1,0 +1,33 @@
+HSC refit 中心坐标约定（2026-11-09）
+
+修复范围
+preprocessing.refit.compute_kron_ellipse 将有限的 pu_refit_x_image/y_image
+坐标对从 FITS/DS9 局部一基坐标转换为 NumPy 局部零基坐标，再供 HSC
+分类、dense target、source/shape center、heatmap 和 SAM prompt 使用。
+仅转换 refit 坐标，不移动原始 LSST 零基 fallback、Gaia 或合成中心。
+重复调用不会二次减一；原始 CSV 列保持不变。
+
+保留的约定
+旧 batch-heavyfp-kron-refit 的 CSV/DS9 导出不变；Kron 半径仍以原始
+base_SdssCentroid 和 footprint 像素计算，不需要因本次修复重新测量。
+preprocessing.refit 的新 refit 导出也保持 FITS 一基坐标；WCS 失败或
+缺少 RA/Dec 时，原始 LSST fallback 经 LTV 平移和 +1，维持同一格式。
+Abell/COSMOS 的独立零基 WCS 路径不变。
+
+已有 Zarr 必须重建
+旧 HSC Zarr 不会在加载时自动修正。不能只对 source_centers 或
+shape_source_centers 减一：confidence、dense shape、区域分类与其他
+监督也依赖原中心，且 Gaia/合成中心不能一律移动。
+请用修复后的预处理代码重新生成 HSC 标签及最终 Zarr，优先写入新
+输出目录。复用已有原始图像、refit CSV、half/noisy 产品和背景 mask
+即可，不需要重建 JWST 数据或重算旧 refit 半径。
+training_batch 的 receipt 签名包含预处理代码哈希，本次修复会使旧签名
+失效；这不等于后台已自动重新生成数据。不要手工给旧 store 补版本号。
+
+新 HSC Zarr 的 .zattrs 包含：
+  "hsc_refit_center_policy": "fits1_to_numpy0_v1"
+此标记表示生成器采用了修复后的约定，不能通过只修改元数据迁移旧标签。
+已经用旧标签训练的 checkpoint 不会因此自动纠正，应与新数据训练作区分。
+
+回归测试
+python -m unittest preprocessing.tests.test_refit_center_coordinates -v

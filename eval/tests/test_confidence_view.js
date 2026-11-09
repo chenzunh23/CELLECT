@@ -16,6 +16,11 @@ vm.runInContext(source.slice(source.indexOf('async function toggleViewItem('),so
   context.window.ScaleControls=context.ScaleControls={params:()=>['display_scaling=log'],isInputMode:()=>false};
   const changed=vm.runInContext("imageUrl({token:'a'})",context);
   assert(changed.includes('confidence=1') && changed.includes('display_scaling=log'));
+  const heatmapLegend=vm.runInContext("confidenceLegendHtml({proposal_mode:'heatmap'})",context);
+  assert(heatmapLegend.includes('Heatmap probability') && heatmapLegend.includes('continuous'));
+  assert(!heatmapLegend.includes('argmax'));
+  const ordinalLegend=vm.runInContext("confidenceLegendHtml({proposal_mode:'ordinal'})",context);
+  assert(ordinalLegend.includes('pixel argmax') && !ordinalLegend.includes('Heatmap probability'));
   context.showDetect=false;
   await vm.runInContext("toggleViewItem('confidence')",context);
   assert(context.viewConfidence); // No toggle before detection, and no extra inference.

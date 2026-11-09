@@ -1,5 +1,71 @@
 # Abell 共同 WCS、4096 父块与 512 训练样本
 
+## BLUE4：至少四蓝带中的三带通过（2026-11-09）
+
+当前代码策略 `uncover_native_abell_v9_three_of_four_blue_band_psf`：候选检测波段为
+F090W、F115W、F150W、F200W，至少三个波段独立原始 FULL 拟合 SNR≥4，且通过
+紧致性、拟合质量、中心散布、模型核与近邻排除。F090W缺覆盖时可由另外三带确认。
+对单个候选，只有其自身通过检测的波段才可直接补 strict 中心；未通过的第四带
+和检测组之外的所有波段（也包括F070W、F140M等短波）均需本波段固定PSF SNR≥4。
+不再按滤波器波长小于2.12微米就一律免PSF筛选。2像素去重换中心、原有紧致风险源
+PSF≤4否决、Gaia与孔径SNR等原规则保留。
+
+检测实现为 `utils/abell_blue_detection.py`，没有依赖analysis脚本。输入为已对齐
+原始完整coadd及各波段模型；原图与模型/残余基底去除图共同产生SExtractor种子，
+四带确认只在原始FULL上同时拟合像素积分Gaussian和局部二次背景，不用减模型后的
+低通量决定源的SNR。风险区也保留原先F277W/F356W模型的贡献，它们不参加候选确认。
+沿用先前通过审核的渐进阈值10/5/3/2/1.2/1、MINAREA=3、
+DEBLEND_NTHRESH=64、MINCONT=1e-5等条件。解析Jacobian加速非线性拟合，不改变模型。
+
+所有51个已规划空间父块的检测命令（独立于Zarr生成）：
+
+```bash
+cd /home/czh23/CELLECT
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+/home/czh23/miniconda3/envs/cellect/bin/python -u \
+  -m preprocessing.utils.abell_blue_detection \
+  --workers 4 --fit-workers 4 --output-root /data/czh23/analysis/2026-11/2026-11-09/abell_blue4_all
+```
+
+可用 `--parents x+00_y-01` 只检测一块。输出逐块`verified_centers.fits`、全部种子及
+原图拟合诊断表`all_candidates.fits`、REG、SExtractor文本日志、完成签名。
+不保留大尺寸中间FITS。每块完成后进程退出；失败块记录于summary.json，成功块可续跑。
+输入/配置/代码签名改变时重做；签名相同则保留合并候选文件mtime，避免误触发Zarr重建。
+
+所有块成功后生成统一天空星表 `verified_blue_centers.fits`，跨块2像素去重，保留
+origin_parent/origin_debug_id。表内DETBANDS/MINBANDS和逐源`<band>_detected`记录跨带条件。
+统一生成入口现在自动完成/核验全天区检测，再生成 Abell Zarr：
+
+```bash
+bash /home/czh23/analysis/2026-11/2026-11-09/space_zarr_uncover_blue/generate_new_zarr.sh
+```
+
+该专用入口的默认检测输出是同目录 `blue_detection/`，默认4父块×4局部拟合worker，
+由 `BLUE_PARENT_WORKERS`、`BLUE_FIT_WORKERS` 调整。SExtractor像素栈3200万、对象栈6万、
+图像缓冲1024行，分别由 `BLUE_SEX_MEMORY_PIXSTACK`、`BLUE_SEX_MEMORY_OBJSTACK`、
+`BLUE_SEX_MEMORY_BUFSIZE` 调整；这些是条目/行数，不是进程内存上限，0不表示无限。
+即使SExtractor返回0，日志中出现栈溢出仍将该块判为失败，禁止合并/继续Zarr生成。
+所有请求父块成功后才发布统一星表。检测日志同步写入Zarr生成总日志，逐块完成后回收进程。
+
+去混叠溢出使用独立回退：只有该参考图/阈值改用1024核心区+64像素halo检测；中心只归属
+核心区，转换回父块坐标后沿用2像素去重。若仍溢出，递归缩小核心至128，再失败则停止。
+不改变检测阈值及原始FULL拟合确认条件，也不把局部footprint作为科学形状标签。
+步骤星表保存输入摘要、结果哈希及完成回执；正常阈值无需重复执行。
+已知旧版8c99f17...6727d8对任何overflow均拒绝发布父块，所以其成功结果在配置/资产及
+星表哈希均一致时可直接复用；未知旧代码不能绕过签名。恢复步骤保存`tiled/recovery.json`。
+
+此入口默认复用1105 COSMOS，并在1109 `training_zarr_space_uncover_blue_manhattan` 原路径
+重建策略/星表签名变化的Abell；逐父块完整写好临时store后再替换旧store。中断后重跑时，
+已经按新签名完成的父块会跳过。不需要先删除整个Zarr，COSMOS不重新生成。
+独立检测入口为同目录 `run_blue_detection.sh`，可以先并行检测、稍后再运行生成入口。
+`BLUE_DETECT=0 UNCOVER_BLUE_CATALOG=/path/catalog.fits` 可显式使用外部星表。
+通用预处理默认内置星表仍保留三带旧资产用于兼容；只有上述专用入口自动接入全天区BLUE4。
+不要将仅单块试验的合并表误用于全区域正式补源。
+
+生成完成后，同目录 `prepare_split.py` 自动更新 `split/train.txt` 和 `split/val.txt`：
+x+00_y+00、x-01_y-01整父块验证，x+01_y+00保留x=368/736/1104与y=2208/2576六个窗口；
+训练排除与验证实际视场相交的所有波段/相邻父块/独立大源样本。COSMOS划分沿用1109配置。
+
 ## 已验证紧致源后处理（2026-11-08）
 
 `use_uncover` 正式流程在原有分类之后、Zarr 写出之前，默认执行

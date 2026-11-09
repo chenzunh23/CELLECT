@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import multiprocessing as mp
+import os
 import random
 import weakref
 from dataclasses import dataclass
@@ -507,36 +508,86 @@ def discover_zarr_records(
     return records
 
 
+def zarr_image_input_roots(root: Path, *, hsc_root=None, space_root=None) -> dict[str, Path]:
+    """Explicit family roots replace --root for discovery, not for image scaling.
+
+    Accept either a collection directory or its zarr/ child. With no override,
+    preserve legacy --root behavior and discover all families there.
+    """
+    supplied={name:value for name,value in [('hsc',hsc_root),('space',space_root)] if value}
+    if not supplied:return {'all':Path(root).expanduser().resolve()}
+    result={}
+    for name,value in supplied.items():
+        path=Path(value).expanduser().resolve()
+        if (path/'zarr').is_dir():path=path/'zarr'
+        if not path.is_dir():raise FileNotFoundError(f'{name} Zarr root does not exist: {path}')
+        result[name]=path
+    return result
+
+
+def _image_store_family(attrs: dict) -> str:
+    tract=str(attrs.get('tract',''));dataset=str(attrs.get('dataset','')).lower()
+    if tract=='Abell2744' or tract.startswith('COSMOS_') or dataset in ('abell','cosmos'):return 'space'
+    bands=attrs.get('bands',[])
+    if dataset.startswith('hsc') or (bands and all(str(b).startswith(('HSC-','NB')) for b in bands)):return 'hsc'
+    return 'other'
+
+
+def _image_store_readers(root: Path, *, hsc_root=None, space_root=None):
+    inputs=zarr_image_input_roots(root,hsc_root=hsc_root,space_root=space_root)
+    grouped={}
+    for family,path in inputs.items():grouped.setdefault(path,set()).add(family)
+    seen=set()
+    for base,families in grouped.items():
+        stores=[]
+        if base.name.endswith('.zarr'):stores=[base]
+        else:
+            # A store's arrays/chunks are leaves, not more datasets. Pruning
+            # also excludes hidden interrupted publications and scratch parts.
+            for folder,dirs,_ in os.walk(base):
+                for name in dirs:
+                    if name.endswith('.zarr') and not name.startswith('.'):stores.append(Path(folder)/name)
+                dirs[:]=sorted(d for d in dirs if not d.endswith('.zarr') and not d.startswith('.') and d!='_parts')
+        for store in sorted(stores):
+            resolved=store.resolve()
+            if resolved in seen:continue
+            manifest=store.parent/f'{store.name}_manifest.json'
+            try:reader=PatchZarrReader(store)
+            except (FileNotFoundError,json.JSONDecodeError) as exc:
+                if not manifest.exists():
+                    print(f'[zarr] skip incomplete store without manifest: {store} ({exc})',flush=True);continue
+                raise
+            attrs=reader.attrs
+            if attrs.get('format')=='cellect_direct_patch_zarr' and not manifest.exists():
+                print(f'[zarr] skip incomplete direct store without manifest: {store}',flush=True);continue
+            if not attrs.get('image_level_training',False) or len(attrs.get('bands',[]))!=1:continue
+            if 'all' not in families and _image_store_family(attrs) not in families:continue
+            seen.add(resolved)
+            yield store,reader,base
+
+
+def discover_zarr_image_bands(root: Path, *, hsc_root=None, space_root=None) -> list[str]:
+    return sorted({str(reader.attrs['bands'][0]) for _,reader,_ in
+        _image_store_readers(root,hsc_root=hsc_root,space_root=space_root)})
+
+
 def discover_zarr_image_records(
     root: Path,
     *,
     bands: Sequence[str],
     max_records: int | None = None,
+    hsc_root: Path | str | None = None,
+    space_root: Path | str | None = None,
 ) -> list[CutoutRecord]:
     """Discover single-band image-level Zarr samples for SAM detector training."""
 
     root = Path(root).expanduser().resolve()
-    stores = sorted(root.rglob("*.zarr"))
     records: list[CutoutRecord] = []
+    names: set[str] = set()
     wanted_bands = {str(band) for band in bands}
-    for store in stores:
-        manifest_path = store.parent / f"{store.name}_manifest.json"
-        try:
-            reader = PatchZarrReader(store)
-        except (FileNotFoundError, json.JSONDecodeError) as exc:
-            if not manifest_path.exists():
-                print(f"[zarr] skip incomplete store without manifest: {store} ({exc})", flush=True)
-                continue
-            raise
+    for store,reader,input_root in _image_store_readers(root,hsc_root=hsc_root,space_root=space_root):
         attrs = reader.attrs
-        if attrs.get("format") == "cellect_direct_patch_zarr" and not manifest_path.exists():
-            print(f"[zarr] skip incomplete direct store without manifest: {store}", flush=True)
-            continue
-        if not bool(attrs.get("image_level_training", False)):
-            continue
         store_bands = tuple(str(b) for b in attrs.get("bands", []))
-        if len(store_bands) != 1:
-            continue
         band = store_bands[0]
         if wanted_bands and band not in wanted_bands:
             continue
@@ -552,7 +603,7 @@ def discover_zarr_image_records(
         patch = str(attrs.get("patch", store.stem.split("__", 1)[0]))
         store_group = _infer_group_from_store_name(store)
         try:
-            rel_root = str(store.parent.relative_to(root))
+            rel_root = str(store.parent.relative_to(input_root))
         except ValueError:
             rel_root = ""
         for i in range(n):
@@ -560,9 +611,13 @@ def discover_zarr_image_records(
             group = groups[i] if i < len(groups) and groups[i] else store_group
             tile_name = tile_names[i] if i < len(tile_names) else f"sample_{i:06d}"
             parts = [value for value in (tract, dataset_source, patch, group, band, tile_name) if value]
+            record_name='/'.join(parts)
+            if record_name in names:
+                raise ValueError(f'Duplicate image record from Zarr inputs: {record_name}; select one version of each dataset')
+            names.add(record_name)
             records.append(
                 CutoutRecord(
-                    name="/".join(parts),
+                    name=record_name,
                     image_paths=(_zarr_uri(store, i),),
                     meas_path="",
                     x0=int(tile_x0[i]),
@@ -754,6 +809,9 @@ class ZarrCutoutDataset(Dataset):
             for c in band_centers:
                 if c.numel():
                     c[:, 0] = float(width - 1) - c[:, 0]
+            band_strict_center_only_centers=[c.clone() for c in band_strict_center_only_centers]
+            for c in band_strict_center_only_centers:
+                if c.numel():c[:,0]=float(width-1)-c[:,0]
             centers = band_centers[0] if band_centers else centers
             band_shape_source_centers = [c.clone() for c in band_shape_source_centers]
             band_shape_source_values = [v.clone() for v in band_shape_source_values]
@@ -769,6 +827,8 @@ class ZarrCutoutDataset(Dataset):
         shape_source_ids = band_shape_source_ids[0]
         return {
             "image": image,
+            "proposal_metadata": {key:reader.attrs.get(key) for key in
+                ('confidence_config','image_fits','reference_fits','patch','dataset')},
             "band_names": list(reader.attrs.get("bands", [])),
             "pixel_scale_arcsec": reader.attrs.get("confidence_config", {}).get("pixel_scale_arcsec"),
             "band_mask_instances": mask_instances,

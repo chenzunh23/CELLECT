@@ -356,17 +356,27 @@ refresh the browser after updating these files.
 After **Detect**, **View → Show Confidence** overlays the per-pixel predicted
 class before the detection threshold and NMS: 1 blue, 2 green, 3 yellow, 4 red;
 class 0 is transparent. This is the class argmax, not a rounded ordinal score.
+For a heatmap checkpoint, the same button displays continuous sigmoid
+probabilities in [0,1], with a probability legend instead of ordinal classes.
+Colors vary continuously from blue to green/yellow to red. Zero and invalid
+pixels are transparent; weak responses below 0.1 are not discarded. Existing
+single-channel confidence NPZ files are recognized from their saved logit shape.
 Scaling, custom limits, inversion and smoothing remain adjustable without model
 inference. Confidence maps are saved even with `--no-make-masks` or zero detections.
 Each detection writes `session_dir/confidence/<candidate>_confidence.npz` with
 float32 `logits` (C,H,W), `labels`, `score`, `ordinal_expectation`, and `valid`.
+Heatmap NPZ files additionally identify their proposal/display mode; `score`
+is the actual sigmoid probability, while `labels` retain old diagnostic bins.
 Arrays use lower-origin image coordinates. A bounded RAM cache reloads labels
+or continuous heatmap scores
 from these files after eviction; it does not rerun the encoder.
 **Export Selected** always copies this NPZ and additionally writes
 `<candidate>_confidence_overlay.png` using the display scaling selected when
 export starts (default ZScale for API exports without view settings), regardless
 of whether Show Confidence is enabled. Paths and display settings are included
-in the manifest. Existing saved mask PNGs continue to use normal ZScale.
+in the manifest, including `confidence_display_kind` and the value range.
+The same confidence overlay filename contains a continuous probability overlay
+for heatmap checkpoints. Existing saved mask PNGs continue to use normal ZScale.
 
 Regression checks:
 

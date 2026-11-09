@@ -169,12 +169,25 @@ function imageUrl(c) {
   return params.length ? `/image/${c.token}.png?${params.join('&')}` : `/image/${c.token}.png`;
 }
 
+function confidenceLegendHtml(currentState) {
+  const heatmap = currentState && (currentState.proposal_mode === 'heatmap' ||
+    currentState.confidence_score === 'heatmap' ||
+    (currentState.inference_parameters || {}).confidence_score === 'heatmap');
+  if (heatmap) return 'Heatmap probability (before threshold / NMS): 0 ' +
+    '<span style="display:inline-block;width:180px;height:12px;background:linear-gradient(to right,#2673ff,#00f259,#ffd90d,#ff0d1a)"></span> 1' +
+    ' · continuous color; zero / invalid pixels transparent';
+  return 'Confidence (pixel argmax, before threshold / NMS): ' +
+    '<span style="color:#2673ff">■ 1</span> · <span style="color:#00f259">■ 2</span> · ' +
+    '<span style="color:#ffd90d">■ 3</span> · <span style="color:#ff0d1a">■ 4</span> · 0 transparent';
+}
+
 function updateViewMenu() {
   const inputMode = window.ScaleControls && ScaleControls.isInputMode();
   const snrEnabled = window.SnrControls && SnrControls.isEnabled();
   const maskEnabled = window.MaskControls && MaskControls.isEnabled();
   const states = {inputScaling: inputMode, shape: viewShape, center: viewCenter, masks: viewMasks, confidence: viewConfidence, snrFilter: snrEnabled, maskFilter: maskEnabled, invert: viewInvert, smooth: smoothEnabled};
   document.getElementById('confidenceLegend').classList.toggle('hidden', !viewConfidence || !showDetect);
+  document.getElementById('confidenceLegend').innerHTML = confidenceLegendHtml(state);
   for (const item of document.querySelectorAll('.viewItem')) {
     const key = item.dataset.view;
     item.querySelector('.viewCheck').textContent = states[key] ? '✓' : '';

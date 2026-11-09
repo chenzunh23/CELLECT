@@ -19,7 +19,7 @@ from .image_processing import ImagePreparationConfig, prepare_image
 from .labels import SourceClass, SourceLabels
 from .meas_processing import MeasProcessingConfig, classify_meas_basics
 from .ordinary import OrdinaryConfig, label_ordinary_sources
-from .refit import DirectRefitConfig, RefitConfig, attach_refit_geometry, attach_refit_radius_from_table, compute_kron_ellipse, run_refit_from_meas
+from .refit import HSC_REFIT_CENTER_POLICY, DirectRefitConfig, RefitConfig, attach_refit_geometry, attach_refit_radius_from_table, compute_kron_ellipse, run_refit_from_meas
 from .region_filling import fill_dense_regions
 from .snr import SnrConfig, compute_snr_for_sample
 from .utils.catalog import source_ids
@@ -279,6 +279,7 @@ class PreprocessingPipeline:
                 "image_fits": str(inputs.image_fits),
                 "refit_csv": str(inputs.refit_csv) if inputs.refit_csv is not None else "",
                 "source_export_mode": "training_v3",
+                "hsc_refit_center_policy": HSC_REFIT_CENTER_POLICY,
                 "dataset_source": str(inputs.dataset_source),
                 "band": str(inputs.band or ""),
                 "patch": str(inputs.patch or ""),

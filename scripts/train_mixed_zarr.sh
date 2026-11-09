@@ -2,7 +2,9 @@
 set -euo pipefail
 cd /home/czh23/CELLECT
 PYTHON=${PYTHON:-/home/czh23/miniconda3/envs/cellect/bin/python}
-ROOT=${ROOT:-/data/czh23/analysis/2026-09/2026-09-28/training_zarr_psfee_parent20_lsst_hsc_thresh5/zarr}
+HSC_ROOT=${HSC_ROOT:-}
+SPACE_ROOT=${SPACE_ROOT:-}
+ROOT=${ROOT:-${SPACE_ROOT:-${HSC_ROOT:-/data/czh23/analysis/2026-09/2026-09-28/training_zarr_psfee_parent20_lsst_hsc_thresh5/zarr}}}
 # No implicit all-field split: use the same explicit train/val lists as legacy runs.
 SPLITS=${SPLITS:-}
 TRAIN_FILE=${TRAIN_FILE:-${SPLITS:+$SPLITS/train.txt}}
@@ -62,7 +64,7 @@ common=(--mode "$MODE" --data-format zarr --root "$ROOT" --bands all --checkpoin
   --sam-lr-drop-fractions 0.7 0.9 --sam-lr-drop-gamma 0.1
   --sam-lr-phase2-epoch 50 --sam-encoder-lr-after 0 --sam-head-lr-after 0
   --freeze-proposal-after-epochs -1
-  --confidence-loss-mode ce_hard --confidence-loss-weight 1 --confidence-pos-weight 32
+  --confidence-loss-mode ce_hard --confidence-loss-weight "${CONFIDENCE_LOSS_WEIGHT:-1}" --confidence-pos-weight 32
   --confidence-ce-weights 1 4 8 16 32
   --confidence-score ordinal_expectation --confidence-threshold 2
   --no-use-ordinal-expectation --no-debug-ordinal-expectation
@@ -100,11 +102,36 @@ common=(--mode "$MODE" --data-format zarr --root "$ROOT" --bands all --checkpoin
   --wandb-project Astro_CELLECT2D_SAM --wandb-log-interval 10
   --wandb-run-name "${WANDB_RUN_NAME:-cellect_${SAM_MODEL_TYPE}_pred_iou_1002}"
   --wandb-mode "${WANDB_MODE:-online}")
+if [[ -n "$HSC_ROOT" ]]; then common+=(--hsc-zarr-root "$HSC_ROOT"); fi
+if [[ -n "$SPACE_ROOT" ]]; then common+=(--space-zarr-root "$SPACE_ROOT"); fi
 case "${SAM_COMPILE:-1}" in
   1|on|true) common+=(--sam-compile) ;;
   0|off|false) common+=(--no-sam-compile) ;;
   *) echo 'SAM_COMPILE must be 1/0, on/off, or true/false' >&2; exit 1 ;;
 esac
+if [[ -n ${PROPOSAL_MODE:-} ]]; then
+  common+=(--proposal-mode "$PROPOSAL_MODE")
+  if [[ "$PROPOSAL_MODE" == heatmap ]]; then
+    common+=(--heatmap-loss "${HEATMAP_LOSS:-soft_bce}"
+      --heatmap-sigma-mode "${HEATMAP_SIGMA_MODE:-fixed}" --heatmap-sigma "${HEATMAP_SIGMA:-1.5}"
+      --heatmap-sigma-min "${HEATMAP_SIGMA_MIN:-0.6666666666666666}"
+      --heatmap-sigma-max "${HEATMAP_SIGMA_MAX:-2.6666666666666665}"
+      --heatmap-boundary-tolerance "${HEATMAP_BOUNDARY_TOLERANCE:-0.05}"
+      --heatmap-psf-ee-root "${HEATMAP_PSF_EE_ROOT:-}"
+      --offset-center-size 5 --offset-loss-weight "${OFFSET_LOSS_WEIGHT:-1}"
+      --shape-center-size 3)
+  fi
+fi
+# Independent of proposal mode. An omitted switch preserves checkpoint inference.
+# IMAGE_FUSION takes precedence over the earlier heatmap-specific alias.
+image_fusion=${IMAGE_FUSION:-${HEATMAP_IMAGE_FUSION:-}}
+if [[ -n "$image_fusion" ]]; then
+  case "$image_fusion" in
+    1|on|true) common+=(--image-fusion) ;;
+    0|off|false) common+=(--no-image-fusion) ;;
+    *) echo 'IMAGE_FUSION must be 1/0, on/off, or true/false' >&2; exit 1 ;;
+  esac
+fi
 case "${ADAM_STATE_LOG:-0}" in
   1|on|true) common+=(--adam-state-log --adam-state-log-interval "${ADAM_STATE_LOG_INTERVAL:-100}") ;;
   0|off|false) ;;

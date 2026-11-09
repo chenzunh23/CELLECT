@@ -24,8 +24,30 @@ from .geometry import EllipseGeometry, ellipse_axes_from_moments
 from .area_filter import area_filter_masks
 from .no_data import center_no_data
 
-POLICY_VERSION='uncover_native_abell_v8_verified_blue_postprocess'
+POLICY_VERSION='uncover_native_abell_v9_three_of_four_blue_band_psf'
 DEFAULT_BLUE_CATALOG=Path(__file__).resolve().parents[1]/'assets/abell_verified_blue_centers_v1.fits'
+
+
+def direct_blue_detection(candidates, band):
+    """Only an individually confirmed band bypasses current-band PSF gating.
+
+    Legacy verified tables certify the original three bands. Merely being a
+    short-wave filter is no longer sufficient. New four-band tables carry
+    per-source *_detected flags and can accept any three of the four bands.
+    """
+    bands=str(candidates.meta.get('DETBANDS','F115W,F150W,F200W')).split(',')
+    if band not in bands:return np.zeros(len(candidates),bool)
+    flag=band+'_detected'
+    if flag in candidates.colnames:
+        passed=np.asarray(candidates[flag],bool)
+        if band+'_snr' in candidates.colnames:
+            snr=np.asarray(candidates[band+'_snr'],float);passed=passed&np.isfinite(snr)&(snr>=4)
+        return passed
+    if band+'_snr' in candidates.colnames:
+        snr=np.asarray(candidates[band+'_snr'],float)
+        return np.isfinite(snr)&(snr>=float(candidates.meta.get('BLUECUT',4.)))
+    # Minimal legacy verified catalogs have already certified all three bands.
+    return np.asarray(candidates['blue_candidate'],bool)
 
 
 def blue_candidates_on_window(path, header, shape, *, margin=20.):
@@ -44,10 +66,19 @@ def blue_candidates_on_window(path, header, shape, *, margin=20.):
     table=table[keep];table['x']=x[keep];table['y']=y[keep]
     if len(np.unique(table['debug_id']))!=len(table):raise ValueError('Verified BLUE debug IDs must be unique')
     selected=np.asarray(table['blue_candidate'],bool)
-    for band in ('F115W','F150W','F200W'):
+    bands=str(table.meta.get('DETBANDS','F115W,F150W,F200W')).split(',')
+    minimum=int(table.meta.get('MINBANDS',3))
+    if minimum<3 or minimum>len(bands) or not set(bands).issubset({'F090W','F115W','F150W','F200W'}):
+        raise ValueError('Invalid verified BLUE detection-band contract')
+    passed=np.zeros(len(table),int)
+    for band in bands:
+        if band+'_snr' not in table.colnames:raise ValueError(f'Missing {band} SNR in BLUE catalog')
         snr=np.asarray(table[band+'_snr'],float)
-        if np.any(selected&(~np.isfinite(snr)|(snr<4))):
-            raise ValueError(f'Verified BLUE selection must pass all three bands at SNR>=4: {path}')
+        valid=np.isfinite(snr)&(snr>=4)
+        if band+'_detected' in table.colnames:valid&=np.asarray(table[band+'_detected'],bool)
+        passed+=valid
+    if np.any(selected&(passed<minimum)):
+        raise ValueError(f'Verified BLUE selection must pass all three bands or at least three declared BLUE bands at SNR>=4: {path}')
     return table
 
 
@@ -284,8 +315,8 @@ def add_blue_compact_centers(labels, candidates, band, *, core_snr=None,
     """Use verified BLUE positions for duplicates; append missing strict centers.
 
     Input must be the verified BLUE candidate table, never red-only detections.
-    Short-wave bands accept the supplied BLUE selection; long-wave bands also
-    require signed, measured fixed-PSF core SNR >= red_min_snr. Spatial matching
+    Individually confirmed detection bands accept their BLUE selection; all
+    other band/source pairs require fixed-PSF core SNR >= red_min_snr. Matching
     is to actual retained centers, not nearest-UNCOVER-ID hints. Existing clean,
     weak and strict classes retain their class and ellipse axes, but matching
     centers move to the BLUE position. The old coordinates/ID remain auditable.
@@ -307,7 +338,8 @@ def add_blue_compact_centers(labels, candidates, band, *, core_snr=None,
     ix=np.clip(np.floor(np.nan_to_num(x)+.5).astype(int),0,w-1)
     iy=np.clip(np.floor(np.nan_to_num(y)+.5).astype(int),0,h-1)
     eligible&=labels.dense[iy,ix]!=int(DenseLabel.STRICT_IGNORE)
-    if not shortwave:eligible&=np.isfinite(snr)&(snr>=red_min_snr)
+    direct=direct_blue_detection(candidates,band)
+    eligible&=direct|(np.isfinite(snr)&(snr>=red_min_snr))
     # These are independently verified BLUE peaks. Any UNCOVER flag columns
     # copied by nearest-neighbor matching are only hints, not source identities
     # (and -1 means unmatched); they cannot veto this supplemental branch.
@@ -328,7 +360,9 @@ def add_blue_compact_centers(labels, candidates, band, *, core_snr=None,
     status=np.full(n,'not_eligible',dtype='U40');status[eligible]='eligible'
     source_id=np.zeros(n,np.int64);matched_native=np.full(n,-1,np.int64)
     score=np.zeros(n)
-    if all(b+'_snr' in candidates.colnames for b in ('F115W','F150W','F200W')):
+    if 'selection_score' in candidates.colnames:
+        score=np.nan_to_num(np.asarray(candidates['selection_score'],float),nan=-np.inf)
+    elif all(b+'_snr' in candidates.colnames for b in ('F115W','F150W','F200W')):
         score=np.min(np.array([np.asarray(candidates[b+'_snr'],float) for b in ('F115W','F150W','F200W')]),axis=0)
         score=np.nan_to_num(score,nan=-np.inf)
     ids=np.asarray(candidates['debug_id'],np.int64)
@@ -386,11 +420,12 @@ def add_blue_compact_centers(labels, candidates, band, *, core_snr=None,
     labels.strict_ids=np.r_[labels.strict_ids[extra_keep],newids]
     oldgaia=np.zeros(oldextra,bool) if labels.strict_is_gaia is None else labels.strict_is_gaia
     labels.strict_is_gaia=np.r_[oldgaia[extra_keep],np.zeros(len(added),bool)]
-    if not shortwave:status[blue&(~np.isfinite(snr)|(snr<red_min_snr))]='red_psf_snr_below_threshold'
+    status[blue&~direct&(~np.isfinite(snr)|(snr<red_min_snr))]='red_psf_snr_below_threshold' if not shortwave else 'band_psf_snr_below_threshold'
     source_id[added]=newids
     return dict(blue_candidates=int(blue.sum()),eligible=int(eligible.sum()),
         existing_centers=len(moves),recentered=len(moves),merged_old=len(merged),
         duplicate_blue=int(duplicate.sum()),added=int(len(added)),shortwave=shortwave,
+        direct_current_band=int((blue&direct).sum()),psf_required=int((blue&~direct).sum()),
         red_min_snr=float(red_min_snr),dedup_pixels=float(dedup_pixels),
         status=status,source_id=source_id,matched_native_index=matched_native,
         center_moves=moves,merged_old_sources=merged)

@@ -920,6 +920,7 @@ class BrowserState:
             self.log_a = 1000.0
         self.confidence_threshold = float(args.confidence_threshold)
         self.confidence_score = str(args.confidence_score)
+        self.proposal_mode = 'auto'
         self.nms_radius = int(getattr(args, "active_nms_radius", args.nms_radius))
         self.center_refinement = str(args.center_refinement)
         self.center_refinement_radius = int(args.center_refinement_radius)
@@ -1256,6 +1257,7 @@ class BrowserState:
 
     def state_payload(self) -> dict[str, Any]:
         return {
+            "proposal_mode": getattr(self, 'proposal_mode', 'auto'),
             "root": str(self.root),
             "dataset": self.dataset_id,
             "dataset_label": dataset_label(self.dataset_id),
@@ -1632,6 +1634,8 @@ class BrowserState:
     def _store_confidence(self, band_outputs, ref, valid):
         maps = confidence_maps(band_outputs, width=ref.width, height=ref.height,
                                valid_mask=valid, score_mode=self.confidence_score)
+        heatmap=maps['logits'].shape[0]==1
+        self.proposal_mode='heatmap' if heatmap else 'ordinal'
         target = self.session_dir / 'confidence' / f'{ref.candidate_id}_confidence.npz'
         target.parent.mkdir(parents=True, exist_ok=True)
         with target.with_suffix('.npz.tmp').open('wb') as handle:
@@ -1639,10 +1643,14 @@ class BrowserState:
                 checkpoint=str(self.checkpoint), token=ref.token,
                 confidence_threshold=self.confidence_threshold, nms_radius=self.nms_radius,
                 x0=ref.x0, y0=ref.y0, orientation='lower-origin; y increases upward',
-                labels_definition='argmax of all confidence classes before threshold/NMS')
+                proposal_mode=self.proposal_mode,
+                display_kind='heatmap' if heatmap else 'ordinal',
+                score_definition='sigmoid(logits[0])' if heatmap else self.confidence_score,
+                labels_definition=('legacy display bins at [0.1,0.25,0.5,0.75]; browser uses continuous score'
+                    if heatmap else 'argmax of all confidence classes before threshold/NMS'))
         target.with_suffix('.npz.tmp').replace(target)
         self.confidence_paths_by_token[ref.token] = target
-        self._confidence_cache.put(ref.token, maps['labels'])
+        self._confidence_cache.put(ref.token, maps['score'] if heatmap else maps['labels'])
 
     def _confidence_for_token(self, token):
         labels = self._confidence_cache.get(token)
@@ -1651,7 +1659,8 @@ class BrowserState:
             if path is None:
                 raise RuntimeError('Run Detect to generate the confidence map')
             with np.load(path) as stored:
-                labels = stored['labels']
+                heatmap=stored['logits'].shape[0]==1
+                labels=stored['score'].astype(np.float32) if heatmap else stored['labels']
             self._confidence_cache.put(token, labels)
         return labels
 
@@ -1876,6 +1885,11 @@ class BrowserState:
                     list(key),
                     dynamic_image_size=True,
                 )
+                self.proposal_mode=getattr(getattr(model,'decoder',None),'proposal_mode','ordinal')
+                if self.proposal_mode=='heatmap':
+                    self.confidence_score='heatmap'
+                    self.confidence_threshold=.5
+                    self.nms_radius=1
                 model._browser_mask_config = dict(cfg or {})
                 self._model_by_bands[key] = (model, dict(cfg or {}))
             model, cfg = self._model_by_bands[key]
@@ -2107,6 +2121,8 @@ class BrowserState:
         detect_csv_path = out_dir / f"{stem}_detections.csv"
         mask_png_path = out_dir / f"{stem}_mask_overlay.png"
         confidence_source = getattr(self, 'confidence_paths_by_token', {}).get(ref.token)
+        confidence_is_heatmap=confidence_source is not None and np.issubdtype(
+            self._confidence_for_token(ref.token).dtype,np.floating)
         confidence_npz_path = out_dir / f'{stem}_confidence.npz'
         confidence_png_path = out_dir / f'{stem}_confidence_overlay.png'
         if confidence_source is not None:
@@ -2190,7 +2206,9 @@ class BrowserState:
             "confidence_npz_path": str(confidence_npz_path) if confidence_source is not None else "",
             "confidence_png_path": str(confidence_png_path) if write_png and confidence_source is not None else "",
             "confidence_view": confidence_display_options(confidence_view),
-            "confidence_classes": {str(k): v for k, v in {0:'background (transparent)', 1:'blue', 2:'green', 3:'yellow', 4:'red'}.items()},
+            "confidence_display_kind": 'heatmap' if confidence_is_heatmap else 'ordinal',
+            "confidence_value_range": [0.,1.] if confidence_is_heatmap else [0,4],
+            "confidence_classes": {} if confidence_is_heatmap else {str(k): v for k, v in {0:'background (transparent)', 1:'blue', 2:'green', 3:'yellow', 4:'red'}.items()},
             "export_subdir": str(out_dir),
             "n_detections": len(detect_rows),
             "inference_parameters": self._inference_parameters(),

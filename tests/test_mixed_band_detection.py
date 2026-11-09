@@ -8,6 +8,61 @@ from utils.detection_metadata import sample_band_name, valid_predictions
 
 BANDS = ['HSC-G', 'HSC-I', 'F115W', 'F444W', 'F090W']
 
+
+def _write_discovery_store(path,tract,band,field):
+    import json
+    path.mkdir(parents=True)
+    (path/'.zattrs').write_text(json.dumps(dict(format='cellect_direct_patch_zarr',image_level_training=True,
+        tract=tract,patch=field,bands=[band])))
+    (path.parent/(path.name+'_manifest.json')).write_text('{}')
+    def array(name,value):
+        p=path/name;p.mkdir();value=np.asarray(value)
+        (p/'.zarray').write_text(json.dumps(dict(shape=value.shape,chunks=value.shape,dtype=value.dtype.str)))
+        (p/'.'.join('0' for _ in value.shape)).write_bytes(value.tobytes())
+    def text(value):return np.frombuffer(value.encode()+b'\0',dtype=np.uint8)[None,:].copy()
+    p=path/'images';p.mkdir();(p/'.zarray').write_text(json.dumps(dict(shape=[1,1,3,2,2],chunks=[1,1,3,2,2],dtype='<f4')))
+    array('tile_x0',np.array([0],np.int32));array('tile_y0',np.array([0],np.int32))
+    array('tile_name',text('grid_r00_c00_x0_y0'));array('dataset_source',text('half_coadd'))
+
+
+def test_independent_ground_and_space_roots_filter_families_and_keep_selectors():
+    import tempfile
+    from pathlib import Path
+    from astro_train_zarr_data import discover_zarr_image_records,discover_zarr_image_bands
+    from utils.train_eval_utils import filter_records_by_patches
+    with tempfile.TemporaryDirectory() as td:
+        base=Path(td);ground=base/'ground';space=base/'space'
+        _write_discovery_store(ground/'zarr/hsc/i.zarr','9813','HSC-I','4,5')
+        _write_discovery_store(ground/'zarr/wrong/a.zarr','Abell2744','F090W','wrong_field')
+        _write_discovery_store(space/'zarr/abell/a.zarr','Abell2744','F444W','x+00_y+00')
+        _write_discovery_store(space/'zarr/cosmos/c.zarr','COSMOS_1727','F115W','P0019_x00000_y00000')
+        _write_discovery_store(space/'zarr/wrong/i.zarr','9813','HSC-G','8,4')
+        kwargs=dict(hsc_root=ground,space_root=space)
+        assert discover_zarr_image_bands(space,**kwargs)==['F115W','F444W','HSC-I']
+        records=discover_zarr_image_records(space,bands=[],**kwargs)
+        assert len(records)==3 and {r.tract for r in records}=={'9813','Abell2744','COSMOS_1727'}
+        selected=filter_records_by_patches(records,{'half_coadd:4,5'},space)
+        assert len(selected)==1 and selected[0].tract=='9813'
+        selected=filter_records_by_patches(records,{records[1].name},space)
+        assert len(selected)==1 and selected[0].name==records[1].name
+        assert len(discover_zarr_image_records(space,bands=[],max_records=2,**kwargs))==2
+        assert len(discover_zarr_image_records(ground/'zarr',bands=[]))==2
+
+
+def test_shared_family_root_is_scanned_once_and_duplicate_versions_rejected():
+    import tempfile
+    from pathlib import Path
+    from astro_train_zarr_data import discover_zarr_image_records
+    with tempfile.TemporaryDirectory() as td:
+        root=Path(td)
+        _write_discovery_store(root/'zarr/hsc/i.zarr','9813','HSC-I','4,5')
+        _write_discovery_store(root/'zarr/abell/a.zarr','Abell2744','F444W','x+00_y+00')
+        assert len(discover_zarr_image_records(root,bands=[],hsc_root=root,space_root=root/'zarr'))==2
+        _write_discovery_store(root/'zarr/another/i.zarr','9813','HSC-I','4,5')
+        try:discover_zarr_image_records(root,bands=[],hsc_root=root)
+        except ValueError as exc:assert 'Duplicate image record' in str(exc)
+        else:raise AssertionError('Two versions of the same HSC record were accepted')
+
 def make_totals(names, linking=False):
     n=len(names)
     outputs={'confidence':torch.zeros(n,1,5,8,8)}
@@ -76,3 +131,21 @@ def test_zarr_wcs_tile_offset():
         tile=wcs_for_path('zarr:///tmp/test.zarr#0',1,{})
     assert tile is not None
     assert np.allclose(tile.all_pix2world([[100,200]],0),parent.all_pix2world([[612,1224]],0),atol=1e-10)
+
+
+def test_full_record_selector_keeps_one_band_tile_and_legacy_parent_selection():
+    from pathlib import Path
+    from astro_train_data import CutoutRecord
+    from utils.train_eval_utils import filter_records_by_patches
+    def rec(parent,band,tile):
+        return CutoutRecord(name=f'Abell2744/half_coadd/{parent}/half/{band}/{tile}',
+            image_paths=('zarr:///tmp/parent.zarr#0',),meas_path='',x0=368,y0=2208,
+            dataset_source='half_coadd',tract='Abell2744',patch=parent,tile_name=tile)
+    records=[rec('x+00_y+00','F115W','r06_c01_x368_y2208'),
+             rec('x+00_y+00','F115W','r06_c02_x736_y2208'),
+             rec('x+00_y+00','F150W','r06_c01_x368_y2208'),
+             rec('x+01_y+00','F115W','r06_c01_x368_y2208')]
+    selected=filter_records_by_patches(records,{records[0].name},Path('/tmp'))
+    assert [r.name for r in selected]==[records[0].name]
+    parent=filter_records_by_patches(records,{'half_coadd:Abell2744/x+00_y+00'},Path('/tmp'))
+    assert [r.name for r in parent]==[r.name for r in records[:3]]

@@ -49,7 +49,7 @@ from preprocessing.dataset_inputs import (
 )
 from preprocessing.meas_processing import MeasProcessingConfig, classify_meas_basics
 from preprocessing.ordinary import OrdinaryConfig, label_ordinary_sources
-from preprocessing.refit import RefitConfig, attach_refit_geometry, compute_kron_ellipse
+from preprocessing.refit import HSC_REFIT_CENTER_POLICY, RefitConfig, attach_refit_geometry, compute_kron_ellipse
 from preprocessing.region_filling import fill_dense_regions, RegionFillingConfig
 from preprocessing.snr import SnrConfig, SnrThresholds, compute_snr_for_sample, thresholds_from_args
 from preprocessing.utils.catalog import source_ids
@@ -591,7 +591,8 @@ def write_classified_patch(task: StoreTask, image: np.ndarray, labels: PatchLabe
             "confidence_config": confidence_config,
             "source_area_weight_policy": source_area_weight_policy(),
             "segmentation_policy": labels.segmentation_policy,
-            **({"hsc_star_protection": labels.star_protection_policy,
+            **({"hsc_refit_center_policy": HSC_REFIT_CENTER_POLICY,
+                "hsc_star_protection": labels.star_protection_policy,
                 "hsc_star_sources": labels.star_protection_sources,
                 "hsc_nested_bright_policy": labels.table.meta.get('hsc_nested_bright_policy'),
                 "hsc_nested_bright_sources": labels.table.meta.get('hsc_nested_bright_sources')}

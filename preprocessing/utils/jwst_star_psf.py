@@ -235,7 +235,7 @@ def fit_angle(image, center, band, pixel_scale):
                 status='rotation_only',fit_pixels=int(valid.sum()))
 
 
-def measure_fixed_psf_catalog(image, rms, band, candidates, *, noise_factor=1., progress=None):
+def measure_fixed_psf_catalog(image, rms, band, candidates, *, noise_factor=1., progress=None,selection=None):
     """Force the current-band PSF at BLUE positions; never search red peaks.
 
     Neighbors and fit configuration match the validated compact-center pilot.
@@ -247,6 +247,7 @@ def measure_fixed_psf_catalog(image, rms, band, candidates, *, noise_factor=1., 
     xy=np.c_[np.asarray(candidates['x'],float),np.asarray(candidates['y'],float)]
     selected=np.asarray(candidates['blue_candidate'],bool)&np.isfinite(xy).all(axis=1)
     neighbors=xy[selected];tree=cKDTree(neighbors) if len(neighbors) else None
+    if selection is not None:selected&=np.asarray(selection,bool)
     rows=[];snr=np.full(len(candidates),np.nan)
     h,w=image.shape
     for i in np.flatnonzero(selected):

@@ -179,12 +179,17 @@ class SamCellectDecoder(nn.Module):
         use_prompt_ir: bool = False,
         prompt_ir_stages: Sequence[str] = ('stem','up1','up2'),
         prompt_ir_config: Optional[dict] = None,
+        proposal_mode: str = 'ordinal',
+        heatmap_image_fusion: bool = False,
     ) -> None:
         super().__init__()
         if len(tuple(decoder_channels)) != 4:
             raise ValueError("decoder_channels must contain four stages for 32x32 -> 512x512 decoding")
         self.seg_classes = int(seg_classes)
         self.confidence_levels = int(confidence_levels)
+        self.proposal_mode = proposal_mode
+        if proposal_mode not in ('ordinal','heatmap'):raise ValueError('Unknown proposal mode')
+        if proposal_mode == 'heatmap':self.confidence_levels=1
         self.embedding_dim = int(embedding_dim)
         self.shape_channels = int(shape_channels)
         self.use_cen = bool(use_cen)
@@ -194,6 +199,9 @@ class SamCellectDecoder(nn.Module):
         self.pred_channels = self.shape_channels
 
         c1, c2, c3, c4 = [int(ch) for ch in decoder_channels]
+        from .heatmap import ImagePyramid
+        # Keep the original checkpoint prefix; fusion is shared by both proposal modes.
+        self.heatmap_image_pyramid=(ImagePyramid(dict(up2=c2,up3=c3,up4=c4)) if heatmap_image_fusion else None)
         self.stem = _conv_norm_lrelu(int(in_channels), c1)
         self.up1 = _norm_lrelu_upscale_conv_norm_lrelu(c1, c1)
         self.up2 = _norm_lrelu_upscale_conv_norm_lrelu(c1, c2)
@@ -234,8 +242,14 @@ class SamCellectDecoder(nn.Module):
             }
         )
 
-        self.confidence_head = nn.Conv2d(c4, self.confidence_levels, kernel_size=1, bias=False)
-        self.shape_refine = _conv_norm_lrelu(c4 + self.confidence_levels, c4)
+        if proposal_mode == 'heatmap':
+            from .heatmap import PredictionTower
+            self.center_head=PredictionTower(c4,1,bias=-2.19)
+            self.offset_head=PredictionTower(c4,2)
+            nn.init.zeros_(self.offset_head[-1].weight)
+        else:
+            self.confidence_head = nn.Conv2d(c4, self.confidence_levels, kernel_size=1, bias=False)
+        self.shape_refine = _conv_norm_lrelu(c4 if proposal_mode=='heatmap' else c4 + self.confidence_levels, c4)
         self.shape_head = nn.Conv2d(c4, self.shape_channels, kernel_size=1, bias=False)
         self.prompt_ir = (MultiScalePromptIR(int(in_channels),{'neck':int(in_channels),**film_channels},
             stages=prompt_ir_stages,config=prompt_ir_config) if use_prompt_ir else None)
@@ -289,6 +303,10 @@ class SamCellectDecoder(nn.Module):
         ) if self.psf_depthwise else None
 
         condition = self.prompt_ir.condition_encoder(flat) if self.prompt_ir is not None else None
+        shallow=None
+        if self.heatmap_image_pyramid is not None:
+            if flat_images is None:raise ValueError('Image-fused source decoder requires input images')
+            shallow=self.heatmap_image_pyramid(flat_images)
         image_context = None
         if self.prompt_ir is not None:
             flat_valid = image_valid_mask
@@ -304,21 +322,24 @@ class SamCellectDecoder(nn.Module):
         out = self._forward_conditioned_stage("up1", self.up1, out, flat_processing_ids, flat_psf, flat_psf_native_sizes)
         if self.prompt_ir is not None:out = self.prompt_ir('up1',out,condition,image_context)
         ds2 = self._forward_conditioned_stage("up2", self.up2, out, flat_processing_ids, flat_psf, flat_psf_native_sizes)
+        if shallow is not None:ds2=self.heatmap_image_pyramid.fuse('up2',ds2,shallow)
         if self.prompt_ir is not None:ds2 = self.prompt_ir('up2',ds2,condition,image_context)
         ds3 = self._forward_conditioned_stage("up3", self.up3, ds2, flat_processing_ids, flat_psf, flat_psf_native_sizes)
+        if shallow is not None:ds3=self.heatmap_image_pyramid.fuse('up3',ds3,shallow)
         if self.prompt_ir is not None:ds3 = self.prompt_ir('up3',ds3,condition,image_context)
         out = self._forward_conditioned_stage("up4", self.up4, ds3, flat_processing_ids, flat_psf, flat_psf_native_sizes)
+        if shallow is not None:out=self.heatmap_image_pyramid.fuse('up4',out,shallow)
         if self.prompt_ir is not None:out = self.prompt_ir('up4',out,condition,image_context)
         out = self._forward_conditioned_stage("refine", self.refine, out, flat_processing_ids, flat_psf, flat_psf_native_sizes)
         if self.prompt_ir is not None:out = self.prompt_ir('refine',out,condition,image_context)
 
-        confidence = self.confidence_head(out)
+        confidence = self.center_head(out) if self.proposal_mode=='heatmap' else self.confidence_head(out)
         target_size = tuple(output_size) if output_size is not None else tuple(confidence.shape[-2:])
         if tuple(confidence.shape[-2:]) != target_size:
             confidence = self._crop_to_output_size(confidence, target_size)
             out = self._crop_to_output_size(out, target_size)
 
-        shape_input = torch.cat([out, confidence], dim=1)
+        shape_input = out if self.proposal_mode=='heatmap' else torch.cat([out, confidence], dim=1)
         raw_shape = self.shape_head(self.shape_refine(shape_input))
         shape = self._shape_from_raw(raw_shape)
 
@@ -326,6 +347,7 @@ class SamCellectDecoder(nn.Module):
             "confidence": confidence,
             "shape": shape,
         }
+        if self.proposal_mode=='heatmap':outputs['offset']=self.offset_head(out)
         if per_band:
             outputs = {
                 key: value.reshape(batch, bands, *value.shape[1:])

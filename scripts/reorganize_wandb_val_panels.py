@@ -126,6 +126,38 @@ def repair_adam_spec(spec, available_metrics):
         reason='only missing Adam charts restored; all non-Adam layout state retained')
 
 
+def repair_offset_spec(spec, available_metrics):
+    """Add explicit center/offset charts without rebuilding other sections."""
+    result=copy.deepcopy(spec);host=result.get('section',result)
+    bank=host.get('panelBankConfig')
+    if not isinstance(bank,dict) or not isinstance(bank.get('sections',[]),list):
+        raise ValueError('Unsupported layout: no section.panelBankConfig.sections')
+    sections=bank.setdefault('sections',[])
+    represented={m for section in sections for panel in section.get('panels',[]) for m in panel_metrics(panel)}
+    titles={
+        'train/epoch/offset':'Train offset Smooth L1',
+        'val/epoch/offset':'Validation offset Smooth L1',
+        'train/iteration/loss/offset':'Train offset Smooth L1 (iteration)',
+        'train/epoch/center':'Train legacy center loss',
+        'val/epoch/center':'Validation legacy center loss',
+        'train/iteration/loss/center':'Train legacy center loss (iteration)',
+    }
+    keys=set(available_metrics)&titles.keys()
+    missing=keys-represented
+    if missing:
+        section=next((s for s in sections if s.get('name')=='center_offset'),None)
+        if section is None:section=new_section('center_offset');sections.append(section)
+        for metric in sorted(missing):
+            chart=new_panel(metric,'center_offset','epoch')
+            chart['config']['chartTitle']=titles[metric]
+            section.setdefault('panels',[]).append(chart)
+        section['isPanelsAuto']=False;section.pop('defaultName',None);section['isOpen']=True
+    return result,dict(changed=result!=spec,repair_offset_only=True,
+        available_offset_metrics=len(keys),added_offset_charts=len(missing),
+        section_counts={s.get('name',''):len(s.get('panels',[])) for s in sections},
+        reason='only missing center/offset charts added; all other layout state retained')
+
+
 def transform_spec(spec, available_metrics, x_axis='epoch'):
     """Materialize automatic panels, preserve other custom panels, split Val.
 
@@ -383,7 +415,7 @@ def process(api, config, output, apply=False):
         # A project workspace is shared even if its run table currently selects
         # a handful of old runs. Freezing it using only those runs hides Adam
         # and other metric families first logged outside the date/name filter.
-        if 'project-view' in config.get('view_types',['run-view','project-view']):
+        if 'project-view' in config.get('view_types',['run-view','project-view']) and not config.get('repair_offset_only'):
             project_run_count=0
             for run in runs_with_metrics(api, f'{entity}/{project}',per_page=50):
                 project_run_count+=1
@@ -431,7 +463,9 @@ def process(api, config, output, apply=False):
                     run_ids=sorted(references), shared_layout=is_shared,
                     note='Shared layouts may affect runs outside the date filter too' if is_shared else '')
                 try:
-                    if config.get('repair_adam_only'):
+                    if config.get('repair_offset_only'):
+                        after,change=repair_offset_spec(before,metrics)
+                    elif config.get('repair_adam_only'):
                         after,change=repair_adam_spec(before,metrics)
                     else:
                         after, change = transform_spec(before, metrics, config.get('x_axis', 'epoch'))
@@ -451,6 +485,7 @@ def process(api, config, output, apply=False):
                     shared += int(is_shared)
                     print(f'[{record["status"]}] {kind} {view.get("displayName") or view["name"]}: '
                           f'adam added={change.get("added_adam_charts",0)} '
+                          f'offset added={change.get("added_offset_charts",0)} '
                           f'detection={change.get("detection_charts",0)} val/epoch={change.get("epoch_charts",0)}',flush=True)
                 except Exception as exc:
                     record['status']='error';record['error']=str(exc)
@@ -512,6 +547,7 @@ def main():
     parser.add_argument('--username',help='Layout creator username, not entity/team; use @me for logged-in account')
     parser.add_argument('--apply',action='store_true',help='Save the planned layout changes remotely')
     parser.add_argument('--repair-adam-only',action='store_true',help='Only add missing Adam charts; preserve val/detection and every other layout setting')
+    parser.add_argument('--repair-offset-only',action='store_true',help='Only add missing center/offset charts; preserve every other layout setting')
     parser.add_argument('--restore',type=Path,help='Preview/restore previously applied backups')
     parser.add_argument('--output-dir',type=Path,help='Local backup directory; otherwise a timestamped directory')
     args=parser.parse_args()
@@ -520,6 +556,9 @@ def main():
     if args.since:config['since']=args.since
     if args.until:config['until']=None if args.until.lower()=='none' else args.until
     if args.repair_adam_only:config['repair_adam_only']=True
+    if args.repair_offset_only:config['repair_offset_only']=True
+    if config.get('repair_adam_only') and config.get('repair_offset_only'):
+        parser.error('Choose only one targeted layout repair')
     if args.username is not None:config['username']=None if args.username=='@me' else args.username
     if config.get('scope','both') not in ('both','runs','shared'):parser.error('scope must be both/runs/shared')
     if not args.restore and any('YOUR_' in p for p in config.get('project_urls',[])):

@@ -16,7 +16,11 @@ def confidence_maps(outputs, *, width, height, valid_mask, score_mode):
     valid = np.asarray(valid_mask, bool) & torch.isfinite(logits[0]).all(0).numpy()
     if valid.shape != (height, width):
         raise ValueError('Confidence validity shape mismatch')
-    labels = logits[0].argmax(0).numpy().astype(np.uint8)
+    if logits.shape[1]==1:
+        # Legacy diagnostic bins; the browser and detection use continuous sigmoid scores.
+        labels=np.digitize(logits[0,0].sigmoid().numpy(),[.1,.25,.5,.75]).astype(np.uint8)
+    else:
+        labels = logits[0].argmax(0).numpy().astype(np.uint8)
     labels[~valid] = 0
     scores = confidence_detection_score({'confidence': logits}, score_mode)[0].numpy().copy()
     ordinal = confidence_detection_score({'confidence': logits}, 'ordinal_expectation')[0].numpy().copy()
@@ -27,7 +31,9 @@ def confidence_maps(outputs, *, width, height, valid_mask, score_mode):
 
 
 def confidence_overlay_uint8(background, labels, *, alpha=.60):
-    """Background PNG is top-down; stored dense maps use lower-origin pixels."""
+    """Render ordinal integer labels or a continuous floating-point heatmap."""
+    if np.issubdtype(np.asarray(labels).dtype,np.floating):
+        return heatmap_overlay_uint8(background,labels,alpha=alpha)
     base = np.asarray(background, dtype=np.uint8)
     if base.ndim == 2:
         base = np.repeat(base[..., None], 3, axis=-1)
@@ -39,6 +45,27 @@ def confidence_overlay_uint8(background, labels, *, alpha=.60):
         selected = levels == level
         rgb[selected] = (1-alpha)*rgb[selected] + alpha*255*np.asarray(color)
     return np.clip(np.rint(rgb), 0, 255).astype(np.uint8)
+
+
+def heatmap_overlay_uint8(background, probability, *, alpha=.60):
+    """Continuous sigmoid probabilities; zero/invalid support is transparent.
+
+    PNG backgrounds are top-down and saved arrays use lower-origin pixels.
+    Root-scaled opacity reveals weak peaks without thresholding or rerunning SAM.
+    """
+    base=np.asarray(background,dtype=np.uint8)
+    if base.ndim==2:base=np.repeat(base[...,None],3,axis=-1)
+    score=np.flipud(np.asarray(probability,dtype=np.float32))
+    if base.shape[:2]!=score.shape:
+        raise ValueError('Heatmap overlay and background shape mismatch')
+    valid=np.isfinite(score)
+    score=np.where(valid,np.clip(score,0.,1.),0.)
+    colors=np.asarray([CONF_COLORS[k] for k in (1,2,3,4)],dtype=np.float32)
+    stops=np.linspace(0.,1.,len(colors))
+    color=np.stack([np.interp(score,stops,colors[:,channel]) for channel in range(3)],axis=-1)
+    opacity=(float(alpha)*np.sqrt(score))[...,None]
+    rgb=(1.-opacity)*base.astype(np.float32)+opacity*255.*color
+    return np.clip(np.rint(rgb),0,255).astype(np.uint8)
 
 
 def confidence_display_options(options=None):

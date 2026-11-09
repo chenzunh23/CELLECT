@@ -197,6 +197,11 @@ def _stable_selector_seed(*parts: object) -> int:
 
 def record_patch_aliases(rec: CutoutRecord, root: Path) -> set[str]:
     aliases: set[str] = set()
+    # A fully qualified record selects one band/tile, allowing disjoint
+    # train/validation windows inside the same Abell parent. Patch/group
+    # selectors keep their historical whole-parent behavior.
+    if rec.name:
+        aliases.add(str(rec.name).strip('/'))
     source = str(getattr(rec, "dataset_source", "coadd") or "coadd")
     aliases.add(source)
     if rec.patch:

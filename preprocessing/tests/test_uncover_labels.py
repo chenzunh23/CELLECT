@@ -21,6 +21,116 @@ def make_input(n):
 
 
 class UncoverTests(unittest.TestCase):
+    def test_blue_recovery_reuses_only_exact_predecessor_successes(self):
+        from copy import deepcopy
+        from preprocessing.utils.abell_blue_detection import compatible_signature,COMPATIBLE_CODE_HASHES
+        old=dict(code=next(iter(COMPATIBLE_CODE_HASHES)),config={'snr':4},assets=['same'],job={'name':'x+00_y-01'})
+        new={**old,'code':'new_recovery_only'}
+        self.assertTrue(compatible_signature(old,new))
+        for key,value in [('assets',['different']),('config',{'snr':5}),('job',{'name':'another'})]:
+            changed=deepcopy(new);changed[key]=value
+            self.assertFalse(compatible_signature(old,changed))
+        self.assertFalse(compatible_signature({**old,'code':'unknown'},new))
+
+    def test_blue_tiled_detection_recurses_and_preserves_boundary_centers(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from astropy.io import fits
+        from preprocessing.utils.abell_blue_detection import tiled_sextractor,_sextractor,SExtractorDeblendOverflow
+        yy,xx=np.mgrid[:256,:256];image=np.zeros((256,256),np.float32)
+        points=np.array([[127.7,80.3],[190.2,128.4],[60.1,193.6]])
+        for x,y in points:image+=50*np.exp(-((xx-x)**2+(yy-y)**2)/8)
+        def split_large(source,*args,**kwargs):
+            if max(fits.getdata(source).shape)>140:raise SExtractorDeblendOverflow('forced big-parent case')
+            return _sextractor(source,*args,**kwargs)
+        with tempfile.TemporaryDirectory() as td:
+            p=Path(td);fits.writeto(p/'input.fits',image)
+            with patch('preprocessing.utils.abell_blue_detection._sextractor',side_effect=split_large):
+                t=tiled_sextractor(p/'input.fits',p/'tiles',5,core_size=128,halo=16,min_core=64)
+            self.assertEqual(len(t),3)
+            xy=np.c_[t['XWIN_IMAGE'],t['YWIN_IMAGE']]-1
+            for point in points:self.assertLess(float(np.linalg.norm(xy-point,axis=1).min()),.3)
+
+    def test_blue_sextractor_memory_options_and_silent_overflow_rejection(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from preprocessing.utils.abell_blue_detection import _sextractor
+        def overflow(cmd,**kwargs):
+            Path(cmd[cmd.index('-CATALOG_NAME')+1]).write_text('')
+            kwargs['stderr'].write('WARNING: Pixel stack overflow, some objects may be merged\n')
+        with tempfile.TemporaryDirectory() as td:
+            with patch('preprocessing.utils.abell_blue_detection.subprocess.check_output',return_value=''):
+                with patch('preprocessing.utils.abell_blue_detection.subprocess.run',side_effect=overflow) as call:
+                    with self.assertRaisesRegex(RuntimeError,'stack failure'):
+                        _sextractor(Path(td)/'input.fits',Path(td)/'sex',2,
+                            memory=dict(MEMORY_PIXSTACK=64000000,MEMORY_OBJSTACK=60000,MEMORY_BUFSIZE=2048))
+                    cmd=call.call_args.args[0]
+                    for option,value in [('MEMORY_PIXSTACK','64000000'),('MEMORY_OBJSTACK','60000'),('MEMORY_BUFSIZE','2048')]:
+                        self.assertEqual(cmd[cmd.index('-'+option)+1],value)
+
+    def test_blue_real_sextractor_defaults_detect_a_compact_peak(self):
+        import tempfile
+        from pathlib import Path
+        from astropy.io import fits
+        from preprocessing.utils.abell_blue_detection import _sextractor
+        yy,xx=np.mgrid[:128,:128]
+        image=np.random.default_rng(11).normal(0,1,(128,128))+50*np.exp(-((xx-64)**2+(yy-64)**2)/8)
+        with tempfile.TemporaryDirectory() as td:
+            p=Path(td);fits.writeto(p/'input.fits',image.astype(np.float32))
+            t=_sextractor(p/'input.fits',p/'sex',5)
+            distance=np.hypot(np.asarray(t['X_IMAGE'])-65,np.asarray(t['Y_IMAGE'])-65)
+            self.assertLess(float(distance.min()),1.)
+
+    def test_four_blue_confirmation_and_unconfirmed_band_psf_gate(self):
+        from types import SimpleNamespace
+        from preprocessing.utils.uncover_labels import add_blue_compact_centers,direct_blue_detection
+        t=Table(dict(debug_id=[1,2],blue_candidate=[True,True],x=[30.,70.],y=[40.,40.],
+            F090W_snr=[6.,6.],F115W_snr=[2.,6.],F150W_snr=[6.,6.],F200W_snr=[6.,6.],
+            F090W_detected=[True,True],F115W_detected=[False,True],F150W_detected=[True,True],F200W_detected=[True,True]))
+        t.meta.update(DETBANDS='F090W,F115W,F150W,F200W',MINBANDS=3)
+        def label():return SimpleNamespace(dense=np.zeros((100,100),np.uint8),label_classes=np.array([],np.int16),
+            geom_x=np.array([]),geom_y=np.array([]),source_ids=np.array([],np.int64),
+            strict_x=np.array([]),strict_y=np.array([]),strict_ids=np.array([],np.int64),strict_is_gaia=np.array([],bool))
+        self.assertEqual(direct_blue_detection(t,'F115W').tolist(),[False,True])
+        self.assertFalse(direct_blue_detection(t,'F070W').any())
+        result=add_blue_compact_centers(label(),t,'F115W',core_snr=[3.99,np.nan])
+        self.assertEqual(result['added'],1);self.assertEqual(result['status'][0],'band_psf_snr_below_threshold')
+        self.assertEqual(add_blue_compact_centers(label(),t,'F070W',core_snr=[4.,3.99])['added'],1)
+
+    def test_blue_raw_quadratic_fit_and_analytic_jacobian(self):
+        from preprocessing.utils.abell_blue_detection import gaussian_model_jacobian,fit_blue_core
+        yy,xx=np.mgrid[-8:9,-8:9];xx=xx.ravel().astype(float);yy=yy.ravel().astype(float)
+        bg=np.c_[np.ones(len(xx)),xx/8,yy/8,(xx/8)**2,xx*yy/64,(yy/8)**2]
+        p=np.array([30.,.3,-.4,1.2,.4,.1,.2,.03,.02,-.01])
+        model,jac=gaussian_model_jacobian(p,xx,yy,bg)
+        for j in range(len(p)):
+            step=np.zeros(len(p));step[j]=1e-5
+            numeric=(gaussian_model_jacobian(p+step,xx,yy,bg)[0]-gaussian_model_jacobian(p-step,xx,yy,bg)[0])/2e-5
+            np.testing.assert_allclose(jac[:,j],numeric,rtol=2e-5,atol=2e-7)
+        yy,xx=np.mgrid[:64,:64];dx=(xx-32).ravel();dy=(yy-32).ravel()
+        bg=np.c_[np.ones(len(dx)),dx/8,dy/8,(dx/8)**2,dx*dy/64,(dy/8)**2]
+        image=gaussian_model_jacobian(p,dx,dy,bg)[0].reshape(64,64)
+        result=fit_blue_core(image,np.full(image.shape,.02),32.,32.)
+        self.assertTrue(result['success']);self.assertAlmostEqual(result['x'],32.3,places=4)
+        self.assertAlmostEqual(result['y'],31.6,places=4);self.assertGreater(result['snr'],4)
+
+    def test_parallel_blue_fits_match_serial_results(self):
+        from preprocessing.utils.abell_blue_detection import gaussian_model_jacobian,refine_seeds,BANDS
+        yy,xx=np.mgrid[:64,:64];dx=(xx-32).ravel();dy=(yy-32).ravel()
+        bg=np.c_[np.ones(len(dx)),dx/8,dy/8,(dx/8)**2,dx*dy/64,(dy/8)**2]
+        p=np.array([30.,.3,-.4,1.2,.4,.1,.2,.03,.02,-.01])
+        image=gaussian_model_jacobian(p,dx,dy,bg)[0].reshape(64,64)
+        raw={b:image for b in BANDS};rms={b:np.full(image.shape,.02) for b in BANDS}
+        seeds=[dict(x_init=32.,y_init=32.,isoarea=10,a_image=1.2,b_image=1.2)]
+        w=WCS(naxis=2);w.wcs.crpix=[1,1];w.wcs.crval=[3.58,-30.4]
+        w.wcs.cdelt=[-.03/3600,.03/3600];w.wcs.ctype=['RA---TAN','DEC--TAN']
+        one=refine_seeds(seeds,raw,rms,np.zeros_like(image),w.to_header(),'test',fit_workers=1)
+        two=refine_seeds(seeds,raw,rms,np.zeros_like(image),w.to_header(),'test',fit_workers=2)
+        for key in ('x','y','F090W_snr','F200W_snr'):np.testing.assert_allclose(one[key],two[key])
+        self.assertTrue(two['blue_candidate'][0])
+
     def test_bash_passes_actual_uncover_workers_and_background_arguments(self):
         import os,sys,json,tempfile,subprocess
         from pathlib import Path

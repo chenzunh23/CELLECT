@@ -238,6 +238,8 @@ def sample_map_at_centers(map_tensor: Tensor, centers: Tensor) -> Tensor:
 
 def confidence_detection_score(outputs: Dict[str, Tensor], mode: str) -> Tensor:
     logits = outputs["confidence"]
+    if logits.shape[1]==1:
+        return logits[:,0].float().sigmoid()
     if mode == "raw":
         return logits[:, -1]
     if mode == "ordinal_prob":

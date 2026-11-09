@@ -18,6 +18,9 @@ from .utils.geometry import EllipseGeometry, ellipse_axes_from_moments
 
 
 CENTRAL_PIXEL_ER = 0.38259771140356325
+# Version the training adapter, not the legacy FITS/DS9 CSV format. Existing
+# Zarr targets must be regenerated: their dense labels also used the old center.
+HSC_REFIT_CENTER_POLICY = "fits1_to_numpy0_v1"
 KRON_FLAGS = (
     "ext_photometryKron_KronFlux_flag_bad_radius",
     "ext_photometryKron_KronFlux_flag_used_psf_radius",
@@ -216,9 +219,16 @@ def image_positions_from_reference(
     fallback_x: np.ndarray,
     fallback_y: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
+    """Export local FITS/DS9 (one-based) positions, including fallback rows.
+
+    LSST centroids and SpanSets use zero-based parent-image coordinates. LTV
+    maps those parent coordinates into this reference image. Keep the exported
+    convention compatible with historical refit CSVs; training converts it in
+    ``compute_kron_ellipse`` rather than changing the CSV or measured radius.
+    """
     finite = np.isfinite(ra_rad) & np.isfinite(dec_rad)
-    x = np.asarray(fallback_x, dtype=np.float64).copy()
-    y = np.asarray(fallback_y, dtype=np.float64).copy()
+    x = np.asarray(fallback_x, dtype=np.float64) + float(header.get("LTV1", 0.0)) + 1.0
+    y = np.asarray(fallback_y, dtype=np.float64) + float(header.get("LTV2", 0.0)) + 1.0
     try:
         wcs = WCS(header)
         if np.any(finite):
@@ -1018,7 +1028,13 @@ def sdss_ellipse(table: Table) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 
 def compute_kron_ellipse(table: Table, config: RefitConfig = RefitConfig()) -> EllipseGeometry:
-    """Compute refit Kron aperture ellipses using SDSS shape orientation."""
+    """Compute training ellipses, converting refit FITS centers to NumPy.
+
+    ``pu_refit_x_image/y_image`` retain the local, one-based CSV coordinates.
+    Only finite refit coordinate pairs are converted; original LSST fallback
+    centroids are already zero-based and must not receive this subtraction.
+    The input table is not modified, so repeated geometry calls are idempotent.
+    """
 
     x, y = source_xy(table)
     sdss_major, sdss_minor, theta = sdss_ellipse(table)
@@ -1028,8 +1044,8 @@ def compute_kron_ellipse(table: Table, config: RefitConfig = RefitConfig()) -> E
         take = np.isfinite(refit_x) & np.isfinite(refit_y)
         x = x.copy()
         y = y.copy()
-        x[take] = refit_x[take]
-        y[take] = refit_y[take]
+        x[take] = refit_x[take] - 1.0
+        y[take] = refit_y[take] - 1.0
     kron_columns = (config.output_column,) if config.require_match else (
         config.output_column,
         "ext_photometryKron_KronFlux_radius",

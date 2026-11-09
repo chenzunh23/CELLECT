@@ -42,6 +42,56 @@ class ConfidenceTests(unittest.TestCase):
         self.assertGreater(result[2,1,2], result[2,1,0])  # Blue bottom row.
         self.assertGreater(result[0,3,0], result[0,3,2])  # Red top row.
 
+    def test_heatmap_overlay_is_continuous_and_keeps_weak_values_and_invalid_support(self):
+        background=np.full((2,4,3),60,np.uint8)
+        probability=np.array([[.05,.08,0.,np.nan],[.51,.59,.9,1.]],np.float32)
+        result=confidence_overlay_uint8(background,probability)
+        np.testing.assert_array_equal(result[1,2:],background[1,2:])
+        self.assertFalse(np.array_equal(result[1,0],background[1,0]))  # <.1 remains visible.
+        self.assertFalse(np.array_equal(result[1,0],result[1,1]))
+        self.assertFalse(np.array_equal(result[0,0],result[0,1]))  # Same old display bin.
+        self.assertGreater(result[0,3,0],result[0,3,2])
+
+    def test_heatmap_cache_disk_fallback_and_export_preserve_continuous_scores(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state=make_state(tmp,1);ref=state.refs[0]
+            state.make_masks=False;state.confidence_score='heatmap';state.confidence_threshold=.5
+            state.detect_rows_by_token[ref.token]=[]
+            probability=torch.full((1,1,32,32),.001)
+            probability[0,0,5,5]=.05;probability[0,0,5,6]=.08;probability[0,0,6,5]=.8
+            valid=np.ones((32,32),bool);valid[0,0]=False
+            state._store_confidence({'confidence':torch.logit(probability)},ref,valid)
+            expected=probability[0,0].numpy().copy();expected[~valid]=np.nan
+            self.assertEqual(state.proposal_mode,'heatmap')
+            np.testing.assert_allclose(state._confidence_for_token(ref.token),expected,rtol=1e-6)
+            state._confidence_cache=ArrayCache(0)
+            np.testing.assert_allclose(state._confidence_for_token(ref.token),expected,rtol=1e-6)
+            with np.load(state.confidence_paths_by_token[ref.token]) as data:
+                self.assertEqual(str(data['proposal_mode']),'heatmap')
+                self.assertEqual(str(data['score_definition']),'sigmoid(logits[0])')
+                self.assertEqual(data['labels'][5,5],0)  # Browser does not use these old bins.
+            state._detect_tile_slots=lambda *args,**kwargs:dict(n_images=0,n_detections=0)
+            with patch.object(browser_core,'infer_cellect',side_effect=AssertionError('Unexpected model call')):
+                normal=state.image_png(ref.token,detect=True,show_shape=False,show_confidence=True,display_scaling='zscale')
+                changed=state.image_png(ref.token,detect=True,show_shape=False,show_confidence=True,display_scaling='log')
+                self.assertNotEqual(normal,changed)
+                state.export_selected(workers=1,confidence_view={'display_scaling':'log'})
+            row=json.loads((state.export_dir/'export_manifest.jsonl').read_text())
+            self.assertEqual(Path(row['confidence_png_path']).read_bytes(),changed)
+            self.assertEqual(row['confidence_display_kind'],'heatmap')
+            self.assertEqual(row['confidence_classes'],{})
+            self.assertEqual(row['confidence_value_range'],[0.,1.])
+
+    def test_earlier_heatmap_npz_without_mode_metadata_is_recognized(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state=make_state(tmp,1);ref=state.refs[0]
+            path=Path(tmp)/'old_confidence.npz'
+            score=np.full((32,32),.07,np.float32)
+            np.savez_compressed(path,logits=np.full((1,32,32),-2.5866893,np.float32),
+                labels=np.zeros((32,32),np.uint8),score=score)
+            state.confidence_paths_by_token[ref.token]=path
+            np.testing.assert_array_equal(state._confidence_for_token(ref.token),score)
+
     def test_detection_writes_confidence_even_without_masks_or_centers(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = make_state(tmp, 1);ref = state.refs[0]

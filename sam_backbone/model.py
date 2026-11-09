@@ -235,6 +235,8 @@ def build_sam_cellect2d(
     astro_preprocess_sigma_iters: int = -1,
     astro_preprocess_z_clip: Optional[Tuple[float, float]] = None,
     dynamic_image_size: bool = False,
+    proposal_mode: str = 'ordinal',
+    heatmap_image_fusion: bool = False,
 ) -> SamCellect2D:
     psf_encoder_injection = str(psf_encoder_injection)
     if psf_encoder_injection not in {"none", "pre_neck", "post_neck", "both"}:
@@ -265,6 +267,8 @@ def build_sam_cellect2d(
         psf_num_heads=int(psf_num_heads),
     )
     decoder = SamCellectDecoder(
+        proposal_mode=proposal_mode,
+        heatmap_image_fusion=heatmap_image_fusion,
         in_channels=256,
         seg_classes=seg_classes,
         confidence_levels=confidence_levels,

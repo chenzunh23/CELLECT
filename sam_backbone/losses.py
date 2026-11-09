@@ -300,8 +300,15 @@ def _build_pred_prompt_tensors(
 ) -> Optional[Dict[str, Tensor]]:
     if outputs["confidence"].ndim != 5:
         return None
-    flat_outputs = _flatten_per_band_outputs({"confidence": outputs["confidence"], "shape": outputs["shape"]})
-    pred_list = detect_centers_fn(
+    flat_outputs = _flatten_per_band_outputs({key:outputs[key] for key in ('confidence','shape','offset') if key in outputs})
+    heatmap_anchors = None
+    if 'offset' in flat_outputs:
+        from .heatmap import decode
+        found=decode(flat_outputs,threshold if 0<threshold<=1 else .5,1)
+        heatmap_anchors=[row['anchor_xy'] for row in found]
+        pred_list=[row['xy'] for row in found]
+    else:
+        pred_list = detect_centers_fn(
         flat_outputs,
         threshold=threshold,
         nms_radius=nms_radius,
@@ -311,7 +318,7 @@ def _build_pred_prompt_tensors(
         center_refinement=center_refinement,
         center_refinement_radius=center_refinement_radius,
         merge_close_centers=False,
-    )
+        )
     if debug_timer is not None:
         debug_timer("mask.pred.detect_centers")
     flat_shape_pred = flat_outputs["shape"]
@@ -331,10 +338,15 @@ def _build_pred_prompt_tensors(
         if centers.numel() == 0:
             continue
         keep_count = _prompt_sample_limit(centers.shape[0], int(max_pred_per_sample), float(sample_fraction))
-        centers = _random_subset_rows(centers, keep_count)
+        if heatmap_anchors is None:
+            centers = _random_subset_rows(centers, keep_count)
+            sample_centers=centers
+        else:
+            selected=_random_subset_rows(torch.cat([centers,heatmap_anchors[flat_idx]],1),keep_count)
+            centers,sample_centers=selected[:,:2],selected[:,2:]
         if centers.numel() == 0:
             continue
-        prompt_shapes = _sample_chw_nearest(flat_shape_pred[flat_idx], centers)
+        prompt_shapes = _sample_chw_nearest(flat_shape_pred[flat_idx], sample_centers)
         if bool(detach_prompt_shapes):
             prompt_shapes = prompt_shapes.detach()
         clean_at_center = _sample_hw_nearest(flat_clean[flat_idx], centers).to(dtype=torch.bool)

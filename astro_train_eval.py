@@ -49,6 +49,8 @@ from astro_train_zarr_data import (
     ZarrChunkLocalBatchSampler,
     ZarrCutoutDataset,
     discover_zarr_image_records,
+    discover_zarr_image_bands,
+    zarr_image_input_roots,
     discover_zarr_records,
     zarr_passthrough_batch,
 )
@@ -701,6 +703,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Legacy root containing cutouts/reference_catalogs, or direct Zarr root when --data-format zarr.",
     )
     parser.add_argument("--reference-dir", default=None)
+    parser.add_argument('--hsc-zarr-root',default=None,
+        help='Optional HSC-only input collection/zarr root for independent image-level Zarr; combine with --space-zarr-root.')
+    parser.add_argument('--space-zarr-root',default=None,
+        help='Optional COSMOS/Abell input collection/zarr root. Explicit family roots replace --root discovery; originals are read directly.')
     parser.add_argument("--cutout-dir", default=None)
     parser.add_argument(
         "--band-reference-root",
@@ -911,6 +917,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "auto uses fused_encoder for multi-band data or when EN is enabled.",
     )
     parser.add_argument("--sam-model-type", choices=("vit_b", "vit_l", "vit_h"), default="vit_b")
+    parser.add_argument('--proposal-mode',choices=('ordinal','heatmap'),default=None,
+        help='Default ordinal; inferred from a heatmap checkpoint when omitted.')
+    parser.add_argument('--heatmap-loss',choices=('soft_bce','focal'),default='soft_bce')
+    parser.add_argument('--image-fusion','--heatmap-image-fusion',dest='heatmap_image_fusion',
+        action=argparse.BooleanOptionalAction,default=None,
+        help='Fuse shallow image features into the SAM source decoder for ordinal or heatmap proposals; inferred from checkpoints when omitted.')
+    parser.add_argument('--heatmap-sigma-mode',choices=('fixed','psf-ee'),default='fixed')
+    parser.add_argument('--heatmap-sigma',type=float,default=1.5)
+    parser.add_argument('--heatmap-sigma-min',type=float,default=2/3)
+    parser.add_argument('--heatmap-sigma-max',type=float,default=8/3)
+    parser.add_argument('--heatmap-boundary-tolerance',type=float,default=.05)
+    parser.add_argument('--heatmap-psf-ee-root',default='')
+    parser.add_argument('--offset-center-size',type=int,default=5)
+    parser.add_argument('--offset-loss-weight',type=float,default=1.)
     parser.add_argument(
         "--sam-checkpoint",
         default=None,
@@ -1113,7 +1133,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--confidence-score",
-        choices=("cellect", "raw", "ordinal_prob", "ordinal_expectation"),
+        choices=("cellect", "raw", "ordinal_prob", "ordinal_expectation", "heatmap"),
         default="cellect",
         help="Score used for center detection. cellect applies DK1 smoothing plus kernel_size=3 local-max logic from CELLECT.",
     )
@@ -1527,6 +1547,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
+    if (args.hsc_zarr_root or args.space_zarr_root) and (args.data_format!='zarr' or not args.zarr_random_image_batches):
+        raise ValueError('--hsc-zarr-root/--space-zarr-root require --data-format zarr --zarr-random-image-batches')
     if args.gradient_debug_probes:
         args.gradient_debug = True
     if args.adam_state_log and args.adam_state_log_interval < 1:
@@ -1579,6 +1601,37 @@ def main() -> None:
         raise ValueError("--seg-classes must be >= 2")
     if int(args.shape_center_size) <= 0 or int(args.shape_center_size) % 2 != 1:
         raise ValueError("--shape-center-size must be a positive odd integer, normally 3 or 5")
+    inferred_proposal={'proposal_mode':'ordinal','heatmap_image_fusion':False}
+    if args.checkpoint:
+        from sam_backbone.heatmap import proposal_kwargs_from_state_dict
+        saved=torch.load(_expand_path(args.checkpoint),map_location='cpu',weights_only=False)
+        inferred_proposal=proposal_kwargs_from_state_dict(saved.get('model',saved))
+        saved_args=saved.get('args',{})
+        import sys
+        for name in ('heatmap_loss','heatmap_sigma_mode','heatmap_sigma','heatmap_sigma_min',
+                     'heatmap_sigma_max','heatmap_boundary_tolerance','heatmap_psf_ee_root',
+                     'offset_center_size','offset_loss_weight'):
+            flag='--'+name.replace('_','-')
+            if name in saved_args and not any(t==flag or t.startswith(flag+'=') for t in sys.argv[1:]):
+                setattr(args,name,saved_args[name])
+        del saved
+    if args.proposal_mode is None:args.proposal_mode=inferred_proposal['proposal_mode']
+    if args.heatmap_image_fusion is None:args.heatmap_image_fusion=inferred_proposal['heatmap_image_fusion']
+    if args.proposal_mode=='heatmap':
+        if args.model_variant!='sam_per_band' or args.data_format!='zarr':
+            raise ValueError('Heatmap proposal currently requires sam_per_band and Zarr sparse GT')
+        from sam_backbone.heatmap import HeatmapConfig
+        HeatmapConfig(sigma=args.heatmap_sigma,boundary_tolerance=args.heatmap_boundary_tolerance,
+            offset_size=args.offset_center_size,shape_size=args.shape_center_size)
+        if not 0<args.heatmap_sigma_min<=args.heatmap_sigma_max:
+            raise ValueError('Invalid heatmap sigma clipping bounds')
+        args.confidence_threshold=.5
+        args.confidence_score='heatmap'
+        args.nms_radius=1
+        args.use_ordinal_expectation=False
+        args.center_loss_weight=0.
+        args.small_shape_loss_weight=0.
+        args.confidence_loss_mode='heatmap_'+args.heatmap_loss
     distributed, rank, world_size, local_rank, device, backend = _setup_distributed(args)
     is_main = _is_main(rank)
     run = None
@@ -1623,8 +1676,7 @@ def main() -> None:
         if list(args.bands) == ["all"]:
             if args.data_format != "zarr" or not args.zarr_random_image_batches:
                 raise ValueError("--bands all requires image-level Zarr")
-            from preprocessing.make_zarr_patch_splits import scan_stores
-            args.bands = sorted({s.band for s in scan_stores(root, [], [])})
+            args.bands = discover_zarr_image_bands(root,hsc_root=args.hsc_zarr_root,space_root=args.space_zarr_root)
             if not args.bands:
                 raise RuntimeError("No completed image-level stores found")
             if is_main:
@@ -1633,8 +1685,11 @@ def main() -> None:
             if reference_dir is not None or cutout_dir is not None or band_reference_root is not None:
                 raise ValueError("--reference-dir/--cutout-dir/--band-reference-root are legacy-only options")
             if bool(args.zarr_random_image_batches):
-                records = discover_zarr_image_records(root, bands=args.bands, max_records=discover_max_records)
+                records = discover_zarr_image_records(root, bands=args.bands, max_records=discover_max_records,
+                    hsc_root=args.hsc_zarr_root,space_root=args.space_zarr_root)
                 if is_main:
+                    print('Zarr inputs: '+json.dumps({k:str(v) for k,v in zarr_image_input_roots(
+                        root,hsc_root=args.hsc_zarr_root,space_root=args.space_zarr_root).items()}),flush=True)
                     print(
                         f"Using {len(records)} image-level Zarr records for SAM training; "
                         f"batch-size={args.batch_size} counts images."
@@ -1768,6 +1823,17 @@ def main() -> None:
             print(f"WARNING: fixed validation tile(s) not found and cannot be forced into val: {missing_fixed_val}")
         if args.mode == "eval":
             val_records = records
+        if args.proposal_mode=='heatmap' and args.heatmap_sigma_mode=='psf-ee':
+            from preprocessing.utils.heatmap_sigma import resolve_sigma
+            from astro_train_zarr_data import _parse_zarr_uri
+            stores={_parse_zarr_uri(rec.image_paths[0])[0] for rec in train_records+val_records}
+            for store in sorted(stores):
+                meta=json.loads((store/'.zattrs').read_text())
+                calibration={k:meta.get(k) for k in ('confidence_config','image_fits','reference_fits','patch','dataset')}
+                for band in meta['bands']:
+                    resolve_sigma(json.dumps(calibration,sort_keys=True),band,args.heatmap_psf_ee_root,
+                        args.heatmap_sigma_min,args.heatmap_sigma_max)
+            if is_main:print(f'Validated PSF-EE heatmap calibration for {len(stores)} stores',flush=True)
 
         center_radius_px = (
             float(args.match_radius)
@@ -1781,6 +1847,11 @@ def main() -> None:
             confidence_outer_weight=float(args.confidence_loss_weight),
             confidence_pos_weight=float(args.confidence_pos_weight),
             confidence_loss_mode=str(args.confidence_loss_mode),
+            heatmap_loss=args.heatmap_loss,heatmap_sigma=args.heatmap_sigma,
+            heatmap_sigma_mode=args.heatmap_sigma_mode,heatmap_sigma_min=args.heatmap_sigma_min,
+            heatmap_sigma_max=args.heatmap_sigma_max,heatmap_boundary_tolerance=args.heatmap_boundary_tolerance,
+            heatmap_psf_ee_root=args.heatmap_psf_ee_root,offset_center_size=args.offset_center_size,
+            offset_loss_weight=args.offset_loss_weight,
             confidence_ce_weights=tuple(float(v) for v in args.confidence_ce_weights),
             style_router_loss_weight=(
                 float(args.style_router_loss_weight) if bool(args.sam_encoder_style_prompt) else 0.0
@@ -2051,6 +2122,8 @@ def main() -> None:
         args.model_variant = model_variant
         if bool(args.sam_prompt_ir) and model_variant!='sam_per_band':
             raise ValueError('--sam-prompt-ir requires --model-variant sam_per_band')
+        if bool(args.heatmap_image_fusion) and model_variant!='sam_per_band':
+            raise ValueError('--image-fusion requires --model-variant sam_per_band')
         if model_variant == "sam_per_band":
             args.seg_loss_weight = 0.0
             args.disable_ex_loss = True
@@ -2150,6 +2223,8 @@ def main() -> None:
             )
             model = build_sam_cellect2d(
                 args.sam_model_type,
+                proposal_mode=args.proposal_mode,
+                heatmap_image_fusion=args.heatmap_image_fusion,
                 checkpoint=_expand_path(args.sam_checkpoint) if args.sam_checkpoint else None,
                 num_bands=len(args.bands),
                 image_size=512,
@@ -2219,9 +2294,12 @@ def main() -> None:
             state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
             if model_variant == "sam_per_band" and (
                 bool(args.sam_decoder_film) or bool(args.sam_encoder_style_prompt) or bool(args.sam_prompt_ir)
+                or bool(args.heatmap_image_fusion)
             ):
                 incompatible = model.load_state_dict(state, strict=False)
                 allowed_missing_prefixes = []
+                if args.heatmap_image_fusion:
+                    allowed_missing_prefixes.append('decoder.heatmap_image_pyramid.')
                 if bool(args.sam_prompt_ir):
                     allowed_missing_prefixes.append('decoder.prompt_ir.')
                 if bool(args.sam_decoder_film):
@@ -2411,6 +2489,8 @@ def main() -> None:
 
         metadata = {
             "args": vars(args),
+            'zarr_input_roots':({k:str(v) for k,v in zarr_image_input_roots(root,
+                hsc_root=args.hsc_zarr_root,space_root=args.space_zarr_root).items()} if args.data_format=='zarr' else None),
             "loss_weights": asdict(weights),
             "mask_inactive_optimizer_policy": "clear_prompt_and_mask_grads_to_none_before_step",
             "num_records": len(records),
@@ -2636,6 +2716,7 @@ def main() -> None:
                 confidence_outer_weight=0.0,
                 shape_outer_weight=0.0,
                 center_position=0.0,
+                offset_loss_weight=0.0,
                 small_shape_loss_weight=0.0,
                 style_router_loss_weight=0.0,
                 detach_mask_prompt_shapes=True,
@@ -2653,6 +2734,8 @@ def main() -> None:
                 filtered["shape"] = float(metrics["shape"])
             if float(active_weights.center_position) > 0.0 and "center" in metrics:
                 filtered["center"] = float(metrics["center"])
+            if args.proposal_mode=='heatmap' and active_weights.offset_loss_weight>0 and 'center' in metrics:
+                filtered['offset']=float(metrics.get('offset',metrics['center']))
             if float(active_weights.small_shape_loss_weight) > 0.0 and "small_shape" in metrics:
                 filtered["small_shape"] = float(metrics["small_shape"])
             if float(active_weights.style_router_loss_weight) > 0.0 and "style_router" in metrics:
@@ -2848,6 +2931,7 @@ def main() -> None:
                         "confidence": float(epoch_weights.confidence_outer_weight),
                         "shape": float(epoch_weights.shape_outer_weight),
                         "center": float(epoch_weights.center_position),
+                        "offset": float(epoch_weights.offset_loss_weight) if args.proposal_mode=='heatmap' else 0.0,
                         "small_shape": float(epoch_weights.small_shape_loss_weight),
                     },
                 }
@@ -2894,6 +2978,7 @@ def main() -> None:
                         "proposal/confidence_loss_weight": float(epoch_weights.confidence_outer_weight),
                         "proposal/shape_loss_weight": float(epoch_weights.shape_outer_weight),
                         "proposal/center_loss_weight": float(epoch_weights.center_position),
+                        "proposal/offset_loss_weight": float(epoch_weights.offset_loss_weight) if args.proposal_mode=='heatmap' else 0.0,
                         "proposal/small_shape_loss_weight": float(epoch_weights.small_shape_loss_weight),
                     }
                     epoch_payload["prompt/gt_ratio"] = 1.0 - float(epoch_payload["prompt/predicted_ratio"])

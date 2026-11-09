@@ -894,6 +894,7 @@ def load_cellect_model(
     )
     film_from_state = isinstance(state, dict) and any("decoder.denoised_film." in str(k) for k in state)
     from sam_backbone.prompt_ir import prompt_ir_kwargs_from_state_dict
+    from sam_backbone.heatmap import proposal_kwargs_from_state_dict
     prompt_ir_kwargs=prompt_ir_kwargs_from_state_dict(state)
     base_channels = int(top.get("base_channels") or cfg.get("base_channels", 32))
     if dynamic_image_size is None:
@@ -924,6 +925,7 @@ def load_cellect_model(
         astro_preprocess_in_model=False,
         dynamic_image_size=bool(dynamic_image_size),
         **prompt_ir_kwargs,
+        **proposal_kwargs_from_state_dict(state),
     ).to(device)
     incompatible = model.load_state_dict(strip_module_prefix(state), strict=False)
     if incompatible.missing_keys or incompatible.unexpected_keys:
@@ -932,6 +934,8 @@ def load_cellect_model(
             flush=True,
         )
     model.eval()
+    if getattr(getattr(model,'decoder',None),'proposal_mode','ordinal')=='heatmap':
+        cfg.update(proposal_mode='heatmap',confidence_score='heatmap',confidence_threshold=.5,nms_radius=1)
     return model, cfg
 
 
@@ -996,6 +1000,7 @@ def detection_rows(
         center_refinement_radius=int(center_refinement_radius),
     )[0]
     xy = np.asarray(found["xy"], dtype=np.float32).reshape(-1, 2)
+    anchors=np.asarray(found.get('anchor_xy',xy),dtype=np.float32).reshape(-1,2)
     scores = np.asarray(found["score"], dtype=np.float32).reshape(-1)
     shape = detect_outputs["shape"][0].detach().float().cpu().numpy()
     rows = []
@@ -1006,14 +1011,16 @@ def detection_rows(
             continue
         if valid is not None and not valid[yi,xi]:
             continue
+        sx,sy=map(lambda v:int(round(float(v))),anchors[idx])
+        if not (0<=sx<width and 0<=sy<height):continue
         rows.append(
             {
                 "x": float(x),
                 "y": float(y),
                 "score": float(scores[idx]) if idx < len(scores) else float("nan"),
-                "major": float(shape[0, yi, xi]),
-                "minor": float(shape[1, yi, xi]),
-                "theta": float(shape[2, yi, xi]) if shape.shape[0] > 2 else 0.0,
+                "major": float(shape[0, sy, sx]),
+                "minor": float(shape[1, sy, sx]),
+                "theta": float(shape[2, sy, sx]) if shape.shape[0] > 2 else 0.0,
             }
         )
     return rows

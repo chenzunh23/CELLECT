@@ -143,6 +143,15 @@ class LossWeights:
     mask_stability: float = 0.1
     mask_unmatched_prompt: float = 0.2
     center_only_shape_factor: float = 0.2
+    heatmap_loss: str = 'soft_bce'
+    heatmap_sigma: float = 1.5
+    heatmap_sigma_mode: str = 'fixed'
+    heatmap_sigma_min: float = 2/3
+    heatmap_sigma_max: float = 8/3
+    heatmap_boundary_tolerance: float = .05
+    heatmap_psf_ee_root: str = ''
+    offset_center_size: int = 5
+    offset_loss_weight: float = 1.
     mask_min_area_px: float = 15.0
     mask_area_ratio_lower: float = 0.05
     mask_area_ratio_upper: float = 2.0
@@ -524,6 +533,9 @@ def dense_losses(
     center_radius_px: float,
     debug_timer: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Tensor]:
+    if outputs['confidence'].shape[1]==1 and 'offset' in outputs:
+        from sam_backbone.heatmap import dense_losses as heatmap_losses
+        return heatmap_losses(outputs,batch,weights)
     # Debug
     # torch.cuda.synchronize()
     # start_time = time.time()
@@ -749,6 +761,18 @@ def dense_losses_any(
     }
     if "band_shape_source_weights" in batch:
         flat_batch["shape_source_weights"] = _flatten_band_centers(batch["band_shape_source_weights"])
+    if 'offset' in outputs:
+        n,b=outputs['confidence'].shape[:2]
+        flat_batch.update(
+            ids=_flatten_band_centers(batch['band_ids']),
+            strict_centers=_flatten_band_centers(batch['band_strict_center_only_centers']),
+            strict_ids=_flatten_band_centers(batch['band_strict_center_only_ids']),
+            shape_source_ids=_flatten_band_centers(batch['band_shape_source_ids']),
+            pu=batch['band_pu_class_mask'].reshape(-1,*batch['band_pu_class_mask'].shape[2:]),
+            valid=batch['band_valid_mask'].reshape(-1,*batch['band_valid_mask'].shape[2:]),
+            image=batch['image'].reshape(n*b,-1,*batch['image'].shape[-2:]),
+            proposal_metadata=[meta for meta in batch.get('proposal_metadata',[[{}]*b for _ in range(n)]) for _ in range(b)],
+            band_names=[names[j] for names in batch['band_names'] for j in range(b)])
     if "seg_logits" in outputs:
         flat_batch["seg"] = batch["band_seg"].reshape(-1, *batch["band_seg"].shape[2:])  # type: ignore[union-attr]
         flat_batch["seg_loss_weight"] = batch["band_seg_loss_weight"].reshape(
@@ -960,6 +984,13 @@ def _compute_detection_peak_maps(
     use_ordinal_expectation: bool = False,
     debug_ordinal_expectation: bool = False,
 ) -> Tuple[Tensor, Tensor, Dict[str, object]]:
+    if outputs['confidence'].shape[1]==1 and 'offset' in outputs:
+        score=outputs['confidence'][:,0].float().sigmoid()
+        effective=float(threshold) if 0<float(threshold)<=1 else .5
+        pooled=F.max_pool2d(score[:,None],3,1,1)[:,0]
+        peaks=(score>effective)&(score==pooled)
+        return score,peaks,dict(center_score=score,final_peaks=peaks,
+            detection_score_mode='heatmap',effective_threshold=effective,foreground_gate_active=False)
     detection_score_mode = "ordinal_expectation" if use_ordinal_expectation else str(confidence_score)
     effective_threshold = float(ORDINAL_EXPECTATION_THRESHOLD if use_ordinal_expectation else threshold)
     ordinal_expectation_score: Optional[Tensor] = None
@@ -1878,6 +1909,9 @@ def detect_centers_tensors(
     merge still leaves one centroid per seeded, connected level-4 region.
     """
 
+    if outputs['confidence'].shape[1]==1 and 'offset' in outputs:
+        from sam_backbone.heatmap import decode
+        return [r['xy'] for r in decode(outputs,threshold if 0<threshold<=1 else .5,1)]
     conf, peaks, _ = _compute_detection_peak_maps(
         outputs,
         threshold=threshold,
@@ -1954,6 +1988,10 @@ def detect_centers_with_scores(
 ) -> List[Dict[str, np.ndarray]]:
     """Detect centers and return ``xy`` plus scalar confidence scores."""
 
+    if outputs['confidence'].shape[1]==1 and 'offset' in outputs:
+        from sam_backbone.heatmap import decode
+        return [{k:v.detach().cpu().numpy().astype(np.float32) for k,v in row.items()}
+                for row in decode(outputs,threshold if 0<threshold<=1 else .5,1)]
     conf, peaks, _ = _compute_detection_peak_maps(
         outputs,
         threshold=threshold,
@@ -2855,6 +2893,7 @@ def run_epoch(
         "confidence": 0.0,
         "shape": 0.0,
         "center": 0.0,
+        "offset": 0.0,
         "small_shape": 0.0,
         "style_router": 0.0,
         "triplet": 0.0,
@@ -3192,6 +3231,8 @@ def run_epoch(
         sums["confidence"] += float(losses["confidence"].detach()) * batch_size
         sums["shape"] += float(losses["shape"].detach()) * batch_size
         sums["center"] += float(losses["center"].detach()) * batch_size
+        if "offset" in losses:
+            sums["offset"] += float(losses["offset"].detach()) * batch_size
         sums["small_shape"] += float(losses["small_shape"].detach()) * batch_size
         sums["style_router"] += float(losses["style_router"].detach()) * batch_size
         sums["triplet"] += float(triplet.detach()) * batch_size
@@ -3235,6 +3276,8 @@ def run_epoch(
                 local_metrics["loss/shape"] = float(losses["shape"].detach())
             if float(weights.center_position) > 0.0:
                 local_metrics["loss/center"] = float(losses["center"].detach())
+            if 'offset' in outputs and weights.offset_loss_weight>0:
+                local_metrics['loss/offset']=float(losses['offset'].detach())
             if float(weights.small_shape_loss_weight) > 0.0:
                 local_metrics["loss/small_shape"] = float(losses["small_shape"].detach())
             if float(weights.style_router_loss_weight) > 0.0:
@@ -3373,6 +3416,7 @@ def validate_epoch(
         "confidence": 0.0,
         "shape": 0.0,
         "center": 0.0,
+        "offset": 0.0,
         "small_shape": 0.0,
         "style_router": 0.0,
         "triplet": 0.0,
@@ -3499,6 +3543,8 @@ def validate_epoch(
         sums["confidence"] += float(losses["confidence"].detach()) * batch_size
         sums["shape"] += float(losses["shape"].detach()) * batch_size
         sums["center"] += float(losses["center"].detach()) * batch_size
+        if "offset" in losses:
+            sums["offset"] += float(losses["offset"].detach()) * batch_size
         sums["small_shape"] += float(losses["small_shape"].detach()) * batch_size
         sums["style_router"] += float(losses["style_router"].detach()) * batch_size
         sums["triplet"] += float(triplet.detach()) * batch_size

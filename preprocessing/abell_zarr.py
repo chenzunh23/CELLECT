@@ -105,19 +105,22 @@ def uncover_labels_for_window(args, reference, rheader, catalog, gaia, backgroun
             progress(f'[abell-uncover] {tag} no premeasured compact catalog; try verified sky catalog')
     blue_catalog=getattr(args,'uncover_blue_catalog',None)
     if candidates is None and blue_catalog:
-        from .utils.uncover_labels import blue_candidates_on_window
+        from .utils.uncover_labels import blue_candidates_on_window,direct_blue_detection
         compact_path=Path(blue_catalog)
         candidates=blue_candidates_on_window(compact_path,header,reference.shape)
         candidates['fixed_psf_core_snr']=np.full(len(candidates),np.nan)
         progress(f'[abell-uncover] {tag} stage=verified_BLUE_projection candidates={len(candidates)} catalog={compact_path}')
-        if int(band[1:4])>212 and len(candidates):
+        needs_psf=np.asarray(candidates['blue_candidate'],bool)&~direct_blue_detection(candidates,band)
+        progress(f'[abell-uncover] {tag} BLUE_band_gate direct_current_band={int((~needs_psf).sum())} '
+            f'fixed_PSF_required={int(needs_psf.sum())} threshold={getattr(args,"uncover_compact_red_snr",4.)}')
+        if needs_psf.any():
             from .utils.jwst_star_psf import empirical_core_rms,calibrate_core_noise,measure_fixed_psf_catalog
             progress(f'[abell-uncover] {tag} stage=BLUE_current_band_fixed_PSF')
             sky=np.asarray(background,bool)&(segments==0)&np.isfinite(reference)
             rms=empirical_core_rms(reference,sky)
             noise_factor,noise_audit=calibrate_core_noise(reference,rms,band,sky)
             snr,measurements=measure_fixed_psf_catalog(reference,rms,band,candidates,
-                noise_factor=noise_factor,
+                noise_factor=noise_factor,selection=needs_psf,
                 progress=lambda stage,n:progress(f'[abell-uncover] {tag} {stage} n={n}'))
             candidates['fixed_psf_core_snr']=snr
             measurements.write(Path(audit)/(prefix+'_blue_psf_measurements.fits'),overwrite=True)

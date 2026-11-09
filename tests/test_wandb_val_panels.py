@@ -31,6 +31,27 @@ def sections(spec):return {s['name']:s for s in spec['section']['panelBankConfig
 
 
 class PanelMigrationTests(unittest.TestCase):
+    def test_offset_only_repair_preserves_history_layout_and_has_correct_axes(self):
+        source=layout([panel('val/detection/F444W/recall')])
+        source['section']['panelBankConfig']['sections'].append(dict(name='adam',panels=[panel('adam/test')]))
+        metrics={'train/epoch/offset','val/epoch/offset','train/iteration/loss/offset','val/epoch/loss'}
+        out,report=wb.repair_offset_spec(source,metrics)
+        self.assertEqual(out['section']['panelBankConfig']['sections'][:2],source['section']['panelBankConfig']['sections'])
+        for key in ('runSets','settings','workspaceSettings'):
+            self.assertEqual(out['section'][key],source['section'][key])
+        charts=sections(out)['center_offset']['panels']
+        self.assertEqual(report['added_offset_charts'],3)
+        for chart in charts:
+            metric=chart['config']['metrics'][0]
+            self.assertEqual(chart['config']['xAxis'],'iteration' if '/iteration/' in metric else 'epoch')
+        again,report=wb.repair_offset_spec(out,metrics)
+        self.assertEqual(again,out);self.assertFalse(report['changed'])
+
+    def test_offset_repair_does_not_duplicate_existing_custom_charts(self):
+        source=layout([panel('val/epoch/offset','my-offset')])
+        out,report=wb.repair_offset_spec(source,{'val/epoch/offset'})
+        self.assertEqual(out,source);self.assertFalse(report['changed'])
+
     def test_run_metadata_is_batched_when_sdk_supports_it(self):
         calls=[]
         def runs(path, *, lazy=True, **kwargs):
