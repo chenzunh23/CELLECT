@@ -10,16 +10,19 @@ COMPONENT_WEIGHTS = {
     'dice': 'mask_dice', 'bce': 'mask_bce', 'centroid': 'mask_centroid',
     'outside': 'mask_outside', 'area': 'mask_min_area', 'max_area': 'mask_max_area',
     'pred_iou': 'mask_pred_iou', 'stability': 'mask_stability',
+    'moment': 'mask_moment',
 }
 GROUP_STAT_KEYS = tuple(f'_mask_group_{group}_{key}'
     for group in ('gt', 'pred')
-    for key in (*COMPONENT_WEIGHTS, 'dice_weight', 'bce_weight', 'geom_weight',
-                'count', 'supervised_count', 'bce_count'))
+    for key in (*COMPONENT_WEIGHTS, 'dice_weight', 'bce_weight', 'geom_weight', 'moment_weight',
+                'count', 'supervised_count', 'bce_count', 'moment_count',
+                'catalog_moment_count', 'instance_moment_count'))
 
 
 @torch.no_grad()
 def group_statistics(selected, kinds, prompt_weights, labelled, bce_eligible,
-                     quality, supervision_scale):
+                     quality, supervision_scale, *, moment_active=None):
+    if moment_active is None:moment_active=torch.zeros_like(labelled)
     values = []
     for group in ('gt', 'pred'):
         member = (kinds != 1) if group == 'gt' else (kinds == 1)
@@ -27,14 +30,18 @@ def group_statistics(selected, kinds, prompt_weights, labelled, bce_eligible,
         dw, bw = weight * labelled, weight * bce_eligible
         for component in COMPONENT_WEIGHTS:
             w = dw if component in ('dice', 'pred_iou') else bw if component == 'bce' else weight
+            if component=='moment':w=weight*moment_active*torch.where(labelled,quality,torch.ones_like(quality))
             if component in ('dice', 'bce'):
                 w = w * quality * supervision_scale
             elif component == 'pred_iou':
                 w = w * quality
-            values.append((selected[component].detach().double() * w).sum())
-        values.extend([dw.sum(), bw.sum(), weight.sum(),
+            value=selected.get(component,torch.zeros_like(prompt_weights))
+            values.append((value.detach().double() * w).sum())
+        values.extend([dw.sum(), bw.sum(), weight.sum(), (weight*moment_active).sum(),
                        ((weight > 0)).sum(), ((weight > 0) & labelled).sum(),
-                       ((weight > 0) & bce_eligible).sum()])
+                       ((weight > 0) & bce_eligible).sum(), ((weight>0)&moment_active).sum(),
+                       ((weight>0)&moment_active&~labelled).sum(),
+                       ((weight>0)&moment_active&labelled).sum()])
     return torch.stack(values)
 
 
@@ -46,13 +53,15 @@ def finish_group_metrics(metrics, weights):
         prefix = f'_mask_group_{group}_'
         total = 0.
         for component, attr in COMPONENT_WEIGHTS.items():
-            denom_key = 'dice_weight' if component in ('dice', 'pred_iou') else 'bce_weight' if component == 'bce' else 'geom_weight'
+            denom_key = ('dice_weight' if component in ('dice', 'pred_iou') else
+                         'bce_weight' if component == 'bce' else 'moment_weight' if component=='moment' else 'geom_weight')
             denominator = raw[prefix + denom_key]
             mean = raw[prefix + component] / denominator if denominator > 0 else 0.
             metrics[f'mask_{group}_mean_{component}'] = mean
             total += float(getattr(weights, attr, 0.)) * mean
         metrics[f'mask_{group}_mean_total'] = total  # Before outer mask weight.
-        for key in ('count', 'supervised_count', 'bce_count', 'dice_weight', 'bce_weight', 'geom_weight'):
+        for key in ('count', 'supervised_count', 'bce_count', 'dice_weight', 'bce_weight', 'geom_weight',
+                    'moment_weight', 'moment_count', 'catalog_moment_count', 'instance_moment_count'):
             metrics[f'mask_{group}_{key}'] = raw[prefix + key]
     count = metrics['mask_gt_count'] + metrics['mask_pred_count']
     metrics['mask_actual_pred_fraction'] = metrics['mask_pred_count']/count if count else 0.

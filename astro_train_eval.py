@@ -1318,7 +1318,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Additional BCE/Dice multiplier; instance reliability (normally 0.25) is retained.")
     parser.add_argument("--mask-outside-kron-scale", type=float, default=1.5,
                         help="Kron semi-axis multiplier for outside penalty only; does not resize prompt boxes.")
-    parser.add_argument("--mask-centroid-weight", type=float, default=0.2)
+    parser.add_argument("--mask-centroid-weight", type=float, default=0.03)
+    parser.add_argument('--mask-moment-weight',type=float,default=.3,
+                        help='Normalized central-moment ellipticity loss; HSC clean/isolated-bright weak prior, labelled JWST GT moments. 0 disables.')
+    parser.add_argument('--mask-moment-match-radius',type=float,default=3.,
+                        help='Native-pixel radius for unique predicted-prompt/catalog association; GT prompts use exact IDs.')
+    parser.add_argument('--mask-hsc-area-ratio-lower',type=float,default=.25,
+                        help='HSC-only lower mask/Kron area soft bound; other datasets retain --mask-area-ratio-lower.')
+    parser.add_argument('--mask-hsc-area-ratio-upper',type=float,default=2.,
+                        help='HSC-only upper mask/Kron area soft bound.')
     parser.add_argument("--mask-outside-weight", type=float, default=0.5)
     parser.add_argument("--mask-min-area-weight", type=float, default=0.1)
     parser.add_argument("--mask-max-area-weight", type=float, default=0.1)
@@ -1547,6 +1555,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
+    if not np.isfinite(args.mask_moment_weight) or args.mask_moment_weight<0:
+        raise ValueError('--mask-moment-weight must be finite and nonnegative')
+    if not np.isfinite(args.mask_moment_match_radius) or args.mask_moment_match_radius<=0:
+        raise ValueError('--mask-moment-match-radius must be positive')
+    if not (0<args.mask_hsc_area_ratio_lower<args.mask_hsc_area_ratio_upper
+            and np.isfinite(args.mask_hsc_area_ratio_upper)):
+        raise ValueError('HSC mask area bounds require 0 < lower < upper < infinity')
     if (args.hsc_zarr_root or args.space_zarr_root) and (args.data_format!='zarr' or not args.zarr_random_image_batches):
         raise ValueError('--hsc-zarr-root/--space-zarr-root require --data-format zarr --zarr-random-image-batches')
     if args.gradient_debug_probes:
@@ -1876,6 +1891,10 @@ def main() -> None:
             mask_supervision_weight=float(args.mask_supervision_weight),
             mask_outside_kron_scale=float(args.mask_outside_kron_scale),
             mask_centroid=float(args.mask_centroid_weight),
+            mask_moment=float(args.mask_moment_weight),
+            mask_moment_match_radius=float(args.mask_moment_match_radius),
+            mask_hsc_area_ratio_lower=float(args.mask_hsc_area_ratio_lower),
+            mask_hsc_area_ratio_upper=float(args.mask_hsc_area_ratio_upper),
             mask_outside=float(args.mask_outside_weight),
             mask_min_area=float(args.mask_min_area_weight),
             mask_max_area=float(args.mask_max_area_weight),

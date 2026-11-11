@@ -112,6 +112,8 @@ class PreprocessingPipeline:
         shape_classes = labels.source_class[shape_mask].astype(np.uint8, copy=False)
         shape_ids = np.asarray(ids[shape_mask], dtype=np.int64)
         shape_offsets = np.asarray([[0, len(shape_centers)]], dtype=np.int64)
+        from .utils.mask_moments import moment_eligibility
+        moment_eligible=moment_eligibility(table,labels.source_class,geom,reasons=labels.reason)
         return {
             "source_centers": centers,
             "source_ids": center_ids,
@@ -124,6 +126,7 @@ class PreprocessingPipeline:
             "shape_source_classes": shape_classes,
             "shape_source_ids": shape_ids,
             "shape_source_offsets": shape_offsets,
+            "shape_source_moment_eligible": moment_eligible[shape_mask],
         }
 
     def run_patch_band(self, inputs: PatchBandInputs) -> Path:
@@ -280,6 +283,7 @@ class PreprocessingPipeline:
                 "refit_csv": str(inputs.refit_csv) if inputs.refit_csv is not None else "",
                 "source_export_mode": "training_v3",
                 "hsc_refit_center_policy": HSC_REFIT_CENTER_POLICY,
+                "mask_moment_policy": "clean_or_isolated_bright_weak_v1",
                 "dataset_source": str(inputs.dataset_source),
                 "band": str(inputs.band or ""),
                 "patch": str(inputs.patch or ""),

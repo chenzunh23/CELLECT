@@ -135,7 +135,11 @@ class LossWeights:
     mask_bce: float = 1.0
     mask_supervision_weight: float = 0.2
     mask_outside_kron_scale: float = 1.5
-    mask_centroid: float = 0.2
+    mask_centroid: float = 0.03
+    mask_moment: float = 0.3
+    mask_moment_match_radius: float = 3.0
+    mask_hsc_area_ratio_lower: float = 0.25
+    mask_hsc_area_ratio_upper: float = 2.0
     mask_outside: float = 0.5
     mask_min_area: float = 0.1
     mask_max_area: float = 0.1
@@ -178,6 +182,7 @@ def active_mask_loss_keys(weights: LossWeights) -> Tuple[str, ...]:
         ("dice", float(weights.mask_dice)),
         ("bce", float(weights.mask_bce)),
         ("centroid", float(weights.mask_centroid)),
+        ("moment", float(weights.mask_moment)),
         ("outside", float(weights.mask_outside)),
         ("area", float(weights.mask_min_area)),
         ("max_area", float(weights.mask_max_area)),
@@ -2905,6 +2910,7 @@ def run_epoch(
         "mask_dice": 0.0,
         "mask_bce": 0.0,
         "mask_centroid": 0.0,
+        "mask_moment": 0.0,
         "mask_outside": 0.0,
         "mask_area": 0.0,
         "mask_max_area": 0.0,
@@ -2993,6 +2999,7 @@ def run_epoch(
             "dice",
             "bce",
             "centroid",
+            "moment",
             "outside",
             "area",
             "max_area",
@@ -3244,6 +3251,7 @@ def run_epoch(
         sums["mask_dice"] += float(mask_losses["dice"].detach()) * batch_size
         sums["mask_bce"] += float(mask_losses["bce"].detach()) * batch_size
         sums["mask_centroid"] += float(mask_losses["centroid"].detach()) * batch_size
+        sums["mask_moment"] += float(mask_losses["moment"].detach()) * batch_size
         sums["mask_outside"] += float(mask_losses["outside"].detach()) * batch_size
         sums["mask_area"] += float(mask_losses["area"].detach()) * batch_size
         sums["mask_max_area"] += float(mask_losses["max_area"].detach()) * batch_size
@@ -3428,6 +3436,7 @@ def validate_epoch(
         "mask_dice": 0.0,
         "mask_bce": 0.0,
         "mask_centroid": 0.0,
+        "mask_moment": 0.0,
         "mask_outside": 0.0,
         "mask_area": 0.0,
         "mask_max_area": 0.0,
@@ -3556,6 +3565,7 @@ def validate_epoch(
         sums["mask_dice"] += float(mask_losses["dice"].detach()) * batch_size
         sums["mask_bce"] += float(mask_losses["bce"].detach()) * batch_size
         sums["mask_centroid"] += float(mask_losses["centroid"].detach()) * batch_size
+        sums["mask_moment"] += float(mask_losses["moment"].detach()) * batch_size
         sums["mask_outside"] += float(mask_losses["outside"].detach()) * batch_size
         sums["mask_area"] += float(mask_losses["area"].detach()) * batch_size
         sums["mask_max_area"] += float(mask_losses["max_area"].detach()) * batch_size

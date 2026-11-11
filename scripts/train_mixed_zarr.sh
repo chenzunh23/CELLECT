@@ -83,7 +83,10 @@ common=(--mode "$MODE" --data-format zarr --root "$ROOT" --bands all --checkpoin
   --noncoadd-snr-annulus-r-out 15 --noncoadd-snr-annulus-exclude-radius 6
   --mask-loss-weight "${MASK_LOSS_WEIGHT:-5}" --mask-loss-warmup-epochs "${MASK_WARMUP_EPOCHS:-3}"
   --mask-loss-interval 1 --mask-loss-interval-scale
-  --mask-centroid-weight 0.4 --mask-outside-weight 1
+  --mask-centroid-weight "${MASK_CENTROID_WEIGHT:-0.03}" --mask-outside-weight 1
+  --mask-moment-weight "${MASK_MOMENT_WEIGHT:-0.3}"
+  --mask-moment-match-radius "${MASK_MOMENT_MATCH_RADIUS:-3}"
+  --mask-hsc-area-ratio-lower 0.25 --mask-hsc-area-ratio-upper 2
   --mask-min-area-weight 1 --mask-max-area-weight 0.1
   --mask-pred-iou-weight "${MASK_PRED_IOU_WEIGHT:-0.2}" --mask-stability-weight 0
   --mask-unmatched-prompt-weight 0.2 --center-only-shape-factor 0.2 --mask-pred-iou-thresh 0.8

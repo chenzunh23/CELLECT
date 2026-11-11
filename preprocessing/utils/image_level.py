@@ -621,7 +621,8 @@ def _strict_centers_in_tile(labels: PatchLabels, spec, origin: tuple[int, int], 
     return result
 
 
-def _tile_targets(labels: PatchLabels, spec, origin: tuple[int, int], *, confidence=None) -> dict[str, np.ndarray]:
+def _tile_targets(labels: PatchLabels, spec, origin: tuple[int, int], *, confidence=None,
+                  moment_eligible=None) -> dict[str, np.ndarray]:
     size = int(spec.size)
     dense = _crop(labels.dense, spec.x0, spec.y0, origin, size).astype(np.uint8, copy=False)
     tile_x0 = float(spec.x0) - float(origin[0])
@@ -703,6 +704,8 @@ def _tile_targets(labels: PatchLabels, spec, origin: tuple[int, int], *, confide
         "shape_classes": shape_classes,
         "shape_ids": shape_ids,
         "shape_weights": area_weights[source_idx],
+        "shape_moment_eligible": ((labels.label_classes == int(SourceClass.CLEAN))
+                                   if moment_eligible is None else moment_eligible)[source_idx],
     }
     if (labels.segmentation_ids is None) != (labels.segmentation_weight is None):
         raise ValueError("segmentation IDs and weights must be supplied together")

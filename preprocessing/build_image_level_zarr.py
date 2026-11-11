@@ -421,6 +421,21 @@ def write_classified_patch(task: StoreTask, image: np.ndarray, labels: PatchLabe
     shape_classes_flat: list[np.ndarray] = []
     shape_ids_flat: list[np.ndarray] = []
     shape_weights_flat: list[np.ndarray] = []
+    shape_moment_flat: list[np.ndarray] = []
+    from preprocessing.utils.mask_moments import moment_eligibility, jwst_moment_snr, POLICY, JWST_POLICY
+    from preprocessing.utils.geometry import EllipseGeometry
+    moment_geometry=EllipseGeometry(labels.geom_x,labels.geom_y,labels.geom_major,labels.geom_minor,
+                                   labels.geom_theta,np.pi*labels.geom_major*labels.geom_minor)
+    hsc_moments = task.band.startswith(('HSC-', 'NB'))
+    moment_dataset = 'hsc' if hsc_moments else (provenance or {}).get('dataset', 'jwst')
+    moment_threshold = float((provenance or {}).get('snr_thresholds', {}).get('weak_below',
+                             labels.table.meta.get('mask_moment_weak_snr_threshold', 7.)))
+    moment_eligible=moment_eligibility(labels.table,labels.label_classes,moment_geometry,
+        dataset=moment_dataset,weak_snr_threshold=moment_threshold,band=task.band)
+    moment_policy = POLICY if hsc_moments else JWST_POLICY
+    moment_metadata = ({} if hsc_moments else dict(
+        mask_moment_weak_snr_threshold=moment_threshold,
+        mask_moment_snr_source=jwst_moment_snr(labels.table,band=task.band,count=len(labels.source_ids))[1]))
     shape_offsets = np.zeros((n, 2), dtype=np.int64)
     source_cursor = 0
     strict_cursor = 0
@@ -435,7 +450,7 @@ def write_classified_patch(task: StoreTask, image: np.ndarray, labels: PatchLabe
             raw_tile = _crop(image, spec.x0, spec.y0, origin, h)
             scaled_chw = _scale_image_chw(raw_tile, task)
         images[i, 0] = scaled_chw
-        target = _tile_targets(labels, spec, origin, confidence=confidence_config)
+        target = _tile_targets(labels, spec, origin, confidence=confidence_config, moment_eligible=moment_eligible)
         if valid_mask is not None:
             v=_crop(valid_mask,spec.x0,spec.y0,origin,h)
             context = v if input_valid_mask is None else _crop(input_valid_mask,spec.x0,spec.y0,origin,h)
@@ -457,7 +472,7 @@ def write_classified_patch(task: StoreTask, image: np.ndarray, labels: PatchLabe
             target['pu'][positive_fill]=int(DenseLabel.STRICT_CENTER_ONLY)
             if 'segmentation_weight' in target:target['segmentation_weight'][~v]=0
             for center_key,others in [('source_centers',['source_ids']),('strict_centers',['strict_ids']),
-                                      ('shape_centers',['shape_values','shape_classes','shape_ids','shape_weights'])]:
+                                      ('shape_centers',['shape_values','shape_classes','shape_ids','shape_weights','shape_moment_eligible'])]:
                 centers=target[center_key]
                 xy=np.clip(np.floor(centers+.5).astype(int),0,h-1)
                 center_valid = (context & domain) if center_key == 'strict_centers' else (v & context)
@@ -513,6 +528,7 @@ def write_classified_patch(task: StoreTask, image: np.ndarray, labels: PatchLabe
         shape_classes_flat.append(target["shape_classes"])
         shape_ids_flat.append(target["shape_ids"])
         shape_weights_flat.append(target["shape_weights"])
+        shape_moment_flat.append(target['shape_moment_eligible'])
         shape_cursor += len(target["shape_centers"])
         shape_offsets[i, 1] = shape_cursor
 
@@ -590,6 +606,8 @@ def write_classified_patch(task: StoreTask, image: np.ndarray, labels: PatchLabe
             **(provenance or {}),
             "confidence_config": confidence_config,
             "source_area_weight_policy": source_area_weight_policy(),
+            "mask_moment_policy": moment_policy,
+            **moment_metadata,
             "segmentation_policy": labels.segmentation_policy,
             **({"hsc_refit_center_policy": HSC_REFIT_CENTER_POLICY,
                 "hsc_star_protection": labels.star_protection_policy,
@@ -612,6 +630,7 @@ def write_classified_patch(task: StoreTask, image: np.ndarray, labels: PatchLabe
         shape_source_ids=_cat(shape_ids_flat, None, np.int64),
         shape_source_offsets=shape_offsets,
         shape_source_weights=_cat(shape_weights_flat, None, np.float32),
+        shape_source_moment_eligible=_cat(shape_moment_flat, None, np.uint8),
     )
     write_training_image_level_zarr(output, batch, overwrite=task.overwrite, chunk_tiles=task.chunk_tiles)
     return {"output": str(output), "samples": n, "patch": task.patch, "band": task.band, "dataset_source": task.dataset_source, "group": task.group}

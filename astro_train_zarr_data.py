@@ -741,6 +741,7 @@ class ZarrCutoutDataset(Dataset):
         band_shape_source_classes = []
         band_shape_source_ids = []
         band_shape_source_weights = []
+        band_shape_source_moment_eligible = []
         if reader.has_array("shape_source_offsets"):
             shape_offsets = reader.read_full_small("shape_source_offsets").astype(np.int64, copy=False)
             shape_centers_flat = reader.read_full_small("shape_source_centers").astype(np.float32, copy=False)
@@ -750,6 +751,10 @@ class ZarrCutoutDataset(Dataset):
             shape_weights_flat = (reader.read_full_small("shape_source_weights").astype(np.float32, copy=False)
                                   if reader.has_array("shape_source_weights")
                                   else np.ones(len(shape_ids_flat), np.float32))
+            moment_flat=(reader.read_full_small('shape_source_moment_eligible')
+                         if reader.has_array('shape_source_moment_eligible') else None)
+            if moment_flat is not None and (moment_flat.shape != shape_ids_flat.shape or not np.isin(moment_flat,[0,1]).all()):
+                raise ValueError('Invalid source moment eligibility in Zarr store')
             if (shape_weights_flat.shape != shape_ids_flat.shape
                     or not np.isfinite(shape_weights_flat).all() or np.any(shape_weights_flat <= 0)):
                 raise ValueError("Invalid source weights in Zarr store")
@@ -760,6 +765,7 @@ class ZarrCutoutDataset(Dataset):
                 band_shape_source_classes.append(torch.from_numpy(shape_classes_flat[s0:s1]))
                 band_shape_source_ids.append(torch.from_numpy(shape_ids_flat[s0:s1]))
                 band_shape_source_weights.append(torch.from_numpy(shape_weights_flat[s0:s1]))
+                band_shape_source_moment_eligible.append(None if moment_flat is None else torch.from_numpy(moment_flat[s0:s1].astype(bool)))
         else:
             # Backward compatibility for stores created before source-level
             # shape metadata was added. Only clean centers are recoverable.
@@ -789,6 +795,7 @@ class ZarrCutoutDataset(Dataset):
                 band_shape_source_classes.append(torch.ones((len(source_centers),), dtype=torch.uint8))
                 band_shape_source_ids.append(source_ids)
                 band_shape_source_weights.append(torch.ones(len(source_ids), dtype=torch.float32))
+                band_shape_source_moment_eligible.append(None)
 
         if self.augment and random.random() < 0.5:
             width = int(image.shape[-1])
@@ -828,7 +835,8 @@ class ZarrCutoutDataset(Dataset):
         return {
             "image": image,
             "proposal_metadata": {key:reader.attrs.get(key) for key in
-                ('confidence_config','image_fits','reference_fits','patch','dataset')},
+                ('confidence_config','image_fits','reference_fits','patch','dataset',
+                 'mask_moment_policy','mask_moment_weak_snr_threshold')},
             "band_names": list(reader.attrs.get("bands", [])),
             "pixel_scale_arcsec": reader.attrs.get("confidence_config", {}).get("pixel_scale_arcsec"),
             "band_mask_instances": mask_instances,
@@ -888,6 +896,7 @@ class ZarrCutoutDataset(Dataset):
             "band_shape_source_classes": band_shape_source_classes,
             "band_shape_source_ids": band_shape_source_ids,
             "band_shape_source_weights": band_shape_source_weights,
+            "band_shape_source_moment_eligible": band_shape_source_moment_eligible,
             "name": rec.name,
             "tile_name": rec.tile_name,
             "tract": rec.tract,

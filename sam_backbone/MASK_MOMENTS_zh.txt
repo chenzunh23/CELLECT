@@ -1,0 +1,134 @@
+Mask 归一化二阶矩／椭率初版（2026-11-10）
+
+参数
+--mask-moment-weight 0.3：默认新增椭率 loss 权重。0 可关闭。
+--mask-moment-match-radius 3：预测 prompt 与同图同波段目录关联的像素半径。
+--mask-hsc-area-ratio-lower 0.25
+--mask-hsc-area-ratio-upper 2
+--mask-centroid-weight 0.03：降低后的初版默认值，可显式覆盖。
+其它像素监督、outside、面积项外层权重不变；mask 总开关仍是 --mask-loss-weight。
+HSC 的面积区间是已有面积 loss 的软约束，不会硬裁剪 mask 或删掉检测。
+非 HSC 继续使用原来的 --mask-area-ratio-lower/upper，不能用 HSC 的0.25约束COSMOS。
+train_mixed_zarr.sh 支持 MASK_MOMENT_WEIGHT、MASK_MOMENT_MATCH_RADIUS、MASK_CENTROID_WEIGHT。
+
+仅回填已有、坐标已修正的 HSC store
+入口：python -m preprocessing.backfill_mask_moment_eligibility
+--root：生成根目录、其子目录或单个.zarr。
+--generation-command：原生成命令的纯文本文件；仅解析参数，不执行其shell内容。
+--dataset-sources noisy：只选择noisy；half_coadd可另选，但必须先重建修复旧中心。
+--limit 1：先只读试跑一个store；省略--apply时始终不修改生产Zarr。
+--workers 4 --apply：离线回放分类、严格核对后正式回填；应先停止所选store的生成及训练。
+回填核对原receipt记录的输入文件大小/mtime，以及所有稀疏ID、类别、中心和椭圆参数。
+只新增shape_source_moment_eligible、资格policy及小型审计信息，保留原.zattrs备份，
+不改RGB、dense标签、已有稀疏数组、manifest、生成receipt；完成项可安全跳过。
+源ID保持int64，不经浮点转换。缺失坐标修正policy或对齐不一致时拒绝回填。
+回放仍需读取原FITS/目录，并重用PSF缓存（复制到临时目录），耗时应以单store试跑为准；
+训练时不再做这些匹配。若原输入或分类已改变，必须重建，不能强行回填。
+
+数学口径
+在预测 mask 自身质心附近计算人口协方差 C（分母为质量，不是样本数减一）。
+e=((Cxx-Cyy),2Cxy)/(Cxx+Cyy+eps)，与目标椭率做 mean SmoothL1。
+HSC 使用同源 shape_source_values 的 (a,b,theta) 构造目标椭率，共同Kron缩放消去；
+不把Kron轴长当作原始SdssShape RMS轴长，不额外强约束绝对二阶矩尺度。
+COSMOS/Abell优先用实际用于监督的同一张GT mask原生像素计算目标矩，保留像素loss；
+没有实例GT时，回退到同源星表(a,b,theta)的归一化椭率。两种目标不叠加，避免冲突。
+任何数据集的截断目录椭圆、椭圆内缺少有效覆盖的源均不对完整目录形态反传。
+运算使用FP32；预测logits先按推理规则bilinear/align_corners=False插值到原生输入大小，
+再sigmoid、排除无效像素并计算矩。只处理有资格的prompt；分块checkpoint避免保留
+所有全分辨率概率图。普通SAM默认512输入和128低分辨率mask输出不变。
+归一化矩不约束大小，不能取代已有面积loss；远处低概率尾部仍需要可信天空BCE抑制。
+
+等价性能优化（2026-11-10）
+不改变权重、prompt数量、资格门槛、GT优先级、原生插值/FP32矩或面积约束。
+mask_selection=pred_iou时先确定detach的赢家，只计算该候选的原生二阶矩；
+未选中的候选本来就不贡献此项loss/梯度。mask_selection=loss仍计算全部候选后选择。
+先检查截断/覆盖，再计算预测矩；没有合格目标时不执行native插值，保留零梯度图。
+覆盖mask按图像保存，在checkpoint内部按小批源索引，避免checkpoint输入重新保存N份全图覆盖。
+native分块默认64，并按K*H*W限制临时像素量；不会降低监督分辨率或引入近似矩。
+无实例GT的批次先按图像area下采样valid/可信背景，再按源索引；此时positive恒为0，
+与原来的先复制N张全图再下采样等价。混合实例GT批次保留原有精确partial-target路径。
+目录关联预先一次复制小型prompt元数据，避免逐图CUDA nonzero/tolist同步；匹配规则不变。
+debug-mask-loss新增partial_targets、catalog_targets、moment_targets、moment_native、moment阶段计时。
+H100独立基准：2048 prompts、K=3、128 logits到512原图；二阶矩前反向415ms->100ms，
+无实例目标构造21.25ms->0.29ms；两部分额外峰值分别1283->529MiB、8704->385MiB。
+loss差为0、梯度最大绝对差6.22e-15；CPU测试另覆盖两种选择模式及有/无GT的整体loss/梯度。
+以上是子模块基准，不是整轮训练加速比，实际还受SAM decoder、数据加载和GPU负载影响。
+复现：python scripts/benchmark_mask_moment_loss.py --device cuda:0 --prompts 2048 --repeats 7
+不需重写Zarr或修改checkpoint结构；运行中的进程不会自动加载此代码，需在下次启动时生效。
+
+样本资格：预处理时一次确定，训练不查询FITS、不重跑bright pipeline
+shape_source_moment_eligible：uint8/boolean，长度与shape_source_ids完全一致。
+HSC规则不变：clean启用。
+ordinary_snr_weak_shape：不启用，不因高密度区域的dense shape覆盖而改判。
+亮源weak：复用现有bright pipeline的孤立、形状可用、低混叠分类原因：
+  single_cluster_large_bright_component_weak_shape
+  isolated_bright_galaxy_weak_shape
+  no_upper_isolated_large_aperture_weak_shape
+Gaia PSF weak：需要SAT gate通过，且按bright pipeline的椭圆相交判据与其它
+活跃目录源无交叠，才启用。其它weak、混叠、strict/ignore源不启用。
+此资格只控制新增矩loss；不删除检测候选，不取消低SNR源已有的其它监督。
+
+COSMOS/Abell资格（jwst_clean_or_high_snr_weak_v1）
+所有最终clean源启用；最终weak源仅在本波段SNR有限且>=该数据集weak_below时启用。
+weak_below复用--cosmos-snr-weak-threshold/--abell-snr-weak-threshold及公共SNR参数，默认7。
+即使weak是因FLAGS/风险区域而保留，也以数值SNR判定，不套用HSC孤立亮源白名单。
+strict、ignore、dropped及缺失/非有限SNR的weak不启用；有限几何始终是前提。
+COSMOS用本波段snr_<band>，记录为classification_snr；Abell优先用原分类流程的
+remeasured_aperture_snr（UNCOVER也是FULL重测值），不能用别的波段或Gaia亮度代替。
+存在重测列但某行NaN/被mask时，不回退到那一行的高catalog SNR来绕过门槛。
+新生成Zarr仍只保存ID对齐的资格布尔数组，另存mask_moment_policy、
+mask_moment_weak_snr_threshold和mask_moment_snr_source供审计；训练不读FITS。
+实例GT优先于星表，且仍须通过上述资格；无GT的合格源使用星表回退。
+
+关联及梯度
+GT/mandatory prompt按int64源ID查表，不从重叠dense shape采样目标。
+预测prompt先与全部目录源做批量最近关联并保证预测间一对一，再查预存资格标志；
+因此靠近weak源的预测不会错误获得更远clean源的监督。目录目标与位置全部detach。
+heatmap偏移后的坐标只用于目录关联，proposal shape仍从解码选定的原anchor读取。
+HSC面积参考优先使用匹配的同源Kron；无匹配时只能用detach的proposal shape估计。
+moment loss按有资格的prompt权重归一化，不被大量无资格weak稀释；实例可靠性保留。
+日志增加mask_moment、mask_gt/pred_mean_moment、mask_gt/pred_moment_count等。
+另加mask_gt/pred_catalog_moment_count、mask_gt/pred_instance_moment_count，
+用于区分星表回退与实例GT矩（累计prompt次数，不是去重源数）。
+
+是否需要重写Zarr
+已存在的(a,b,theta)足以计算此归一化目标，不需要为此补原始xx/yy/xy。
+但旧HSC Zarr的weak类别没有保存分类原因，无法可靠恢复完整资格规则。
+因此必须更新HSC标签元数据，新增shape_source_moment_eligible；无需重写图像像素。
+可用预处理重新生成HSC Zarr，或从同一版bright分类结果按ID回填这个小数组。
+新预处理自动写数组及mask_moment_policy=clean_or_isolated_bright_weak_v1；
+parent打包、稀疏offset、数据增强和collate均保持该数组与ID的对齐。
+本次未自动重写已有Zarr，也未启动训练。旧数据若缺标志且含HSC weak，启用矩loss会
+明确报错，防止将低SNR weak猜作亮源；临时跑旧loss可设--mask-moment-weight 0。
+非HSC旧store的clean可直接使用新分支：有GT用GT矩，无GT用星表椭率。
+但旧store没有高SNR weak证据：缺少新版资格policy/数组时只启用clean并给出RuntimeWarning。
+要启用JWST高SNR weak必须更新其资格数组及新版policy；新预处理自动写入。
+旧HSC资格policy不能当作JWST高SNR证明。不能只改policy字符串或将所有weak置True。
+科学上只需回填小型资格元数据，不必改变已有图像/密集标签；若没有准确的同源、
+同独立窗口的分类SNR记录，需要用新预处理重新生成，不能拿父窗口SNR猜测独立大源stamp。
+HSC使用backfill_mask_moment_eligibility；JWST另用下述专门入口，不混用政策。
+本次没有批量改写生产Zarr，也没有重启/热更新任何运行中训练；新规则在下次启动训练时加载。
+之前的HSC坐标修复仍需通过重建标签生效；只补本数组不能修复旧的一基中心标签。
+
+测试
+python -m unittest tests.test_mask_moments preprocessing.tests.test_mask_moment_eligibility -v
+
+JWST元数据回填入口
+python -m preprocessing.backfill_jwst_mask_moment_eligibility --root /path/to/root/zarr
+默认只读校验、不写Zarr；--apply才正式写入资格数组和.zattrs，原属性保留备份。
+--datasets cosmos/abell可单选或同时选择；--bands F070W、--limit 1可先小样本试跑。
+--workers默认2，Abell窗口重放较耗CPU/内存，不建议直接沿用生成时的32进程。
+--data-root用于指定原始生成根目录（含abell/labels）；默认可从传入root向上寻找。
+COSMOS：复用现存类别，按int64 ID读取本波段SNR并核对WCS中心/轴长/角度。
+Abell普通网格：复用sources.fits的final_class、已采用中心/轴长和remeasured_aperture_snr。
+Abell独立窗口：不能借用父窗口SNR；缺失时默认报出需要重放的数据块，不部分发布该store。
+--replay-missing明确允许仅对缺少SNR证据的窗口重放标签/SNR流程，不运行Zarr writer、
+RGB缩放、tile筛选/打包或训练；临时文件写到/tmp，不改生产审计和背景产品。
+没有有限数值SNR的已记录Gaia PSF合成weak仍不启用，不能按Gaia亮度猜作高SNR。
+--cache-dir默认/home/czh23/.cache/cellect/jwst_moment_backfill；独立窗口的紧凑测量结果
+按原输入/政策/科学代码指纹缓存，dry-run后再--apply无需重复重放。dry-run也可写此独立缓存。
+--report /path/to/report.jsonl保存逐store状态和eligible_clean/weak计数；失败返回非零退出码。
+--replace-legacy仅允许显式升级旧policy数组；旧数组改名备份，不静默覆盖新版政策结果。
+新版policy及合法数组已存在的store直接跳过，支持断点续跑。
+运行前停止读取目标space store的训练；生成任务仍持锁时入口会拒绝执行，不会自动终止进程。
+所有回填均不改RGB、稠密标签、已有ID/坐标/offset、实例mask、manifest或生成receipt。

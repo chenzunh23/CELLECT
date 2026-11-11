@@ -41,6 +41,8 @@ def uncover_signature(args, band):
         risk_bright_mag=args.uncover_risk_bright_mag,risk_sigma=args.uncover_risk_sigma,
         reject_untrusted=args.uncover_reject_untrusted,
         kron_other_fraction_max=getattr(args,'uncover_kron_other_fraction',.30),
+        halo_no_kron=dict(enabled=True,region='current-band official bCG model risk',
+            order='ignore native missing-Kron rows before BLUE dedup/insertion',preserve_independent_blue_gaia=True),
         native_psf_review=dict(enabled=getattr(args,'uncover_native_psf_review',True),
             snr_min=getattr(args,'uncover_native_psf_snr',4.),
             moment_max_arcsec=getattr(args,'uncover_native_psf_moment_max',.10)),

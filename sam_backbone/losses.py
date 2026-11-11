@@ -14,6 +14,7 @@ from .mask_supervision import (instance_prompts, combine_prompts, partial_target
                                partial_bce_dice, area_ratio_penalty, mask_iou_targets)
 
 from .mask_metrics import GROUP_STAT_KEYS, group_statistics
+from .mask_moments import catalog_targets, moment_loss, native_ellipticity, prepare_moment_targets
 
 MaskTimingFn = Callable[[str, float, Dict[str, float]], float]
 
@@ -182,6 +183,7 @@ def _zero_mask_losses(anchor: Tensor) -> Dict[str, Tensor]:
         "dice": zero,
         "bce": zero,
         "centroid": zero,
+        "moment": zero,
         "outside": zero,
         "area": zero,
         "max_area": zero,
@@ -202,6 +204,7 @@ def _any_mask_component_enabled(weights: object) -> bool:
             ("mask_dice", 0.0),
             ("mask_bce", 0.0),
             ("mask_centroid", 0.0),
+            ("mask_moment", 0.0),
             ("mask_outside", 0.0),
             ("mask_min_area", 0.0),
             ("mask_max_area", 0.1),
@@ -439,13 +442,14 @@ def _sam_mask_loss_for_prompts(
     weight_dice = float(getattr(weights, "mask_dice")) > 0.0
     weight_bce = float(getattr(weights, "mask_bce")) > 0.0
     weight_centroid = float(getattr(weights, "mask_centroid")) > 0.0
+    weight_moment = float(getattr(weights, 'mask_moment', 0.0)) > 0.0
     weight_outside = float(getattr(weights, "mask_outside")) > 0.0
     weight_min_area = float(getattr(weights, "mask_min_area")) > 0.0
     weight_max_area = float(getattr(weights, "mask_max_area", 0.1)) > 0.0
     weight_pred_iou = float(getattr(weights, "mask_pred_iou", 0.1)) > 0.0
     weight_stability = float(getattr(weights, "mask_stability", 0.1)) > 0.0
 
-    needs_prob = weight_dice or weight_centroid or weight_outside or weight_min_area or weight_max_area
+    needs_prob = weight_dice or weight_centroid or weight_outside or weight_min_area or weight_max_area or weight_moment
     needs_target = weight_outside or weight_min_area
     prob = torch.sigmoid(logits) if needs_prob else None
     t_phase = _mark_mask_timing(
@@ -462,6 +466,12 @@ def _sam_mask_loss_for_prompts(
     zero = logits.sum() * 0.0
     positive, negative, valid, instance_quality, labelled = partial_targets(
         prompts, batch, image_hw=image_hw, mask_hw=(mh, mw), device=logits.device)
+    t_phase = _mark_mask_timing(debug_timing,f'{timing_prefix}.partial_targets',t_phase)
+    bands=int(outputs['confidence'].shape[1]) if outputs['confidence'].ndim==5 else 1
+    moment_targets=catalog_targets(prompts,batch if weight_moment or weight_min_area else None,bands=bands,
+        match_radius=float(getattr(weights,'mask_moment_match_radius',3.)),require_eligibility=weight_moment,
+        match_non_hsc=weight_moment)
+    t_phase = _mark_mask_timing(debug_timing,f'{timing_prefix}.catalog_targets',t_phase)
     # Probability outside the observed image/valid coverage has no area or moment.
     if prob is not None:
         prob = prob * valid[:, None]
@@ -530,22 +540,28 @@ def _sam_mask_loss_for_prompts(
         lower = float(getattr(weights, "mask_area_ratio_lower", 0.05))
         upper = float(getattr(weights, "mask_area_ratio_upper", 2.0))
         target_shapes = prompts["target_shapes"].to(device=logits.device, dtype=logits.dtype).detach()
+        hsc=moment_targets['is_hsc'];matched_hsc=hsc & moment_targets['matched']
+        target_shapes=torch.where(matched_hsc[:,None],moment_targets['shapes'],target_shapes)
+        area_centers=torch.where(matched_hsc[:,None],moment_targets['centers'],prompts['centers'])
         shape_major = target_shapes[:, 0].abs().clamp_min(1.0) * float(ellipse_sigma)
         shape_minor = target_shapes[:, 1].abs().clamp_min(1.0) * float(ellipse_sigma)
         shape_area = math.pi * shape_major * shape_minor
         # At a cutout/coverage boundary constrain only the visible Kron area.
-        kron = _ellipse_targets_lowres(prompts['centers'], target_shapes,
+        kron = _ellipse_targets_lowres(area_centers, target_shapes,
             mask_hw=(mh, mw), image_hw=image_hw, ellipse_sigma=ellipse_sigma)
         angle = target_shapes[:, 2]
         half_w = ((shape_major*angle.cos())**2+(shape_minor*angle.sin())**2).sqrt()
         half_h = ((shape_major*angle.sin())**2+(shape_minor*angle.cos())**2).sqrt()
-        cx, cy = prompts['centers'].unbind(-1)
+        cx, cy = area_centers.unbind(-1)
         clipped = (cx-half_w < 0) | (cy-half_h < 0) | (cx+half_w >= image_hw[1]) | (cy+half_h >= image_hw[0])
         clipped |= ((kron*(1-valid)).sum((-1, -2)) > 0)
         visible_area = (kron*valid).sum((-1, -2))*full_area_scale
         shape_area = torch.where(clipped, visible_area.clamp_min(1), shape_area)
         area_ratio = area_full / shape_area[:, None].clamp_min(1.0)
         area_loss = area_ratio_penalty(area_ratio, lower, upper)
+        hsc_lower=float(getattr(weights,'mask_hsc_area_ratio_lower',.25))
+        hsc_upper=float(getattr(weights,'mask_hsc_area_ratio_upper',2.))
+        area_loss=torch.where(hsc[:,None],area_ratio_penalty(area_ratio,hsc_lower,hsc_upper),area_loss)
     else:
         area_loss = logits.new_zeros((n, int(logits.shape[1])))
     t_phase = _mark_mask_timing(debug_timing, f"{timing_prefix}.min_area", t_phase, enabled=float(weight_min_area))
@@ -564,6 +580,44 @@ def _sam_mask_loss_for_prompts(
     else:
         centroid = logits.new_zeros((n, int(logits.shape[1])))
     t_phase = _mark_mask_timing(debug_timing, f"{timing_prefix}.centroid", t_phase, enabled=float(weight_centroid))
+
+    selection = str(getattr(weights, 'mask_selection', 'pred_iou')).lower()
+    early_best = torch.argmax(iou_predictions.detach(),dim=1) if selection == 'pred_iou' else None
+    if weight_moment:
+        prepared_moments=prepare_moment_targets(moment_targets,image_hw=image_hw,valid=valid,
+            labelled=labelled,prompts=prompts,batch=batch)
+        t_phase = _mark_mask_timing(debug_timing,f'{timing_prefix}.moment_targets',t_phase)
+        # Coverage is per IMAGE; gather only each bounded native-moment chunk.
+        native_valid=(batch['band_valid_mask'].to(device=logits.device).reshape(-1,*image_hw)
+                      if batch is not None and 'band_valid_mask' in batch else
+                      torch.ones((1,*image_hw),device=logits.device,dtype=torch.bool))
+        coverage_indices=(prompts['batch_indices'] if batch is not None and 'band_valid_mask' in batch else
+                          torch.zeros(n,device=logits.device,dtype=torch.long))
+        candidates=torch.where(prepared_moments[1] & valid_prompt if early_best is not None
+                               else prepared_moments[1])[0]
+        predicted_e=logits[...,0,0,None].expand(-1,-1,2)*0.
+        if len(candidates):
+            if early_best is not None:
+                # The winner depends ONLY on detached predicted IoU. Other
+                # candidates never contribute moment loss or gradients.
+                chosen=early_best[candidates]
+                e=native_ellipticity(logits[candidates,chosen][:,None],native_valid,image_hw,
+                                     coverage_indices=coverage_indices[candidates])
+                predicted_e=predicted_e.index_put((candidates,chosen),e[:,0])
+            else:
+                # loss-based selection still needs every candidate's moments.
+                predicted_e=predicted_e.index_copy(0,candidates,
+                    native_ellipticity(logits[candidates],native_valid,image_hw,
+                                      coverage_indices=coverage_indices[candidates]))
+        t_phase = _mark_mask_timing(debug_timing,f'{timing_prefix}.moment_native',t_phase,
+                                   prompts=float(len(candidates)),candidates=1. if early_best is not None else float(_k))
+        moments,moment_active=moment_loss(prob,moment_targets,image_hw=image_hw,valid=valid,
+            labelled=labelled,prompts=prompts,batch=batch,prediction_e=predicted_e,prepared=prepared_moments)
+    else:
+        moments=logits.new_zeros((n,int(logits.shape[1])))
+        moment_active=torch.zeros(n,device=logits.device,dtype=torch.bool)
+    moment_quality=torch.where(labelled,instance_quality,torch.ones_like(instance_quality))
+    t_phase = _mark_mask_timing(debug_timing,f'{timing_prefix}.moment',t_phase,enabled=float(weight_moment))
 
     max_area_ratio = float(getattr(weights, "mask_max_area_ratio", 0.5))
     if max_area_ratio <= 0.0:
@@ -599,13 +653,14 @@ def _sam_mask_loss_for_prompts(
     selection = str(getattr(weights, "mask_selection", "pred_iou")).lower()
     supervision_scale = float(getattr(weights, 'mask_supervision_weight', 0.2))
     if selection == "pred_iou":
-        best = torch.argmax(iou_predictions.detach(), dim=1)
+        best = early_best
     elif selection == "loss":
         target_factor = supervision_scale * instance_quality[:, None]
         selection_score = (
             (float(getattr(weights, "mask_dice")) * dice * target_factor * labelled[:, None] if weight_dice else 0.0)
             + (float(getattr(weights, "mask_bce")) * bce * target_factor if weight_bce else 0.0)
             + (float(getattr(weights, "mask_centroid")) * centroid if weight_centroid else 0.0)
+            + (float(getattr(weights, 'mask_moment', 0.)) * moments * moment_quality[:,None] if weight_moment else 0.0)
             + (float(getattr(weights, "mask_outside")) * outside if weight_outside else 0.0)
             + (float(getattr(weights, "mask_min_area")) * area_loss if weight_min_area else 0.0)
             + (float(getattr(weights, "mask_max_area", 0.1)) * max_area_loss if weight_max_area else 0.0)
@@ -621,6 +676,7 @@ def _sam_mask_loss_for_prompts(
         "dice": dice[row, best],
         "bce": bce[row, best],
         "centroid": centroid[row, best],
+        "moment": moments[row,best],
         "outside": outside[row, best],
         "area": area_loss[row, best],
         "max_area": max_area_loss[row, best],
@@ -630,6 +686,8 @@ def _sam_mask_loss_for_prompts(
 
     geom_weights = prompt_weights * valid_prompt.to(dtype=prompt_weights.dtype)
     geom_denom = geom_weights.sum().clamp_min(1.0)
+    moment_weights=geom_weights*moment_active*moment_quality
+    moment_denom=(geom_weights*moment_active).sum().clamp_min(1.0)
     # Retain q=0.25 as absolute reliability; dividing by sum(q) would cancel it.
     dice_weights = prompt_weights * labelled * instance_quality * supervision_scale
     bce_weights = prompt_weights * bce_eligible * instance_quality * supervision_scale
@@ -640,6 +698,7 @@ def _sam_mask_loss_for_prompts(
         "dice": (selected["dice"] * dice_weights).sum() / dice_denom if weight_dice else zero,
         "bce": (selected["bce"] * bce_weights).sum() / bce_denom if weight_bce else zero,
         "centroid": (selected["centroid"] * geom_weights).sum() / geom_denom if weight_centroid else zero,
+        "moment": (selected['moment']*moment_weights).sum()/moment_denom if weight_moment else zero,
         "outside": (selected["outside"] * geom_weights).sum() / geom_denom if weight_outside else zero,
         "area": (selected["area"] * geom_weights).sum() / geom_denom if weight_min_area else zero,
         "max_area": (selected["max_area"] * geom_weights).sum() / geom_denom if weight_max_area else zero,
@@ -650,6 +709,7 @@ def _sam_mask_loss_for_prompts(
         (float(getattr(weights, "mask_dice")) * out["dice"] if weight_dice else zero)
         + (float(getattr(weights, "mask_bce")) * out["bce"] if weight_bce else zero)
         + (float(getattr(weights, "mask_centroid")) * out["centroid"] if weight_centroid else zero)
+        + (float(getattr(weights, 'mask_moment', 0.)) * out['moment'] if weight_moment else zero)
         + (float(getattr(weights, "mask_outside")) * out["outside"] if weight_outside else zero)
         + (float(getattr(weights, "mask_min_area")) * out["area"] if weight_min_area else zero)
         + (float(getattr(weights, "mask_max_area", 0.1)) * out["max_area"] if weight_max_area else zero)
@@ -664,15 +724,18 @@ def _sam_mask_loss_for_prompts(
     out['supervised_prompts'] = (labelled & valid_prompt).sum().to(logits.dtype)
     per_prompt = logits.new_zeros(n)
     for key, attr in [('dice','mask_dice'), ('bce','mask_bce'), ('centroid','mask_centroid'),
+                      ('moment','mask_moment'),
                       ('outside','mask_outside'), ('area','mask_min_area'), ('max_area','mask_max_area'),
                       ('pred_iou','mask_pred_iou'), ('stability','mask_stability')]:
         q, denom = ((dice_weights, dice_denom) if key == 'dice' else
                     (bce_weights, bce_denom) if key == 'bce' else
                     (iou_weights, dice_denom) if key == 'pred_iou' else
+                    (moment_weights,moment_denom) if key == 'moment' else
                     (geom_weights, geom_denom))
         per_prompt = per_prompt + float(getattr(weights, attr, 0.0))*selected[key]*q/denom
     out['group_stats'] = group_statistics(selected, kinds, prompt_weights, labelled,
-                                          bce_eligible, instance_quality, supervision_scale)
+                                          bce_eligible, instance_quality, supervision_scale,
+                                          moment_active=moment_active)
     out['gt_total'] = per_prompt[kinds != 1].sum()
     out['pred_total'] = per_prompt[kinds == 1].sum()
     if return_selection:

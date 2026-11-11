@@ -81,6 +81,8 @@ def combine_prompts(mandatory, gt, pred, *, pred_ratio, max_gt=128, max_pred=128
     keys = ('batch_indices', 'centers', 'prompt_shapes', 'target_shapes', 'weights', 'mask_target_weights')
     result = {k: torch.stack([p[k][j] for _, p, j in selected]) for k in keys}
     result['source_kind'] = torch.tensor([kind for kind, _, _ in selected], device=anchor.device)
+    result['source_ids'] = torch.tensor([int(p['source_ids'][j]) if 'source_ids' in p else -1
+                                        for kind,p,j in selected],device=anchor.device,dtype=torch.long)
     result['instance_masks'] = [p['instance_masks'][j] if kind == 2 else None for kind, p, j in selected]
     return result
 
@@ -94,6 +96,34 @@ def partial_targets(prompts, batch, *, image_hw, mask_hw, device):
     partial observed coverage. Independent parent/child masks remain overlapping.
     """
     n = len(prompts['centers']); h, w = image_hw
+    rows = prompts.get('instance_masks', [None]*n)
+    if not any(row is not None for row in rows):
+        # No positive instance targets (the normal HSC path). Pool each image
+        # ONCE before indexing prompts instead of materializing N*H*W copies.
+        # Pooling and indexing commute here because positive is identically 0.
+        flat = prompts['batch_indices']
+        coverage = None if batch is None else batch.get('band_valid_mask')
+        sky = None if batch is None else batch.get('band_trusted_background')
+        if coverage is not None:
+            observed = coverage.to(device=device, dtype=torch.float32).reshape(-1,h,w)
+        elif sky is not None:
+            observed = torch.ones_like(sky.to(device=device,dtype=torch.float32).reshape(-1,h,w))
+        else:
+            observed = torch.ones((1,*mask_hw),device=device)
+        negative = (torch.zeros_like(observed) if sky is None else
+                    sky.to(device=device,dtype=torch.float32).reshape(-1,h,w)*observed)
+        if tuple(observed.shape[-2:]) != tuple(mask_hw):
+            observed = F.interpolate(observed[:,None],size=mask_hw,mode='area')[:,0]
+            negative = F.interpolate(negative[:,None],size=mask_hw,mode='area')[:,0]
+            negative = (negative >= 1-1e-6).float()
+        if coverage is None and sky is None:
+            valid = observed.expand(n,-1,-1)
+            negative = negative.expand(n,-1,-1)
+        else:
+            valid = observed[flat]
+            negative = negative[flat]
+        return (torch.zeros_like(valid),negative,valid,
+                torch.ones(n,device=device),torch.zeros(n,device=device,dtype=torch.bool))
     positive = torch.zeros((n, h, w), device=device)
     quality = torch.ones(n, device=device)
     labelled = torch.zeros(n, device=device, dtype=torch.bool)

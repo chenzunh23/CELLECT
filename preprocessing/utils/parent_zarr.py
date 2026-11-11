@@ -45,6 +45,8 @@ def merge_parent_stores(parts, output, *, attrs, chunk_tiles=20):
     }
     if 'shape_source_weights' in keys[0]:
         sparse['shape_source_offsets'].append('shape_source_weights')
+    if 'shape_source_moment_eligible' in keys[0]:
+        sparse['shape_source_offsets'].append('shape_source_moment_eligible')
     special=set(sparse)|{v for vs in sparse.values() for v in vs}|{f'segmentation_overlap_{v}' for v in ['meta','data','offsets','weights']}
     finalattrs=dict(json.loads((parts[0][0]/'.zattrs').read_text()),**attrs)
     finalattrs.update(num_samples=n,parent_packed_stamps=True,chunk_tail_policy='pool_pad_train',sample_kind='mixed',chunk_tiles=int(chunk_tiles))

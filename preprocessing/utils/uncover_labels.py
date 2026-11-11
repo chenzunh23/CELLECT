@@ -24,7 +24,7 @@ from .geometry import EllipseGeometry, ellipse_axes_from_moments
 from .area_filter import area_filter_masks
 from .no_data import center_no_data
 
-POLICY_VERSION='uncover_native_abell_v9_three_of_four_blue_band_psf'
+POLICY_VERSION='uncover_native_abell_v10_halo_no_kron_before_blue'
 DEFAULT_BLUE_CATALOG=Path(__file__).resolve().parents[1]/'assets/abell_verified_blue_centers_v1.fits'
 
 
@@ -308,6 +308,35 @@ def kron_segmentation_quality(geometry, source_ids, source_classes, segmentation
     return dict(kron_pixel_count=total,kron_visible_pixel_count=visible,
         kron_other_seg_pixel_count=other,kron_other_seg_fraction=fraction,
         kron_seg_evaluated=evaluated,kron_other_seg_bad=evaluated&(fraction>other_fraction_max))
+
+
+def ignore_native_halo_without_kron(labels):
+    """Veto native no-Kron halo rows before BLUE claims retained centers.
+
+    The per-band model-risk mask is already sampled by the ordinary classifier.
+    Independent BLUE/fallback insertions and Gaia theoretical models are not
+    native missing-Kron detections. Never revive dropped/ignored rows here.
+    """
+    table=labels.table;n=len(labels.label_classes)
+    radius=np.asarray(np.ma.filled(table['kron_radius'],np.nan),float)
+    risk=np.asarray(np.ma.filled(table['snr_contaminated_region'],False),bool)
+    gaia=np.asarray(np.ma.filled(table['gaia_psf_model'],False),bool) if 'gaia_psf_model' in table.colnames else np.zeros(n,bool)
+    native=(np.asarray(labels.source_ids,np.int64)>0)&~gaia
+    selected=native&risk&(~np.isfinite(radius)|(radius<=0))
+    before=labels.label_classes.copy()
+    changed=selected&np.isin(before,[C.CLEAN,C.WEAK_SHAPE,C.STRICT_CENTER_ONLY,C.RESTRICTED_BRIGHT_REGION])
+    labels.label_classes[changed]=int(C.ORDINARY_IGNORE)
+    reasons=np.asarray(np.ma.filled(table['classification_reason'],''),dtype='U128')
+    reasons[changed]='uncover_halo_no_kron_ignore_before_blue'
+    table['classification_reason']=reasons
+    table['class_before_halo_no_kron']=before
+    table['halo_no_kron_risk']=selected
+    table['halo_no_kron_ignored']=changed
+    table['class_after_halo_no_kron']=labels.label_classes.copy()
+    return dict(enabled=True,selected=int(selected.sum()),ignored=int(changed.sum()),
+        definition='native positive-ID non-Gaia rows in current-band model-risk region with nonfinite/nonpositive kron_radius',
+        order='after native ordinary/bright/Gaia/Kron-segmentation filters; before BLUE dedup/insertion and native PSF review',
+        blue_and_gaia='independent insertions retain their existing verification rules')
 
 
 def add_blue_compact_centers(labels, candidates, band, *, core_snr=None,
@@ -738,6 +767,7 @@ def classify_reference(reference, header, catalog, gaia, background, band, *,
     for name,values in ordinary.stages.items():table['class_after_'+name]=values
     measurement=ordinary.diagnostics['aperture_measurement']
     table['remeasured_aperture_snr']=measurement['snr'];table['aperture_snr_trusted']=measurement['trusted']
+    table.meta['mask_moment_weak_snr_threshold'] = float(snr_config.thresholds.weak_below)
     for key in ('snr_bad','snr_contaminated_region','no_kron_snr_threshold','snr_risk_bright_exempt',
                 'aperture_background_trusted','aperture_snr_effective_trusted'):
         table[key]=ordinary.diagnostics[key]
@@ -792,6 +822,8 @@ def classify_reference(reference, header, catalog, gaia, background, band, *,
         labels.table['class_after_kron_segmentation']=labels.label_classes.copy()
         segmentation_audit.update(evaluated=int(quality['kron_seg_evaluated'].sum()),
             above_threshold=int(bad.sum()),downgraded=int(changed.sum()))
+    halo_no_kron_audit=ignore_native_halo_without_kron(labels)
+    if progress:progress('halo_no_kron_ignore_before_BLUE',halo_no_kron_audit['ignored'])
     if progress:progress('dense_paint',len(labels.source_ids))
     ignored=np.isin(components,result.ordinary_ignore_component_ids) if len(result.ordinary_ignore_component_ids) else np.zeros(reference.shape,bool)
     if native_segmentation is not None:
@@ -828,7 +860,7 @@ def classify_reference(reference, header, catalog, gaia, background, band, *,
             risk_bright_photometry=f'UNCOVER {flux_key}, AB ZP28.9, finite positive flux and error; valid Kron required',
             contaminated_region_enabled=snr_contaminated_mask is not None),
         snr_risk_bright_exempt_sources=int(np.sum(ordinary.diagnostics['snr_risk_bright_exempt'])),
-        kron_segmentation=segmentation_audit,
+        kron_segmentation=segmentation_audit,halo_no_kron=halo_no_kron_audit,
         containment_policy='Existing IoU>=0.8 / inner fraction>=0.8 rules; valid Kron and retained non-ignore only; no contains-ignore demotion.',
         training_reference='half-coadd image and sky for bright/dense; FULL coadd image/sky for SNR')
     return labels,summary

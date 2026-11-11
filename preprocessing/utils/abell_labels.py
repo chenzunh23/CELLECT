@@ -87,6 +87,12 @@ def classify_reference(reference, header, catalog, gaia, background, band, *, tr
                                               thresholds=snr_thresholds)
     restricted=np.isin(components,result.restricted_fallback_component_ids) if len(result.restricted_fallback_component_ids) else None
     ignored=np.isin(components,result.ordinary_ignore_component_ids) if len(result.ordinary_ignore_component_ids) else None
+    table['classification_snr'] = np.asarray(data.snr, float)
+    table['classification_reason'] = np.asarray(result.labels.reason, str)
+    measured = ordinary.diagnostics.get('aperture_snr')
+    if measured is not None:
+        table['remeasured_aperture_snr'] = np.asarray(measured, float)
+    table.meta['mask_moment_weak_snr_threshold'] = float(snr_thresholds.weak_below)
     labels=PatchLabels(table,np.empty(reference.shape,np.uint8),result.labels.source_class.copy(),geom.x,geom.y,geom.major,geom.minor,
         geom.theta,np.asarray(table['NUMBER'],np.int64),result.strict_center_x,result.strict_center_y,result.strict_center_source_id,
         strict_is_gaia=np.array(['gaia' in str(reason) for reason in result.strict_center_reason],bool))

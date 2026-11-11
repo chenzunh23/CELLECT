@@ -21,6 +21,47 @@ def make_input(n):
 
 
 class UncoverTests(unittest.TestCase):
+    def test_halo_no_kron_veto_preserves_gaia_geometry_and_existing_rejections(self):
+        from types import SimpleNamespace
+        from preprocessing.utils.uncover_labels import ignore_native_halo_without_kron
+        table=Table(dict(kron_radius=[np.nan,2.,np.nan,np.nan,np.nan,np.nan,np.nan,np.nan],
+            snr_contaminated_region=[True,True,False,True,True,True,True,True],
+            gaia_psf_model=[False,False,False,True,False,False,False,False],
+            classification_reason=['original']*8))
+        labels=SimpleNamespace(table=table,source_ids=np.array([1,2,3,4,-5,6,7,8]),
+            label_classes=np.array([C.STRICT_CENTER_ONLY,C.CLEAN,C.STRICT_CENTER_ONLY,C.WEAK_SHAPE,
+                                    C.STRICT_CENTER_ONLY,C.DROPPED,C.ORDINARY_IGNORE,C.STRICT_IGNORE]))
+        summary=ignore_native_halo_without_kron(labels)
+        self.assertEqual(summary['ignored'],1)
+        np.testing.assert_array_equal(labels.label_classes,[C.ORDINARY_IGNORE,C.CLEAN,C.STRICT_CENTER_ONLY,
+            C.WEAK_SHAPE,C.STRICT_CENTER_ONLY,C.DROPPED,C.ORDINARY_IGNORE,C.STRICT_IGNORE])
+        self.assertEqual(table['class_before_halo_no_kron'][0],C.STRICT_CENTER_ONLY)
+        self.assertEqual(table['classification_reason'][0],'uncover_halo_no_kron_ignore_before_blue')
+
+    def test_halo_veto_before_blue_allows_independent_center_insertion(self):
+        from types import SimpleNamespace
+        from preprocessing.utils.uncover_labels import ignore_native_halo_without_kron,add_blue_compact_centers
+        def labels():
+            return SimpleNamespace(table=Table(dict(kron_radius=[np.nan],snr_contaminated_region=[True],
+                classification_reason=['uncover_no_kron'])),source_ids=np.array([123]),
+                label_classes=np.array([C.STRICT_CENTER_ONLY]),geom_x=np.array([50.]),geom_y=np.array([50.]),
+                dense=np.zeros((100,100),np.uint8),strict_x=np.array([]),strict_y=np.array([]),
+                strict_ids=np.array([],np.int64),strict_is_gaia=np.array([],bool))
+        candidates=Table(dict(debug_id=[8],blue_candidate=[True],x=[51.],y=[50.],
+            F115W_snr=[6.],F150W_snr=[6.],F200W_snr=[6.]))
+        old=labels();old_result=add_blue_compact_centers(old,candidates,'F115W',scope='test')
+        ignore_native_halo_without_kron(old)
+        self.assertEqual(old_result['recentered'],1);self.assertEqual(len(old.strict_ids),0)
+        new=labels();ignore_native_halo_without_kron(new)
+        new_result=add_blue_compact_centers(new,candidates,'F115W',scope='test')
+        self.assertEqual(new.label_classes[0],C.ORDINARY_IGNORE)
+        self.assertEqual(new_result['added'],1);self.assertEqual(new_result['recentered'],0)
+        self.assertEqual(new.strict_x[0],51.)
+        # A red-band candidate still needs the original fixed-PSF threshold.
+        red=labels();ignore_native_halo_without_kron(red)
+        failed=add_blue_compact_centers(red,candidates,'F444W',core_snr=np.array([3.9]),scope='test')
+        self.assertEqual(failed['added'],0)
+
     def test_blue_recovery_reuses_only_exact_predecessor_successes(self):
         from copy import deepcopy
         from preprocessing.utils.abell_blue_detection import compatible_signature,COMPATIBLE_CODE_HASHES

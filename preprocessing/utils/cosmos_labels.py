@@ -61,6 +61,9 @@ def classify_window(raw, header, catalog, catalog_path, gaia, background, band, 
     bright = label_bright_sources(data, ordinary.labels, image_shape=raw.shape, image_header=header,
         gaia_table=gaia,source_ids=np.asarray(tab['id']),
         config=JWSTBrightConfig('cosmos',scale,PSF_FWHM_ARCSEC[band],gaia_reference_epoch=2016.))
+    tab['classification_snr'] = np.asarray(data.snr, float)
+    tab['classification_reason'] = np.asarray(bright.labels.reason, str)
+    tab.meta['mask_moment_weak_snr_threshold'] = float(snr_thresholds.weak_below)
     from .truncated_kron import large_kron_geometry
     raw_large=large_kron_geometry(catalog['id'],x,y,
         np.asarray(catalog['kron2_a'],float)/scale,np.asarray(catalog['kron2_b'],float)/scale,
