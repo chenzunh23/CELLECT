@@ -76,7 +76,8 @@ class JwstInputTests(unittest.TestCase):
             dict(image_fits=str(source),quality_mask_npz=str(quality),sample_name='same',proposal=1727,pointing=19,band='F444W')]}))
         prep=prepare_image(raw,header=header(128),source_path=source)
         params=fit_parent_rgb(prep.image);rgb=apply_parent_rgb(prep.image,params)
-        bright,_=build_bright_components(prep,config=BrightRegionConfig(threshold=5,clip_threshold=5))
+        bright,_=build_bright_components(prep,config=BrightRegionConfig(threshold=5,clip_threshold=5,
+            lupton_q=200.,lupton_stretch=50.))
         self.assertTrue(bright[50,50]);self.assertFalse(bright[90:94,90:94].any())
         self.assertFalse(bright[20:40,:6].any())
         lab=labels();lab.dense=np.full((128,128),int(DenseLabel.BACKGROUND),np.uint8)

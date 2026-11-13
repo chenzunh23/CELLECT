@@ -82,6 +82,38 @@ def make_state(root, count=6):
 
 
 class ParallelExportTests(unittest.TestCase):
+    def test_count_title_is_exact_and_pixels_are_preserved(self):
+        from PIL import Image
+        a=np.random.default_rng(2).integers(0,256,(512,512,3),dtype=np.uint8)
+        title=browser_core.detection_export_title('long_source_name',225)
+        self.assertEqual(title,'Detected: 225')
+        titled=browser_core.titled_export_image(a,title)
+        header=titled.height-512
+        self.assertGreater(header,30)
+        np.testing.assert_array_equal(np.asarray(titled)[header:],a)
+        other=browser_core.titled_export_image(a,'Detected: 9')
+        self.assertEqual(other.size,titled.size)
+        np.testing.assert_array_equal(np.asarray(browser_core.titled_export_image(a,'')),a)
+        self.assertEqual(browser_core.detection_export_title('id',1,'none'),'')
+        self.assertIn('id',browser_core.detection_export_title('id',1,'full'))
+
+    def test_export_title_options_are_snapshotted_and_recorded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state=make_state(tmp,2)
+            state.export_selected(write_png=True,title_mode='none',title_font_size=28)
+            rows=[json.loads(s) for s in (Path(tmp)/'export_manifest.jsonl').read_text().splitlines()]
+            self.assertTrue(all(r['export_title_options']==dict(mode='none',font_size_at_512=28.) for r in rows))
+            for row in rows:
+                with np.load(row['mask_npz_path'], allow_pickle=False) as masks:
+                    self.assertIn('packed', masks.files)
+                    self.assertIn('row_indices', masks.files)
+                    self.assertEqual(int(masks['height']),32)
+                    np.testing.assert_array_equal(masks['bounds'],np.empty((0,4),dtype=np.int32))
+            with self.assertRaisesRegex(ValueError,'font size'):
+                state.export_selected(write_png=False,title_font_size=float('nan'))
+            with self.assertRaisesRegex(ValueError,'title mode'):
+                state.export_selected(write_png=False,title_mode='unsupported')
+
     def test_parallel_files_match_serial_and_order_is_preserved(self):
         with tempfile.TemporaryDirectory() as tmp:
             serial = make_state(Path(tmp)/'serial')

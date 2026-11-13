@@ -1104,8 +1104,12 @@ def build_prompt_masks(
     return label_map
 
 
-def mask_overlay(image: np.ndarray, label_map: np.ndarray, *, alpha: float = 0.40, edge_width: int = 1) -> np.ndarray:
-    rgb = zscale_rgb(image)
+def mask_overlay(image: np.ndarray, label_map: np.ndarray, *, alpha: float = 0.40, edge_width: int = 1,
+                 background_rgb: np.ndarray | None = None) -> np.ndarray:
+    """Instance colors over ZScale or an already displayed lower-origin RGB image."""
+    rgb = zscale_rgb(image) if background_rgb is None else np.asarray(background_rgb,dtype=np.float32).copy()
+    if rgb.shape != (*label_map.shape,3):
+        raise ValueError('Mask/background RGB shapes differ')
     palette = np.asarray(
         [
             (0.00, 0.82, 1.00),

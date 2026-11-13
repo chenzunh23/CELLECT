@@ -166,7 +166,10 @@ def main():
     parser.add_argument('--report',required=True)
     options, rest = parser.parse_known_args()
     args = parse_args(rest)
+    from .image_processing import log_generation_scaling
+    scaling = log_generation_scaling(args)
     result = check(args)
+    result['scaling'] = scaling
     output = Path(options.report)
     output.parent.mkdir(parents=True,exist_ok=True)
     output.write_text(json.dumps(result,indent=2,default=str)+'\n')

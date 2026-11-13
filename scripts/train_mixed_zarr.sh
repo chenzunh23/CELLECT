@@ -91,7 +91,7 @@ common=(--mode "$MODE" --data-format zarr --root "$ROOT" --bands all --checkpoin
   --mask-pred-iou-weight "${MASK_PRED_IOU_WEIGHT:-0.2}" --mask-stability-weight 0
   --mask-unmatched-prompt-weight 0.2 --center-only-shape-factor 0.2 --mask-pred-iou-thresh 0.8
   --mask-stability-score-thresh 0.95 --mask-stability-score-offset 1 --mask-stability-temperature 10
-  --mask-prompt-gt-epochs "${MASK_GT_EPOCHS:-10}" --mask-prompt-pred-epoch "${MASK_PRED_EPOCH:-30}"
+  --mask-prompt-gt-epochs "${MASK_GT_EPOCHS:-10}" --mask-prompt-pred-epoch "${MASK_PRED_EPOCH:-${MASK_PRED_EPOCHS:-30}}"
   --mask-selection "${MASK_SELECTION:-pred_iou}"
   --mask-max-gt-per-sample 128 --mask-max-pred-per-sample 128
   --mask-prompt-chunk-size "${MASK_PROMPT_CHUNK_SIZE:-256}"

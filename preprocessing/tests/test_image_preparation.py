@@ -62,7 +62,7 @@ class ImagePreparationTests(unittest.TestCase):
         raw[63:65, 63:65] = np.nan
         prepared = prepare_image(raw, config=ImagePreparationConfig(input_unit="native"))
         bright, labels = build_bright_components(prepared, config=BrightRegionConfig(
-            threshold=5, clip_threshold=5, statistics_clip_sigma=5))
+            threshold=5, clip_threshold=5, statistics_clip_sigma=5,lupton_q=200.,lupton_stretch=50.))
         self.assertTrue(bright[63, 63])
         self.assertEqual(labels[63, 63], labels[60, 60])
         self.assertFalse(prepared.finite_mask[63, 63])

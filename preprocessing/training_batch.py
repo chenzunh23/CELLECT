@@ -21,7 +21,7 @@ from .utils.inputs import TileSpec, make_tile_specs
 from .utils.large_sources import large_source_specs, crop_padded, valid_tile_specs
 from .utils.parent_scaling import fit_parent_rgb, apply_parent_rgb
 from .utils.background_tiles import cosmos_region, abell_region, read_mask, check_source
-from .image_processing import prepare_image
+from .image_processing import prepare_image, jwst_bright_config
 from .snr import thresholds_from_args, snr_policy_from_args, hsc_snr_job_metadata
 
 
@@ -125,7 +125,7 @@ def cosmos_parent(args,row):
     raw,valid,header,hard_bad=read_window(source,ox,oy,size,return_hard_bad=True)
     sky,bgmeta=cosmos_region(row['background'],source.image_fits,ox,oy,size,size)
     labels=classify_window(raw,header,catalog,catalog_path,gaia,sky,source.band,
-        snr_thresholds=thresholds_from_args(args,'cosmos'))
+        snr_thresholds=thresholds_from_args(args,'cosmos'),bright_config=jwst_bright_config(args))
     core=raw[halo:halo+4096,halo:halo+4096]
     if not np.isfinite(core).any():return dict(status='empty',outputs=[])
     prep=prepare_image(raw,header=header,protected_invalid_mask=hard_bad)
@@ -133,7 +133,9 @@ def cosmos_parent(args,row):
     core_header['CRPIX1']-=halo;core_header['CRPIX2']-=halo
     core_header['NAXIS1']=core.shape[1];core_header['NAXIS2']=core.shape[0]
     params=fit_parent_rgb(prepare_image(core,header=core_header,
-        protected_invalid_mask=hard_bad[halo:halo+4096,halo:halo+4096]).image)
+        protected_invalid_mask=hard_bad[halo:halo+4096,halo:halo+4096]).image,
+        q=args.image_lupton_q,stretch=args.image_lupton_stretch,
+        high_percentile=args.image_log_high_percentile)
     (audit/'scaling.json').write_text(json.dumps(params,indent=2))
     patch=f'P{source.patch}_x{px:05d}_y{py:05d}'
     task=task_for(args,output_root=root/'zarr'/'cosmos'/f'proposal_{source.proposal}',
@@ -172,7 +174,7 @@ def cosmos_parent(args,row):
         if np.count_nonzero(valid[1792:2304,1792:2304])<(1-args.jwst_max_invalid_fraction)*512**2:continue
         sky,bgmeta=cosmos_region(row['background'],source.image_fits,cx,cy,4096,4096)
         lab=classify_window(raw,ch,catalog,catalog_path,gaia,sky,source.band,
-            snr_thresholds=thresholds_from_args(args,'cosmos'))
+            snr_thresholds=thresholds_from_args(args,'cosmos'),bright_config=jwst_bright_config(args))
         stask=replace(part_task,patch=patch+'_'+spec.name.split('_')[1])
         metadata={**provenance,'sample_kind':'large_source','stamp_bounds':[spec.x0,spec.y0,spec.x1,spec.y1],
             'label_window':[cx,cy,cx+4096,cy+4096], 'labels_generated_independently':True,
@@ -375,6 +377,8 @@ def run_job(args,row):
         cross_boundary_only=args.cross_boundary_only,large_limit=args.large_limit,
         max_invalid_fraction=args.jwst_max_invalid_fraction,
         snr_thresholds=snr_policy_from_args(args,'hsc' if row['kind'].startswith('hsc') else row['kind']))
+    from .image_processing import generation_scaling
+    signature['scaling'] = generation_scaling(args)
     if row['kind'] in ('abell','cosmos'):
         from .utils.jwst_star_psf import star_policy
         signature['jwst_star_protection']=star_policy()

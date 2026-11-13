@@ -30,10 +30,12 @@ def confidence_maps(outputs, *, width, height, valid_mask, score_mode):
                 ordinal_expectation=ordinal, valid=valid)
 
 
-def confidence_overlay_uint8(background, labels, *, alpha=.60):
+def confidence_overlay_uint8(background, labels, *, alpha=.60, colors=None):
     """Render ordinal integer labels or a continuous floating-point heatmap."""
     if np.issubdtype(np.asarray(labels).dtype,np.floating):
-        return heatmap_overlay_uint8(background,labels,alpha=alpha)
+        return heatmap_overlay_uint8(background,labels,alpha=alpha,colors=colors)
+    if not np.isfinite(alpha) or not 0 <= alpha <= 1:
+        raise ValueError('Confidence alpha must be between 0 and 1')
     base = np.asarray(background, dtype=np.uint8)
     if base.ndim == 2:
         base = np.repeat(base[..., None], 3, axis=-1)
@@ -41,18 +43,20 @@ def confidence_overlay_uint8(background, labels, *, alpha=.60):
     if base.shape[:2] != levels.shape:
         raise ValueError('Confidence overlay and background shape mismatch')
     rgb = base.astype(np.float32)
-    for level, color in CONF_COLORS.items():
+    for level, color in (CONF_COLORS if colors is None else colors).items():
         selected = levels == level
         rgb[selected] = (1-alpha)*rgb[selected] + alpha*255*np.asarray(color)
     return np.clip(np.rint(rgb), 0, 255).astype(np.uint8)
 
 
-def heatmap_overlay_uint8(background, probability, *, alpha=.60):
+def heatmap_overlay_uint8(background, probability, *, alpha=.60, colors=None):
     """Continuous sigmoid probabilities; zero/invalid support is transparent.
 
     PNG backgrounds are top-down and saved arrays use lower-origin pixels.
     Root-scaled opacity reveals weak peaks without thresholding or rerunning SAM.
     """
+    if not np.isfinite(alpha) or not 0 <= alpha <= 1:
+        raise ValueError('Confidence alpha must be between 0 and 1')
     base=np.asarray(background,dtype=np.uint8)
     if base.ndim==2:base=np.repeat(base[...,None],3,axis=-1)
     score=np.flipud(np.asarray(probability,dtype=np.float32))
@@ -60,7 +64,8 @@ def heatmap_overlay_uint8(background, probability, *, alpha=.60):
         raise ValueError('Heatmap overlay and background shape mismatch')
     valid=np.isfinite(score)
     score=np.where(valid,np.clip(score,0.,1.),0.)
-    colors=np.asarray([CONF_COLORS[k] for k in (1,2,3,4)],dtype=np.float32)
+    palette=CONF_COLORS if colors is None else colors
+    colors=np.asarray([palette[k] for k in (1,2,3,4)],dtype=np.float32)
     stops=np.linspace(0.,1.,len(colors))
     color=np.stack([np.interp(score,stops,colors[:,channel]) for channel in range(3)],axis=-1)
     opacity=(float(alpha)*np.sqrt(score))[...,None]

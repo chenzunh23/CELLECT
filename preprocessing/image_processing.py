@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import os
 from pathlib import Path
 
@@ -11,7 +12,7 @@ from astropy.io import fits
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-cellect")
 
-from data_filtering.sam_input_scaling import build_bright_mask, scale_training_image
+from data_filtering.sam_input_scaling import build_bright_mask, scale_training_image, scaling_contract
 from .utils.image import fill_nonfinite_hybrid, hsc_surface_brightness_factor
 
 
@@ -143,6 +144,35 @@ class BrightRegionConfig:
     anscombe_clip: bool = False
     anscombe_scale: float = 1000.0
     statistics_clip_sigma: float | None = None
+
+
+def generation_scaling(settings, *, image_log_a=None, bright_log_a=None):
+    """One definition for startup logs, receipts and actual store metadata."""
+    image = scaling_contract(mode=settings.image_scaling_mode, scope=settings.image_scaling_scope,
+        q=settings.image_lupton_q, stretch=settings.image_lupton_stretch,
+        log_a=settings.image_log_a if image_log_a is None else image_log_a,
+        clip=settings.clip_threshold, high_percentile=settings.image_log_high_percentile)
+    bright = scaling_contract(mode=settings.bright_mask_mode, scope='classification_parent',
+        q=settings.bright_lupton_q, stretch=settings.bright_lupton_stretch,
+        log_a=settings.bright_log_a if bright_log_a is None else bright_log_a,
+        clip=settings.clip_threshold, high_percentile=settings.bright_log_high_percentile)
+    return dict(image=image, bright=bright)
+
+
+def log_generation_scaling(settings, **kwargs):
+    contract = generation_scaling(settings, **kwargs)
+    print('[scaling] Zarr generation '+json.dumps(contract, sort_keys=True), flush=True)
+    return contract
+
+
+def jwst_bright_config(settings):
+    """Use the logged CLI parameters also in JWST catalog adapters."""
+    return BrightRegionConfig(mode=getattr(settings,'bright_mask_mode','log-lupton'),
+        threshold=getattr(settings,'bright_threshold',5.),clip_threshold=getattr(settings,'clip_threshold',5.),
+        dilation=getattr(settings,'bright_dilation',2),log_a=1000.,
+        log_high_percentile=getattr(settings,'bright_log_high_percentile',99.5),
+        lupton_q=getattr(settings,'bright_lupton_q',20.),lupton_stretch=getattr(settings,'bright_lupton_stretch',.5),
+        statistics_clip_sigma=5.)
 
 
 def read_fits_image(path: Path | str, *, hdu: int | str = 1) -> tuple[np.ndarray, fits.Header]:

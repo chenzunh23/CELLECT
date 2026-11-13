@@ -16,7 +16,7 @@ from .utils.large_sources import large_source_specs, valid_tile_specs, crop_padd
 from .utils.parent_scaling import fit_parent_rgb, apply_parent_rgb
 from .utils.sky_tiles import reproject_tile
 from .utils.abell_labels import classify_reference
-from .image_processing import prepare_image
+from .image_processing import prepare_image, jwst_bright_config
 from .labels import DenseLabel
 from .snr import thresholds_from_args, snr_policy_from_args
 from .dataset_inputs import header_info, image_hdu
@@ -86,6 +86,7 @@ def uncover_labels_for_window(args, reference, rheader, catalog, gaia, backgroun
     labels,summary=classify_uncover(reference,rheader,catalog,gaia,background,band,
         native_header=native_header,training_background=training_sky,
         bright_image=prepared,bright_header=header,native_segmentation=segments,
+        bright_config=jwst_bright_config(args),
         snr_config=config,snr_risk_model=normalized_model,
         snr_risk_sigma=args.uncover_risk_sigma,snr_risk_coverage=coverage,
         progress=lambda stage,n=0:print(f'[abell-uncover] {band} {prefix}: {stage} n={n}',flush=True))
@@ -212,7 +213,9 @@ def _build_parent(args, row):
     from .utils.jwst_star_psf import star_policy
     use_uncover=getattr(args,'use_uncover',False)
     catalog_path=args.uncover_catalog if use_uncover else args.abell_catalog
-    signature=dict(snr_thresholds=snr_policy_from_args(args,'abell'),uncover=uncover_signature(args,row['band']),jwst_star_protection=star_policy(),source_area_weight_policy=source_area_weight_policy(),confidence_asset=asset,max_invalid_fraction=args.jwst_max_invalid_fraction,
+    from .image_processing import generation_scaling
+    signature=dict(scaling=generation_scaling(args, image_log_a=1000., bright_log_a=1000.),
+        snr_thresholds=snr_policy_from_args(args,'abell'),uncover=uncover_signature(args,row['band']),jwst_star_protection=star_policy(),source_area_weight_policy=source_area_weight_policy(),confidence_asset=asset,max_invalid_fraction=args.jwst_max_invalid_fraction,
         stride=368,max_tiles=args.max_tiles,large_only=getattr(args,'large_only',False),
         large_limit=getattr(args,'large_limit',0),cross_boundary_only=getattr(args,'cross_boundary_only',False),
         background_root=args.background_root,sex_detect_thresh=args.sex_detect_thresh,
@@ -270,7 +273,8 @@ def _build_parent(args, row):
     else:
         labels,summary=classify_reference(reference,rheader,catalog,gaia,background,row['band'],training_background=training_sky,
                                           bright_image=prepared,bright_header=header,
-                                          snr_thresholds=thresholds_from_args(args,'abell'))
+                                          snr_thresholds=thresholds_from_args(args,'abell'),
+                                          bright_config=jwst_bright_config(args))
     del reference,background
     # Keep frozen original geometry and final labels for audits/centered views.
     labels.table['final_class']=labels.label_classes
@@ -278,7 +282,8 @@ def _build_parent(args, row):
     labels.table['original_kron_a']=labels.geom_major;labels.table['original_kron_b']=labels.geom_minor
     labels.table.write(audit/'sources.fits',overwrite=True)
     progress(f'[abell-zarr] {row["band"]}/{row["patch"]} stage=scaling_and_grid_Zarr candidates={len(grid)}')
-    params=fit_parent_rgb(prepared.image)
+    params=fit_parent_rgb(prepared.image,q=task.image_lupton_q,stretch=task.image_lupton_stretch,
+                          high_percentile=task.image_log_high_percentile)
     (audit/'scaling.json').write_text(json.dumps(params,indent=2)+'\n')
     scaled=apply_parent_rgb(prepared.image,params)
     provenance=dict(dataset='abell',snr_thresholds=snr_policy_from_args(args,'abell'),split_group='Abell2744',parent_id=row['patch'],
@@ -341,7 +346,8 @@ def _build_parent(args, row):
             else:
                 lab,_=classify_reference(refcontext,rch,catalog,gaia,refsky,row['band'],training_background=sky,
                                          bright_image=prep,bright_header=ch,
-                                         snr_thresholds=thresholds_from_args(args,'abell'))
+                                         snr_thresholds=thresholds_from_args(args,'abell'),
+                                         bright_config=jwst_bright_config(args))
             extra_task=replace(part_task,patch=row['patch']+'_'+source_id)
             one=TileSpec(spec.name,1792,1792,512,kind='large_source')
             extra_result=write_classified_patch(extra_task,prep.image,lab,tile_specs=[one],valid_mask=ok,

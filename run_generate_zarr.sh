@@ -39,6 +39,8 @@ args=(--training-batch --training-kinds "${kinds[@]}"
   --confidence-mode "${CONFIDENCE_MODE:-psf-ee}" --tile-size 512 --stride 368 --chunk-tiles "$CHUNK_TILES"
   --clip-threshold 5 --bright-threshold 5 --bright-dilation 2
   --image-scaling-mode zscore-log-lupton-rgb --image-scaling-scope patch
+  --image-lupton-q "${IMAGE_LUPTON_Q:-20}" --image-lupton-stretch "${IMAGE_LUPTON_STRETCH:-0.5}"
+  --bright-lupton-q "${BRIGHT_LUPTON_Q:-20}" --bright-lupton-stretch "${BRIGHT_LUPTON_STRETCH:-0.5}"
   --bright-mask-mode log-lupton --jwst-max-invalid-fraction 0.10)
 command=("$PYTHON" -u -m preprocessing.build_image_level_zarr "${args[@]}" "$@")
 if [[ ${DRY_RUN:-0} == 1 ]]; then

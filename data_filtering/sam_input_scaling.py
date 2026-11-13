@@ -1,7 +1,8 @@
 """Shared single-band scaling utilities for SAM/CELLECT preprocessing.
 
-The functions here mirror the diagnostics in ``visualize_sam_input_scalings.py``
-so preprocessing and visualization use the same definitions.
+Production RGB/bright paths use an unclipped zscore as the input to log and
+Lupton, followed by independent channel standardization and clipping. The
+low-level transforms remain intensity-domain primitives for diagnostics.
 """
 
 from __future__ import annotations
@@ -13,6 +14,36 @@ import numpy as np
 from astropy.io import fits
 from astropy.stats import sigma_clipped_stats
 from astropy.visualization import make_lupton_rgb
+
+
+SCALING_VERSION = "zscore_first_v1"
+
+
+def scaling_contract(*, mode="zscore-log-lupton-rgb", scope="supplied_array",
+                     q=20., stretch=.5, log_a=1000., clip=5., high_percentile=99.5):
+    """JSON-safe definition; Q20/s0.5 remains the explicit control default."""
+    mode = str(mode).lower().replace('_', '-')
+    nonlinear = mode in {'zscore-log-lupton-rgb', 'zscore-lupton-log-rgb',
+                         'log-lupton-rgb', 'log-lupton', 'zscore-lupton-log', 'lupton-log'}
+    return dict(version=SCALING_VERSION if nonlinear else 'single_transform_v1', mode=mode,
+                order=('prepared_intensity -> unclipped_zscore -> log/lupton -> '
+                       'channel_standardize -> clip' if nonlinear else mode),
+                statistics_scope=str(scope), lupton_q=float(q), lupton_stretch=float(stretch),
+                log_a=(float(log_a) if np.isfinite(log_a) else
+                       'per-band: broad=1000, NB0387=3000, NB1010=100'),
+                log_high_percentile=float(high_percentile), clip_threshold=float(clip))
+
+
+def unclipped_zscore_input(image, stats):
+    """Use fitted background statistics without capping bright input pixels.
+
+    Nonlinear transforms must see the unbounded z image, not the clipped first
+    encoder channel. Preserve no-data so it cannot bias subsequent statistics.
+    """
+    image = np.asarray(image, dtype=np.float32)
+    z = ((image - stats['zscore_median']) / stats['std']).astype(np.float32)
+    z[~np.isfinite(image)] = np.nan
+    return z
 
 
 def finite_values(image: np.ndarray) -> np.ndarray:
@@ -316,15 +347,16 @@ def build_bright_mask(
                 z = current_z
             bright = z >= float(threshold)
         elif normalized_mode in {"log-lupton", "zscore-lupton-log", "lupton-log"}:
+            transform_input = unclipped_zscore_input(image, current_stats)
             log_map, _log_stats = log_single(
-                image,
-                minimum=float(current_stats["raw_min"]),
+                transform_input,
+                minimum=float(np.nanmin(transform_input)),
                 high_pct=float(log_high_percentile),
                 a=float(log_a),
             )
             lupton_map, _lupton_stats = lupton_single(
-                image,
-                minimum=float(current_stats["zscore_median"]),
+                transform_input,
+                minimum=0.,
                 stretch=float(lupton_stretch),
                 q=float(lupton_q),
             )
@@ -367,6 +399,8 @@ def scale_training_image(
 
     Modes ending in ``-rgb`` return ``[3, H, W]`` arrays.  The three-channel
     mode ``zscore-log-lupton-rgb`` uses channel order ``zscore, log, lupton``.
+    Log and Lupton receive the unbounded background zscore, before the final
+    channel standardization/clipping. The Q20/s0.5 control remains the default.
     Single-scaling RGB modes repeat the same transformed plane three times so
     the SAM encoder receives a native RGB-shaped tensor.
     """
@@ -400,15 +434,16 @@ def scale_training_image(
         )
 
     if normalized_mode in {"zscore-log-lupton-rgb", "zscore-lupton-log-rgb", "log-lupton-rgb"}:
+        transform_input = unclipped_zscore_input(image, current_stats)
         log_map, _log_stats = log_single(
-            image,
-            minimum=float(current_stats["raw_min"]),
+            transform_input,
+            minimum=float(np.nanmin(transform_input)),
             high_pct=float(log_high_percentile),
             a=float(log_a),
         )
         lupton_map, _lupton_stats = lupton_single(
-            image,
-            minimum=float(current_stats["zscore_median"]),
+            transform_input,
+            minimum=0.,
             stretch=float(lupton_stretch),
             q=float(lupton_q),
         )

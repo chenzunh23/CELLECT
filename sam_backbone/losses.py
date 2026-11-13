@@ -117,6 +117,27 @@ def _boxes_from_centers_shapes(
     return torch.stack([x0, y0, x1, y1], dim=1)
 
 
+def _mask_grid_centers(
+    mask_hw: Tuple[int, int],
+    image_hw: Tuple[int, int],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tuple[Tensor, Tensor]:
+    """Return floating native-pixel (y, x) centers of the mask grid.
+
+    This is the inverse sampling convention of bilinear align_corners=False:
+    native = (mask_index + 0.5) * native_size / mask_size - 0.5.
+    Keep geometry at least FP32 under AMP; never round subpixel centers.
+    """
+    mh, mw = mask_hw
+    h, w = image_hw
+    dtype = torch.float64 if dtype == torch.float64 else torch.float32
+    y = (torch.arange(mh, device=device, dtype=dtype) + 0.5) * (float(h) / mh) - 0.5
+    x = (torch.arange(mw, device=device, dtype=dtype) + 0.5) * (float(w) / mw) - 0.5
+    return y, x
+
+
 def _ellipse_targets_lowres(
     centers_xy: Tensor,
     shapes: Tensor,
@@ -129,18 +150,17 @@ def _ellipse_targets_lowres(
     mh, mw = int(mask_hw[0]), int(mask_hw[1])
     if n == 0:
         return centers_xy.new_zeros((0, mh, mw))
-    scale_x = float(mw) / float(image_hw[1])
-    scale_y = float(mh) / float(image_hw[0])
-    yy, xx = torch.meshgrid(
-        torch.arange(mh, device=centers_xy.device, dtype=centers_xy.dtype),
-        torch.arange(mw, device=centers_xy.device, dtype=centers_xy.dtype),
-        indexing="ij",
-    )
-    cx = centers_xy[:, 0] * scale_x
-    cy = centers_xy[:, 1] * scale_y
-    major = shapes[:, 0].abs().clamp_min(1.0) * float(ellipse_sigma) * scale_x
-    minor = shapes[:, 1].abs().clamp_min(1.0) * float(ellipse_sigma) * scale_y
-    theta = shapes[:, 2] if shapes.shape[1] >= 3 else shapes.new_zeros((n,))
+    y, x = _mask_grid_centers((mh, mw), image_hw,
+        device=centers_xy.device, dtype=centers_xy.dtype)
+    yy, xx = torch.meshgrid(y, x, indexing="ij")
+    # Rotate in native coordinates: scaling axes before rotation is incorrect
+    # when the horizontal and vertical resize factors differ.
+    centers = centers_xy.to(dtype=x.dtype)
+    native_shapes = shapes.to(dtype=x.dtype)
+    cx, cy = centers.unbind(-1)
+    major = native_shapes[:, 0].abs().clamp_min(1.0) * float(ellipse_sigma)
+    minor = native_shapes[:, 1].abs().clamp_min(1.0) * float(ellipse_sigma)
+    theta = native_shapes[:, 2] if shapes.shape[1] >= 3 else x.new_zeros((n,))
     dx = xx.unsqueeze(0) - cx[:, None, None]
     dy = yy.unsqueeze(0) - cy[:, None, None]
     cos_t = torch.cos(theta)[:, None, None]
@@ -568,12 +588,14 @@ def _sam_mask_loss_for_prompts(
 
     if weight_centroid:
         assert prob is not None and prob_sum is not None
-        x_coords = torch.arange(mw, device=logits.device, dtype=logits.dtype).view(1, 1, 1, mw)
-        y_coords = torch.arange(mh, device=logits.device, dtype=logits.dtype).view(1, 1, mh, 1)
+        y_coords, x_coords = _mask_grid_centers((mh, mw), image_hw,
+            device=logits.device, dtype=logits.dtype)
+        x_coords = x_coords.view(1, 1, 1, mw)
+        y_coords = y_coords.view(1, 1, mh, 1)
         cx = (prob * x_coords).sum(dim=(-1, -2)) / prob_sum.clamp_min(1e-6)
         cy = (prob * y_coords).sum(dim=(-1, -2)) / prob_sum.clamp_min(1e-6)
-        dx = cx * (float(image_hw[1])/mw) - prompts['centers'][:, 0, None]
-        dy = cy * (float(image_hw[0])/mh) - prompts['centers'][:, 1, None]
+        dx = cx - prompts['centers'][:, 0, None]
+        dy = cy - prompts['centers'][:, 1, None]
         axes = prompts['target_shapes'][:, :2].detach().abs().clamp_min(1)
         radius = (axes[:, 0]*axes[:, 1]).sqrt()
         centroid = torch.linalg.vector_norm(torch.stack((dx, dy), dim=-1), dim=-1)/radius[:, None]

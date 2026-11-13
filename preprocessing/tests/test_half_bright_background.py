@@ -1,5 +1,6 @@
 """Training-image bright selection and exact HSC half-background provenance."""
 from pathlib import Path
+from dataclasses import replace
 from types import SimpleNamespace
 import json
 import tempfile
@@ -27,6 +28,9 @@ class HalfBrightBackgroundTests(unittest.TestCase):
         from preprocessing.utils.abell_labels import classify_ordinary_sources
         full,half,catalog,gaia=self.inputs();captured=[]
         def bright(image,**kw):
+            # This tests HALF-vs-FULL provenance. Use a threshold that the
+            # zscore-first Q20/s0.5 control can reach on this Gaussian fixture.
+            kw['config']=replace(kw['config'],threshold=3.)
             result=build_bright_components(image,**kw);captured.append(result[0]);return result
         with patch('preprocessing.utils.abell_labels.build_bright_components',side_effect=bright), \
              patch('preprocessing.utils.abell_labels.classify_ordinary_sources',wraps=classify_ordinary_sources) as ordinary:

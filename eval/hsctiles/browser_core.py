@@ -688,7 +688,46 @@ def _draw_centers_on_uint8(image_rgb: np.ndarray, rows: list[dict[str, float]], 
     return np.asarray(pil, dtype=np.uint8)
 
 
-def _save_titled_png(path: Path, image_rgb: np.ndarray, title: str, *, min_image_size: int = 512) -> None:
+def detection_export_title(candidate_id: str, count: int, mode: str = 'detected', *, input_shape=False) -> str:
+    if mode == 'detected':
+        return f'Detected: {int(count)}'
+    if mode == 'none':
+        return ''
+    if mode == 'full':
+        return f'{candidate_id} {"input shape " if input_shape else ""}detections={int(count)}'
+    raise ValueError('export title mode must be detected, full, or none')
+
+
+def export_title_options(mode='detected', font_size=22.) -> dict[str, Any]:
+    detection_export_title('', 0, mode)
+    font_size = float(font_size)
+    if not np.isfinite(font_size) or not 4 <= font_size <= 256:
+        raise ValueError('export title font size must be between 4 and 256 pixels at width 512')
+    return dict(mode=mode, font_size_at_512=font_size)
+
+
+def _export_title_font(size: int):
+    candidates = [os.environ.get('CELLECT_EXPORT_FONT', ''),
+        str(Path.home()/'.local/share/fonts/Arial.ttf'), 'Arial.ttf',
+        '/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf', 'DejaVuSans.ttf']
+    for path in candidates:
+        if not path:
+            continue
+        try:
+            return ImageFont.truetype(path, size=size)
+        except OSError:
+            pass
+    return ImageFont.load_default(size=size)
+
+
+def titled_export_image(image_rgb: np.ndarray, title: str, *, min_image_size: int = 512,
+                       font_size: float = 22.) -> Image.Image:
+    """Title font scales with image width; science pixels are never rescaled down.
+
+    At 512px, 22px matches 14pt when four images fill an 18.4-inch reference
+    figure. The shorter count-only title has the same header height for all counts.
+    """
+    export_title_options(font_size=font_size)
     arr = np.asarray(image_rgb)
     if arr.ndim == 2:
         pil = Image.fromarray(arr.astype(np.uint8), mode="L").convert("RGB")
@@ -697,14 +736,37 @@ def _save_titled_png(path: Path, image_rgb: np.ndarray, title: str, *, min_image
     scale = max(1, int(np.ceil(float(min_image_size) / float(max(pil.size)))))
     if scale > 1:
         pil = pil.resize((pil.width * scale, pil.height * scale), Image.Resampling.NEAREST)
-    title_suffix = f" ({scale}x)" if scale > 1 else ""
-    font = ImageFont.load_default()
-    title_text = f"{title}{title_suffix}"
-    title_h = 30
+    if not title:
+        return pil
+    pixels = max(1, int(round(float(font_size)*pil.width/512.)))
+    font = _export_title_font(pixels)
+    pad = max(4, int(round(pixels*.35)))
+    # Detailed titles can wrap; never silently reduce their font size.
+    probe = ImageDraw.Draw(pil)
+    lines = []
+    line = ''
+    for char in str(title):
+        if char == '\n' or (line and probe.textlength(line+char,font=font)>pil.width-2*pad):
+            lines.append(line);line=''
+            if char=='\n':continue
+        line += char
+    lines.append(line)
+    line_h = int(np.ceil(pixels*1.20))
+    title_h = 2*pad+len(lines)*line_h
     canvas = Image.new("RGB", (pil.width, pil.height + title_h), "white")
     canvas.paste(pil, (0, title_h))
     draw = ImageDraw.Draw(canvas)
-    draw.text((8, 8), title_text, fill=(20, 20, 20), font=font)
+    for index, line in enumerate(lines):
+        bbox = draw.textbbox((0,0),line,font=font)
+        x = (pil.width-(bbox[2]-bbox[0]))/2-bbox[0]
+        y = pad+index*line_h+(line_h-(bbox[3]-bbox[1]))/2-bbox[1]
+        draw.text((x,y),line,fill=(20,20,20),font=font)
+    return canvas
+
+
+def _save_titled_png(path: Path, image_rgb: np.ndarray, title: str, *, min_image_size: int = 512,
+                     font_size: float = 22.) -> None:
+    canvas = titled_export_image(image_rgb,title,min_image_size=min_image_size,font_size=font_size)
     path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(path)
 
@@ -955,6 +1017,9 @@ class BrowserState:
         self._mask_cache = ArrayCache(128 * 1024**2)
         self.image_workers = max(1, int(getattr(args, "image_workers", 4)))
         self.export_workers = max(1, int(getattr(args, "export_workers", 4)))
+        self.export_title_mode = getattr(args, 'export_title_mode', 'detected')
+        self.export_title_font_size = float(getattr(args, 'export_title_font_size', 22.))
+        export_title_options(self.export_title_mode, self.export_title_font_size)
         self._export_lock = threading.Lock()
         self._export_progress_lock = threading.Lock()
         self._export_progress = {"stage": "idle", "completed": 0, "total": 0}
@@ -1237,6 +1302,8 @@ class BrowserState:
             "checkpoint": str(self.checkpoint),
             "image_workers": self.image_workers,
             "export_workers": self.export_workers,
+            "export_title_mode": self.export_title_mode,
+            "export_title_font_size": self.export_title_font_size,
             "snr_workers": self.snr_workers,
             "snr_aperture_diameter_arcsec": self._snr_default_diameter(),
             "snr_log_path": str(self.session_dir / "snr.log"),
@@ -1281,6 +1348,8 @@ class BrowserState:
             "checkpoint_name": self.checkpoint.name,
             "image_workers": self.image_workers,
             "export_workers": self.export_workers,
+            "export_title_mode": self.export_title_mode,
+            "export_title_font_size": self.export_title_font_size,
             "snr_workers": self.snr_workers,
             "snr_aperture_diameter_arcsec": self._snr_default_diameter(),
             "snr_log_path": str(self.session_dir / "snr.log"),
@@ -2094,10 +2163,12 @@ class BrowserState:
         return path
 
     def _export_ref(self, ref: FrameRef, detect_rows: list[dict[str, Any]], masks: Any,
-                    write_png: bool, confidence_view=None) -> tuple[dict[str, Any], dict[str, float]]:
+                    write_png: bool, confidence_view=None, title_options=None) -> tuple[dict[str, Any], dict[str, float]]:
         """CPU-only export of one candidate; masks are pinned by the producer."""
         started = last = time.perf_counter()
         timings: dict[str, float] = {}
+        title_options = title_options or export_title_options(
+            getattr(self,'export_title_mode','detected'),getattr(self,'export_title_font_size',22.))
 
         def mark(stage: str) -> None:
             nonlocal last
@@ -2120,6 +2191,9 @@ class BrowserState:
         kron_snr_png_path = out_dir / f"{stem}_kron_snr_overlay.png"
         detect_csv_path = out_dir / f"{stem}_detections.csv"
         mask_png_path = out_dir / f"{stem}_mask_overlay.png"
+        mask_npz_path = out_dir / f"{stem}_masks.npz"
+        if masks is not None:
+            np.savez_compressed(mask_npz_path, **masks)
         confidence_source = getattr(self, 'confidence_paths_by_token', {}).get(ref.token)
         confidence_is_heatmap=confidence_source is not None and np.issubdtype(
             self._confidence_for_token(ref.token).dtype,np.floating)
@@ -2156,8 +2230,9 @@ class BrowserState:
             _save_titled_png(
                 detect_png_path,
                 overlay,
-                f"{ref.candidate_id} detections={len(detect_rows)}",
+                detection_export_title(ref.candidate_id,len(detect_rows),title_options['mode']),
                 min_image_size=512,
+                font_size=title_options['font_size_at_512'],
             )
             scaled = self._scaled_input_for_ref(ref)
             input_overlay = _input_shape_overlay_uint8(
@@ -2170,8 +2245,9 @@ class BrowserState:
             _save_titled_png(
                 input_shape_png_path,
                 input_overlay,
-                f"{ref.candidate_id} input shape detections={len(detect_rows)}",
+                detection_export_title(ref.candidate_id,len(detect_rows),title_options['mode'],input_shape=True),
                 min_image_size=512,
+                font_size=title_options['font_size_at_512'],
             )
             mark("detection_pngs")
             cached_snr, snr_costs = self._measure_snr_rows_for_ref(ref, detection_image, detect_rows)
@@ -2203,6 +2279,7 @@ class BrowserState:
             "kron_snr_png_path": str(kron_snr_png_path) if write_png else "",
             "detect_csv_path": str(detect_csv_path),
             "mask_png_path": str(mask_png_path) if write_png and masks is not None else "",
+            "mask_npz_path": str(mask_npz_path) if masks is not None else "",
             "confidence_npz_path": str(confidence_npz_path) if confidence_source is not None else "",
             "confidence_png_path": str(confidence_png_path) if write_png and confidence_source is not None else "",
             "confidence_view": confidence_display_options(confidence_view),
@@ -2211,6 +2288,7 @@ class BrowserState:
             "confidence_classes": {} if confidence_is_heatmap else {str(k): v for k, v in {0:'background (transparent)', 1:'blue', 2:'green', 3:'yellow', 4:'red'}.items()},
             "export_subdir": str(out_dir),
             "n_detections": len(detect_rows),
+            "export_title_options": title_options,
             "inference_parameters": self._inference_parameters(),
             "checkpoint": str(self.checkpoint),
         }
@@ -2231,10 +2309,13 @@ class BrowserState:
             self._export_progress.update(changes)
 
     def export_selected(self, write_png: bool = True, *, workers: int | None = None,
-                        confidence_view=None) -> dict[str, Any]:
+                        confidence_view=None, title_mode=None, title_font_size=None) -> dict[str, Any]:
         workers = self.export_workers if workers is None else int(workers)
         if workers < 1:
             raise ValueError("export workers must be at least 1")
+        title_options = export_title_options(
+            getattr(self,'export_title_mode','detected') if title_mode is None else title_mode,
+            getattr(self,'export_title_font_size',22.) if title_font_size is None else title_font_size)
         if not self._export_lock.acquire(blocking=False):
             raise RuntimeError("an export is already running; see /api/export_status")
         started = time.perf_counter()
@@ -2312,7 +2393,7 @@ class BrowserState:
                         while len(pending) >= 2 * workers:
                             collect_done(block=True)
                         future = pool.submit(self._export_ref, ref, rows, masks, write_png,
-                                             confidence_view)
+                                             confidence_view, title_options)
                         pending[future] = (index, ref)
                         collect_done()
                     # Only the bounded queue retains this chunk's masks.
@@ -2328,6 +2409,7 @@ class BrowserState:
             temp.replace(target)
             elapsed = time.perf_counter() - started
             report = {"workers": workers, "n_exported": len(manifest), "elapsed_seconds": elapsed,
+                      "export_title_options": title_options,
                       "detection_and_mask_seconds": detect_seconds,
                       "regenerated_cached_masks": regenerated_masks,
                       "cpu_stage_seconds_sum": {key: sum(item["seconds"].get(key, 0) for item in timings)

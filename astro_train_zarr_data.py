@@ -571,6 +571,50 @@ def discover_zarr_image_bands(root: Path, *, hsc_root=None, space_root=None) -> 
         _image_store_readers(root,hsc_root=hsc_root,space_root=space_root)})
 
 
+def log_zarr_scaling(root: Path, *, hsc_root=None, space_root=None, bands=(), image_level=True):
+    """Report actual persisted inputs, never relabel old arrays as new scaling.
+
+    Metadata only: no science image chunks are opened and no scaling is rerun.
+    Different definitions are listed separately, including mixed-root training.
+    """
+    wanted = set(map(str, bands)) - {'all'}
+    print('[scaling] Training input=stored_zarr_passthrough; runtime_rescaling=false; reading scaling metadata', flush=True)
+    if image_level:
+        stores = ((p, r.attrs) for p, r, _ in _image_store_readers(
+            root, hsc_root=hsc_root, space_root=space_root))
+    else:
+        root = Path(root).expanduser().resolve()
+        paths = [root] if root.name.endswith('.zarr') else sorted(root.rglob('*.zarr'))
+        stores = ((p, _read_json(p/'.zattrs')) for p in paths if (p/'.zattrs').is_file())
+    definitions = {}
+    for path, attrs in stores:
+        if wanted and not wanted.intersection(map(str, attrs.get('bands', []))):
+            continue
+        mode = attrs.get('image_scaling_mode', attrs.get('scaling_mode', 'unknown'))
+        contract = attrs.get('image_scaling_contract')
+        if not contract:
+            composite = str(mode).replace('_', '-') in (
+                'zscore-log-lupton-rgb', 'zscore-lupton-log-rgb', 'log-lupton-rgb')
+            contract = dict(version=attrs.get('image_scaling_version',
+                'legacy_raw_first_unversioned' if composite else 'unversioned_unknown'),
+                mode=mode, order=attrs.get('image_scaling_order',
+                'prepared_intensity -> log/lupton -> channel_standardize -> clip' if composite else 'unknown'),
+                statistics_scope=attrs.get('image_scaling_scope', 'unknown'),
+                lupton_q=attrs.get('image_lupton_q'), lupton_stretch=attrs.get('image_lupton_stretch'),
+                log_a=attrs.get('image_log_a'), clip_threshold=attrs.get('image_clip_threshold',attrs.get('clip_threshold')))
+        key = json.dumps(contract, sort_keys=True)
+        if key not in definitions:
+            definitions[key] = dict(contract=contract, stores=0, example_store=str(path))
+        definitions[key]['stores'] += 1
+    summary = dict(input='stored_zarr_passthrough', runtime_rescaling=False,
+                   definitions=list(definitions.values()))
+    for definition in summary['definitions']:
+        print('[scaling] '+json.dumps(definition, sort_keys=True), flush=True)
+    if not definitions:
+        print('[scaling] No matching scaling metadata found; definition=unknown', flush=True)
+    return summary
+
+
 def discover_zarr_image_records(
     root: Path,
     *,

@@ -698,7 +698,7 @@ def classify_reference(reference, header, catalog, gaia, background, band, *,
         native_header, training_background=None, bright_image=None, bright_header=None,
         native_segmentation=None, progress=None,snr_config=UncoverSnrConfig(),
         snr_contaminated_mask=None,aperture_measurement=None,
-        snr_risk_model=None,snr_risk_sigma=3.,snr_risk_coverage=None):
+        snr_risk_model=None,snr_risk_sigma=3.,snr_risk_coverage=None,bright_config=None):
     """Same full-reference/half-bright/Gaia framework, with native UNCOVER rules."""
     from ..image_processing import prepare_image,PreparedImage,build_bright_components,BrightRegionConfig
     from ..bright_label import project_gaia_rows
@@ -729,7 +729,7 @@ def classify_reference(reference, header, catalog, gaia, background, band, *,
         if not np.allclose(points,projected,atol=1e-3,rtol=0):raise ValueError('HALF and FULL WCS must align')
     bp=prepared if bright_image is None else (bright_image if isinstance(bright_image,PreparedImage)
         else prepare_image(bright_image,header=bright_header))
-    bright,components=build_bright_components(bp,config=BrightRegionConfig(threshold=5,clip_threshold=5,statistics_clip_sigma=5))
+    bright,components=build_bright_components(bp,config=bright_config or BrightRegionConfig(threshold=5,clip_threshold=5,statistics_clip_sigma=5))
     gaia=gaia.copy()
     if 'ref_epoch' not in gaia.colnames:gaia['ref_epoch']=2016.
     grows=project_gaia_rows(gaia,image_shape=reference.shape,image_header=header,pixel_origin=0)

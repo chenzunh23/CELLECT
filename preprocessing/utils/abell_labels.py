@@ -21,7 +21,7 @@ def star_footprint(prepared, bright, gaia_rows):
 
 
 def classify_reference(reference, header, catalog, gaia, background, band, *, training_background=None,
-                       bright_image=None, bright_header=None, snr_thresholds=SnrThresholds()):
+                       bright_image=None, bright_header=None, snr_thresholds=SnrThresholds(),bright_config=None):
     """Select ordinary sources on full coadd; optionally build bright on half.
 
     Formal Zarr callers supply the aligned training half image for bright,
@@ -57,7 +57,7 @@ def classify_reference(reference, header, catalog, gaia, background, band, *, tr
         projected=np.column_stack(WCS(bright_header).celestial.all_world2pix(*w.all_pix2world(points[:,0],points[:,1],0),0))
         if not np.allclose(points,projected,atol=1e-3,rtol=0):
             raise ValueError('Training bright image must align with full-reference WCS')
-    bright,components=build_bright_components(bright_prepared,config=BrightRegionConfig(threshold=5,clip_threshold=5,statistics_clip_sigma=5))
+    bright,components=build_bright_components(bright_prepared,config=bright_config or BrightRegionConfig(threshold=5,clip_threshold=5,statistics_clip_sigma=5))
     if 'ref_epoch' not in gaia.colnames:
         gaia=gaia.copy();gaia['ref_epoch']=2016.
     gaia_rows=project_gaia_rows(gaia,image_shape=reference.shape,image_header=header,pixel_origin=0)

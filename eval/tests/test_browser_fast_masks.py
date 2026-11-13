@@ -175,7 +175,7 @@ class FastFitsAndMasksTests(unittest.TestCase):
                 masks[:,2,:,:]=12. # oversized candidate
                 return masks, torch.tensor([[10.,0.,0.]]).expand(len(points),-1)
         rows = [dict(x=8.,y=8.,major=3.,minor=2.,theta=.3)]*3
-        outputs = {'image_embeddings': torch.zeros(1,1,2,2)}
+        outputs = {'image_embeddings': torch.zeros(1,1,2,2), 'confidence': torch.zeros(1,1,1,16,16)}
         a = decode_masks(Candidates(),outputs,rows,device=torch.device('cpu'),width=16,height=16,chunk_size=1,selection='geometry')
         b = decode_masks(Candidates(),outputs,rows,device=torch.device('cpu'),width=16,height=16,chunk_size=3,selection='geometry')
         np.testing.assert_array_equal(a['selected_tokens'],[2,2,2])

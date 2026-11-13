@@ -16,6 +16,7 @@ from utils.hang_debug import register_worker_stack_dump
 import argparse
 import csv
 import json
+import os
 import random
 import wandb
 from functools import partial
@@ -1555,6 +1556,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
+    scaling_summary = None
+    if int(os.environ.get('RANK', '0')) == 0:
+        if args.data_format == 'zarr':
+            from astro_train_zarr_data import log_zarr_scaling
+            scaling_summary = log_zarr_scaling(_expand_path(args.root), hsc_root=args.hsc_zarr_root,
+                space_root=args.space_zarr_root, bands=args.bands, image_level=args.zarr_random_image_batches)
+        else:
+            print('[scaling] Training input=legacy FITS; scaling=astro_zscale_preprocess (not Zarr RGB)', flush=True)
     if not np.isfinite(args.mask_moment_weight) or args.mask_moment_weight<0:
         raise ValueError('--mask-moment-weight must be finite and nonnegative')
     if not np.isfinite(args.mask_moment_match_radius) or args.mask_moment_match_radius<=0:
@@ -2508,6 +2517,7 @@ def main() -> None:
 
         metadata = {
             "args": vars(args),
+            "input_scaling": scaling_summary,
             'zarr_input_roots':({k:str(v) for k,v in zarr_image_input_roots(root,
                 hsc_root=args.hsc_zarr_root,space_root=args.space_zarr_root).items()} if args.data_format=='zarr' else None),
             "loss_weights": asdict(weights),

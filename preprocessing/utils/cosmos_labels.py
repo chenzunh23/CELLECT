@@ -29,7 +29,7 @@ def load_catalog(path, band):
 
 
 def classify_window(raw, header, catalog, catalog_path, gaia, background, band, *,
-                    snr_thresholds=SnrThresholds()):
+                    snr_thresholds=SnrThresholds(),bright_config=None):
     if gaia is not None and 'ref_epoch' not in gaia.colnames:
         gaia=gaia.copy();gaia['ref_epoch']=2016.
     w = WCS(header).celestial
@@ -78,7 +78,7 @@ def classify_window(raw, header, catalog, catalog_path, gaia, background, band, 
     footprint=np.zeros(raw.shape,bool)
     if any(np.isfinite(r.get('phot_rp_mean_mag',np.nan)) and r['phot_rp_mean_mag']<=18 for r in gaia_rows):
         prepared=prepare_image(raw,header=header)
-        bright_pixels,_=build_bright_components(prepared,config=BrightRegionConfig(threshold=5,clip_threshold=5,statistics_clip_sigma=5))
+        bright_pixels,_=build_bright_components(prepared,config=bright_config or BrightRegionConfig(threshold=5,clip_threshold=5,statistics_clip_sigma=5))
         footprint=bright_star_footprint(prepared,bright_pixels,gaia_rows)
     # Use observed half-coadd wings for orientation/SNR; repaired cores are
     # encoder context, never independent evidence for the rotation fit.

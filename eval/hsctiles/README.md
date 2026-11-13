@@ -37,6 +37,20 @@ CUDA_VISIBLE_DEVICES=0 python eval/hsctiles/eval_hsctile_pack.py \
 
 ## Interactive Browser
 
+Detection export PNGs now default to the centered title `Detected: N`, without
+the source ID or resize suffix. The header uses Arial when installed (otherwise
+Liberation Sans/DejaVu Sans), at 22 pixels per 512-pixel output width. This is
+about 14 pt when four panels fill the 18.4-inch completeness reference figure.
+Image pixels and detection rows are unchanged. Both raw detection and input
+shape export PNGs use the same title definition.
+
+The toolbar has **Export title** (`Detected only`, `Full`, `None`) and **Title
+size**. CLI defaults are `--export-title-mode detected
+--export-title-font-size 22`; the API accepts `title_mode` and `title_font_size`.
+Settings are snapshotted per export and recorded in JSON. Set
+`CELLECT_EXPORT_FONT=/path/to/Arial.ttf` to pin a font. Restart the Python browser
+backend after updating code; refreshing the page alone does not reload it.
+
 All browser instances now share a lightweight entry at `http://127.0.0.1:8800/`.
 Keep using distinct `--port` values for independent experiments; each new browser
 automatically registers and starts/reuses the portal. For example, browsers on

@@ -93,3 +93,22 @@ HSC 既有输出路径不变。JWST 原始 MJy/sr 图像仍需按现有 `prepare
 本次完成的是路径发现、数据加载和已有标签的写入绑定，**没有新增或更改星表筛选策略，也没有运行完整标签/Zarr 批量生产**。
 CLI 的自动分类执行仍是 HSC；JWST 不会误走 HSC meas/refit 筛选。命令行选 JWST 而不指定 `--list-inputs` 会明确提示使用对应标签 adapter 与 `write_classified_patch`。
 后续批量接入应先在 Abell full coadd 上筛选/冻结星表，再映射到 half coadd；不能用半数图重做这一步筛选。
+# 2026-11-11：公共 scaling 定义
+
+`zscore-log-lupton-rgb` 的 log/Lupton 输入改为未截断的
+`z=(I-background_median)/background_sigma`；先换算表面亮度单位，再做
+zscore，再变换，最后各通道独立标准化和截断。第一个通道仍为 zscore。
+公共 `scale_training_image`、亮区 `build_bright_mask`、parent fit/apply 采用
+同一顺序，版本为 `zscore_first_v1`。本轮对照默认继续使用 Q=20、stretch=0.5，
+不是 10 月诊断的 Q=200、stretch=50；既有亮区阈值不变，亮区范围可能改变。
+
+`run_generate_zarr.sh` 可通过 `IMAGE_LUPTON_Q`、`IMAGE_LUPTON_STRETCH`、
+`BRIGHT_LUPTON_Q`、`BRIGHT_LUPTON_STRETCH` 配置，或传原有 CLI 参数。
+生成日志开头和每个 store 记录 image/bright 定义、参数、统计范围；`.zattrs`
+保存 `image_scaling_contract`、`image_scaling_version`、`bright_scaling_contract`。
+receipt 签名和 browser parent 缓存会区分旧定义。
+
+训练启动日志读取输入 Zarr 的真实元数据，分别列出各类定义，并存入
+`run_config.json/input_scaling`。旧的、没有版本字段的 RGB Zarr 标记为
+`legacy_raw_first_unversioned`；训练不对已存三通道进行二次 scaling。
+代码更新不会改写既有 Zarr，旧训练进程也不会热更新。

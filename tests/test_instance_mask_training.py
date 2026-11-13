@@ -43,6 +43,88 @@ def run(logits,p,w,batch=None):
     return out,model
 
 
+def test_mask_centroid_matches_resize_pixel_centers_and_preserves_fractions():
+    import torch.nn.functional as F
+    # The weighted centroid lies between mask pixels. The prompt remains
+    # fractional in both native and low-resolution coordinate systems.
+    for image_hw, mask_hw in [((512,512),(128,128)),((80,96),(10,24)),((32,48),(32,48))]:
+        mh,mw=mask_hw;h,w=image_hw
+        probability=torch.zeros(1,1,mh,mw)
+        probability[...,mh//2,mw//2]=.31
+        probability[...,mh//2+1,mw//2]=.13
+        probability[...,mh//2,mw//2+1]=.07
+        full=F.interpolate(probability,size=image_hw,mode='bilinear',align_corners=False)
+        mass=full.sum()
+        expected=torch.stack(((full*torch.arange(w)[None,:]).sum()/mass,
+                              (full*torch.arange(h)[:,None]).sum()/mass))
+        assert torch.any((expected-expected.round()).abs()>1e-3)
+        logits=torch.logit(probability.clamp_min(1e-30))
+        p=prompts(center=tuple(expected.tolist()))
+        model=Model(logits);model.dynamic_image_size=False
+        out=_sam_mask_loss_for_prompts(model,dict(confidence=torch.zeros(1),image_embeddings=torch.zeros(1)),p,
+            weights=weights(mask_dice=0.,mask_bce=0.,mask_centroid=1.),image_hw=image_hw,ellipse_sigma=1.)
+        # Native-grid FP32 reduction over 512**2 pixels has sub-millipixel
+        # accumulation error; the former 1.5-pixel bias is orders larger.
+        assert out['centroid'].item()<1e-4,(image_hw,out['centroid'])
+        out['total'].backward()
+        assert torch.isfinite(model.logits.grad).all()
+
+
+def test_old_right_up_bias_is_penalized_and_gradient_moves_mass_back():
+    # A coarse mask centered at (60,60) maps to (241.5,241.5), not (240,240).
+    yy,xx=torch.meshgrid(torch.arange(128),torch.arange(128),indexing='ij')
+    probability=(.8*torch.exp(-((xx-60.)**2+(yy-60.)**2)/8)).clamp_min(1e-30)
+    model=Model(torch.logit(probability)[None,None]);model.dynamic_image_size=False
+    p=prompts(center=(240.,240.),shape=(4.,4.,0.))
+    out=_sam_mask_loss_for_prompts(model,dict(confidence=torch.zeros(1),image_embeddings=torch.zeros(1)),p,
+        weights=weights(mask_dice=0.,mask_bce=0.,mask_centroid=1.),image_hw=(512,512),ellipse_sigma=1.)
+    torch.testing.assert_close(out['centroid'],torch.tensor(1.5*2**.5/4),rtol=1e-4,atol=1e-5)
+    out['total'].backward()
+    grad=model.logits.grad[0,0]
+    assert torch.isfinite(grad).all() and grad.abs().sum()>0
+    # Gradient descent reduces right/up mass instead of rewarding the offset.
+    assert (grad*(xx-60.)).sum()>0 and (grad*(yy-60.)).sum()>0
+
+
+def test_lowres_ellipse_keeps_subpixel_centers_without_integer_rounding():
+    from sam_backbone.losses import _ellipse_targets_lowres
+    centers=torch.tensor([[240.,240.],[241.,241.]])
+    low_centers=(centers+.5)/4-.5
+    assert low_centers.is_floating_point()
+    assert not torch.equal(low_centers,low_centers.round())
+    # Both centers would round to coarse pixel (60,60), losing this distinction.
+    torch.testing.assert_close(low_centers.round()[0],low_centers.round()[1])
+    masks=_ellipse_targets_lowres(centers,torch.tensor([[1.,1.,0.]]*2),
+        mask_hw=(128,128),image_hw=(512,512),ellipse_sigma=1.)
+    assert masks[0,60,60]==0 and masks[1,60,60]==1
+
+
+def test_rotated_ellipse_uses_native_geometry_for_unequal_resize_factors():
+    from sam_backbone.losses import _ellipse_targets_lowres
+    centers=torch.tensor([[33.7,27.2],[1.2,2.8]])
+    shapes=torch.tensor([[12.1,3.4,.73],[5.1,2.7,-.4]])
+    image_hw=(64,96);mask_hw=(8,24)
+    # Each coarse cell represents the native center of its 8x4 pixel block.
+    expected=torch.empty(2,*mask_hw)
+    for n in range(2):
+        cx,cy=centers[n];a,b,t=shapes[n]
+        for iy in range(8):
+            for ix in range(24):
+                dx=(ix+.5)*4-.5-cx;dy=(iy+.5)*8-.5-cy
+                xr=t.cos()*dx+t.sin()*dy;yr=-t.sin()*dx+t.cos()*dy
+                expected[n,iy,ix]=((xr/a)**2+(yr/b)**2<=1).float()
+    got=_ellipse_targets_lowres(centers,shapes,mask_hw=mask_hw,image_hw=image_hw,ellipse_sigma=1.)
+    torch.testing.assert_close(got,expected)
+
+
+def test_mask_grid_geometry_is_fp32_under_bfloat16_autocast():
+    from sam_backbone.losses import _mask_grid_centers
+    with torch.autocast('cpu',dtype=torch.bfloat16):
+        y,x=_mask_grid_centers((128,128),(512,512),device=torch.device('cpu'),dtype=torch.bfloat16)
+    assert x.dtype==y.dtype==torch.float32
+    assert x[60].item()==y[60].item()==241.5
+
+
 def test_area_lower_has_gradient_below_old_clamp_and_bounds():
     r=torch.tensor([.01,.049,.05,1.,2.,2.01],requires_grad=True)
     loss=area_ratio_penalty(r,.05,2.)

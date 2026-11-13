@@ -318,6 +318,8 @@ async function refreshState(updateTitle=true) {
   const exportWorkers = document.getElementById('exportWorkers');
   if (exportWorkers.dataset.session !== state.session_name) {
     exportWorkers.value = state.export_workers || 4;
+    document.getElementById('exportTitleMode').value = state.export_title_mode || 'detected';
+    document.getElementById('exportTitleFontSize').value = state.export_title_font_size || 22;
     exportWorkers.dataset.session = state.session_name;
   }
   if (!state.started) {
@@ -643,10 +645,15 @@ async function exportSelected() {
   if (exportBusy) return;
   const workers = Number(document.getElementById('exportWorkers').value);
   if (!Number.isInteger(workers) || workers < 1) throw new Error('Export workers must be a positive integer.');
+  const titleMode = document.getElementById('exportTitleMode').value;
+  const titleFontSize = Number(document.getElementById('exportTitleFontSize').value);
+  if (!Number.isFinite(titleFontSize) || titleFontSize < 4 || titleFontSize > 256) throw new Error('Title size must be between 4 and 256.');
   exportBusy = true;
   document.getElementById('export').disabled = true;
   document.getElementById('export').textContent = 'Exporting ...';
   document.getElementById('exportWorkers').disabled = true;
+  document.getElementById('exportTitleMode').disabled = true;
+  document.getElementById('exportTitleFontSize').disabled = true;
   setStatus(`Exporting ... loading images and preparing detections (${state.n_selected} images, ${workers} workers).`);
   let polling = false;
   const timer = setInterval(async () => {
@@ -677,7 +684,8 @@ async function exportSelected() {
     const result = await fetchJson('/api/export', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({write_png: true, workers, ...(Object.keys(confidenceView).length ? {confidence_view: confidenceView} : {})})
+      body: JSON.stringify({write_png: true, workers, title_mode: titleMode, title_font_size: titleFontSize,
+        ...(Object.keys(confidenceView).length ? {confidence_view: confidenceView} : {})})
     });
     const timing = Number.isFinite(result.elapsed_seconds) ? ` in ${result.elapsed_seconds.toFixed(1)} s (${result.workers} workers)` : '';
     setStatus(`Exported ${result.n_exported} raw frames and ${result.n_detections} detections${timing} to ${result.out_dir}; confidence overlay uses current scaling; mask PNGs use normal ZScale.`);
@@ -687,6 +695,8 @@ async function exportSelected() {
     document.getElementById('export').disabled = false;
     document.getElementById('export').textContent = 'Export Selected';
     document.getElementById('exportWorkers').disabled = false;
+    document.getElementById('exportTitleMode').disabled = false;
+    document.getElementById('exportTitleFontSize').disabled = false;
   }
 }
 

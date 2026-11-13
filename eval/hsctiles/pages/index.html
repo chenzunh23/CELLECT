@@ -47,6 +47,11 @@
         </div>
         <button id="saveCsv">Save CSV</button>
         <label class="pageControl">Export workers <input id="exportWorkers" type="number" min="1" step="1" value="4" aria-label="Export workers"></label>
+        <label class="pageControl">Export title <select id="exportTitleMode" aria-label="Export title">
+          <option value="detected">Detected only</option><option value="full">Full</option><option value="none">None</option>
+        </select></label>
+        <label class="pageControl">Title size <input id="exportTitleFontSize" type="number" min="4" max="256" step="1" value="22"
+          title="Font pixels for a 512-pixel-wide image; scales with output width." aria-label="Export title size"></label>
         <button class="primary" id="export">Export Selected</button>
       </div>
     </div>

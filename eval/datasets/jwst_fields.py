@@ -159,7 +159,9 @@ class JwstFieldAccess(JwstNircamAccess):
         cache_file = self._scaling_cache_file(band, patch, px, py)
         try:
             cached = json.loads(cache_file.read_text())
-            if all(k in cached for k in ('z', 'log', 'log_stats', 'lupton_stats', 'q', 'stretch', 'clip')):
+            from data_filtering.sam_input_scaling import SCALING_VERSION
+            if cached.get('scaling_version') == SCALING_VERSION and all(
+                    k in cached for k in ('z', 'log', 'log_stats', 'lupton_stats', 'q', 'stretch', 'clip')):
                 return cached
         except (OSError, ValueError, TypeError):
             pass

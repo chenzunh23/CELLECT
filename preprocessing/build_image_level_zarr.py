@@ -316,6 +316,8 @@ def write_classified_patch(task: StoreTask, image: np.ndarray, labels: PatchLabe
             max_invalid_fraction=.10
     if 'hsc_snr' in labels.table.meta:
         provenance = {**(provenance or {}), 'hsc_snr': labels.table.meta['hsc_snr']}
+    from .image_processing import log_generation_scaling
+    scaling_metadata = log_generation_scaling(task, image_log_a=_image_log_a(task), bright_log_a=_bright_log_a(task))
     if image.shape != labels.dense.shape:
         raise ValueError("image and dense target shapes must match")
     if cosmos_catalog is not None:
@@ -569,6 +571,10 @@ def write_classified_patch(task: StoreTask, image: np.ndarray, labels: PatchLabe
             "group": task.group,
             "image_scaling_mode": task.image_scaling_mode,
             "image_scaling_scope": task.image_scaling_scope,
+            "image_scaling_contract": scaling_metadata['image'],
+            "image_scaling_version": scaling_metadata['image']['version'],
+            "image_scaling_order": scaling_metadata['image']['order'],
+            "bright_scaling_contract": scaling_metadata['bright'],
             "bright_mask_mode": task.bright_mask_mode,
             "bright_threshold": float(task.bright_threshold),
             "bright_dilation": int(task.bright_dilation),
@@ -1077,6 +1083,8 @@ def write_input_inventory(args):
 
 def main() -> int:
     args = parse_args()
+    from .image_processing import log_generation_scaling
+    log_generation_scaling(args)
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
     if args.training_batch:
